@@ -565,11 +565,17 @@ body{background:#09092E;}
                 <div style="color:var(--mu);font-size:12px">Loading...</div>
               </div>
             </div>
+            <div class="tbl-wrap">
+              <div class="tbl-head">
+                <div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">🔔 Client Insights</div>
+              </div>
+              <div id="insightFeed" style="padding:8px 0">
+                <div style="color:var(--mu);font-size:12px">Loading...</div>
+              </div>
+            </div>
           </div>
         </div>
       </div>
-
-      <!-- ─── SYSTEM OVERVIEW TAB (admin only) ─── -->
       <div id="dashSystem" style="display:none">
         <div style="display:flex;justify-content:flex-end;margin-bottom:12px">
           <button class="btn btn-bl" style="width:auto;padding:8px 16px;font-size:12px" onclick="downloadSystemReport()">⬇ Download System Report</button>
@@ -3020,6 +3026,7 @@ async function renderDashboard(){
 
   renderAdvisoryClientsTable();
   if(APP.role==='admin'){ renderProductClientsTable(); renderAllClientsTable(APP.allClients); renderSystemDashboard(); }
+  renderInsightFeed();
 
   // Use all clients for reviews page (agents see own, admins see all)
   var reviewClients = APP.myClients;
@@ -3027,6 +3034,47 @@ async function renderDashboard(){
     reviewClients.filter(function(c){ return c.next_review_date && new Date(c.next_review_date) < today; }),
     reviewClients.filter(function(c){ if(!c.next_review_date) return false; var d=new Date(c.next_review_date); return d>=today && d<=in30; })
   );
+}
+function renderInsightFeed(){
+  var el=document.getElementById('insightFeed');if(!el) return;
+  var clients=APP.myClients||[];
+  if(!clients.length){el.innerHTML='<div style="color:var(--mu);font-size:12px;padding:8px">No clients yet</div>';return;}
+  var insights=[];
+  var today=new Date();
+  clients.forEach(function(c){
+    var name=esc(c.name||'Client');
+    var data=c.pfos_data||{};
+    var calcs=data.calcs||{};
+    // Negative cash flow
+    if(calcs.netCF<0) insights.push({severity:'critical',icon:'🚨',text:name+' has <strong style="color:var(--rd)">negative cash flow</strong> ('+fmt(Math.abs(calcs.netCF))+'/mo deficit)',clientId:c.id,time:c.updated_at||c.last_review_date});
+    // No emergency fund
+    if(calcs.efMonths!==undefined&&calcs.efMonths<1&&calcs.inc>0) insights.push({severity:'high',icon:'⚠️',text:name+' has <strong style="color:var(--or)">no emergency fund</strong> — vulnerable to any disruption',clientId:c.id,time:c.updated_at});
+    // EF below 3 months
+    else if(calcs.efMonths>0&&calcs.efMonths<3) insights.push({severity:'medium',icon:'🛡️',text:name+' emergency fund at '+(calcs.efMonths).toFixed(1)+' months (target: 3–6)',clientId:c.id,time:c.updated_at});
+    // DTI above 40%
+    if(calcs.dti>40) insights.push({severity:'high',icon:'📊',text:name+' DTI at <strong style="color:var(--or)">'+(calcs.dti).toFixed(0)+'%</strong> — above safe threshold',clientId:c.id,time:c.updated_at});
+    // No income entered
+    if(!calcs.inc||calcs.inc<=0) insights.push({severity:'low',icon:'📋',text:name+' has <strong>incomplete profile</strong> — no income data entered yet',clientId:c.id,time:c.updated_at});
+    // Protection gap
+    if(data.protCalcs&&data.protCalcs.hasGap&&data.protCalcs.gap>100000) insights.push({severity:'medium',icon:'🛡️',text:name+' has '+fmtK(data.protCalcs.gap)+' <strong style="color:var(--or)">protection gap</strong>',clientId:c.id,time:c.updated_at});
+    // Review overdue
+    if(c.next_review_date&&new Date(c.next_review_date)<today){
+      var daysOver=Math.round((today-new Date(c.next_review_date))/(1000*60*60*24));
+      insights.push({severity:'medium',icon:'📅',text:name+' review is <strong style="color:var(--yl)">'+daysOver+' days overdue</strong>',clientId:c.id,time:c.next_review_date});
+    }
+  });
+  // Sort by severity
+  var sevOrder={critical:0,high:1,medium:2,low:3};
+  insights.sort(function(a,b){return (sevOrder[a.severity]||3)-(sevOrder[b.severity]||3);});
+  // Show top 8
+  insights=insights.slice(0,8);
+  if(!insights.length){el.innerHTML='<div style="color:var(--gr);font-size:12px;padding:8px">✓ All clients look healthy — no issues flagged</div>';return;}
+  var h='';
+  insights.forEach(function(ins){
+    var sevCol=ins.severity==='critical'?'var(--rd)':ins.severity==='high'?'var(--or)':ins.severity==='medium'?'var(--yl)':'var(--mu)';
+    h+='<div onclick="openClientProfile(\''+ins.clientId+'\')" style="padding:8px 12px;border-left:3px solid '+sevCol+';margin-bottom:4px;cursor:pointer;font-size:12px;color:rgba(226,232,240,.7);line-height:1.5;transition:background .15s" onmouseover="this.style.background=\'rgba(0,68,191,.06)\'" onmouseout="this.style.background=\'transparent\'">'+ins.icon+' '+ins.text+'</div>';
+  });
+  el.innerHTML=h;
 }
 function getEffectiveTier(client){
   if(!client || typeof client !== 'object') return 'none';
