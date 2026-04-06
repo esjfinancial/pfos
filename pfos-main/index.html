@@ -1721,18 +1721,47 @@ function renderPayScheduleUI(){
   } else {
     S.paySchedules.forEach(function(ps,i){
       var freqLabel={weekly:'Weekly',biweekly:'Every 2 Weeks',semimonthly:'1st & 15th',monthly:'Monthly',irregular:'Irregular'};
+      var payDayDisplay='';
+      if(ps.frequency==='weekly'||ps.frequency==='biweekly'){
+        payDayDisplay=ps.next_pay_date?new Date(ps.next_pay_date+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}):'Not set';
+      } else if(ps.frequency==='semimonthly'){
+        payDayDisplay=(ps.pay_day||1)+ordSuffix(ps.pay_day||1)+' & '+(ps.pay_day_2||15)+ordSuffix(ps.pay_day_2||15);
+      } else {
+        payDayDisplay=(ps.pay_day||1)+ordSuffix(ps.pay_day||1);
+      }
       h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;margin-bottom:8px">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+escH(ps.label||'Paycheck')+'</div><div style="display:flex;gap:6px"><button onclick="editPaySchedule('+i+')" style="background:none;border:none;color:#5B9BFF;cursor:pointer;font-size:12px">✏️</button><button onclick="deletePaySchedule('+i+')" style="background:none;border:none;color:var(--rd);cursor:pointer;font-size:12px">✕</button></div></div>';
       h+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;font-size:11px">';
       h+='<div><span style="color:var(--mu)">Net Pay</span><div style="font-family:var(--fh);font-weight:700;color:var(--gr)">'+fmt(ps.net_amount||0)+'</div></div>';
       h+='<div><span style="color:var(--mu)">Frequency</span><div style="color:var(--wh)">'+(freqLabel[ps.frequency]||ps.frequency)+'</div></div>';
-      h+='<div><span style="color:var(--mu)">Pay Day</span><div style="color:var(--wh)">'+(ps.frequency==='semimonthly'?(ps.pay_day||1)+ordSuffix(ps.pay_day||1)+' & '+(ps.pay_day_2||15)+ordSuffix(ps.pay_day_2||15):(ps.pay_day||1)+ordSuffix(ps.pay_day||1))+'</div></div>';
+      h+='<div><span style="color:var(--mu)">'+(ps.frequency==='weekly'||ps.frequency==='biweekly'?'Next Pay':'Pay Day')+'</span><div style="color:var(--wh)">'+payDayDisplay+'</div></div>';
       h+='</div>';
-      if(ps.deduction_401k>0||ps.employer_match_pct>0){
-        h+='<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,68,191,.1);display:flex;gap:12px;font-size:10px">';
+      // Show all deductions
+      var hasDeductions=ps.deduction_401k>0||ps.deduction_health>0||ps.deduction_other>0||ps.deduction_misc>0||ps.employer_match_pct>0;
+      if(hasDeductions){
+        h+='<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,68,191,.1);display:flex;gap:10px;flex-wrap:wrap;font-size:10px">';
         if(ps.deduction_401k>0) h+='<span style="color:var(--mu)">401k: '+fmt(ps.deduction_401k)+'/check</span>';
+        if(ps.deduction_health>0) h+='<span style="color:var(--mu)">Health: '+fmt(ps.deduction_health)+'/check</span>';
+        if(ps.deduction_other>0) h+='<span style="color:var(--mu)">HSA/FSA: '+fmt(ps.deduction_other)+'/check</span>';
+        if(ps.deduction_misc>0) h+='<span style="color:var(--mu)">Other: '+fmt(ps.deduction_misc)+'/check</span>';
         if(ps.employer_match_pct>0) h+='<span style="color:var(--gr)">Match: '+ps.employer_match_pct+'%</span>';
         h+='</div>';
+      }
+      // 401k cross-validation with retirement panel
+      if(ps.deduction_401k>0){
+        var freq=ps.frequency||'biweekly';
+        var multiplier={weekly:4.33,biweekly:2.167,semimonthly:2,monthly:1};
+        var monthly401k=Math.round(ps.deduction_401k*(multiplier[freq]||2));
+        var retAcct401k=(S.retAccounts||[]).filter(function(ra){return ra.type&&ra.type.indexOf('401')!==-1;});
+        if(retAcct401k.length>0){
+          var retMonthly=retAcct401k.reduce(function(t,ra){return t+(parseFloat(ra.contribution)||0);},0);
+          var diff=Math.abs(monthly401k-retMonthly);
+          if(diff>10){
+            h+='<div style="margin-top:6px;padding:6px 8px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.15);border-radius:2px;font-size:10px;color:var(--yl)">⚠️ 401k mismatch: Pay schedule shows '+fmt(monthly401k)+'/mo but Retirement panel shows '+fmt(retMonthly)+'/mo. <a href="#" onclick="openFinPanel([7]);return false" style="color:#5B9BFF">Review Retirement →</a></div>';
+          }
+        } else {
+          h+='<div style="margin-top:6px;padding:6px 8px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);border-radius:2px;font-size:10px;color:#5B9BFF">💡 401k contribution entered here but no retirement account set up. <a href="#" onclick="openFinPanel([7]);return false" style="color:#5B9BFF">Add 401k in Retirement →</a></div>';
+        }
       }
       h+='</div>';
     });
@@ -1774,7 +1803,23 @@ function editPaySchedule(idx){
   _psEditIdx=idx;
   var ps=idx>=0&&S.paySchedules[idx]?S.paySchedules[idx]:{label:'',frequency:'biweekly',pay_day:'',pay_day_2:'',next_pay_date:'',net_amount:'',gross_amount:'',deduction_401k:'',deduction_other:'',employer_match_pct:'',employer_match_cap:'',owner:'self'};
   var h='<div class="modal-title">'+(idx>=0?'Edit':'Add')+' Pay Schedule</div>';
-  h+='<div class="fi"><label class="lb">Label</label><input class="inp" type="text" id="psLabel" value="'+escH(ps.label||'')+'" placeholder="e.g. My Paycheck, Spouse Paycheck, Freelance"></div>';
+  // Income source dropdown
+  var sources=S.incomeSources||[];
+  var hasIncome=sources.length>0&&sources.some(function(s){return s.amount>0;});
+  if(hasIncome){
+    h+='<div class="fi"><label class="lb">Income Source</label><select class="sel" id="psIncSrc" onchange="psIncomeSelect()">';
+    h+='<option value="">— Select an income source —</option>';
+    sources.forEach(function(s,si){
+      if(!s.amount||s.amount<=0) return;
+      var sel=(ps.income_source_idx===si||ps.label===s.name)?' selected':'';
+      h+='<option value="'+si+'"'+sel+'>'+escH(s.name||'Income '+(si+1))+' — '+fmt(s.amount)+'/mo</option>';
+    });
+    h+='<option value="custom"'+(ps.income_source_idx===undefined&&ps.label&&!sources.some(function(s){return s.name===ps.label;})?' selected':'')+'>Custom / Other</option>';
+    h+='</select></div>';
+    h+='<div id="psCustomLabel" style="'+(ps.income_source_idx===undefined?'':'display:none')+'"><div class="fi"><label class="lb">Custom Label</label><input class="inp" type="text" id="psLabel" value="'+escH(ps.label||'')+'" placeholder="e.g. Freelance, Side Gig"></div></div>';
+  } else {
+    h+='<div class="fi"><label class="lb">Label</label><input class="inp" type="text" id="psLabel" value="'+escH(ps.label||'')+'" placeholder="e.g. My Paycheck, Spouse Paycheck"></div>';
+  }
   h+='<div class="fi"><label class="lb">Frequency</label><select class="sel" id="psFreq" onchange="psFreqChange()">';
   ['weekly','biweekly','semimonthly','monthly','irregular'].forEach(function(f){
     var labels={weekly:'Weekly (every Friday, etc.)',biweekly:'Biweekly (every other week)',semimonthly:'Semimonthly (1st & 15th)',monthly:'Monthly (same date)',irregular:'Irregular'};
@@ -1791,9 +1836,13 @@ function editPaySchedule(idx){
   h+='<div id="psSemiRow" style="'+(showSemi?'':'display:none')+'"><div class="row"><div class="fi"><label class="lb">First Pay Day</label><input class="inp" type="number" id="psSemiDay1" value="'+(ps.pay_day||1)+'" min="1" max="31" placeholder="1"></div><div class="fi"><label class="lb">Second Pay Day</label><input class="inp" type="number" id="psSemiDay2" value="'+(ps.pay_day_2||15)+'" min="1" max="31" placeholder="15"></div></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">Net Pay (take-home per check)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psNet" value="'+(ps.net_amount||'')+'" placeholder="0" style="padding-left:22px"></div></div>';
   h+='<div class="fi"><label class="lb">Gross Pay (optional)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psGross" value="'+(ps.gross_amount||'')+'" placeholder="0" style="padding-left:22px"></div></div></div>';
-  h+='<div class="row"><div class="fi"><label class="lb">401k Deduction / check</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ps401k" value="'+(ps.deduction_401k||'')+'" placeholder="0" style="padding-left:22px"></div></div>';
-  h+='<div class="fi"><label class="lb">Other Pre-Tax Deductions / check</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psOther" value="'+(ps.deduction_other||'')+'" placeholder="HSA, FSA, etc." style="padding-left:22px"></div></div></div>';
-  h+='<div class="row"><div class="fi"><label class="lb">Employer Match %</label><input class="inp" type="number" id="psMatch" value="'+(ps.employer_match_pct||'')+'" step="0.5" min="0" max="100" placeholder="e.g. 6"></div>';
+  h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--yl);margin:12px 0 8px">Pre-Tax Deductions (per paycheck)</div>';
+  h+='<div class="row"><div class="fi"><label class="lb">401k Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ps401k" value="'+(ps.deduction_401k||'')+'" placeholder="0" style="padding-left:22px"></div></div>';
+  h+='<div class="fi"><label class="lb">Health / Dental / Vision Insurance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psHealth" value="'+(ps.deduction_health||'')+'" placeholder="0" style="padding-left:22px"></div></div></div>';
+  h+='<div class="row"><div class="fi"><label class="lb">HSA / FSA Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psOther" value="'+(ps.deduction_other||'')+'" placeholder="0" style="padding-left:22px"></div></div>';
+  h+='<div class="fi"><label class="lb">Other Pre-Tax</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psOtherMisc" value="'+(ps.deduction_misc||'')+'" placeholder="Life ins, transit, etc." style="padding-left:22px"></div></div></div>';
+  h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--gr);margin:12px 0 8px">Employer Contributions</div>';
+  h+='<div class="row"><div class="fi"><label class="lb">Employer 401k Match %</label><input class="inp" type="number" id="psMatch" value="'+(ps.employer_match_pct||'')+'" step="0.5" min="0" max="100" placeholder="e.g. 6"></div>';
   h+='<div class="fi"><label class="lb">Employer Match Cap / check</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psMatchCap" value="'+(ps.employer_match_cap||'')+'" placeholder="0" style="padding-left:22px"></div></div></div>';
   if(S.householdType&&S.householdType!=='individual'){
     h+='<div class="fi"><label class="lb">Whose Income?</label><select class="sel" id="psOwner"><option value="self"'+(ps.owner==='self'?' selected':'')+'>Mine</option><option value="spouse"'+(ps.owner==='spouse'?' selected':'')+'>Spouse</option><option value="joint"'+(ps.owner==='joint'?' selected':'')+'>Joint</option></select></div>';
@@ -1814,11 +1863,52 @@ function psFreqChange(){
   if(dom) dom.style.display=(freq==='monthly')?'':'none';
   if(semi) semi.style.display=(freq==='semimonthly')?'':'none';
 }
+function psIncomeSelect(){
+  var sel=document.getElementById('psIncSrc');
+  var customRow=document.getElementById('psCustomLabel');
+  if(!sel) return;
+  var val=sel.value;
+  if(val==='custom'||val===''){
+    if(customRow) customRow.style.display='';
+    return;
+  }
+  if(customRow) customRow.style.display='none';
+  var idx=parseInt(val);
+  var src=S.incomeSources&&S.incomeSources[idx];
+  if(!src) return;
+  // Pre-fill gross amount from income source
+  var grossEl=document.getElementById('psGross');
+  if(grossEl&&!grossEl.value) grossEl.value=src.amount||'';
+  // Pre-fill label
+  var labelEl=document.getElementById('psLabel');
+  if(labelEl) labelEl.value=src.name||'';
+  // Pre-fill owner based on income source owner
+  var ownerEl=document.getElementById('psOwner');
+  if(ownerEl&&src.owner) ownerEl.value=src.owner;
+  // Pre-fill 401k from retirement accounts if available
+  var retAcct=(S.retAccounts||[]).find(function(ra){
+    return ra.type&&ra.type.indexOf('401')!==-1&&ra.contribution>0;
+  });
+  if(retAcct){
+    var k401El=document.getElementById('ps401k');
+    // Convert monthly contribution to per-check based on frequency
+    var freq=(document.getElementById('psFreq')||{}).value||'biweekly';
+    var divisor={weekly:4.33,biweekly:2.167,semimonthly:2,monthly:1};
+    var perCheck=Math.round((retAcct.contribution||0)/(divisor[freq]||2));
+    if(k401El&&!k401El.value) k401El.value=perCheck;
+  }
+}
 
 function savePaySchedule(){
   var freq=(document.getElementById('psFreq')||{}).value||'biweekly';
+  var incSrc=document.getElementById('psIncSrc');
+  var incIdx=incSrc&&incSrc.value!=='custom'&&incSrc.value!==''?parseInt(incSrc.value):undefined;
+  var labelEl=document.getElementById('psLabel');
+  var label=labelEl?labelEl.value:'';
+  if(!label&&incIdx!==undefined&&S.incomeSources&&S.incomeSources[incIdx]) label=S.incomeSources[incIdx].name;
   var ps={
-    label:(document.getElementById('psLabel')||{}).value||'Paycheck',
+    label:label||'Paycheck',
+    income_source_idx:incIdx,
     frequency:freq,
     next_pay_date:(freq==='weekly'||freq==='biweekly')?(document.getElementById('psNextDate')||{}).value||'':'',
     pay_day:freq==='monthly'?parseInt((document.getElementById('psDay')||{}).value)||1:freq==='semimonthly'?parseInt((document.getElementById('psSemiDay1')||{}).value)||1:0,
@@ -1826,7 +1916,9 @@ function savePaySchedule(){
     net_amount:parseFloat((document.getElementById('psNet')||{}).value)||0,
     gross_amount:parseFloat((document.getElementById('psGross')||{}).value)||0,
     deduction_401k:parseFloat((document.getElementById('ps401k')||{}).value)||0,
+    deduction_health:parseFloat((document.getElementById('psHealth')||{}).value)||0,
     deduction_other:parseFloat((document.getElementById('psOther')||{}).value)||0,
+    deduction_misc:parseFloat((document.getElementById('psOtherMisc')||{}).value)||0,
     employer_match_pct:parseFloat((document.getElementById('psMatch')||{}).value)||0,
     employer_match_cap:parseFloat((document.getElementById('psMatchCap')||{}).value)||0,
     owner:(document.getElementById('psOwner')||{}).value||'self',
@@ -1905,7 +1997,27 @@ function renderHome(){
   var dayOfMonth=now.getDate();var daysLeft=daysInMonth-dayOfMonth;
   var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
   var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
-  var moneyIn=c.inc||0;
+  // Money In = NET take-home (after 401k, health insurance, etc.)
+  var moneyIn=0;
+  if(S.paySchedules&&S.paySchedules.length>0){
+    // Use pay schedules — they already have net pay
+    S.paySchedules.forEach(function(ps){
+      if(!ps.net_amount) return;
+      var freq=ps.frequency||'monthly';
+      var multiplier={weekly:4.33,biweekly:2.167,semimonthly:2,monthly:1,annual:1/12,irregular:1};
+      moneyIn+=ps.net_amount*(multiplier[freq]||1);
+    });
+    moneyIn=Math.round(moneyIn);
+  } else {
+    // Fallback: gross income minus known pre-tax deductions
+    var gross=c.inc||0;
+    var preTaxDeductions=0;
+    // Subtract 401k contributions from retirement accounts
+    (S.retAccounts||[]).forEach(function(ra){
+      if(ra.contribution) preTaxDeductions+=parseFloat(ra.contribution)||0;
+    });
+    moneyIn=Math.max(0,Math.round(gross-preTaxDeductions));
+  }
   var leftToSpend=Math.max(0,moneyIn-moneyOut);
   var dailyBudget=daysLeft>0?Math.round(leftToSpend/daysLeft):0;
   var pctSpent=moneyIn>0?Math.round((moneyOut/moneyIn)*100):0;
@@ -2024,33 +2136,7 @@ function getPayDatesForMonth(month,year){
       }
     }
   });
-  // Also check income sources for next_pay_date (if no pay schedules set up)
-  if(result.length===0&&S.incomeSources&&S.incomeSources.length>0){
-    S.incomeSources.forEach(function(inc){
-      if(!inc.amount||inc.amount<=0) return;
-      var freq=inc.frequency||'monthly';
-      if((freq==='weekly'||freq==='biweekly')&&inc.next_pay_date){
-        var anchor=new Date(inc.next_pay_date+'T12:00:00');
-        var interval=freq==='weekly'?7:14;
-        var monthStart=new Date(year,month,1);
-        var monthEnd=new Date(year,month+1,0);
-        var cursor=new Date(anchor);
-        while(cursor>monthStart) cursor.setDate(cursor.getDate()-interval);
-        while(cursor<=monthEnd){
-          cursor.setDate(cursor.getDate()+interval);
-          if(cursor.getMonth()===month&&cursor.getFullYear()===year){
-            result.push({day:cursor.getDate(),label:inc.name||'Paycheck',amount:inc.amount||0});
-          }
-        }
-      } else if(freq==='semimonthly'){
-        result.push({day:1,label:inc.name||'Paycheck',amount:inc.amount||0});
-        result.push({day:15,label:inc.name||'Paycheck',amount:inc.amount||0});
-      } else if(freq==='monthly'){
-        result.push({day:1,label:inc.name||'Paycheck',amount:inc.amount||0});
-      }
-    });
-  }
-  // Final fallback: if still nothing but income exists, assume 1st and 15th
+  // Fallback: if no pay schedules but income exists, assume 1st and 15th
   if(result.length===0&&S.calcs&&S.calcs.inc>0){
     result.push({day:1,label:'Paycheck',amount:Math.round((S.calcs.inc||0)/2)});
     result.push({day:15,label:'Paycheck',amount:Math.round((S.calcs.inc||0)/2)});
@@ -2471,26 +2557,12 @@ function _incomeRowHtml(src,i){
   var conOpts=['consistent','variable','seasonal','passive'].map(function(c){
     return '<option value="'+c+'"'+(src.consistency===c?' selected':'')+'>'+c.charAt(0).toUpperCase()+c.slice(1)+'</option>';
   }).join('');
-  var freqOpts=['weekly','biweekly','semimonthly','monthly','annual'].map(function(f){
-    var labels={weekly:'Weekly',biweekly:'Biweekly',semimonthly:'1st & 15th',monthly:'Monthly',annual:'Annual'};
-    return '<option value="'+f+'"'+(src.frequency===f?' selected':'')+'>'+labels[f]+'</option>';
-  }).join('');
-  var needsDate=src.frequency==='weekly'||src.frequency==='biweekly';
-  var h='<div class="src-row">'
+  return '<div class="src-row">'
     +'<input class="inp" type="text" placeholder="Source name" value="'+escH(src.name)+'" oninput="updIncome('+i+',\'name\',this.value)">'
-    +'<select class="sel" style="max-width:110px" onchange="updIncome('+i+',\'frequency\',this.value);renderIncomeRow();calc()">'+freqOpts+'</select>'
     +'<select class="sel" onchange="updIncome('+i+',\'consistency\',this.value)">'+conOpts+'</select>'
     +'<div class="inp-prefix" style="flex:2;min-width:140px"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(src.amount||'')+'" oninput="updIncome('+i+',\'amount\',this.value)" style="padding-left:22px"></div>'
     +'<button class="src-del" onclick="delIncome('+i+')">✕</button>'
   +'</div>';
-  if(needsDate){
-    h+='<div style="display:flex;align-items:center;gap:8px;padding:6px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.1);border-radius:0 0 2px 2px;margin-top:-1px">'
-    +'<span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF">📅 Next Pay Date</span>'
-    +'<input class="inp" type="date" value="'+(src.next_pay_date||'')+'" oninput="updIncome('+i+',\'next_pay_date\',this.value);calc()" style="max-width:180px;min-height:36px;font-size:12px;padding:6px 10px">'
-    +'<span style="font-size:10px;color:var(--mu)">System calculates all future pay dates from this</span>'
-    +'</div>';
-  }
-  return h;
 }
 function toggleStayHome(){
   var cb=document.getElementById('spouseStayHome');
