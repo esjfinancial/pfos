@@ -1424,7 +1424,7 @@ function showSection(sec){
   if(activeBtn) activeBtn.classList.add('active');
   // Section-specific initialization
   if(sec==='home') renderHome();
-  if(sec==='finances') renderFinCards();
+  if(sec==='finances'){ showFinCards(); renderFinCards(); }
   if(sec==='tools') renderToolsGrid();
   if(sec==='plan') renderPlanSection();
   // Reset scroll
@@ -1647,6 +1647,21 @@ function renderPlanSection(){
       if(DE.systemFlags.length>5) h+='<div style="font-size:11px;color:var(--mu);text-align:center;padding:8px">+'+(DE.systemFlags.length-5)+' more flags — full analysis in Decision Engine</div>';
       h+='</div>';
     }
+  }
+  // Cross-panel validation flags
+  var cvFlags=runCrossValidation();
+  if(cvFlags.length>0){
+    h+='<div class="sec-group"><div class="sec-group-title">⚠️ Data Consistency ('+cvFlags.length+' issue'+(cvFlags.length>1?'s':'')+')</div>';
+    cvFlags.forEach(function(f){
+      var sevCol=f.severity==='high'?'var(--or)':f.severity==='medium'?'var(--yl)':'var(--mu)';
+      h+='<div style="padding:10px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+sevCol+';border-radius:2px;margin-bottom:6px">';
+      h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+f.icon+' '+f.title+'</div>';
+      h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;line-height:1.5">'+f.desc+'</div>';
+      if(f.autoAdd) h+='<button onclick="'+f.autoAdd+'()" style="background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:var(--gr);font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;padding:5px 12px;border-radius:2px;cursor:pointer;margin-top:6px;margin-right:6px">'+f.autoLabel+'</button>';
+      if(f.action) h+='<button onclick="'+f.action+'" style="background:none;border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;padding:4px 10px;border-radius:2px;cursor:pointer;margin-top:6px">'+f.actionLabel+'</button>';
+      h+='</div>';
+    });
+    h+='</div>';
   }
   // Debt Elimination Engine link
   if(c.totalDebt>0){
@@ -3252,7 +3267,153 @@ function runSanityChecks(){
   return warnings;
 }
 
-// ── PHASE 11: MONTE CARLO SIMULATION ─────────────────────────────────────────
+// ═══════════════════════════════════════════════════
+// CROSS-PANEL DATA VALIDATION
+// Fields talk to each other and flag mismatches
+// ═══════════════════════════════════════════════════
+function runCrossValidation(){
+  var flags=[];
+  var c=S.calcs||{};
+  var debts=S.debts||[];
+  var retAccts=S.retAccounts||[];
+  var expData=S.expData||{};
+  var paySchedules=S.paySchedules||[];
+
+  // 1. Mortgage in Protection but not in Debts
+  var protMortgage=parseFloat(gv('liMortgage'))||0;
+  var debtMortgage=debts.filter(function(d){return d.type==='Mortgage';}).reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+  if(protMortgage>0&&debtMortgage===0){
+    flags.push({icon:'🏠',severity:'high',title:'Mortgage in Protection but not in Debts',desc:'Protection shows '+fmt(protMortgage)+' mortgage but it\'s not in your Debts list.',
+      autoAdd:'cvAddMortgageToDebts',autoLabel:'+ Add Mortgage to Debts Now',
+      action:'openFinPanel([4])',actionLabel:'Go to Debts'});
+  }
+  // 2. Mortgage in Debts but not in Protection
+  if(debtMortgage>0&&protMortgage===0){
+    flags.push({icon:'🏠',severity:'medium',title:'Mortgage in Debts but not in Protection',desc:'You have '+fmt(debtMortgage)+' mortgage debt but Protection doesn\'t include it.',
+      autoAdd:'cvAddMortgageToProtection',autoLabel:'+ Add to Protection Now',
+      action:'openFinPanel([8])',actionLabel:'Go to Protection'});
+  }
+  // 3. Mortgage amounts don't match
+  if(protMortgage>0&&debtMortgage>0&&Math.abs(protMortgage-debtMortgage)>500){
+    flags.push({icon:'🏠',severity:'medium',title:'Mortgage Amounts Don\'t Match',desc:'Protection: '+fmt(protMortgage)+' vs Debts: '+fmt(debtMortgage)+'. Update whichever is outdated.',
+      action:'openFinPanel([8])',actionLabel:'Review Protection'});
+  }
+
+  // 4. Debt minimums vs Expense debt payments
+  var debtMins=debts.reduce(function(t,d){return t+(parseFloat(d.min)||0);},0);
+  var expDebtPayments=0;
+  if(expData.debtPayments) expDebtPayments=parseFloat(expData.debtPayments.amount)||0;
+  if(expData.debtPayments&&expData.debtPayments.subs){
+    var subTotal=0;Object.values(expData.debtPayments.subs).forEach(function(s){subTotal+=parseFloat(s.amount)||0;});
+    if(subTotal>0) expDebtPayments=subTotal;
+  }
+  if(debtMins>0&&expDebtPayments>0&&Math.abs(debtMins-expDebtPayments)>50){
+    flags.push({icon:'💳',severity:'medium',title:'Debt Payments Don\'t Match',desc:'Debt minimums: '+fmt(debtMins)+'/mo vs Expenses: '+fmt(expDebtPayments)+'/mo.',
+      autoAdd:'cvSyncDebtToExpenses',autoLabel:'Sync Expenses to Match Debts',
+      action:'openFinPanel([3])',actionLabel:'Review Expenses'});
+  }
+
+  // 5. Life insurance in Expenses but no Protection data
+  var lifeInsExp=0;
+  if(expData.insurance&&expData.insurance.subs){
+    Object.keys(expData.insurance.subs).forEach(function(k){
+      if(k.indexOf('life')!==-1) lifeInsExp+=parseFloat(expData.insurance.subs[k].amount)||0;
+    });
+  }
+  if(lifeInsExp>0&&!c.protScore&&c.protScore!==0){
+    flags.push({icon:'🛡️',severity:'medium',title:'Paying for Life Insurance but No Coverage Data',desc:'You pay '+fmt(lifeInsExp)+'/mo for life insurance but coverage details aren\'t entered.',
+      action:'openFinPanel([8])',actionLabel:'Set Up Protection Now'});
+  }
+
+  // 6. 401k in pay schedule vs retirement
+  if(paySchedules.length>0){
+    var ps401kMonthly=0;
+    paySchedules.forEach(function(ps){
+      if(!ps.deduction_401k) return;
+      var mult={weekly:4.33,biweekly:2.167,semimonthly:2,monthly:1};
+      ps401kMonthly+=ps.deduction_401k*(mult[ps.frequency]||2);
+    });
+    var ret401kMonthly=retAccts.filter(function(ra){return ra.type&&ra.type.indexOf('401')!==-1;}).reduce(function(t,ra){return t+(parseFloat(ra.contribution)||0);},0);
+    if(ps401kMonthly>0&&ret401kMonthly>0&&Math.abs(ps401kMonthly-ret401kMonthly)>20){
+      flags.push({icon:'💰',severity:'medium',title:'401k Amounts Don\'t Match',desc:'Pay schedule: '+fmt(Math.round(ps401kMonthly))+'/mo vs Retirement: '+fmt(Math.round(ret401kMonthly))+'/mo.',
+        action:'openFinPanel([7])',actionLabel:'Review Retirement'});
+    }
+    if(ps401kMonthly>0&&ret401kMonthly===0){
+      flags.push({icon:'💰',severity:'high',title:'401k Deducted but No Account Set Up',desc:'Pay schedule deducts '+fmt(Math.round(ps401kMonthly))+'/mo for 401k but no 401k account exists.',
+        autoAdd:'cvAdd401kAccount',autoLabel:'+ Add 401k Account Now',
+        action:'openFinPanel([7])',actionLabel:'Go to Retirement'});
+    }
+  }
+
+  // 7. Dependents but no protection/education
+  var deps=parseInt(gv('cpDependents'))||0;
+  if(deps>0){
+    var protCoverage=parseFloat(gv('liCoverage'))||0;
+    if(protCoverage===0&&!c.protScore){
+      flags.push({icon:'👶',severity:'high',title:'Dependents but No Protection',desc:deps+' dependent'+(deps>1?'s':'')+' with no protection plan. Your family needs coverage.',
+        action:'openFinPanel([8])',actionLabel:'Set Up Protection Now'});
+    }
+    var eduChildren=(S.children||[]).length;
+    if(eduChildren===0){
+      flags.push({icon:'🎓',severity:'medium',title:'Dependents but No Education Plan',desc:deps+' dependent'+(deps>1?'s':'')+' with no college savings plan.',
+        action:'openFinPanel([9])',actionLabel:'Set Up Education Now'});
+    }
+  }
+
+  // 8. Income in pay schedule vs income panel
+  if(paySchedules.length>0&&c.inc>0){
+    var psMonthlyGross=0;
+    paySchedules.forEach(function(ps){
+      var gross=ps.gross_amount||ps.net_amount||0;
+      var mult={weekly:4.33,biweekly:2.167,semimonthly:2,monthly:1};
+      psMonthlyGross+=gross*(mult[ps.frequency]||1);
+    });
+    if(psMonthlyGross>0&&Math.abs(psMonthlyGross-c.inc)>200){
+      flags.push({icon:'💵',severity:'low',title:'Income Amounts Differ',desc:'Pay schedule: ~'+fmt(Math.round(psMonthlyGross))+'/mo vs Income panel: '+fmt(Math.round(c.inc))+'/mo.',
+        action:'openFinPanel([2])',actionLabel:'Review Income'});
+    }
+  }
+
+  S._crossValidationFlags=flags;
+  return flags;
+}
+
+// ── CROSS-VALIDATION AUTO-ADD HELPERS ───────────────
+function cvAddMortgageToDebts(){
+  var bal=parseFloat(gv('liMortgage'))||0;
+  if(!S.debts) S.debts=[];
+  S.debts.push({id:Date.now(),name:'Mortgage',type:'Mortgage',balance:bal,rate:0,min:0,actual:0});
+  calc();renderDebts();openFinPanel([4]);
+  // Scroll to debt section and highlight the new row
+  setTimeout(function(){goStep(11);},200);
+}
+function cvAddMortgageToProtection(){
+  var bal=S.debts.filter(function(d){return d.type==='Mortgage';}).reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+  var el=document.getElementById('liMortgage');
+  if(el) el.value=bal;
+  calc();openFinPanel([8]);
+}
+function cvSyncDebtToExpenses(){
+  var debtMins=S.debts.reduce(function(t,d){return t+(parseFloat(d.min)||0);},0);
+  initExpData();
+  if(!S.expData.debtPayments) S.expData.debtPayments={amount:'',period:'monthly',expanded:false,subs:{},leakTagged:false,essential:true,recurring:true};
+  S.expData.debtPayments.amount=debtMins;
+  calc();openFinPanel([3]);
+}
+function cvAdd401kAccount(){
+  // Calculate monthly contribution from pay schedule
+  var monthly=0;
+  (S.paySchedules||[]).forEach(function(ps){
+    if(!ps.deduction_401k) return;
+    var mult={weekly:4.33,biweekly:2.167,semimonthly:2,monthly:1};
+    monthly+=ps.deduction_401k*(mult[ps.frequency]||2);
+  });
+  var matchPct=0;
+  (S.paySchedules||[]).forEach(function(ps){if(ps.employer_match_pct>0) matchPct=ps.employer_match_pct;});
+  if(!S.retAccounts) S.retAccounts=[];
+  S.retAccounts.push({id:Date.now(),type:'401k',name:'401k',balance:0,contribution:Math.round(monthly),matchPct:matchPct,returnRate:7});
+  calc();renderRetAccounts();openFinPanel([7]);
+}
 // ── CHUNK 2: FINANCIAL INDEPENDENCE DATE ─────────────────────────────────────
 function updateFIDate(){
   var card = document.getElementById('sFIDate'); if(!card) return;
