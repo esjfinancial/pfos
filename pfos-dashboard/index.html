@@ -4618,33 +4618,33 @@ setTimeout(function(){
 </div>
 
 <script>
-// ── Calculator Bridge with Client Selector + Rec Save ──
+// ── Financial Tools Bridge (iframe + client selector) ──
+var _advToolsLoaded = false;
 var _advCurrentClient = null;
-var _advCurrentCalcName = '';
  
-// Toggle overrides moved below pfos-calcs.js load
- 
-function advOpenCalc(fn){
-  try{
-    _advCurrentCalcName = fn;
-    openModal('advCalcModal');
-    if(typeof window[fn]==='function') window[fn]();
-    setTimeout(function(){ advInjectRecBar(); }, 300);
-  }catch(e){var el=document.getElementById('insCalcContent');if(el)el.innerHTML='<div style="padding:20px;color:var(--rd)">Error: '+e.message+'</div>';}
-}
- 
-function advFilterTools(){
-  var q=(document.getElementById('advToolSearch')||{}).value.toLowerCase();
-  document.querySelectorAll('#advGrid [data-calc]').forEach(function(b){
-    b.style.display=b.textContent.toLowerCase().indexOf(q)>=0?'':'none';
-  });
+function advInitTools(){
+  advPopulateClients();
+  if(!_advToolsLoaded){
+    var iframe = document.getElementById('advToolsFrame');
+    if(iframe){
+      iframe.addEventListener('load', function(){
+        // Unlock the PFOS app
+        try{ iframe.contentWindow.postMessage({type:'PFOS_AUTH'}, 'https://pfos.esjfinancial.com'); }catch(e){}
+        // Navigate to Tools section after a brief delay
+        setTimeout(function(){
+          try{ iframe.contentWindow.postMessage({type:'PFOS_NAV', section:'tools'}, 'https://pfos.esjfinancial.com'); }catch(e){}
+        }, 800);
+      });
+    }
+    _advToolsLoaded = true;
+  }
 }
  
 function advPopulateClients(){
   var sel=document.getElementById('advClientSel');
   if(!sel||!APP||!APP.myClients) return;
   var current=sel.value||'';
-  sel.innerHTML='<option value="">✏️ Manual Input (blank defaults)</option>';
+  sel.innerHTML='<option value="">✏️ Manual / No Client</option>';
   (APP.myClients||[]).forEach(function(cl){
     if(cl.client_type==='product') return;
     var opt=document.createElement('option');
@@ -4659,92 +4659,43 @@ async function advLoadClient(){
   var sel=document.getElementById('advClientSel');
   var val=sel?sel.value:'';
   var info=document.getElementById('advClientInfo');
+  var iframe=document.getElementById('advToolsFrame');
+ 
   if(!val){
-    window.S={calcs:{},debts:[],retAccounts:[],currentAge:35,riskProfile:'moderate',creditScore:0,children:[],insurancePolicies:[],dependents:0,protCalcs:{}};
     _advCurrentClient=null;
-    if(info) info.textContent='Manual mode — enter data in each calculator';
+    if(info) info.textContent='';
+    // Send empty state to PFOS
+    if(iframe&&iframe.contentWindow){
+      try{ iframe.contentWindow.postMessage({type:'PFOS_LOAD', state:null, mode:'advisor', tier:'pro_plus'}, 'https://pfos.esjfinancial.com'); }catch(e){}
+    }
     return;
   }
+ 
   var client=(APP.myClients||[]).find(function(c){return c.id===val;});
-  if(!client){if(info) info.textContent='Client not found';return;}
+  if(!client){if(info) info.textContent='Not found';return;}
   _advCurrentClient=client;
   if(info) info.innerHTML='Loading...';
+ 
   try{
     var {data:profile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',val).maybeSingle();
     var fd=(profile&&profile.financial_data)?profile.financial_data:{};
-    var sc=(profile&&profile.scores)?profile.scores:{};
-    var c=fd.calcs||{};
-    window.S={
-      calcs:c, debts:fd.debts||[], retAccounts:fd.retAccounts||[],
-      currentAge:fd.currentAge||client.age||35, riskProfile:fd.riskProfile||'moderate',
-      creditScore:sc.creditScore||fd.creditScore||0, children:fd.children||[],
-      insurancePolicies:fd.insurancePolicies||fd.policies||[],
-      dependents:fd.dependents||0, protCalcs:fd.protCalcs||{}, incomeSources:fd.incomeSources||[]
-    };
-    if(info) info.innerHTML='<strong style="color:var(--wh)">'+(client.name||'—')+'</strong> loaded · Age: '+window.S.currentAge+' · Risk: '+window.S.riskProfile;
-  }catch(err){
-    window.S={calcs:{},debts:[],retAccounts:[],currentAge:client.age||35,riskProfile:'moderate',creditScore:0,children:[],insurancePolicies:[],dependents:0,protCalcs:{}};
-    if(info) info.innerHTML='<strong>'+(client.name||'—')+'</strong> (no financial data yet)';
-  }
-}
+    var stateData=(fd&&fd.S)?fd.S:null;
  
-function advInjectRecBar(){
-  if(!_advCurrentClient) return;
-  var container=document.getElementById('insCalcContent');
-  if(!container||document.getElementById('advRecBar')) return;
-  var clientName=(_advCurrentClient.name||'Client');
-  var bar=document.createElement('div');
-  bar.id='advRecBar';
-  bar.style.cssText='margin-top:16px;padding:14px;background:linear-gradient(135deg,rgba(0,68,191,.08),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.2);border-radius:4px';
-  bar.innerHTML='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">📋 Save as Recommendation for '+esc(clientName)+'</div>'
-    +'<textarea id="advRecNote" class="inp" rows="2" placeholder="Add a note for '+esc(clientName)+'..." style="width:100%;margin-bottom:8px;font-size:12px;box-sizing:border-box"></textarea>'
-    +'<div style="display:flex;gap:8px;align-items:center">'
-    +'<select class="sel" id="advRecPriority" style="width:auto;min-height:36px;font-size:11px"><option value="medium">Medium Priority</option><option value="high">🔴 High Priority</option><option value="low">Low Priority</option></select>'
-    +'<button class="btn btn-or" onclick="advSaveRec()" style="flex:1;padding:10px;font-size:12px">💾 Save to '+esc(clientName)+'\'s Recs</button>'
-    +'</div>';
-  container.appendChild(bar);
-}
- 
-async function advSaveRec(){
-  if(!_advCurrentClient) return;
-  var note=(document.getElementById('advRecNote')||{}).value||'';
-  var priority=(document.getElementById('advRecPriority')||{}).value||'medium';
-  var calcTitle=(document.getElementById('insCalcTitle')||{}).textContent||'Calculator';
-  var content=document.getElementById('insCalcContent');
-  var outputText='';
-  if(content){
-    var clone=content.cloneNode(true);
-    var rb=clone.querySelector('#advRecBar');if(rb)rb.remove();
-    outputText=clone.textContent.replace(/\s+/g,' ').trim().substring(0,2000);
-  }
-  try{
-    var btn=document.querySelector('#advRecBar .btn-or');
-    if(btn){btn.textContent='Saving...';btn.disabled=true;}
-    var {error}=await db.from('advisor_recommendations').insert({
-      client_id:_advCurrentClient.id, advisor_id:APP.userId,
-      title:calcTitle, section:'calculator_analysis', priority:priority,
-      recommendation:note||('Calculator analysis: '+calcTitle),
-      details:outputText, status:'drafted', source:'calculator',
-      created_at:new Date().toISOString()
-    });
-    if(error) throw error;
-    if(btn){btn.textContent='✅ Saved!';btn.style.background='var(--gr)';
-      setTimeout(function(){btn.textContent='💾 Save Another';btn.style.background='';btn.disabled=false;
-        var ta=document.getElementById('advRecNote');if(ta)ta.value='';},2000);}
+    if(iframe&&iframe.contentWindow){
+      iframe.contentWindow.postMessage({
+        type:'PFOS_LOAD',
+        state:stateData,
+        mode:'advisor',
+        tier:'pro_plus',
+        clientId:client.id,
+        clientName:client.name||'Client'
+      }, 'https://pfos.esjfinancial.com');
+    }
+    if(info) info.innerHTML='<strong style="color:var(--wh)">'+(client.name||'—')+'</strong> loaded';
   }catch(err){
-    alert('Error saving: '+err.message);
-    var btn=document.querySelector('#advRecBar .btn-or');
-    if(btn){btn.textContent='💾 Try Again';btn.disabled=false;}
+    if(info) info.innerHTML=(client.name||'—')+' (no data)';
   }
 }
-</script>
-<script src="/pfos-calcs/pfos-calcs.js" defer></script>
-<script>
-// OVERRIDE after pfos-calcs.js loads — remove toggle, always use client data
-window.addEventListener('load', function(){
-  window.calcToggleHTML = function(){ return ''; };
-  window.isForMe = function(){ return true; };
-});
 </script>
 
 </body>
