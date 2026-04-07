@@ -11574,4 +11574,3 @@ function calcFIRE(){
   h+=calcDisclaim('This calculator provides educational information based on historical averages. It does not constitute investment advice. Past performance does not guarantee future results. Early retirement involves risks including healthcare costs, sequence of returns risk, inflation, and lifestyle changes. The 4% rule is based on the Trinity Study using US historical data. Consult a licensed investment professional.');
   el.innerHTML=h;
 }
-
