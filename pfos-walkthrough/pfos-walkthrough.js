@@ -207,6 +207,7 @@ window._wtSkip = function(){ endTour(); showReminderBanner(); };
 window._wtEnd = function(){ endTour(); markCompleted(); };
 window._wtStart = startTour;
 window._wtReset = function(){ resetCompletion(); startTour(); };
+window._wtHide = function(){ endTour(); hideReminderBanner(); var r=document.getElementById('wt-replay');if(r)r.style.display='none'; };
 
 function endTour(){
   var el = document.getElementById('wt-overlay');
@@ -438,9 +439,6 @@ function getClientPortalSteps(role){
 }
 
 // ── BOOT ──
-// Don't run inside iframes (e.g. PFOS loaded from client-profile)
-if(window.parent !== window){ return; }
-
 if(document.readyState === 'loading'){
   document.addEventListener('DOMContentLoaded', detectContext);
 } else {
