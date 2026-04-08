@@ -95,9 +95,7 @@ function createOverlay(){
   var old = document.getElementById('wt-spotlight');if(old)old.remove();
   var old2 = document.getElementById('wt-tooltip');if(old2)old2.remove();
 
-  spotlight = document.createElement('div');
-  spotlight.id = 'wt-spotlight';
-  document.body.appendChild(spotlight);
+  spotlight = null; // No separate spotlight — we style the target directly
 
   tooltip = document.createElement('div');
   tooltip.id = 'wt-tooltip';
@@ -111,6 +109,16 @@ function showStep(idx){
   var step = steps[idx];
 
   // Pre-action (e.g. navigate to a section)
+  // Remove highlight from previous target
+  var prevHighlight = document.querySelector('[data-wt-highlight]');
+  if(prevHighlight){
+    prevHighlight.removeAttribute('data-wt-highlight');
+    prevHighlight.style.outline = '';
+    prevHighlight.style.outlineOffset = '';
+    prevHighlight.style.boxShadow = '';
+    prevHighlight.style.zIndex = '';
+  }
+
   if(step.before) step.before();
 
   // Small delay to let DOM update
@@ -126,8 +134,13 @@ function showStep(idx){
     // Position spotlight
     if(target && step.target !== 'center'){
       var rect = target.getBoundingClientRect();
-      var pad = 6;
-      spotlight.style.cssText = 'display:block;position:fixed;top:'+(rect.top-pad)+'px;left:'+(rect.left-pad)+'px;width:'+(rect.width+pad*2)+'px;height:'+(rect.height+pad*2)+'px;border-radius:6px';
+      // Highlight the target directly
+      target.setAttribute('data-wt-highlight','1');
+      target.style.outline = '2px solid #5B9BFF';
+      target.style.outlineOffset = '3px';
+      target.style.boxShadow = '0 0 20px rgba(91,155,255,.4), 0 0 40px rgba(91,155,255,.15)';
+      target.style.position = target.style.position || 'relative';
+      target.style.zIndex = '100000';
       // Scroll into view if needed
       if(rect.top < 0 || rect.bottom > window.innerHeight){
         target.scrollIntoView({behavior:'smooth',block:'center'});
@@ -135,7 +148,7 @@ function showStep(idx){
         return;
       }
     } else {
-      spotlight.style.display = 'none';
+      // No spotlight for center steps
     }
 
     positionTooltip(target, step);
@@ -207,8 +220,15 @@ window._wtReset = function(){ resetCompletion(); startTour(); };
 window._wtHide = function(){ endTour(); hideReminderBanner(); var r=document.getElementById('wt-replay');if(r)r.style.display='none'; };
 
 function endTour(){
-  var s = document.getElementById('wt-spotlight');if(s)s.remove();
   var t = document.getElementById('wt-tooltip');if(t)t.remove();
+  var prevHighlight = document.querySelector('[data-wt-highlight]');
+  if(prevHighlight){
+    prevHighlight.removeAttribute('data-wt-highlight');
+    prevHighlight.style.outline = '';
+    prevHighlight.style.outlineOffset = '';
+    prevHighlight.style.boxShadow = '';
+    prevHighlight.style.zIndex = '';
+  }
 }
 
 // ── REMINDER BANNER ──
@@ -457,7 +477,7 @@ function injectCSS(){
   style.id = 'wt-styles';
   style.textContent = ''
     +'#wt-overlay{position:fixed;inset:0;z-index:99999;pointer-events:none}'
-    +'#wt-spotlight{position:absolute;border:2px solid #5B9BFF;border-radius:6px;z-index:100000;pointer-events:none;transition:all .3s ease;box-shadow:0 0 20px rgba(91,155,255,.4),0 0 40px rgba(91,155,255,.15);background:transparent}'
+    
     +'#wt-tooltip{position:absolute;background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(91,155,255,.35);border-radius:8px;padding:20px;z-index:100001;pointer-events:auto;box-shadow:0 12px 40px rgba(0,0,0,.7);max-width:420px}'
     +'.wt-close{position:absolute;top:10px;right:12px;background:none;border:none;color:#64748B;font-size:18px;cursor:pointer;padding:4px;z-index:1}.wt-close:hover{color:#F0F6FF}'
     +'.wt-step-count{font-family:Rajdhani,sans-serif;font-size:9px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px}'
@@ -597,14 +617,14 @@ function getDashboardSteps(){
     {target:'center',icon:'👋',title:'Welcome to the Advisor Dashboard',body:'Your command center for managing clients, tracking recommendations, and running your practice. Let\'s walk through every tool available to you.',delay:100},
     {target:'#nav-dashboard',position:mob?'bottom':'right',icon:'📊',title:'Dashboard',body:'Your home base — client stats, upcoming reviews, follow-up reminders, and quick search. Everything at a glance.',before:function(){nav('dashboard');}},
     {target:'#nav-advisory-clients',position:mob?'bottom':'right',icon:'👥',title:'Advisory Clients',body:'Your full client list with status, tier, health scores, and compliance tracking. Click any client to open their detailed profile.',before:function(){nav('advisory-clients');}},
-    {target:'#nav-new-client',position:mob?'bottom':'right',icon:'➕',title:'Add New Client',body:'Create advisory or product clients. Set their tier, assign an advisor, send portal invitations, and link couples — all from one form.'},
+    {target:'#nav-new-client',position:mob?'bottom':'right',icon:'➕',title:'Add New Client',body:'Create advisory or product clients. Set their tier, assign an advisor, send portal invitations, and link couples — all from one form.',before:function(){nav('advisory-clients');}},
     {target:'#nav-reviews',position:mob?'bottom':'right',icon:'📅',title:'Reviews',body:'Track all scheduled client reviews. See overdue, upcoming, and completed reviews. Send reminder emails with one click.',before:function(){nav('reviews');}},
     {target:'#nav-priority',position:mob?'bottom':'right',icon:'🎯',title:'Priority Dashboard',body:'Clients ranked by urgency — overdue reviews, missing data, low health scores. Color-coded so you never miss a follow-up.',before:function(){nav('priority');if(typeof renderPriorityDashboard==='function')renderPriorityDashboard();}},
     {target:'#nav-rec-pipeline',position:mob?'bottom':'right',icon:'🔄',title:'Recommendation Pipeline',body:'Track every recommendation from draft to implementation. Compliance rates, effectiveness scoring, and bulk starter packs for new clients.',before:function(){nav('rec-pipeline');if(typeof renderRecPipeline==='function')renderRecPipeline();}},
     {target:'#nav-agent-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools (93 Calculators)',body:'All 93 calculators with a client selector at the top. Select a client to pre-fill their data, or choose Manual Input to enter a custom profile. Run any calculator, then save the results as a recommendation directly to that client\'s profile — all without leaving this page.',before:function(){nav('agent-tools');}},
     {target:'#nav-leaderboard',position:mob?'bottom':'right',icon:'🏆',title:'Client Leaderboard',body:'See your healthiest clients, top compliance rates, and top savers. Great for identifying success stories and clients who need attention.',before:function(){nav('leaderboard');if(typeof renderClientLeaderboard==='function')renderClientLeaderboard();}},
     {target:'#nav-my-performance',position:mob?'bottom':'right',icon:'📊',title:'My Performance',body:'Your personal metrics — total clients, reviews completed, recommendations implemented, sessions logged, and average client health score.',before:function(){nav('my-performance');if(typeof renderAdvisorPerformancePage==='function')renderAdvisorPerformancePage();}},
-    {target:'#nav-my-finances',position:mob?'bottom':'right',icon:'💰',title:'My Finances',body:'Your own personal financial profile using the full PFOS tool — separate from client data. Practice what you preach.'},
+    {target:'#nav-my-finances',position:mob?'bottom':'right',icon:'💰',title:'My Finances',body:'Your own personal financial profile using the full PFOS tool — separate from client data. Practice what you preach.',before:function(){nav('dashboard');}},
     {target:'[onclick*="openPulseCheck"]',position:'right',icon:'💓',title:'Pulse Check',before:function(){if(typeof showPage==='function')showPage('dashboard');},body:'A <strong>30-second tap-to-answer</strong> scoring tool for networking events and prospecting. Ask 6 quick questions, get a score 0-100, a pre-written opening line, and save the prospect as a new client with one click. Find it in the sidebar under Pulse Check.'},
     {target:'[onclick*="openQuickRec"]',position:'right',icon:'⚡',title:'Quick Rec',before:function(){if(typeof showPage==='function')showPage('dashboard');},body:'Create a recommendation for any client in seconds — select the client, pick a section, set priority, type or dictate your recommendation, and save. Perfect for capturing ideas on the go. Find it in the sidebar.'},
     {target:'#nav-bulk-msg',position:mob?'bottom':'right',icon:'📢',title:'Bulk Message',body:'Send a message to all your clients at once — announcements, market updates, or seasonal reminders. One click, every client gets it.'},
