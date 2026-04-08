@@ -289,116 +289,86 @@ function getSteps(page, role){
 // ── PFOS MAIN STEPS ──
 function getMainSteps(role){
   var s = [];
+  var mob = window.innerWidth < 768;
+  function nav(sec){ if(typeof showSection==='function') showSection(sec); }
 
-  // Welcome
   s.push({
     target:'center', icon:'👋',
     title:'Welcome to PFOS!',
     body: role==='advisor'
-      ? 'This is your client\'s Personal Financial Operating System. Let\'s walk through the key sections so you can manage their finances effectively.'
-      : 'This is your Personal Financial Operating System — everything you need to understand, plan, and optimize your finances. Let\'s take a quick tour.',
+      ? 'This is your client\'s Personal Financial Operating System. Let\'s walk through each section.'
+      : 'This is your Personal Financial Operating System. Let\'s walk through everything available to you.',
     delay:100
   });
 
-  // Navigation
   s.push({
-    target: isMobile ? '#navHome' : '#navHome',
-    position: isMobile ? 'top' : 'right',
-    icon:'🧭', title:'Navigation',
-    body:'These tabs are your main sections. <strong>Home</strong> is your dashboard, <strong>Finances</strong> is where you enter data, <strong>My Plan</strong> tracks recommendations, <strong>Tools</strong> has 93 calculators, and <strong>Reports</strong> generates your financial reports.',
-    before: function(){ if(typeof showSection==='function') showSection('home'); }
+    target:'#navHome', position: mob?'top':'right',
+    icon:'🏠', title:'Home — Your Dashboard',
+    body:'Your financial snapshot — monthly cash flow, 4 health scores, key metrics, and smart alerts. Updated in real time as you enter data.',
+    before: function(){ nav('home'); }
   });
 
-  // Home Dashboard
   s.push({
-    target:'#secHome',
-    position:'bottom', icon:'🏠', title:'Home Dashboard',
-    body:'Your financial snapshot at a glance — monthly cash flow, financial scores, key metrics, and smart alerts. This updates automatically as you enter data.',
-    before: function(){ if(typeof showSection==='function') showSection('home'); }
+    target:'#navFinances', position: mob?'top':'right',
+    icon:'💰', title:'Finances — Enter Your Data',
+    body:'Enter everything here — income, expenses, debts, retirement, insurance, and more. <strong>Start with Income and Expenses</strong> for the biggest impact.',
+    before: function(){ nav('finances'); }
   });
 
-  // Scores
   s.push({
-    target:'#scoreGrid',
-    position:'bottom', icon:'📊', title:'Your 4 Financial Scores',
-    body:'Each score rates you 1-10 across <strong>Cash Flow</strong> (income vs expenses), <strong>Protection</strong> (insurance coverage), <strong>Growth</strong> (retirement trajectory), and <strong>Efficiency</strong> (fees & tax optimization). Together they give a complete picture.',
+    target:'#finCardsGrid', position:'top',
+    icon:'📋', title:'Financial Categories',
+    body:'Each card is a category. Click any card to expand it and enter data. Green checkmarks show completed sections. The more you fill in, the more accurate your scores become.',
+    before: function(){ nav('finances'); }
   });
 
-  // Finances
   s.push({
-    target: isMobile ? '#navFinances' : '#navFinances',
-    position: isMobile ? 'top' : 'right',
-    icon:'💰', title:'My Finances',
-    body:'This is where you enter all your financial data — income, expenses, debts, retirement accounts, insurance, and more. Each card represents a category. The more you fill in, the more accurate your scores and projections become.',
-    before: function(){ if(typeof showSection==='function') showSection('finances'); }
+    target:'#navPlan', position: mob?'top':'right',
+    icon:'📋', title:'My Plan',
+    body: role==='advisor'
+      ? 'This client\'s recommendations live here. Create drafts, track implementation, and monitor progress over time.'
+      : role==='client-advisor'
+      ? 'Your advisor\'s personalized recommendations. Track what\'s been implemented and what\'s coming next.'
+      : 'AI-powered recommendations based on your data — no advisor required. Request one anytime for professional guidance.',
+    before: function(){ nav('plan'); }
   });
 
-  // Finance Cards
   s.push({
-    target:'#finCardsGrid',
-    position:'bottom', icon:'📋', title:'Financial Categories',
-    body:'Click any card to expand it and enter your data. Green checkmarks mean that section is complete. Work through each one — start with <strong>Income</strong> and <strong>Expenses</strong> for the biggest impact.',
-    before: function(){ if(typeof showSection==='function') showSection('finances'); }
-  });
-
-  // Tools
-  s.push({
-    target: isMobile ? '#navTools' : '#navTools',
-    position: isMobile ? 'top' : 'right',
+    target:'#navTools', position: mob?'top':'right',
     icon:'🔧', title:'93 Financial Calculators',
-    body:'Every financial question has a dedicated calculator — from "Can I Afford This?" to retirement projections, student loan strategies, insurance comparisons, and more. Each one uses your profile data for personalized results.',
-    before: function(){ if(typeof showSection==='function') showSection('tools'); }
+    body:'Every financial question has a calculator — affordability, loans, retirement, insurance, student loans, tax strategy, behavioral finance, and more. All personalized with your data.',
+    before: function(){ nav('tools'); }
   });
 
-  // For Someone Else (client-facing)
   if(role !== 'advisor'){
     s.push({
-      target:'center', icon:'👥', title:'"For Someone Else" Mode',
-      body:'Every calculator has a <strong>For Someone Else</strong> button. Use it to run calculations for a family member, friend, or anyone — just enter their details and click Apply. Great for helping others without them needing their own account.',
+      target:'center', icon:'👥',
+      title:'"For Someone Else" Mode',
+      body:'Every calculator has a <strong>For Someone Else</strong> button. Enter someone else\'s details, click Apply, and the calculator recalculates with their profile. Great for helping family or friends.'
     });
   }
 
-  // Reports
   s.push({
-    target: isMobile ? '#navReports' : '#navReports',
-    position: isMobile ? 'top' : 'right',
+    target:'#navReports', position: mob?'top':'right',
     icon:'📄', title:'Reports',
-    body:'Generate comprehensive financial reports you can save, print, or share. Reports include your scores, projections, and recommended actions.',
-    before: function(){ if(typeof showSection==='function') showSection('reports'); }
+    body:'Generate comprehensive financial reports you can save, print, or share. Includes scores, projections, and recommended actions.',
+    before: function(){ nav('reports'); }
   });
 
-  // Advisor-specific
   if(role === 'advisor'){
     s.push({
-      target:'.hdr-mode',
-      position:'bottom', icon:'⚙️', title:'Advisor Mode',
-      body:'You\'re in <strong>Advisor Mode</strong>. Click <strong>Switch</strong> to toggle between advisor and client view. In advisor mode you can see additional tools and save data to the client\'s profile.',
+      target:'.hdr-mode', position:'bottom',
+      icon:'⚙️', title:'Advisor Controls',
+      body:'<strong>Switch</strong> toggles between advisor and client view. Use <strong>Save to Client</strong> to save changes, and <strong>Generate Report</strong> to create a downloadable report.',
+      before: function(){ nav('home'); }
     });
   }
 
-  // Client with advisor
-  if(role === 'client-advisor'){
-    s.push({
-      target: isMobile ? '#navPlan' : '#navPlan',
-      position: isMobile ? 'top' : 'right',
-      icon:'📋', title:'My Plan — Advisor Recommendations',
-      body:'Your advisor creates personalized recommendations here. You can view each one, track implementation progress, and communicate with your advisor about next steps.',
-      before: function(){ if(typeof showSection==='function') showSection('plan'); }
-    });
-  }
-
-  // Solo client
-  if(role === 'client-solo'){
-    s.push({
-      target:'center', icon:'🤖', title:'AI-Powered Recommendations',
-      body:'PFOS analyzes your financial data and generates personalized recommendations automatically — no advisor required. If you ever want professional guidance, you can request an advisor consultation directly from the platform.',
-    });
-  }
-
-  // Done
   s.push({
-    target:'center', icon:'🎉', title:'You\'re All Set!',
-    body:'That\'s the tour! Start by entering your <strong>Income</strong> and <strong>Expenses</strong> in the Finances tab — everything else builds from there. You can replay this tour anytime by clicking the <strong>❓</strong> button in the bottom right.',
+    target:'#navFinances', position: mob?'top':'right',
+    icon:'🎉', title:'You\'re All Set!',
+    body:'Start here — enter your <strong>Income</strong> and <strong>Expenses</strong> and everything else builds from there.<br><br>Click <strong>❓</strong> anytime to replay this tour.',
+    before: function(){ nav('finances'); }
   });
 
   return s;
@@ -406,35 +376,51 @@ function getMainSteps(role){
 
 // ── DASHBOARD STEPS (placeholder — expand later) ──
 function getDashboardSteps(){
+  var mob = window.innerWidth < 768;
+  function nav(pg){ if(typeof showPage==='function') showPage(pg); }
+
   return [
-    {target:'center',icon:'👋',title:'Welcome to the Advisor Dashboard',body:'This is your command center for managing clients, tracking recommendations, and monitoring your practice. Let\'s walk through the key features.',delay:100},
-    {target:'center',icon:'📊',title:'Dashboard Overview',body:'Your main dashboard shows client stats, upcoming reviews, and follow-up reminders. Use the sidebar to navigate between sections.'},
-    {target:'center',icon:'👥',title:'Client Management',body:'Add and manage advisory and product clients. Each client has a profile with financial data, recommendations, and session history.'},
-    {target:'center',icon:'💓',title:'Pulse Check',body:'The Pulse Check is a 30-second tap-to-answer tool for networking events. Score prospects 0-100 and save them as new clients with one click.'},
-    {target:'center',icon:'🧰',title:'Financial Tools',body:'Access all 93 calculators with a client selector. Pick a client, run any calculator with their data pre-filled, and save results as recommendations.'},
-    {target:'center',icon:'🎉',title:'Ready to Go!',body:'Explore the sidebar for more features — Priority Dashboard, Rec Pipeline, Leaderboard, Bulk Messaging, and more. Click ❓ anytime to replay this tour.'},
+    {target:'center',icon:'👋',title:'Welcome to the Advisor Dashboard',body:'Your command center for managing clients, tracking recommendations, and running your practice. Let\'s walk through each section.',delay:100},
+    {target:'#nav-dashboard',position:mob?'bottom':'right',icon:'📊',title:'Dashboard',body:'Your home base — client stats, upcoming reviews, follow-up reminders, and quick search.',before:function(){nav('dashboard');}},
+    {target:'#nav-advisory-clients',position:mob?'bottom':'right',icon:'👥',title:'Advisory Clients',body:'Your full client list with status, tier, health scores, and compliance tracking. Click any client to open their detailed profile.',before:function(){nav('advisory-clients');}},
+    {target:'#nav-new-client',position:mob?'bottom':'right',icon:'➕',title:'Add New Client',body:'Create advisory or product clients. Set their tier, assign an advisor, send portal invitations, and link couples — all from one form.'},
+    {target:'#nav-priority',position:mob?'bottom':'right',icon:'🎯',title:'Priority Dashboard',body:'Clients ranked by urgency — overdue reviews, missing data, low health scores. Never miss a follow-up.',before:function(){nav('priority');if(typeof renderPriorityDashboard==='function')renderPriorityDashboard();}},
+    {target:'#nav-rec-pipeline',position:mob?'bottom':'right',icon:'🔄',title:'Recommendation Pipeline',body:'Track every recommendation from draft to implementation. Compliance rates, effectiveness scoring, and bulk starter packs.',before:function(){nav('rec-pipeline');if(typeof renderRecPipeline==='function')renderRecPipeline();}},
+    {target:'#nav-agent-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools',body:'All 93 calculators. Select a client to pre-fill their data, run any calculator, and save results as recommendations.',before:function(){nav('agent-tools');}},
+    {target:'#nav-leaderboard',position:mob?'bottom':'right',icon:'🏆',title:'Leaderboard & Performance',body:'Healthiest clients, top compliance, and top savers. My Performance tracks your personal metrics.',before:function(){nav('leaderboard');if(typeof renderClientLeaderboard==='function')renderClientLeaderboard();}},
+    {target:'#nav-my-finances',position:mob?'bottom':'right',icon:'💰',title:'My Finances',body:'Your own personal financial profile — separate from client data. Use PFOS for yourself too.'},
+    {target:'#nav-dashboard',position:mob?'bottom':'right',icon:'🎉',title:'Ready to Go!',body:'Explore Pulse Check, Bulk Messaging, CSV Export, and Quick Rec in the sidebar.<br><br>Click <strong>❓</strong> anytime to replay this tour.',before:function(){nav('dashboard');}},
   ];
 }
 
 // ── CLIENT PROFILE STEPS (placeholder) ──
 function getClientProfileSteps(){
+  var mob = window.innerWidth < 768;
   return [
-    {target:'center',icon:'👋',title:'Client Profile',body:'This is your detailed view of a client\'s financial life. From here you can edit their data, manage recommendations, generate reports, and open the full PFOS tool.',delay:100},
-    {target:'center',icon:'⚡',title:'Open PFOS',body:'Click <strong>Open / Edit in PFOS</strong> to launch the full financial planning tool with this client\'s data loaded. Any changes you make can be saved back to their profile.'},
-    {target:'center',icon:'📋',title:'Recommendations',body:'Add, track, and manage recommendations through their full lifecycle — from draft to implementation. Use AI Suggest for automated recommendation generation.'},
-    {target:'center',icon:'📈',title:'Progress Reports',body:'Generate progress reports that show score changes, implemented recommendations, and financial trajectory over time.'},
-    {target:'center',icon:'🎉',title:'All Set!',body:'Click ❓ anytime to replay this tour.'},
+    {target:'center',icon:'👋',title:'Client Profile',body:'Everything about this client — financial data, recommendations, reports, and session history — all in one place.',delay:100},
+    {target:'#profileActionBtns',position:'bottom',icon:'⚡',title:'Quick Actions',body:'<strong>Open PFOS</strong> launches the full planning tool with their data. <strong>Save Notes</strong> records session notes. <strong>Edit Profile</strong> updates their info. <strong>Net Worth Statement</strong> generates a formal one-pager.'},
+    {target:'#profileHeaderArea',position:'bottom',icon:'👤',title:'Client Overview',body:'Name, status, tier, contact info, review dates, and couple linking. Change status, assign agents, or manage household type from here.'},
+    {target:'center',icon:'📝',title:'Recommendations',body:'Scroll down to manage all recommendations. <strong>+ Add Recommendation</strong> creates one manually. <strong>AI Suggest</strong> auto-generates them. Each tracks through draft → proposed → agreed → active → implemented.'},
+    {target:'center',icon:'📈',title:'Reports & Notes',body:'<strong>Progress Report</strong> shows score changes and implementation progress. <strong>Session Notes</strong> logs meeting summaries. <strong>Follow-up Reminders</strong> keeps you on track.'},
+    {target:'center',icon:'🎉',title:'All Set!',body:'Click <strong>❓</strong> anytime to replay this tour.'},
   ];
 }
 
 // ── CLIENT PORTAL STEPS (placeholder) ──
 function getClientPortalSteps(role){
+  var mob = window.innerWidth < 768;
+  function nav(pg){ if(typeof showClientPage==='function') showClientPage(pg); }
+
   return [
-    {target:'center',icon:'👋',title:'Welcome to Your Financial Portal',body:'This is your personal financial hub. View your scores, track recommendations, and access your financial data anytime.',delay:100},
-    {target:'center',icon:'📊',title:'Your Financial Health',body:'Your dashboard shows your 4 financial health scores and key metrics. These update automatically as your data changes.'},
-    {target:'center',icon:'📋',title:'Recommendations',body: role==='client-advisor' ? 'Your advisor creates personalized recommendations here. Track what\'s been implemented and what\'s next.' : 'AI-powered recommendations appear here based on your financial data. No advisor required — but you can request one anytime.'},
-    {target:'center',icon:'📄',title:'Reports & History',body:'View and download all your financial reports. Your timeline shows every milestone in your financial journey.'},
-    {target:'center',icon:'🎉',title:'You\'re Ready!',body:'Explore your portal and click ❓ anytime to replay this tour.'},
+    {target:'center',icon:'👋',title:'Welcome to Your Financial Portal',body:'Your personal financial hub — scores, reports, tools, and communication, all in one place.',delay:100},
+    {target:'#cnav-overview',position:mob?'bottom':'right',icon:'📊',title:'Overview',body:'Your dashboard with 4 health scores, key metrics, and financial summary.',before:function(){nav('overview');}},
+    {target:'#cnav-pfos',position:mob?'bottom':'right',icon:'⚡',title:'My Financial Data',body:'View and update all your financial data — income, expenses, debts, retirement, insurance, and more. This is where you build your complete financial picture.',before:function(){nav('pfos');}},
+    {target:'#cnav-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools',body:'93 calculators for every financial question — loans, retirement, insurance, student loans, taxes, and more. All personalized with your data.',before:function(){nav('tools');}},
+    {target:'#cnav-reports',position:mob?'bottom':'right',icon:'📄',title:'My Reports',body:'View and download all your financial reports. Track your progress over time.',before:function(){nav('reports');}},
+    {target:'#cnav-messages',position:mob?'bottom':'right',icon:'💬',title:'Messages',body: role==='client-advisor' ? 'Two-way messaging with your advisor. Ask questions, share updates, or request a review.' : 'Communication center. Request an advisor consultation when you\'re ready for professional guidance.',before:function(){nav('messages');if(typeof loadClientMessages==='function')loadClientMessages();}},
+    {target:'#cnav-journey',position:mob?'bottom':'right',icon:'🗺️',title:'My Journey',body:'Your financial timeline — every milestone, score improvement, and recommendation implemented in one visual history.',before:function(){nav('journey');if(typeof renderJourneyTimeline==='function')renderJourneyTimeline();}},
+    {target:'#cnav-spending',position:mob?'bottom':'right',icon:'📊',title:'Spending Analysis',body:'See where your money goes — category breakdowns, trends, and spending patterns over time.',before:function(){nav('spending');if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();}},
+    {target:'#cnav-overview',position:mob?'bottom':'right',icon:'🎉',title:'You\'re Ready!',body:'Explore your portal — Calendar, Pay Schedule, Insurance Policies, Estate Planning, and Achievements are all in the sidebar.<br><br>Click <strong>❓</strong> anytime to replay this tour.',before:function(){nav('overview');}},
   ];
 }
 
