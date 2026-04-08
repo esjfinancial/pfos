@@ -114,7 +114,13 @@ function showStep(idx){
 
   // Small delay to let DOM update
   setTimeout(function(){
-    var target = step.target ? document.querySelector(step.target) : null;
+    var target = step.target && step.target !== 'center' ? document.querySelector(step.target) : null;
+
+    // Skip if target element doesn't exist
+    if(step.target && step.target !== 'center' && !target){
+      if(idx < steps.length - 1){ showStep(idx + 1); return; }
+      else { endTour(); return; }
+    }
 
     // Position spotlight
     if(target && step.target !== 'center'){
@@ -243,9 +249,10 @@ function injectCSS(){
   style.id = 'wt-styles';
   style.textContent = ''
     +'#wt-overlay{position:fixed;inset:0;z-index:99999;pointer-events:none}'
-    +'#wt-overlay::before{content:"";position:fixed;inset:0;background:rgba(0,0,0,.6);pointer-events:auto}'
-    +'#wt-spotlight{position:absolute;box-shadow:0 0 0 9999px rgba(0,0,0,.6);z-index:100000;pointer-events:none;transition:all .3s ease}'
+    +'#wt-overlay::before{content:"";position:fixed;inset:0;background:rgba(0,0,0,.65);pointer-events:auto;z-index:99999}'
+    +'#wt-spotlight{position:absolute;box-shadow:0 0 0 9999px rgba(0,0,0,.7);border:2px solid rgba(91,155,255,.6);z-index:100000;pointer-events:none;transition:all .3s ease}'
     +'#wt-tooltip{position:absolute;background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(91,155,255,.25);border-radius:8px;padding:20px;z-index:100001;pointer-events:auto;box-shadow:0 12px 40px rgba(0,0,0,.5);max-width:420px}'
+    +'.wt-close{position:absolute;top:10px;right:12px;background:none;border:none;color:#64748B;font-size:18px;cursor:pointer;padding:4px;z-index:1}.wt-close:hover{color:#F0F6FF}'
     +'.wt-step-count{font-family:Rajdhani,sans-serif;font-size:9px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px}'
     +'.wt-icon{font-size:32px;margin-bottom:8px}'
     +'.wt-title{font-family:Rajdhani,sans-serif;font-size:16px;font-weight:700;color:#F0F6FF;margin-bottom:6px}'
@@ -431,6 +438,9 @@ function getClientPortalSteps(role){
 }
 
 // ── BOOT ──
+// Don't run inside iframes (e.g. PFOS loaded from client-profile)
+if(window.parent !== window){ return; }
+
 if(document.readyState === 'loading'){
   document.addEventListener('DOMContentLoaded', detectContext);
 } else {
