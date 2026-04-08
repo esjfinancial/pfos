@@ -139,7 +139,11 @@ function showStep(idx){
       target.style.outline = '2px solid #5B9BFF';
       target.style.outlineOffset = '3px';
       target.style.boxShadow = '0 0 20px rgba(91,155,255,.4), 0 0 40px rgba(91,155,255,.15)';
-      target.style.position = target.style.position || 'relative';
+      // Don't change position on fixed elements (like the ? button)
+      var computedPos = window.getComputedStyle(target).position;
+      if(computedPos !== 'fixed' && computedPos !== 'absolute'){
+        target.style.position = 'relative';
+      }
       target.style.zIndex = '100000';
       // Scroll into view if needed
       if(rect.top < 0 || rect.bottom > window.innerHeight){
@@ -654,16 +658,27 @@ function getClientPortalSteps(role){
   function nav(pg){ if(typeof showClientPage==='function') showClientPage(pg); }
 
   return [
-    {target:'center',icon:'👋',title:'Welcome to Your Financial Portal',body:'Your personal financial hub — scores, reports, tools, and communication, all in one place.',delay:100},
-    {target:'#cnav-overview',position:mob?'bottom':'right',icon:'📊',title:'Overview',body:'Your dashboard with 4 health scores, key metrics, and financial summary.',before:function(){nav('overview');}},
+    {target:'center',icon:'👋',title:'Welcome to Your Financial Portal',body:'Your personal financial hub — scores, reports, tools, and communication, all in one place. Let\'s walk through everything.',delay:100},
+    {target:'#cnav-overview',position:mob?'bottom':'right',icon:'📊',title:'Overview',body:'Your dashboard with 4 health scores, key metrics, and financial summary. This updates automatically as your data changes.',before:function(){nav('overview');}},
     {target:'#cnav-pfos',position:mob?'bottom':'right',icon:'⚡',title:'My Financial Data',body:'View and update all your financial data — income, expenses, debts, retirement, insurance, and more. This is where you build your complete financial picture.',before:function(){nav('pfos');}},
     {target:'#cnav-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools',body:'93 calculators for every financial question — loans, retirement, insurance, student loans, taxes, and more. All personalized with your data.',before:function(){nav('tools');}},
-    {target:'#cnav-reports',position:mob?'bottom':'right',icon:'📄',title:'My Reports',body:'View and download all your financial reports. Track your progress over time.',before:function(){nav('reports');}},
+    {target:'#cnav-studentloans',position:mob?'bottom':'right',icon:'🎓',title:'Student Loans',body:'12 dedicated student loan tools — income-driven repayment estimator, Public Service Loan Forgiveness tracker, forgiveness checker, refi analysis, and more.',before:function(){nav('studentloans');}},
+    {target:'#cnav-loantools',position:mob?'bottom':'right',icon:'🏠',title:'Loans & Deals',body:'Loan calculator, APR truth calculator, rate comparison, refinance analysis, buy vs lease, and buy vs rent — all the tools for major purchase decisions.',before:function(){nav('loantools');}},
+    {target:'#cnav-lifeevents',position:mob?'bottom':'right',icon:'🎯',title:'Life Events',body:'Planning a wedding, having a baby, changing jobs, relocating, or going through a divorce? Each major life event has a dedicated calculator.',before:function(){nav('lifeevents');}},
+    {target:'#cnav-reports',position:mob?'bottom':'right',icon:'📄',title:'My Reports',body:'View and download all your financial reports. Track your progress over time with score changes and projections.',before:function(){nav('reports');}},
     {target:'#cnav-messages',position:mob?'bottom':'right',icon:'💬',title:'Messages',body: role==='client-advisor' ? 'Two-way messaging with your advisor. Ask questions, share updates, or request a review.' : 'Communication center. Request an advisor consultation when you\'re ready for professional guidance.',before:function(){nav('messages');if(typeof loadClientMessages==='function')loadClientMessages();}},
+    {target:'#cnav-notifications',position:mob?'bottom':'right',icon:'🔔',title:'Notifications',body:'Stay informed about changes to your account, new reports, recommendation updates, and advisor activity.',before:function(){nav('notifications');if(typeof loadNotificationCenter==='function')loadNotificationCenter();}},
     {target:'#cnav-journey',position:mob?'bottom':'right',icon:'🗺️',title:'My Journey',body:'Your financial timeline — every milestone, score improvement, and recommendation implemented in one visual history.',before:function(){nav('journey');if(typeof renderJourneyTimeline==='function')renderJourneyTimeline();}},
     {target:'#cnav-spending',position:mob?'bottom':'right',icon:'📊',title:'Spending Analysis',body:'See where your money goes — category breakdowns, trends, and spending patterns over time.',before:function(){nav('spending');if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();}},
-    {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always in the bottom-right corner. Tap it for <strong>instant help</strong> on whatever screen you\'re viewing — your data, calculators, messages, or reports. It knows where you are and shows relevant tips.'},
-    {target:'#cnav-overview',position:mob?'bottom':'right',icon:'🎉',title:'You\'re Ready!',body:'Explore your portal — Calendar, Pay Schedule, Insurance Policies, Estate Planning, and Achievements are all in the sidebar.<br><br>Click <strong>❓</strong> anytime to replay this tour.',before:function(){nav('overview');}},
+    {target:'#cnav-calendar',position:mob?'bottom':'right',icon:'📅',title:'Calendar',body:'Your financial calendar — bill due dates, pay dates, review appointments, and important financial milestones.',before:function(){nav('calendar');if(typeof renderClientCalendar==='function')renderClientCalendar();}},
+    {target:'#cnav-payschedule',position:mob?'bottom':'right',icon:'💰',title:'Pay Schedule',body:'Track your paycheck timing, deductions, and take-home pay. See exactly what lands in your account and when.',before:function(){nav('payschedule');if(typeof renderClientPaySchedule==='function')renderClientPaySchedule();}},
+    {target:'#cnav-policies',position:mob?'bottom':'right',icon:'🛡️',title:'Insurance Policies',body:'View all your insurance policies — life, disability, health, property. See coverage amounts, premiums, and identify gaps.',before:function(){nav('policies');if(typeof renderClientPolicies==='function')renderClientPolicies();}},
+    {target:'#cnav-estate',position:mob?'bottom':'right',icon:'📜',title:'Estate Planning',body:'Estate tax exposure, wealth transfer strategies, beneficiary tracking, and legacy planning tools.',before:function(){nav('estate');if(typeof renderClientEstate==='function')renderClientEstate();}},
+    {target:'#cnav-engage',position:mob?'bottom':'right',icon:'🏆',title:'Achievements',body:'Track your financial milestones and earn achievements as you build better financial habits.',before:function(){nav('engage');if(typeof initEngagementPage==='function')initEngagementPage();}},
+    {target:'#cnav-privacy',position:mob?'bottom':'right',icon:'🔒',title:'Privacy & Sharing',body:'Control what your advisor can see, manage data sharing preferences, and request account changes.',before:function(){nav('privacy');}},
+    {target:'#cnav-activity',position:mob?'bottom':'right',icon:'👁️',title:'Advisor Activity',body:'See exactly what your advisor has accessed, changed, or reviewed on your account. Full transparency.',before:function(){nav('activity');if(typeof loadAdvisorActivity==='function')loadAdvisorActivity();}},
+    {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always in the bottom-right corner. Tap it for <strong>instant help</strong> specific to whatever screen you\'re viewing.'},
+    {target:'#cnav-overview',position:mob?'bottom':'right',icon:'🎉',title:'You\'re Ready!',body:'You have access to everything you need to manage your financial life. Start with your Overview to see where you stand.<br><br>Click <strong>❓</strong> anytime for help.',before:function(){nav('overview');}},
   ];
 }
 
