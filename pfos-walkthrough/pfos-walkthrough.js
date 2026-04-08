@@ -92,15 +92,16 @@ function startTour(){
 // ── CREATE OVERLAY ──
 function createOverlay(){
   // Remove existing
-  var old = document.getElementById('wt-overlay');
-  if(old) old.remove();
+  var old = document.getElementById('wt-spotlight');if(old)old.remove();
+  var old2 = document.getElementById('wt-tooltip');if(old2)old2.remove();
 
-  overlay = document.createElement('div');
-  overlay.id = 'wt-overlay';
-  overlay.innerHTML = '<div id="wt-spotlight"></div><div id="wt-tooltip"></div>';
-  document.body.appendChild(overlay);
-  spotlight = document.getElementById('wt-spotlight');
-  tooltip = document.getElementById('wt-tooltip');
+  spotlight = document.createElement('div');
+  spotlight.id = 'wt-spotlight';
+  document.body.appendChild(spotlight);
+
+  tooltip = document.createElement('div');
+  tooltip.id = 'wt-tooltip';
+  document.body.appendChild(tooltip);
 }
 
 // ── SHOW STEP ──
@@ -206,8 +207,8 @@ window._wtReset = function(){ resetCompletion(); startTour(); };
 window._wtHide = function(){ endTour(); hideReminderBanner(); var r=document.getElementById('wt-replay');if(r)r.style.display='none'; };
 
 function endTour(){
-  var el = document.getElementById('wt-overlay');
-  if(el) el.remove();
+  var s = document.getElementById('wt-spotlight');if(s)s.remove();
+  var t = document.getElementById('wt-tooltip');if(t)t.remove();
 }
 
 // ── REMINDER BANNER ──
@@ -604,10 +605,10 @@ function getDashboardSteps(){
     {target:'#nav-leaderboard',position:mob?'bottom':'right',icon:'🏆',title:'Client Leaderboard',body:'See your healthiest clients, top compliance rates, and top savers. Great for identifying success stories and clients who need attention.',before:function(){nav('leaderboard');if(typeof renderClientLeaderboard==='function')renderClientLeaderboard();}},
     {target:'#nav-my-performance',position:mob?'bottom':'right',icon:'📊',title:'My Performance',body:'Your personal metrics — total clients, reviews completed, recommendations implemented, sessions logged, and average client health score.',before:function(){nav('my-performance');if(typeof renderAdvisorPerformancePage==='function')renderAdvisorPerformancePage();}},
     {target:'#nav-my-finances',position:mob?'bottom':'right',icon:'💰',title:'My Finances',body:'Your own personal financial profile using the full PFOS tool — separate from client data. Practice what you preach.'},
-    {target:'center',icon:'💓',title:'Pulse Check',body:'A <strong>30-second tap-to-answer</strong> scoring tool for networking events and prospecting. Ask 6 quick questions, get a score 0-100, a pre-written opening line, and save the prospect as a new client with one click. Find it in the sidebar under Pulse Check.'},
-    {target:'center',icon:'⚡',title:'Quick Rec',body:'Create a recommendation for any client in seconds — select the client, pick a section, set priority, type or dictate your recommendation, and save. Perfect for capturing ideas on the go. Find it in the sidebar.'},
+    {target:'[onclick*="openPulseCheck"]',position:'right',icon:'💓',title:'Pulse Check',body:'A <strong>30-second tap-to-answer</strong> scoring tool for networking events and prospecting. Ask 6 quick questions, get a score 0-100, a pre-written opening line, and save the prospect as a new client with one click. Find it in the sidebar under Pulse Check.'},
+    {target:'[onclick*="openQuickRec"]',position:'right',icon:'⚡',title:'Quick Rec',body:'Create a recommendation for any client in seconds — select the client, pick a section, set priority, type or dictate your recommendation, and save. Perfect for capturing ideas on the go. Find it in the sidebar.'},
     {target:'#nav-bulk-msg',position:mob?'bottom':'right',icon:'📢',title:'Bulk Message',body:'Send a message to all your clients at once — announcements, market updates, or seasonal reminders. One click, every client gets it.'},
-    {target:'center',icon:'⬇️',title:'Export & Utilities',body:'<strong>Export CSV</strong> downloads your full client list as a spreadsheet. Use the <strong>theme toggle</strong> (🌙) to switch between dark and light mode. <strong>Keyboard shortcuts</strong> — press <strong>?</strong> on any screen for a list.'},
+    {target:'[onclick*="exportClients"]',position:'right',icon:'⬇️',title:'Export & Utilities',body:'<strong>Export CSV</strong> downloads your full client list as a spreadsheet. Use the <strong>theme toggle</strong> (🌙) to switch between dark and light mode. <strong>Keyboard shortcuts</strong> — press <strong>?</strong> on any screen for a list.'},
     {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always here. Tap it for <strong>instant help</strong> specific to whatever page you\'re viewing — client list, tools, pipeline, or any other screen.'},
     {target:'#nav-dashboard',position:mob?'bottom':'right',icon:'🎉',title:'Ready to Go!',body:'You have everything you need. Start by adding clients, running Pulse Checks at your next event, or exploring the 93 calculators.<br><br>Click <strong>❓</strong> anytime for help.',before:function(){nav('dashboard');}},
   ];
