@@ -126,7 +126,7 @@ function showStep(idx){
     if(target && step.target !== 'center'){
       var rect = target.getBoundingClientRect();
       var pad = 6;
-      spotlight.style.cssText = 'display:block;top:'+(rect.top-pad+window.scrollY)+'px;left:'+(rect.left-pad)+'px;width:'+(rect.width+pad*2)+'px;height:'+(rect.height+pad*2)+'px;border-radius:6px';
+      spotlight.style.cssText = 'display:block;position:fixed;top:'+(rect.top-pad)+'px;left:'+(rect.left-pad)+'px;width:'+(rect.width+pad*2)+'px;height:'+(rect.height+pad*2)+'px;border-radius:6px';
       // Scroll into view if needed
       if(rect.top < 0 || rect.bottom > window.innerHeight){
         target.scrollIntoView({behavior:'smooth',block:'center'});
@@ -147,7 +147,8 @@ function positionTooltip(target, step){
   var total = steps.length;
   var idx = currentStep;
 
-  var h = '<div class="wt-step-count">Step '+(idx+1)+' of '+total+'</div>';
+  var h = '<button class="wt-close" onclick="window._wtSkip()">✕</button>';
+  h += '<div class="wt-step-count">Step '+(idx+1)+' of '+total+'</div>';
   if(step.icon) h += '<div class="wt-icon">'+step.icon+'</div>';
   h += '<div class="wt-title">'+step.title+'</div>';
   h += '<div class="wt-body">'+step.body+'</div>';
@@ -161,47 +162,38 @@ function positionTooltip(target, step){
 
   tooltip.innerHTML = h;
 
+  // Always use fixed positioning so tooltip is relative to viewport
+  var tw = Math.min(380, window.innerWidth - 32);
+
   if(isCenter){
-    tooltip.style.cssText = 'display:block;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);max-width:420px;width:90%';
-  } else {
-    var rect = target.getBoundingClientRect();
-    var tw = Math.min(360, window.innerWidth - 32);
-    var pos = step.position || 'bottom';
-
-    // Auto-adjust position if not enough space
-    if(pos === 'bottom' && rect.bottom + 220 > window.innerHeight) pos = 'top';
-    if(pos === 'top' && rect.top < 220) pos = 'bottom';
-    if(pos === 'right' && rect.right + tw + 20 > window.innerWidth) pos = 'bottom';
-    if(pos === 'left' && rect.left < tw + 20) pos = 'bottom';
-
-    var top, left;
-    if(pos === 'bottom'){
-      top = rect.bottom + window.scrollY + 12;
-      left = Math.max(16, Math.min(rect.left + rect.width/2 - tw/2, window.innerWidth - tw - 16));
-    } else if(pos === 'top'){
-      top = rect.top + window.scrollY - 12;
-      left = Math.max(16, Math.min(rect.left + rect.width/2 - tw/2, window.innerWidth - tw - 16));
-      // Will need to adjust after render for height
-    } else if(pos === 'right'){
-      top = rect.top + window.scrollY + rect.height/2 - 80;
-      left = rect.right + 12;
-    } else if(pos === 'left'){
-      top = rect.top + window.scrollY + rect.height/2 - 80;
-      left = rect.left - tw - 12;
-    }
-
-    // Clamp to viewport
-    var maxTop = window.scrollY + window.innerHeight - 250;
-    if(top > maxTop) top = maxTop;
-    if(top < window.scrollY + 10) top = window.scrollY + 10;
-    tooltip.style.cssText = 'display:block;position:absolute;top:'+top+'px;left:'+left+'px;width:'+tw+'px;z-index:100001';
-
-    // Adjust for top position (need rendered height)
-    if(pos === 'top'){
-      var th = tooltip.offsetHeight;
-      tooltip.style.top = (rect.top + window.scrollY - th - 12) + 'px';
-    }
+    tooltip.style.cssText = 'display:block;position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);width:'+tw+'px;z-index:100001';
+    return;
   }
+
+  var rect = target.getBoundingClientRect();
+
+  // Default: position to the right of the target
+  var top = Math.max(20, rect.top + rect.height/2 - 100);
+  var left = rect.right + 16;
+
+  // If not enough room on right, try left
+  if(left + tw > window.innerWidth - 16){
+    left = rect.left - tw - 16;
+  }
+
+  // If not enough room on left either, position below
+  if(left < 16){
+    left = Math.max(16, rect.left);
+    top = rect.bottom + 12;
+  }
+
+  // Clamp to viewport
+  if(top + 300 > window.innerHeight) top = Math.max(20, window.innerHeight - 320);
+  if(top < 20) top = 20;
+  if(left < 16) left = 16;
+  if(left + tw > window.innerWidth - 16) left = window.innerWidth - tw - 16;
+
+  tooltip.style.cssText = 'display:block;position:fixed;top:'+top+'px;left:'+left+'px;width:'+tw+'px;z-index:100001';
 }
 
 // ── NAVIGATION ──
