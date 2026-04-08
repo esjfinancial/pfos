@@ -134,7 +134,7 @@ function showStep(idx){
         return;
       }
     } else {
-      spotlight.style.display = 'none';
+      spotlight.style.cssText = 'display:block;position:fixed;top:0;left:0;width:0;height:0;box-shadow:0 0 0 9999px rgba(0,0,0,.6)';
     }
 
     positionTooltip(target, step);
@@ -190,7 +190,11 @@ function positionTooltip(target, step){
       left = rect.left - tw - 12;
     }
 
-    tooltip.style.cssText = 'display:block;position:absolute;top:'+top+'px;left:'+left+'px;width:'+tw+'px';
+    // Clamp to viewport
+    var maxTop = window.scrollY + window.innerHeight - 250;
+    if(top > maxTop) top = maxTop;
+    if(top < window.scrollY + 10) top = window.scrollY + 10;
+    tooltip.style.cssText = 'display:block;position:absolute;top:'+top+'px;left:'+left+'px;width:'+tw+'px;z-index:100001';
 
     // Adjust for top position (need rendered height)
     if(pos === 'top'){
@@ -237,10 +241,220 @@ function addReplayButton(){
   if(document.getElementById('wt-replay')) return;
   var btn = document.createElement('button');
   btn.id = 'wt-replay';
-  btn.title = 'Replay guided tour';
+  btn.title = 'Help & guided tour';
   btn.innerHTML = '❓';
-  btn.onclick = function(){ window._wtReset(); };
+  btn.onclick = function(){ showContextHelp(); };
   document.body.appendChild(btn);
+}
+
+// ── CONTEXT HELP SYSTEM ──
+function showContextHelp(){
+  var tips = getContextTips();
+  if(!tips) { window._wtReset(); return; }
+
+  var old = document.getElementById('wt-context-help');
+  if(old){ old.remove(); return; }
+
+  var panel = document.createElement('div');
+  panel.id = 'wt-context-help';
+  var h = '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">';
+  h += '<div style="font-family:Rajdhani,sans-serif;font-size:14px;font-weight:700;color:#F0F6FF">'+tips.icon+' '+tips.title+'</div>';
+  h += '<button onclick="document.getElementById(\'wt-context-help\').remove()" style="background:none;border:none;color:#64748B;font-size:18px;cursor:pointer">✕</button>';
+  h += '</div>';
+  for(var i=0;i<tips.items.length;i++){
+    var t = tips.items[i];
+    h += '<div style="padding:10px 12px;background:rgba(0,68,191,.06);border:1px solid rgba(91,155,255,.12);border-radius:4px;margin-bottom:6px">';
+    h += '<div style="font-family:Rajdhani,sans-serif;font-size:12px;font-weight:700;color:#5B9BFF;margin-bottom:3px">'+t.tip+'</div>';
+    h += '<div style="font-size:12px;color:rgba(240,246,255,.65);line-height:1.5">'+t.detail+'</div>';
+    h += '</div>';
+  }
+  h += '<div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(91,155,255,.1)">';
+  h += '<button onclick="document.getElementById(\'wt-context-help\').remove();window._wtReset();" style="width:100%;padding:9px;background:rgba(0,68,191,.1);border:1px solid rgba(91,155,255,.2);border-radius:4px;color:#5B9BFF;font-family:Rajdhani,sans-serif;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">🔄 Replay Full Page Tour</button>';
+  h += '</div>';
+  panel.innerHTML = h;
+  document.body.appendChild(panel);
+}
+
+function getContextTips(){
+  if(currentPage === 'main') return getMainContextTips();
+  if(currentPage === 'dashboard') return getDashContextTips();
+  if(currentPage === 'client-profile') return getCPContextTips();
+  if(currentPage === 'client') return getPortalContextTips();
+  return null;
+}
+
+function getMainContextTips(){
+  // Check if calculator modal is open
+  var calcModal = document.getElementById('insuranceCalcModal');
+  if(calcModal && calcModal.style.display !== 'none' && calcModal.style.display !== ''){
+    return {icon:'🧮',title:'Calculator Help',items:[
+      {tip:'Enter your values',detail:'Type numbers into the input fields. The calculator updates automatically as you change values.'},
+      {tip:'For Someone Else',detail:'Click "For Someone Else" at the top to run this calculator with custom profile values for another person.'},
+      {tip:'Apply & Recalculate',detail:'After entering custom profile values, click "Apply & Recalculate" to update the results.'},
+      {tip:'Share Results',detail:'Use the Share Results button at the bottom to copy or share your calculation.'},
+      {tip:'Request Consultation',detail:'Click "Request Free Consultation" to connect with an advisor about these results.'},
+    ]};
+  }
+
+  // Check which section is active
+  var secHome = document.getElementById('secHome');
+  var secFin = document.getElementById('secFinances');
+  var secPlan = document.getElementById('secPlan');
+  var secTools = document.getElementById('secTools');
+  var secReports = document.getElementById('secReports');
+
+  if(secHome && secHome.classList.contains('active')){
+    return {icon:'🏠',title:'Home Dashboard Help',items:[
+      {tip:'Financial Scores',detail:'Your 4 scores (Cash Flow, Protection, Growth, Efficiency) rate you 1-10. They update automatically as you enter data.'},
+      {tip:'Monthly Cash Flow',detail:'Shows income minus expenses. Green means surplus, red means deficit.'},
+      {tip:'Smart Alerts',detail:'Yellow and red alerts highlight issues that need attention — like low emergency funds or insurance gaps.'},
+      {tip:'Key Metrics',detail:'Net worth, savings rate, and DTI ratio give you a quick health check.'},
+    ]};
+  }
+
+  if(secFin && secFin.classList.contains('active')){
+    // Check if a panel is open
+    var activePanel = document.querySelector('.panel.active');
+    if(activePanel){
+      return {icon:'💰',title:'Entering Financial Data',items:[
+        {tip:'Fill in the fields',detail:'Enter your real numbers. Every field updates your scores and projections immediately.'},
+        {tip:'Save automatically',detail:'Your data saves as you go. No save button needed for individual fields.'},
+        {tip:'Use the navigation',detail:'Click the step buttons at the top to move between sections, or click the back arrow.'},
+        {tip:'Skip sections',detail:'You don\'t have to fill everything at once. Come back anytime to add more data.'},
+      ]};
+    }
+    return {icon:'💰',title:'My Finances Help',items:[
+      {tip:'Click any card',detail:'Each card represents a financial category. Click to expand and enter your data.'},
+      {tip:'Start with Income & Expenses',detail:'These two give the biggest impact on your scores. Start here.'},
+      {tip:'Green checkmarks',detail:'A green ✓ means that section has data. Fill in all sections for the most accurate picture.'},
+      {tip:'Setup badges',detail:'Orange "SETUP" badges indicate sections that need attention.'},
+    ]};
+  }
+
+  if(secPlan && secPlan.classList.contains('active')){
+    return {icon:'📋',title:'My Plan Help',items:[
+      {tip:'Recommendations',detail:'Each recommendation has a status — from draft through implementation. Track your progress here.'},
+      {tip:'Implementation',detail:'Click a recommendation to see details, mark it as implemented, or discuss with your advisor.'},
+      {tip:'AI Suggestions',detail:'The system analyzes your data and suggests prioritized actions you can take.'},
+    ]};
+  }
+
+  if(secTools && secTools.classList.contains('active')){
+    return {icon:'🔧',title:'Financial Tools Help',items:[
+      {tip:'Search calculators',detail:'Use the search bar at the top to find any calculator by name or keyword.'},
+      {tip:'93 calculators',detail:'Organized into 13 categories: Quick Tools, Loans, Debt, Student Loans, Investment, Insurance, Retirement, Tax, Estate, Life Events, Behavioral, Specialty, and Assessments.'},
+      {tip:'Pre-filled data',detail:'Calculators automatically use your profile data. Change any value to see different scenarios.'},
+      {tip:'For Someone Else',detail:'Click "For Someone Else" to run any calculator with custom values for another person.'},
+    ]};
+  }
+
+  if(secReports && secReports.classList.contains('active')){
+    return {icon:'📄',title:'Reports Help',items:[
+      {tip:'Generate Report',detail:'Click "Generate Report" to create a comprehensive financial report with your current data.'},
+      {tip:'Print or Save',detail:'Reports can be printed directly or saved as PDF.'},
+      {tip:'Share with Advisor',detail:'Your advisor can see all generated reports in your client profile.'},
+    ]};
+  }
+
+  return null;
+}
+
+function getDashContextTips(){
+  var activePg = document.querySelector('.pg.active');
+  var pgId = activePg ? activePg.id : '';
+
+  if(pgId === 'pg-advisory-clients' || pgId === 'pg-all-clients' || pgId === 'pg-product-clients'){
+    return {icon:'👥',title:'Client List Help',items:[
+      {tip:'Click any client',detail:'Opens their detailed profile with financial data, recommendations, and session history.'},
+      {tip:'Status column',detail:'New, Active, Review Due, Advisory, or Sold. Click the dropdown to change status.'},
+      {tip:'Health scores',detail:'Shows each client\'s overall financial health score based on their data.'},
+      {tip:'Search',detail:'Use the search bar to quickly find clients by name or email.'},
+    ]};
+  }
+
+  if(pgId === 'pg-agent-tools'){
+    return {icon:'🧰',title:'Financial Tools Help',items:[
+      {tip:'Select a client first',detail:'Use the "Run for" dropdown to select a client. Their data pre-fills every calculator.'},
+      {tip:'Manual mode',detail:'Leave the dropdown on "Manual Input" to enter custom values for any scenario.'},
+      {tip:'Save as recommendation',detail:'After running a calculator with a client selected, scroll down to save the results as a recommendation.'},
+      {tip:'Search',detail:'Use the search bar to filter across all 93 calculators.'},
+    ]};
+  }
+
+  if(pgId === 'pg-priority'){
+    return {icon:'🎯',title:'Priority Dashboard Help',items:[
+      {tip:'Urgency ranking',detail:'Clients are ranked by urgency — overdue reviews, missing data, and low health scores push them higher.'},
+      {tip:'Color coding',detail:'Red = urgent action needed. Orange = attention soon. Green = on track.'},
+      {tip:'Click to open',detail:'Click any client to go directly to their profile.'},
+    ]};
+  }
+
+  if(pgId === 'pg-rec-pipeline'){
+    return {icon:'🔄',title:'Rec Pipeline Help',items:[
+      {tip:'Status workflow',detail:'Recommendations flow: Draft → Pending → Proposed → Agreed → Submitted → Active → Implemented.'},
+      {tip:'Compliance rate',detail:'Shows the percentage of recommendations that have been fully implemented.'},
+      {tip:'Starter packs',detail:'Use bulk templates to quickly add common recommendation sets for new clients.'},
+      {tip:'Effectiveness',detail:'90-day tracking shows whether implemented recommendations are actually improving the client\'s situation.'},
+    ]};
+  }
+
+  if(pgId === 'pg-dashboard'){
+    return {icon:'📊',title:'Dashboard Help',items:[
+      {tip:'Client stats',detail:'Total clients, active, review due, and overdue at a glance.'},
+      {tip:'Upcoming reviews',detail:'Shows clients with reviews scheduled in the next 30 days.'},
+      {tip:'Follow-up reminders',detail:'Reminders you\'ve set for specific clients appear here.'},
+      {tip:'Quick search',detail:'Start typing a client name to find them instantly.'},
+    ]};
+  }
+
+  return null;
+}
+
+function getCPContextTips(){
+  return {icon:'👤',title:'Client Profile Help',items:[
+    {tip:'Open PFOS',detail:'Click "Open / Edit in PFOS" to launch the full planning tool with this client\'s data loaded.'},
+    {tip:'Add Recommendations',detail:'Click "+ Add Recommendation" or use "AI Suggest" to generate recommendations automatically.'},
+    {tip:'Session Notes',detail:'Log notes after each meeting. They\'re saved to the client\'s history.'},
+    {tip:'Progress Report',detail:'Generate a report showing score changes, implemented recommendations, and financial trajectory.'},
+    {tip:'Save to Client',detail:'After editing in PFOS, click "Save to Client" to push all changes to their profile.'},
+  ]};
+}
+
+function getPortalContextTips(){
+  var activePg = document.querySelector('.cpg.active,.client-page.active,[class*="client-pg"].active');
+  // Check sidebar active item
+  var activeNav = document.querySelector('.sb-item.active');
+  var navText = activeNav ? activeNav.textContent.trim() : '';
+
+  if(navText.indexOf('Financial Data') >= 0 || navText.indexOf('PFOS') >= 0){
+    return {icon:'⚡',title:'Financial Data Help',items:[
+      {tip:'Enter your data',detail:'Click any category card to expand it and enter your financial information.'},
+      {tip:'Start with basics',detail:'Income and Expenses are the foundation. Fill these first for the biggest impact on your scores.'},
+      {tip:'Auto-save',detail:'Your data saves automatically as you enter it.'},
+      {tip:'Scores update live',detail:'As you add data, your 4 financial scores recalculate in real time.'},
+    ]};
+  }
+
+  if(navText.indexOf('Tools') >= 0){
+    return {icon:'🧰',title:'Financial Tools Help',items:[
+      {tip:'Search',detail:'Use the search bar to find any of the 93 calculators by name.'},
+      {tip:'Your data pre-fills',detail:'Calculators use your profile data automatically for personalized results.'},
+      {tip:'For Someone Else',detail:'Click "For Someone Else" to run a calculator with custom values for another person.'},
+    ]};
+  }
+
+  if(navText.indexOf('Messages') >= 0){
+    return {icon:'💬',title:'Messages Help',items:[
+      {tip:'Send a message',detail:'Type your message and click Send to communicate with your advisor.'},
+      {tip:'Advisor response',detail:'Your advisor will see your message in their dashboard and respond.'},
+    ]};
+  }
+
+  return {icon:'📊',title:'Portal Help',items:[
+    {tip:'Overview',detail:'Your main dashboard shows your 4 financial health scores and key metrics.'},
+    {tip:'Navigation',detail:'Use the sidebar to access different sections — Financial Data, Tools, Reports, Messages, and more.'},
+    {tip:'Request Advisor',detail:'Don\'t have an advisor? You can request a consultation from within the platform anytime.'},
+  ]};
 }
 
 // ── CSS ──
@@ -249,8 +463,8 @@ function injectCSS(){
   var style = document.createElement('style');
   style.id = 'wt-styles';
   style.textContent = ''
-    +'#wt-overlay{position:fixed;inset:0;z-index:99999;pointer-events:none}'
-    +'#wt-overlay::before{content:"";position:fixed;inset:0;background:rgba(0,0,0,.65);pointer-events:auto;z-index:99999}'
+    +'#wt-overlay{position:fixed;inset:0;z-index:99999;pointer-events:none;overflow-y:auto}'
+    +'#wt-overlay::before{content:"";position:fixed;inset:0;background:transparent;pointer-events:auto;z-index:99999}'
     +'#wt-spotlight{position:absolute;box-shadow:0 0 0 9999px rgba(0,0,0,.7);border:2px solid rgba(91,155,255,.6);z-index:100000;pointer-events:none;transition:all .3s ease}'
     +'#wt-tooltip{position:absolute;background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(91,155,255,.25);border-radius:8px;padding:20px;z-index:100001;pointer-events:auto;box-shadow:0 12px 40px rgba(0,0,0,.5);max-width:420px}'
     +'.wt-close{position:absolute;top:10px;right:12px;background:none;border:none;color:#64748B;font-size:18px;cursor:pointer;padding:4px;z-index:1}.wt-close:hover{color:#F0F6FF}'
@@ -270,6 +484,8 @@ function injectCSS(){
     +'#wt-reminder{position:fixed;top:0;left:0;right:0;z-index:99990;background:linear-gradient(135deg,rgba(0,68,191,.15),rgba(14,14,56,.98));border-bottom:1px solid rgba(91,155,255,.2);padding:12px 20px;font-size:13px;color:#F0F6FF;backdrop-filter:blur(12px)}'
     +'#wt-replay{position:fixed;bottom:80px;right:16px;z-index:9990;width:40px;height:40px;border-radius:50%;background:linear-gradient(135deg,#0044BF,#1155D9);border:1px solid rgba(91,155,255,.3);color:#fff;font-size:18px;cursor:pointer;box-shadow:0 4px 16px rgba(0,68,191,.3);display:flex;align-items:center;justify-content:center;transition:transform .15s}'
     +'#wt-replay:hover{transform:scale(1.1)}'
+    +'#wt-context-help{position:fixed;bottom:80px;right:16px;z-index:99998;width:340px;max-width:calc(100vw - 32px);max-height:70vh;overflow-y:auto;background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(91,155,255,.25);border-radius:8px;padding:16px;box-shadow:0 12px 40px rgba(0,0,0,.5)}'
+    +'@media(max-width:767px){#wt-context-help{bottom:140px;right:8px;width:calc(100vw - 16px)}}'
     +'@media(max-width:767px){#wt-tooltip{max-width:calc(100vw - 32px);padding:16px}#wt-replay{bottom:140px}}';
   document.head.appendChild(style);
 }
@@ -365,6 +581,12 @@ function getMainSteps(role){
   }
 
   s.push({
+    target:'#wt-replay', position:'left',
+    icon:'❓', title:'Need Help Anytime?',
+    body:'This button is always available in the bottom-right corner. Tap it for <strong>instant help</strong> specific to whatever screen you\'re on — whether you\'re inside a calculator, entering data, or viewing reports. It adapts to where you are.'
+  });
+
+  s.push({
     target:'#navFinances', position: mob?'top':'right',
     icon:'🎉', title:'You\'re All Set!',
     body:'Start here — enter your <strong>Income</strong> and <strong>Expenses</strong> and everything else builds from there.<br><br>Click <strong>❓</strong> anytime to replay this tour.',
@@ -389,6 +611,7 @@ function getDashboardSteps(){
     {target:'#nav-agent-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools',body:'All 93 calculators. Select a client to pre-fill their data, run any calculator, and save results as recommendations.',before:function(){nav('agent-tools');}},
     {target:'#nav-leaderboard',position:mob?'bottom':'right',icon:'🏆',title:'Leaderboard & Performance',body:'Healthiest clients, top compliance, and top savers. My Performance tracks your personal metrics.',before:function(){nav('leaderboard');if(typeof renderClientLeaderboard==='function')renderClientLeaderboard();}},
     {target:'#nav-my-finances',position:mob?'bottom':'right',icon:'💰',title:'My Finances',body:'Your own personal financial profile — separate from client data. Use PFOS for yourself too.'},
+    {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always here in the bottom-right corner. Tap it for <strong>instant help</strong> specific to whatever page you\'re viewing — client list, tools, pipeline, or any other screen. It adapts to where you are.'},
     {target:'#nav-dashboard',position:mob?'bottom':'right',icon:'🎉',title:'Ready to Go!',body:'Explore Pulse Check, Bulk Messaging, CSV Export, and Quick Rec in the sidebar.<br><br>Click <strong>❓</strong> anytime to replay this tour.',before:function(){nav('dashboard');}},
   ];
 }
@@ -402,7 +625,8 @@ function getClientProfileSteps(){
     {target:'#profileHeaderArea',position:'bottom',icon:'👤',title:'Client Overview',body:'Name, status, tier, contact info, review dates, and couple linking. Change status, assign agents, or manage household type from here.'},
     {target:'center',icon:'📝',title:'Recommendations',body:'Scroll down to manage all recommendations. <strong>+ Add Recommendation</strong> creates one manually. <strong>AI Suggest</strong> auto-generates them. Each tracks through draft → proposed → agreed → active → implemented.'},
     {target:'center',icon:'📈',title:'Reports & Notes',body:'<strong>Progress Report</strong> shows score changes and implementation progress. <strong>Session Notes</strong> logs meeting summaries. <strong>Follow-up Reminders</strong> keeps you on track.'},
-    {target:'center',icon:'🎉',title:'All Set!',body:'Click <strong>❓</strong> anytime to replay this tour.'},
+    {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always in the bottom-right corner. Tap it for <strong>instant help</strong> on whatever you\'re doing — editing a client, managing recommendations, or generating reports.'},
+    {target:'center',icon:'🎉',title:'All Set!',body:'You\'re ready to go!'},
   ];
 }
 
@@ -420,6 +644,7 @@ function getClientPortalSteps(role){
     {target:'#cnav-messages',position:mob?'bottom':'right',icon:'💬',title:'Messages',body: role==='client-advisor' ? 'Two-way messaging with your advisor. Ask questions, share updates, or request a review.' : 'Communication center. Request an advisor consultation when you\'re ready for professional guidance.',before:function(){nav('messages');if(typeof loadClientMessages==='function')loadClientMessages();}},
     {target:'#cnav-journey',position:mob?'bottom':'right',icon:'🗺️',title:'My Journey',body:'Your financial timeline — every milestone, score improvement, and recommendation implemented in one visual history.',before:function(){nav('journey');if(typeof renderJourneyTimeline==='function')renderJourneyTimeline();}},
     {target:'#cnav-spending',position:mob?'bottom':'right',icon:'📊',title:'Spending Analysis',body:'See where your money goes — category breakdowns, trends, and spending patterns over time.',before:function(){nav('spending');if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();}},
+    {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always in the bottom-right corner. Tap it for <strong>instant help</strong> on whatever screen you\'re viewing — your data, calculators, messages, or reports. It knows where you are and shows relevant tips.'},
     {target:'#cnav-overview',position:mob?'bottom':'right',icon:'🎉',title:'You\'re Ready!',body:'Explore your portal — Calendar, Pay Schedule, Insurance Policies, Estate Planning, and Achievements are all in the sidebar.<br><br>Click <strong>❓</strong> anytime to replay this tour.',before:function(){nav('overview');}},
   ];
 }
