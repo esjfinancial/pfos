@@ -134,7 +134,7 @@ function showStep(idx){
         return;
       }
     } else {
-      spotlight.style.cssText = 'display:block;position:fixed;top:0;left:0;width:0;height:0;box-shadow:0 0 0 9999px rgba(0,0,0,.6)';
+      spotlight.style.cssText = 'display:block;position:fixed;top:0;left:0;width:0;height:0;box-shadow:0 0 0 9999px rgba(0,0,0,.35)';
     }
 
     positionTooltip(target, step);
@@ -465,7 +465,7 @@ function injectCSS(){
   style.textContent = ''
     +'#wt-overlay{position:fixed;inset:0;z-index:99999;pointer-events:none;overflow-y:auto}'
     +'#wt-overlay::before{content:"";position:fixed;inset:0;background:transparent;pointer-events:auto;z-index:99999}'
-    +'#wt-spotlight{position:absolute;box-shadow:0 0 0 9999px rgba(0,0,0,.7);border:2px solid rgba(91,155,255,.6);z-index:100000;pointer-events:none;transition:all .3s ease}'
+    +'#wt-spotlight{position:absolute;box-shadow:0 0 0 9999px rgba(0,0,0,.35);border:2px solid rgba(91,155,255,.6);z-index:100000;pointer-events:none;transition:all .3s ease}'
     +'#wt-tooltip{position:absolute;background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(91,155,255,.25);border-radius:8px;padding:20px;z-index:100001;pointer-events:auto;box-shadow:0 12px 40px rgba(0,0,0,.5);max-width:420px}'
     +'.wt-close{position:absolute;top:10px;right:12px;background:none;border:none;color:#64748B;font-size:18px;cursor:pointer;padding:4px;z-index:1}.wt-close:hover{color:#F0F6FF}'
     +'.wt-step-count{font-family:Rajdhani,sans-serif;font-size:9px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px}'
