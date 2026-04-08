@@ -642,13 +642,22 @@ function getDashboardSteps(){
 function getClientProfileSteps(){
   var mob = window.innerWidth < 768;
   return [
-    {target:'center',icon:'👋',title:'Client Profile',body:'Everything about this client — financial data, recommendations, reports, and session history — all in one place.',delay:100},
-    {target:'#profileActionBtns',position:'bottom',icon:'⚡',title:'Quick Actions',body:'<strong>Open PFOS</strong> launches the full planning tool with their data. <strong>Save Notes</strong> records session notes. <strong>Edit Profile</strong> updates their info. <strong>Net Worth Statement</strong> generates a formal one-pager.'},
-    {target:'#profileHeaderArea',position:'bottom',icon:'👤',title:'Client Overview',body:'Name, status, tier, contact info, review dates, and couple linking. Change status, assign agents, or manage household type from here.'},
-    {target:'center',icon:'📝',title:'Recommendations',body:'Scroll down to manage all recommendations. <strong>+ Add Recommendation</strong> creates one manually. <strong>AI Suggest</strong> auto-generates them. Each tracks through draft → proposed → agreed → active → implemented.'},
-    {target:'center',icon:'📈',title:'Reports & Notes',body:'<strong>Progress Report</strong> shows score changes and implementation progress. <strong>Session Notes</strong> logs meeting summaries. <strong>Follow-up Reminders</strong> keeps you on track.'},
-    {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always in the bottom-right corner. Tap it for <strong>instant help</strong> on whatever you\'re doing — editing a client, managing recommendations, or generating reports.'},
-    {target:'center',icon:'🎉',title:'All Set!',body:'You\'re ready to go!'},
+    {target:'center',icon:'👋',title:'Client Profile',body:'Everything about this client — financial data, recommendations, reports, and session history — all in one place. Let\'s walk through every feature.',delay:100},
+    {target:'#profileHeaderArea',position:'bottom',icon:'👤',title:'Client Overview',body:'Client name, status, tier, contact info, review dates, and couple linking. Change their status, assign agents, or manage household type directly from here.'},
+    {target:'#profileActionBtns',position:'bottom',icon:'⚡',title:'Quick Actions',body:'<strong>Open PFOS</strong> launches the full planning tool with their data. <strong>Save Notes</strong> records advisor notes. <strong>Edit Profile</strong> updates contact info. <strong>Net Worth Statement</strong> generates a formal one-pager.'},
+    {target:'[onclick*="openPFOSForClient"]',position:'right',icon:'📊',title:'Open PFOS Tool',body:'Opens the complete PFOS planning tool with this client\'s data pre-loaded. Make changes to income, expenses, debts, retirement — then click Save to Client to push updates to their profile.'},
+    {target:'[onclick*="openRecommendationModal"]',position:'right',icon:'➕',title:'Add Recommendation',body:'Create a recommendation manually — pick a section (Debt, Retirement, Protection, etc.), set priority, and write your recommendation. It saves as a draft for you to review before activating.'},
+    {target:'[onclick*="generateMeetingAgenda"]',position:'right',icon:'📋',title:'Meeting Agenda',body:'Auto-generates a meeting agenda pulling open recommendations, overdue items, and key financial changes since last review. Perfect for prep before client meetings.'},
+    {target:'[onclick*="generateProgressReport"]',position:'right',icon:'📈',title:'Progress Report',body:'Generates a comprehensive progress report showing score changes, implemented recommendations, net worth trajectory, and key improvements since the last report.'},
+    {target:'#profileSnapshotData',position:'right',icon:'📊',title:'Financial Snapshot',body:'Quick overview of the client\'s key numbers — income, expenses, net worth, debt, savings rate, and DTI ratio. Updates automatically when PFOS data is saved.'},
+    {target:'#advisorNotes',position:'top',icon:'📝',title:'Advisor Notes',body:'Persistent notes about this client — strategy ideas, preferences, important context. Saved separately from session notes. Use the template dropdown for quick-start formats.'},
+    {target:'#sessionNotesInput',position:'top',icon:'📓',title:'Session Notes',body:'Log notes after each client meeting. Each session note is timestamped and saved to the client\'s history. Click <strong>Save Session Note</strong> to add it to the record.'},
+    {target:'#advisorMsgThread',position:'top',icon:'💬',title:'Client Messages',body:'Two-way messaging with your client. See their messages here and send replies. Clients can message you from their portal — you respond right from this profile.'},
+    {target:'#aiRecBtn',position:'bottom',icon:'✨',title:'AI Recommendations',body:'Click <strong>AI Suggest</strong> to analyze this client\'s full financial profile and auto-generate prioritized recommendations. Review each one before activating — the AI drafts, you decide.'},
+    {target:'#scenarioComparePanel',position:'top',icon:'🔀',title:'Scenario Compare',body:'Run side-by-side comparisons of different financial strategies for this client. See how different approaches impact their trajectory over time.'},
+    {target:'#inviteLinkBtn',position:'top',icon:'🔗',title:'Portal Access',body:'Copy and send the client their portal invitation link. They can log in to view their data, reports, and communicate with you directly.'},
+    {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always in the bottom-right corner. Tap it for instant help specific to whatever you\'re doing on this page.'},
+    {target:'#profileActionBtns',position:'bottom',icon:'🎉',title:'All Set!',body:'You have everything you need to manage this client. Start by opening PFOS to review their data, or add a recommendation.<br><br>Click <strong>❓</strong> anytime for help.'},
   ];
 }
 
