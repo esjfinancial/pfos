@@ -72,12 +72,6 @@ function resetCompletion(){
 
 // ── INIT ──
 function initWalkthrough(){
-  // If running inside an iframe (PFOS embedded in client portal or dashboard),
-  // don't show the walkthrough — the parent page handles its own walkthrough
-  if(window.self !== window.top){
-    return; // In iframe — skip entirely to avoid double banner + double ❓
-  }
-
   steps = getSteps(currentPage, currentRole);
   if(!steps || !steps.length) return;
 
@@ -87,6 +81,54 @@ function initWalkthrough(){
   if(!isCompleted()){
     showReminderBanner();
   }
+
+  // On parent pages: monitor for visible iframes (PFOS opening)
+  // When an iframe appears, hide THIS page's walkthrough so only the iframe's shows
+  if(window.self === window.top){
+    monitorIframes();
+  }
+}
+
+var _wtHiddenByIframe = false;
+function monitorIframes(){
+  setInterval(function(){
+    // Check if any iframe is visible on the page (PFOS, or any embedded tool)
+    var iframes = document.querySelectorAll('iframe');
+    var anyVisible = false;
+    for(var i = 0; i < iframes.length; i++){
+      var f = iframes[i];
+      // Check if iframe is visible: has dimensions, not display:none, and its parent container is visible
+      if(f.offsetWidth > 0 && f.offsetHeight > 0){
+        var rect = f.getBoundingClientRect();
+        if(rect.width > 100 && rect.height > 100){
+          anyVisible = true;
+          break;
+        }
+      }
+    }
+
+    if(anyVisible && !_wtHiddenByIframe){
+      // PFOS or another iframe is visible — hide this page's walkthrough
+      _wtHiddenByIframe = true;
+      var banner = document.getElementById('wt-reminder');
+      if(banner) banner.style.display = 'none';
+      var replay = document.getElementById('wt-replay');
+      if(replay) replay.style.display = 'none';
+      // Also end any active tour
+      var tip = document.getElementById('wt-tooltip');
+      if(tip) tip.remove();
+    } else if(!anyVisible && _wtHiddenByIframe){
+      // Iframe closed — restore walkthrough if needed
+      _wtHiddenByIframe = false;
+      var replay2 = document.getElementById('wt-replay');
+      if(replay2) replay2.style.display = '';
+      // Only re-show banner if not completed
+      if(!isCompleted()){
+        var banner2 = document.getElementById('wt-reminder');
+        if(banner2) banner2.style.display = '';
+      }
+    }
+  }, 500);
 }
 
 // ── START TOUR ──
