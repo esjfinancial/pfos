@@ -68,6 +68,12 @@ function resetCompletion(){
 
 // ── INIT ──
 function initWalkthrough(){
+  // If running inside an iframe (PFOS embedded in client portal or dashboard),
+  // don't show the walkthrough — the parent page handles its own walkthrough
+  if(window.self !== window.top){
+    return; // In iframe — skip entirely to avoid double banner + double ❓
+  }
+
   steps = getSteps(currentPage, currentRole);
   if(!steps || !steps.length) return;
 
@@ -217,11 +223,12 @@ function positionTooltip(target, step){
 // ── NAVIGATION ──
 window._wtNext = function(){ showStep(currentStep + 1); };
 window._wtPrev = function(){ showStep(currentStep - 1); };
-window._wtSkip = function(){ endTour(); showReminderBanner(); };
+window._wtSkip = function(){ endTour(); markCompleted(); };
 window._wtEnd = function(){ endTour(); markCompleted(); };
 window._wtStart = startTour;
 window._wtReset = function(){ resetCompletion(); startTour(); };
 window._wtHide = function(){ endTour(); hideReminderBanner(); var r=document.getElementById('wt-replay');if(r)r.style.display='none'; };
+window._wtMarkDone = markCompleted;
 
 function endTour(){
   var t = document.getElementById('wt-tooltip');if(t)t.remove();
@@ -244,7 +251,7 @@ function showReminderBanner(){
     +'<span style="font-size:20px">📖</span>'
     +'<div style="flex:1"><strong>Take the guided tour</strong> to learn how to use this page</div>'
     +'<button onclick="window._wtStart()" style="padding:7px 16px;background:linear-gradient(135deg,#F97316,#EA580C);border:none;border-radius:4px;color:#fff;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;white-space:nowrap">Start Tour</button>'
-    +'<button onclick="this.parentElement.parentElement.remove()" style="background:none;border:none;color:#64748B;font-size:16px;cursor:pointer">✕</button>'
+    +'<button onclick="this.parentElement.parentElement.remove();if(window._wtMarkDone)window._wtMarkDone();" style="background:none;border:none;color:#64748B;font-size:16px;cursor:pointer">✕</button>'
     +'</div>';
   document.body.appendChild(banner);
 }
@@ -670,7 +677,7 @@ function getClientPortalSteps(role){
     {target:'center',icon:'👋',title:'Welcome to Your Financial Portal',body:'Your personal financial hub — scores, reports, tools, and communication, all in one place. Let\'s walk through everything.',delay:100},
     {target:'#cnav-overview',position:mob?'bottom':'right',icon:'📊',title:'Overview',body:'Your dashboard with 4 health scores, key metrics, and financial summary. This updates automatically as your data changes.',before:function(){nav('overview');}},
     {target:'#cnav-pfos',position:mob?'bottom':'right',icon:'⚡',title:'My Financial Data',body:'View and update all your financial data — income, expenses, debts, retirement, insurance, and more. This is where you build your complete financial picture.',before:function(){nav('pfos');}},
-    {target:'#cnav-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools',body:'93 calculators for every financial question — loans, retirement, insurance, student loans, taxes, and more. All personalized with your data.',before:function(){nav('tools');}},
+     {target:'#cnav-quicktools',position:mob?'bottom':'right',icon:'⚡',title:'Financial Tools',body:'102 calculators across 13 categories — loans, retirement, insurance, student loans, taxes, estate planning, and more. All personalized with your data. Browse by category in the sidebar.',before:function(){nav('tools');}},
     {target:'#cnav-studentloans',position:mob?'bottom':'right',icon:'🎓',title:'Student Loans',body:'12 dedicated student loan tools — income-driven repayment estimator, Public Service Loan Forgiveness tracker, forgiveness checker, refi analysis, and more.',before:function(){nav('studentloans');}},
     {target:'#cnav-loantools',position:mob?'bottom':'right',icon:'🏠',title:'Loans & Deals',body:'Loan calculator, APR truth calculator, rate comparison, refinance analysis, buy vs lease, and buy vs rent — all the tools for major purchase decisions.',before:function(){nav('loantools');}},
     {target:'#cnav-lifeevents',position:mob?'bottom':'right',icon:'🎯',title:'Life Events',body:'Planning a wedding, having a baby, changing jobs, relocating, or going through a divorce? Each major life event has a dedicated calculator.',before:function(){nav('lifeevents');}},
