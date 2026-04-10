@@ -6,6 +6,10 @@
 (function(){
 'use strict';
 
+// ── Prevent double initialization (script loaded twice on same page) ──
+if(window._wtInitialized) return;
+window._wtInitialized = true;
+
 // ── CONFIG ──
 var WT_VERSION = '1.0';
 var WT_STORAGE_KEY = 'pfos_wt_';
