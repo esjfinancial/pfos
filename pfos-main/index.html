@@ -811,7 +811,9 @@ input[type=range]::-moz-range-thumb{width:22px;height:22px;border-radius:50%;bac
 </style>
 </head>
 <body style="background:#09092E;margin:0;padding:0">
-<script>(function(){var d=document.documentElement;d.style.background='#09092E';d.style.margin='0';d.style.padding='0';if(document.body)document.body.style.background='#09092E';try{if(window.parent!==window)window.parent.document.body.style.background='#09092E';}catch(e){}})()</script>
+<script>
+const SUPABASE_URL='https://wbndgvicmgeodararpmr.supabase.co';
+(function(){var d=document.documentElement;d.style.background='#09092E';d.style.margin='0';d.style.padding='0';if(document.body)document.body.style.background='#09092E';try{if(window.parent!==window)window.parent.document.body.style.background='#09092E';}catch(e){}})()</script>
 
 <!-- PWA INSTALL BANNER -->
 <div class="pwa-bar" id="pwaBanner">
@@ -1842,7 +1844,7 @@ function estCapGainsTax(income,filingStatus){
 function pi(v){ return parseInt(v)||0; }
 function set(id,h){ var el=document.getElementById(id); if(el) el.innerHTML=h; }
 function openModal(id){ var el=document.getElementById(id); if(el){el.classList.add('open');el.style.display='flex';} }
-function closeModal(id){ var el=document.getElementById(id); if(el){el.classList.remove('open');el.style.display='none';} }
+function closeModal(id){ var el=document.getElementById(id); if(el){el.classList.remove('open');el.style.display='none';} if(id==='insuranceCalcModal'&&_calcUsageId)trackCalcClose(true); }
 function closeReport(){ var el=document.getElementById('reportModal'); if(el){el.classList.remove('open');} }
 
 // ── TIER & TRIAL ─────────────────────────────────────
@@ -7348,7 +7350,108 @@ function renderRiskSidebar(){
 var _currentCalcRender='';
 var _calcForOther=false;
 
-function openToolCalc(funcName){
+
+// ═══════════════════════════════════════════
+// CALCULATOR GATEWAY — Tier Gating + Usage Tracking
+// ═══════════════════════════════════════════
+var _calcAccess={};var _calcUsageId=null;var _calcOpenTime=null;
+
+async function loadCalcTiers(clientId){
+  if(!clientId||typeof SUPABASE_URL==='undefined')return;
+  try{
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    var res=await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({action:'bulk-check',client_id:clientId})
+    });
+    var data=await res.json();
+    if(data.calculators) _calcAccess=data.calculators;
+  }catch(e){console.warn('Calc tier check failed:',e);}
+}
+
+function isCalcAllowed(calcId){
+  if(!_calcAccess[calcId]) return true;
+  return _calcAccess[calcId].allowed;
+}
+
+function getCalcTier(calcId){
+  if(!_calcAccess[calcId]) return 'core';
+  return _calcAccess[calcId].tier_required;
+}
+
+async function trackCalcOpen(calcId,source){
+  _calcOpenTime=Date.now();
+  try{
+    var clientId=(typeof S!=='undefined'&&S.clientId)?S.clientId:((typeof APP!=='undefined'&&APP.currentClientId)?APP.currentClientId:null);
+    var context=window.location.pathname.indexOf('client')>=0?'client_portal':window.location.pathname.indexOf('dashboard')>=0?'agent_dashboard':'pfos_main';
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    var res=await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({
+        action:'track-open',calculator_id:calcId,client_id:clientId,
+        mode:typeof _calcForOther!=='undefined'&&_calcForOther?'for_other':'for_self',
+        source:source||'tool_grid',context:context
+      })
+    });
+    var data=await res.json();
+    _calcUsageId=data.usage_id||null;
+  }catch(e){console.warn('Calc tracking failed:',e);}
+}
+
+async function trackCalcClose(completed){
+  if(!_calcUsageId)return;
+  var duration=_calcOpenTime?Date.now()-_calcOpenTime:null;
+  try{
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({action:'track-close',usage_id:_calcUsageId,duration_ms:duration,completed:completed||false})
+    });
+  }catch(e){}
+  _calcUsageId=null;_calcOpenTime=null;
+}
+
+async function saveCalcResult(calcId,inputs,outputs,verdict){
+  var clientId=(typeof S!=='undefined'&&S.clientId)?S.clientId:((typeof APP!=='undefined'&&APP.currentClientId)?APP.currentClientId:null);
+  if(!clientId)return;
+  try{
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({action:'save-result',calculator_id:calcId,client_id:clientId,inputs:inputs,outputs:outputs,verdict:verdict})
+    });
+  }catch(e){}
+}
+
+function openToolCalc(funcName,source){
+  // Track close of previous calc if any
+  if(_calcUsageId) trackCalcClose(true);
+
+  // Tier check
+  if(!isCalcAllowed(funcName)){
+    var needed=getCalcTier(funcName);
+    var tierLabel=needed==='pro_plus'?'Pro+':needed.charAt(0).toUpperCase()+needed.slice(1);
+    var calcName=(_calcAccess[funcName]&&_calcAccess[funcName].name)||funcName.replace('render','').replace(/([A-Z])/g,' $1').trim();
+    var modal=document.getElementById('insuranceCalcModal');
+    if(modal) modal.style.display='flex';
+    document.getElementById('insCalcTitle').textContent='🔒 '+calcName;
+    var el=document.getElementById('insCalcContent');
+    if(el) el.innerHTML='<div style="text-align:center;padding:40px 20px">'
+      +'<div style="font-size:48px;margin-bottom:12px">🔒</div>'
+      +'<div style="font-family:var(--fd);font-size:24px;color:var(--or);margin-bottom:8px">'+tierLabel+' Feature</div>'
+      +'<div style="font-size:12px;color:var(--mu);margin-bottom:20px;max-width:400px;margin-left:auto;margin-right:auto;line-height:1.7">'
+      +'<strong>'+escH(calcName)+'</strong> is available on the <strong style="color:var(--or)">'+tierLabel+'</strong> plan. '
+      +'Upgrade to access this calculator and all '+tierLabel+' features.</div>'
+      +'<button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else alert(\'Contact your advisor to upgrade.\')" '
+      +'style="padding:12px 32px;background:var(--or);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer">'
+      +'Upgrade to '+tierLabel+' →</button></div>';
+    return;
+  }
+
   _currentCalcRender=funcName;
   _calcForOther=false;
   var modal=document.getElementById('insuranceCalcModal');
@@ -7357,6 +7460,8 @@ function openToolCalc(funcName){
   if(titleEl) titleEl.textContent='Calculator';
   var el=document.getElementById('insCalcContent');
   if(el) el.innerHTML='<div style="text-align:center;padding:20px;color:var(--mu)">Loading...</div>';
+  // Track the open
+  trackCalcOpen(funcName,source||'tool_grid');
   setTimeout(function(){
     if(typeof window[funcName]==='function') window[funcName]();
   },50);
