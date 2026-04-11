@@ -2128,7 +2128,7 @@ function esc(s){ if(!s) return ''; return String(s).replace(/&/g,'&amp;').replac
 function set(id,html){ var el=document.getElementById(id); if(el) el.innerHTML=html; }
 function v(id){ var el=document.getElementById(id); return el?(el.value||'').trim():''; }
 function openModal(id){ var el=document.getElementById(id); if(el)el.classList.add('open'); document.body.style.overflow='hidden'; }
-function closeModal(id){ var el=document.getElementById(id); if(el)el.classList.remove('open'); document.body.style.overflow=''; }
+function closeModal(id){ var el=document.getElementById(id); if(el)el.classList.remove('open'); if(id==='advCalcModal'&&_calcUsageId)trackCalcClose(true); document.body.style.overflow=''; }
 function setBtnLoading(id,loading,label){ var el=document.getElementById(id); if(!el) return; el.disabled=loading; el.textContent=loading?'⟳ Loading...':label; }
 function statusBadge(status){ var m={new:'badge-new',active:'badge-active',review_due:'badge-review',advisory:'badge-advisory',sold:'badge-sold'}; var labels={new:'New',active:'Active',review_due:'Review Due',advisory:'Advisory',sold:'Sold'}; return '<span class="badge '+(m[status]||'badge-new')+'">'+(labels[status]||status||'—')+'</span>'; }
 function showModalErr(id,msg){ var el=document.getElementById(id); if(el){el.textContent=msg;el.style.display='block';} }
@@ -5118,10 +5118,81 @@ setTimeout(function(){
 // ── Calculator Bridge ──
 var _advCurrentClient = null;
 
+
+// ═══════════════════════════════════════════
+// CALCULATOR GATEWAY — Tier Gating + Usage Tracking
+// ═══════════════════════════════════════════
+var _calcAccess={};var _calcUsageId=null;var _calcOpenTime=null;
+
+async function loadCalcTiers(clientId){
+  if(!clientId)return;
+  try{
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    var res=await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({action:'bulk-check',client_id:clientId})
+    });
+    var data=await res.json();
+    if(data.calculators) _calcAccess=data.calculators;
+  }catch(e){console.warn('Calc tier check failed:',e);}
+}
+function isCalcAllowed(calcId){if(!_calcAccess[calcId])return true;return _calcAccess[calcId].allowed;}
+function getCalcTier(calcId){if(!_calcAccess[calcId])return 'core';return _calcAccess[calcId].tier_required;}
+
+async function trackCalcOpen(calcId,source){
+  _calcOpenTime=Date.now();
+  try{
+    var clientId=APP.currentClientId||null;
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    var res=await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({action:'track-open',calculator_id:calcId,client_id:clientId,mode:'for_self',source:source||'tool_grid',context:'agent_dashboard'})
+    });
+    var data=await res.json();_calcUsageId=data.usage_id||null;
+  }catch(e){}
+}
+async function trackCalcClose(completed){
+  if(!_calcUsageId)return;
+  var duration=_calcOpenTime?Date.now()-_calcOpenTime:null;
+  try{
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({action:'track-close',usage_id:_calcUsageId,duration_ms:duration,completed:completed||false})
+    });
+  }catch(e){}
+  _calcUsageId=null;_calcOpenTime=null;
+}
+async function saveCalcResult(calcId,inputs,outputs,verdict){
+  var clientId=APP.currentClientId||null;if(!clientId)return;
+  try{
+    var token='';try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    await fetch(SUPABASE_URL+'/functions/v1/calc-gateway',{
+      method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({action:'save-result',calculator_id:calcId,client_id:clientId,inputs:inputs,outputs:outputs,verdict:verdict})
+    });
+  }catch(e){}
+}
+
 function advOpenCalc(fn){
+  if(_calcUsageId) trackCalcClose(true);
+  // Tier check (for the selected client)
+  if(!isCalcAllowed(fn)){
+    var needed=getCalcTier(fn);
+    var tierLabel=needed==='pro_plus'?'Pro+':needed.charAt(0).toUpperCase()+needed.slice(1);
+    var calcName=(_calcAccess[fn]&&_calcAccess[fn].name)||fn.replace('render','').replace(/([A-Z])/g,' $1').trim();
+    _advCurrentCalcName=fn;
+    openModal('advCalcModal');
+    document.getElementById('insCalcTitle').textContent='🔒 '+calcName;
+    var el=document.getElementById('insCalcContent');
+    if(el) el.innerHTML='<div style="text-align:center;padding:40px 20px"><div style="font-size:48px;margin-bottom:12px">🔒</div><div style="font-family:var(--fd);font-size:24px;color:var(--or);margin-bottom:8px">'+tierLabel+' Feature</div><div style="font-size:12px;color:var(--mu);margin-bottom:20px;max-width:400px;margin-left:auto;margin-right:auto;line-height:1.7">This client needs the <strong style="color:var(--or)">'+tierLabel+'</strong> tier to access <strong>'+calcName+'</strong>.</div></div>';
+    return;
+  }
   try{
     _advCurrentCalcName = fn;
     openModal('advCalcModal');
+    trackCalcOpen(fn,'tool_grid');
     if(typeof window[fn]==='function') window[fn]();
     setTimeout(function(){
       advInjectRecBar();
@@ -5254,6 +5325,7 @@ async function advLoadClient(){
   if(!val){
     window.S={calcs:{},debts:[],retAccounts:[],currentAge:35,riskProfile:'moderate',creditScore:0,children:[],insurancePolicies:[],dependents:0,protCalcs:{}};
     _advCurrentClient=null;
+    if(APP.currentClientId) loadCalcTiers(APP.currentClientId);
     if(info) info.textContent='Manual mode';
     return;
   }
