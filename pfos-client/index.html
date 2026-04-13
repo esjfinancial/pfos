@@ -849,11 +849,11 @@ body{background:#09092E;}
         </div>
       </div>
       <!-- Can I Afford This? -->
-      <div class="info-card" style="margin-bottom:16px;padding:14px">
-        <div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh);margin-bottom:8px">🛒 Can I Afford This?</div>
-        <div style="display:flex;gap:8px;align-items:center">
-          <div style="position:relative;flex:1"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input class="inp" type="number" id="affordInput" placeholder="Enter amount..." style="padding-left:24px;min-height:40px;font-size:14px;width:100%;box-sizing:border-box" oninput="checkAffordability()"></div>
-          <button class="btn" onclick="checkAffordability()" style="padding:8px 14px;min-height:40px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-size:12px;white-space:nowrap">Check</button>
+      <div class="info-card" style="margin-bottom:16px;padding:16px">
+        <div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:10px">🛒 Can I Afford This?</div>
+        <div style="display:flex;gap:10px;align-items:center">
+          <div style="position:relative;flex:1"><span style="position:absolute;left:14px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:20px;font-weight:700">$</span><input class="inp" type="number" id="affordInput" placeholder="Enter amount..." style="padding-left:32px;min-height:54px;font-size:20px;font-weight:600;width:100%;box-sizing:border-box;border-radius:4px" oninput="checkAffordability()"></div>
+          <button class="btn" onclick="checkAffordability()" style="padding:14px 20px;min-height:54px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;font-size:14px;font-weight:700;white-space:nowrap;border-radius:4px">Check</button>
         </div>
         <div id="affordResult" style="margin-top:8px;display:none"></div>
       </div>
@@ -1792,6 +1792,7 @@ function updateMobileTools(){
   var fd=_lastPfosState||{};var c=fd.calcs||{};
   // Net Worth Ticker
   renderClientTracking();
+  loadSupabaseSnapshots();
   var nwEl=document.getElementById('nwTickerVal');
   var nwTrend=document.getElementById('nwTickerTrend');
   if(nwEl){
@@ -1847,7 +1848,11 @@ function _cSvgLine(data,w,h,color,label){
 
 function renderClientTracking(){
   var el=document.getElementById('clientTrackingSection');if(!el) return;
-  var fd=_lastPfosState||{};var snaps=fd.snapshots||[];var c=fd.calcs||{};
+  var fd=_lastPfosState||{};
+  // Try PFOS state snapshots first, fall back to Supabase snapshots
+  var snaps=fd.snapshots||[];
+  if(!snaps.length&&APP._supabaseSnapshots)snaps=APP._supabaseSnapshots;
+  var c=fd.calcs||{};
   if(snaps.length<2){el.innerHTML='';return;}
   var h='<div class="info-card" style="padding:14px">';
   h+='<div class="info-card-title" style="margin-bottom:10px">📊 Financial Trends ('+snaps.length+' months)</div>';
@@ -1880,6 +1885,32 @@ function renderClientTracking(){
   });
   h+='</div></div>';
   el.innerHTML=h;
+}
+
+
+// Load snapshots from Supabase for tracking (fallback when PFOS state doesn't have them)
+async function loadSupabaseSnapshots(){
+  if(!db||!APP.currentClientId) return;
+  try{
+    var {data:rows}=await db.from('client_snapshots').select('*').eq('client_id',APP.currentClientId).order('snapshot_date',{ascending:true}).limit(36);
+    if(rows&&rows.length){
+      APP._supabaseSnapshots=rows.map(function(r){
+        var sd=r.snapshot_data||{};
+        return{
+          date:r.snapshot_date,month:new Date(r.snapshot_date).getMonth(),year:new Date(r.snapshot_date).getFullYear(),
+          label:(new Date(r.snapshot_date).getMonth()+1)+'/'+new Date(r.snapshot_date).getFullYear(),
+          income:r.income||0,expenses:r.expenses||0,netCF:r.net_cf||0,savingsRate:r.savings_rate||0,
+          netWorth:r.net_worth||0,totalAssets:r.total_assets||0,totalDebt:r.total_debt||0,
+          dti:r.dti||0,efMonths:r.ef_months||0,
+          cfScore:r.cf_score||0,protScore:r.prot_score||0,growScore:r.grow_score||0,effScore:r.eff_score||0,
+          retBal:r.ret_bal||0,fiNumber:r.fi_number||0,retGap:r.ret_gap||0,
+          expBreak:sd.expBreak||{},goals:sd.goals||[],debts:sd.debts||[],
+          blendedReturn:sd.blendedReturn||0
+        };
+      });
+      renderClientTracking();
+    }
+  }catch(e){console.warn('loadSupabaseSnapshots:',e);}
 }
 
 function checkAffordability(){
@@ -2625,11 +2656,42 @@ function getClientName(clientId){
 // ── DAILY SNAPSHOT (Phase 4 — trend tracking) ─────────────────────────────────
 async function autoSaveSnapshot(clientId, calcs){
   try{
+    var c=calcs||{};
     var today = new Date().toISOString().split('T')[0];
+    // Build expense breakdown from PFOS state
+    var fd=_lastPfosState||{};var S=fd.S||fd.state||fd||{};
+    var expBreak={};
+    if(S.expData){
+      ['housing','utilities','food','transportation','insurance','debtPayments','subscriptions','discretionary','savings','misc'].forEach(function(k){
+        var ed=S.expData[k];if(!ed)return;var amt=0;
+        if(ed.amount){var a=parseFloat(ed.amount)||0;if(ed.period==='weekly')amt=a*52/12;else if(ed.period==='biweekly')amt=a*26/12;else if(ed.period==='annual')amt=a/12;else amt=a;}
+        if(ed.subs)Object.keys(ed.subs).forEach(function(sk){amt+=(parseFloat(ed.subs[sk])||0);});
+        expBreak[k]=Math.round(amt);
+      });
+    }
+    // Build goals + debts arrays
+    var goals=(S.goals||[]).map(function(g){return{name:g.name,current:g.current||0,target:g.target||0};});
+    var debts=(S.debts||[]).map(function(d){return{name:d.name||'',balance:d.balance||0,rate:d.rate||0};});
     await db.from('client_snapshots').upsert({
       client_id:     clientId,
       snapshot_date: today,
-      calcs:         calcs || {},
+      net_worth:     Math.round(c.netWorth||0),
+      income:        Math.round(c.inc||0),
+      expenses:      Math.round(c.baseExp||0),
+      net_cf:        Math.round(c.netCF||0),
+      total_assets:  Math.round(c.totalAssets||0),
+      total_debt:    Math.round(c.totalDebt||0),
+      dti:           Math.round((c.dti||0)*10)/10,
+      ef_months:     Math.round((c.efMonths||0)*10)/10,
+      savings_rate:  Math.round((c.savingsRate||0)*10)/10,
+      cf_score:      c.cfScore||0,
+      prot_score:    c.protScore||0,
+      grow_score:    c.growScore||0,
+      eff_score:     c.effScore||0,
+      ret_bal:       Math.round((S.ret&&S.ret.balance)||0),
+      fi_number:     Math.round(c.fiNumber||0),
+      ret_gap:       Math.round(c.retGap||0),
+      snapshot_data: {expBreak:expBreak,goals:goals,debts:debts,blendedReturn:c.blendedRetReturn||0},
       created_at:    new Date().toISOString()
     }, { onConflict: 'client_id,snapshot_date' });
   }catch(e){ console.warn('autoSaveSnapshot:', e); }
@@ -2852,12 +2914,37 @@ CREATE TABLE IF NOT EXISTS client_snapshots (
   client_id     UUID REFERENCES clients(id) ON DELETE CASCADE,
   net_worth     NUMERIC DEFAULT 0,
   income        NUMERIC DEFAULT 0,
+  expenses      NUMERIC DEFAULT 0,
+  net_cf        NUMERIC DEFAULT 0,
+  total_assets  NUMERIC DEFAULT 0,
   total_debt    NUMERIC DEFAULT 0,
-  cf_score      SMALLINT DEFAULT 0,
+  dti           NUMERIC DEFAULT 0,
+  ef_months     NUMERIC DEFAULT 0,
   savings_rate  NUMERIC DEFAULT 0,
+  cf_score      SMALLINT DEFAULT 0,
+  prot_score    SMALLINT DEFAULT 0,
+  grow_score    SMALLINT DEFAULT 0,
+  eff_score     SMALLINT DEFAULT 0,
+  ret_bal       NUMERIC DEFAULT 0,
+  fi_number     NUMERIC DEFAULT 0,
+  ret_gap       NUMERIC DEFAULT 0,
+  snapshot_data JSONB DEFAULT '{}',
   snapshot_date DATE DEFAULT CURRENT_DATE,
   created_at    TIMESTAMPTZ DEFAULT NOW()
 );
+-- Migration for existing tables:
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS expenses NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS net_cf NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS total_assets NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS dti NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS ef_months NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS prot_score SMALLINT DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS grow_score SMALLINT DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS eff_score SMALLINT DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS ret_bal NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS fi_number NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS ret_gap NUMERIC DEFAULT 0;
+-- ALTER TABLE client_snapshots ADD COLUMN IF NOT EXISTS snapshot_data JSONB DEFAULT '{}';
 
 -- 12. SESSION_NOTES — advisor session logs per client visit
 CREATE TABLE IF NOT EXISTS session_notes (
