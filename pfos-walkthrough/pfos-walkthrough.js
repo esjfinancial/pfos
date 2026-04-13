@@ -6,10 +6,6 @@
 (function(){
 'use strict';
 
-// ── Prevent double initialization (script loaded twice on same page) ──
-if(window._wtInitialized) return;
-window._wtInitialized = true;
-
 // ── CONFIG ──
 var WT_VERSION = '1.0';
 var WT_STORAGE_KEY = 'pfos_wt_';
@@ -81,54 +77,6 @@ function initWalkthrough(){
   if(!isCompleted()){
     showReminderBanner();
   }
-
-  // On parent pages: monitor for visible iframes (PFOS opening)
-  // When an iframe appears, hide THIS page's walkthrough so only the iframe's shows
-  if(window.self === window.top){
-    monitorIframes();
-  }
-}
-
-var _wtHiddenByIframe = false;
-function monitorIframes(){
-  setInterval(function(){
-    // Check if any iframe is visible on the page (PFOS, or any embedded tool)
-    var iframes = document.querySelectorAll('iframe');
-    var anyVisible = false;
-    for(var i = 0; i < iframes.length; i++){
-      var f = iframes[i];
-      // Check if iframe is visible: has dimensions, not display:none, and its parent container is visible
-      if(f.offsetWidth > 0 && f.offsetHeight > 0){
-        var rect = f.getBoundingClientRect();
-        if(rect.width > 100 && rect.height > 100){
-          anyVisible = true;
-          break;
-        }
-      }
-    }
-
-    if(anyVisible && !_wtHiddenByIframe){
-      // PFOS or another iframe is visible — hide this page's walkthrough
-      _wtHiddenByIframe = true;
-      var banner = document.getElementById('wt-reminder');
-      if(banner) banner.style.display = 'none';
-      var replay = document.getElementById('wt-replay');
-      if(replay) replay.style.display = 'none';
-      // Also end any active tour
-      var tip = document.getElementById('wt-tooltip');
-      if(tip) tip.remove();
-    } else if(!anyVisible && _wtHiddenByIframe){
-      // Iframe closed — restore walkthrough if needed
-      _wtHiddenByIframe = false;
-      var replay2 = document.getElementById('wt-replay');
-      if(replay2) replay2.style.display = '';
-      // Only re-show banner if not completed
-      if(!isCompleted()){
-        var banner2 = document.getElementById('wt-reminder');
-        if(banner2) banner2.style.display = '';
-      }
-    }
-  }, 500);
 }
 
 // ── START TOUR ──
@@ -269,12 +217,11 @@ function positionTooltip(target, step){
 // ── NAVIGATION ──
 window._wtNext = function(){ showStep(currentStep + 1); };
 window._wtPrev = function(){ showStep(currentStep - 1); };
-window._wtSkip = function(){ endTour(); markCompleted(); };
+window._wtSkip = function(){ endTour(); showReminderBanner(); };
 window._wtEnd = function(){ endTour(); markCompleted(); };
 window._wtStart = startTour;
 window._wtReset = function(){ resetCompletion(); startTour(); };
 window._wtHide = function(){ endTour(); hideReminderBanner(); var r=document.getElementById('wt-replay');if(r)r.style.display='none'; };
-window._wtMarkDone = markCompleted;
 
 function endTour(){
   var t = document.getElementById('wt-tooltip');if(t)t.remove();
@@ -297,7 +244,7 @@ function showReminderBanner(){
     +'<span style="font-size:20px">📖</span>'
     +'<div style="flex:1"><strong>Take the guided tour</strong> to learn how to use this page</div>'
     +'<button onclick="window._wtStart()" style="padding:7px 16px;background:linear-gradient(135deg,#F97316,#EA580C);border:none;border-radius:4px;color:#fff;font-size:11px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;cursor:pointer;white-space:nowrap">Start Tour</button>'
-    +'<button onclick="this.parentElement.parentElement.remove();if(window._wtMarkDone)window._wtMarkDone();" style="background:none;border:none;color:#64748B;font-size:16px;cursor:pointer">✕</button>'
+    +'<button onclick="this.parentElement.parentElement.remove()" style="background:none;border:none;color:#64748B;font-size:16px;cursor:pointer">✕</button>'
     +'</div>';
   document.body.appendChild(banner);
 }
@@ -412,7 +359,7 @@ function getMainContextTips(){
   if(secTools && secTools.classList.contains('active')){
     return {icon:'🔧',title:'Financial Tools Help',items:[
       {tip:'Search calculators',detail:'Use the search bar at the top to find any calculator by name or keyword.'},
-      {tip:'93 calculators',detail:'Organized into 13 categories: Quick Tools, Loans, Debt, Student Loans, Investment, Insurance, Retirement, Tax, Estate, Life Events, Behavioral, Specialty, and Assessments.'},
+      {tip:'62 calculators',detail:'Organized into 13 categories: Quick Tools, Loans, Debt, Student Loans, Investment, Insurance, Retirement, Tax, Estate, Life Events, Behavioral, Specialty, and Assessments.'},
       {tip:'Pre-filled data',detail:'Calculators automatically use your profile data. Change any value to see different scenarios.'},
       {tip:'For Someone Else',detail:'Click "For Someone Else" to run any calculator with custom values for another person.'},
     ]};
@@ -447,7 +394,7 @@ function getDashContextTips(){
       {tip:'Select a client first',detail:'Use the "Run for" dropdown to select a client. Their data pre-fills every calculator.'},
       {tip:'Manual mode',detail:'Leave the dropdown on "Manual Input" to enter custom values for any scenario.'},
       {tip:'Save as recommendation',detail:'After running a calculator with a client selected, scroll down to save the results as a recommendation.'},
-      {tip:'Search',detail:'Use the search bar to filter across all 93 calculators.'},
+      {tip:'Search',detail:'Use the search bar to filter across all 62 calculators.'},
     ]};
   }
 
@@ -507,7 +454,7 @@ function getPortalContextTips(){
 
   if(navText.indexOf('Tools') >= 0){
     return {icon:'🧰',title:'Financial Tools Help',items:[
-      {tip:'Search',detail:'Use the search bar to find any of the 93 calculators by name.'},
+      {tip:'Search',detail:'Use the search bar to find any of the 62 calculators by name.'},
       {tip:'Your data pre-fills',detail:'Calculators use your profile data automatically for personalized results.'},
       {tip:'For Someone Else',detail:'Click "For Someone Else" to run a calculator with custom values for another person.'},
     ]};
@@ -678,7 +625,7 @@ function getDashboardSteps(){
     {target:'#nav-reviews',position:mob?'bottom':'right',icon:'📅',title:'Reviews',body:'Track all scheduled client reviews. See overdue, upcoming, and completed reviews. Send reminder emails with one click.',before:function(){nav('reviews');}},
     {target:'#nav-priority',position:mob?'bottom':'right',icon:'🎯',title:'Priority Dashboard',body:'Clients ranked by urgency — overdue reviews, missing data, low health scores. Color-coded so you never miss a follow-up.',before:function(){nav('priority');if(typeof renderPriorityDashboard==='function')renderPriorityDashboard();}},
     {target:'#nav-rec-pipeline',position:mob?'bottom':'right',icon:'🔄',title:'Recommendation Pipeline',body:'Track every recommendation from draft to implementation. Compliance rates, effectiveness scoring, and bulk starter packs for new clients.',before:function(){nav('rec-pipeline');if(typeof renderRecPipeline==='function')renderRecPipeline();}},
-    {target:'#nav-agent-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools (93 Calculators)',body:'All 93 calculators with a client selector at the top. Select a client to pre-fill their data, or choose Manual Input to enter a custom profile. Run any calculator, then save the results as a recommendation directly to that client\'s profile — all without leaving this page.',before:function(){nav('agent-tools');}},
+    {target:'#nav-agent-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools (62 Calculators)',body:'All 62 calculators with a client selector at the top. Select a client to pre-fill their data, or choose Manual Input to enter a custom profile. Run any calculator, then save the results as a recommendation directly to that client\'s profile — all without leaving this page.',before:function(){nav('agent-tools');}},
     {target:'#nav-leaderboard',position:mob?'bottom':'right',icon:'🏆',title:'Client Leaderboard',body:'See your healthiest clients, top compliance rates, and top savers. Great for identifying success stories and clients who need attention.',before:function(){nav('leaderboard');if(typeof renderClientLeaderboard==='function')renderClientLeaderboard();}},
     {target:'#nav-my-performance',position:mob?'bottom':'right',icon:'📊',title:'My Performance',body:'Your personal metrics — total clients, reviews completed, recommendations implemented, sessions logged, and average client health score.',before:function(){nav('my-performance');if(typeof renderAdvisorPerformancePage==='function')renderAdvisorPerformancePage();}},
     {target:'#nav-my-finances',position:mob?'bottom':'right',icon:'💰',title:'My Finances',body:'Your own personal financial profile using the full PFOS tool — separate from client data. Practice what you preach.',before:function(){nav('dashboard');}},
@@ -687,7 +634,7 @@ function getDashboardSteps(){
     {target:'#nav-bulk-msg',position:mob?'bottom':'right',icon:'📢',title:'Bulk Message',body:'Send a message to all your clients at once — announcements, market updates, or seasonal reminders. One click, every client gets it.'},
     {target:'[onclick*="exportClients"]',position:'right',icon:'⬇️',title:'Export & Utilities',before:function(){if(typeof showPage==='function')showPage('dashboard');},body:'<strong>Export CSV</strong> downloads your full client list as a spreadsheet. Use the <strong>theme toggle</strong> (🌙) to switch between dark and light mode. <strong>Keyboard shortcuts</strong> — press <strong>?</strong> on any screen for a list.'},
     {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always here. Tap it for <strong>instant help</strong> specific to whatever page you\'re viewing — client list, tools, pipeline, or any other screen.'},
-    {target:'#nav-dashboard',position:mob?'bottom':'right',icon:'🎉',title:'Ready to Go!',body:'You have everything you need. Start by adding clients, running Pulse Checks at your next event, or exploring the 93 calculators.<br><br>Click <strong>❓</strong> anytime for help.',before:function(){nav('dashboard');}},
+    {target:'#nav-dashboard',position:mob?'bottom':'right',icon:'🎉',title:'Ready to Go!',body:'You have everything you need. Start by adding clients, running Pulse Checks at your next event, or exploring the 62 calculators.<br><br>Click <strong>❓</strong> anytime for help.',before:function(){nav('dashboard');}},
   ];
 }
 
@@ -723,9 +670,9 @@ function getClientPortalSteps(role){
     {target:'center',icon:'👋',title:'Welcome to Your Financial Portal',body:'Your personal financial hub — scores, reports, tools, and communication, all in one place. Let\'s walk through everything.',delay:100},
     {target:'#cnav-overview',position:mob?'bottom':'right',icon:'📊',title:'Overview',body:'Your dashboard with 4 health scores, key metrics, and financial summary. This updates automatically as your data changes.',before:function(){nav('overview');}},
     {target:'#cnav-pfos',position:mob?'bottom':'right',icon:'⚡',title:'My Financial Data',body:'View and update all your financial data — income, expenses, debts, retirement, insurance, and more. This is where you build your complete financial picture.',before:function(){nav('pfos');}},
-     {target:'#cnav-quicktools',position:mob?'bottom':'right',icon:'⚡',title:'Financial Tools',body:'102 calculators across 13 categories — loans, retirement, insurance, student loans, taxes, estate planning, and more. All personalized with your data. Browse by category in the sidebar.',before:function(){nav('tools');}},
-    {target:'#cnav-studentloans',position:mob?'bottom':'right',icon:'🎓',title:'Student Loans',body:'12 dedicated student loan tools — income-driven repayment estimator, Public Service Loan Forgiveness tracker, forgiveness checker, refi analysis, and more.',before:function(){nav('studentloans');}},
-    {target:'#cnav-loantools',position:mob?'bottom':'right',icon:'🏠',title:'Loans & Deals',body:'Loan calculator, APR truth calculator, rate comparison, refinance analysis, buy vs lease, and buy vs rent — all the tools for major purchase decisions.',before:function(){nav('loantools');}},
+    {target:'#cnav-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools',body:'62 calculators for every financial question — loans, retirement, insurance, student loans, taxes, and more. All personalized with your data.',before:function(){nav('tools');}},
+    {target:'#cnav-studentloans',position:mob?'bottom':'right',icon:'🎓',title:'Student Loans',body:'5 powerful student loan tools — Student Loan Center (dashboard + repayment plans + payoff strategies), Forgiveness & PSLF Tracker, Refi vs Keep Federal with private consolidation, Employer Repay Tracker, and Parent PLUS Planner.',before:function(){nav('studentloans');}},
+    {target:'#cnav-loantools',position:mob?'bottom':'right',icon:'🏠',title:'Loans & Deals',body:'Loan Analyzer (with APR truth and rate comparison built in), Refinance Calculator, Debt Payoff Optimizer, Buy vs Lease, Buy vs Rent (with HOA and hidden homeowner costs), and Mortgage Affordability.',before:function(){nav('loantools');}},
     {target:'#cnav-lifeevents',position:mob?'bottom':'right',icon:'🎯',title:'Life Events',body:'Planning a wedding, having a baby, changing jobs, relocating, or going through a divorce? Each major life event has a dedicated calculator.',before:function(){nav('lifeevents');}},
     {target:'#cnav-reports',position:mob?'bottom':'right',icon:'📄',title:'My Reports',body:'View and download all your financial reports. Track your progress over time with score changes and projections.',before:function(){nav('reports');}},
     {target:'#cnav-messages',position:mob?'bottom':'right',icon:'💬',title:'Messages',body: role==='client-advisor' ? 'Two-way messaging with your advisor. Ask questions, share updates, or request a review.' : 'Communication center. Request an advisor consultation when you\'re ready for professional guidance.',before:function(){nav('messages');if(typeof loadClientMessages==='function')loadClientMessages();}},
@@ -735,7 +682,7 @@ function getClientPortalSteps(role){
     {target:'#cnav-calendar',position:mob?'bottom':'right',icon:'📅',title:'Calendar',body:'Your financial calendar — bill due dates, pay dates, review appointments, and important financial milestones.',before:function(){nav('calendar');if(typeof renderClientCalendar==='function')renderClientCalendar();}},
     {target:'#cnav-payschedule',position:mob?'bottom':'right',icon:'💰',title:'Pay Schedule',body:'Track your paycheck timing, deductions, and take-home pay. See exactly what lands in your account and when.',before:function(){nav('payschedule');if(typeof renderClientPaySchedule==='function')renderClientPaySchedule();}},
     {target:'#cnav-policies',position:mob?'bottom':'right',icon:'🛡️',title:'Insurance Policies',body:'View all your insurance policies — life, disability, health, property. See coverage amounts, premiums, and identify gaps.',before:function(){nav('policies');if(typeof renderClientPolicies==='function')renderClientPolicies();}},
-    {target:'#cnav-estate',position:mob?'bottom':'right',icon:'📜',title:'Estate Planning',body:'Estate tax exposure, wealth transfer strategies, beneficiary tracking, and legacy planning tools.',before:function(){nav('estate');if(typeof renderClientEstate==='function')renderClientEstate();}},
+    {target:'#cnav-estate',position:mob?'bottom':'right',icon:'📜',title:'Estate Planning',body:'Estate Dashboard with tax exposure and legacy view built in, Gift & Wealth Transfer planner with 2026 sunset analysis, and Generational Wealth engine.',before:function(){nav('estate');if(typeof renderClientEstate==='function')renderClientEstate();}},
     {target:'#cnav-engage',position:mob?'bottom':'right',icon:'🏆',title:'Achievements',body:'Track your financial milestones and earn achievements as you build better financial habits.',before:function(){nav('engage');if(typeof initEngagementPage==='function')initEngagementPage();}},
     {target:'#cnav-privacy',position:mob?'bottom':'right',icon:'🔒',title:'Privacy & Sharing',body:'Control what your advisor can see, manage data sharing preferences, and request account changes.',before:function(){nav('privacy');}},
     {target:'#cnav-activity',position:mob?'bottom':'right',icon:'👁️',title:'Advisor Activity',body:'See exactly what your advisor has accessed, changed, or reviewed on your account. Full transparency.',before:function(){nav('activity');if(typeof loadAdvisorActivity==='function')loadAdvisorActivity();}},
