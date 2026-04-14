@@ -169,6 +169,8 @@ body.has-pfos-nav .app{padding-bottom:70px}
 @media(min-width:500px){.tools-grid{grid-template-columns:1fr 1fr}}
 @media(min-width:900px){.tools-grid{grid-template-columns:1fr 1fr 1fr}}
 .tool-card{display:flex;align-items:center;gap:10px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:12px 14px;cursor:pointer;transition:border-color .2s}
+.tool-card.tier-locked{opacity:0.45;filter:grayscale(0.3)}
+.tool-card.tier-locked::after{content:'🔒';position:absolute;top:6px;right:6px;font-size:12px}
 .tool-card:hover{border-color:rgba(91,155,255,.4)}
 .tool-card .tool-icon{font-size:20px;flex-shrink:0}
 .tool-card .tool-name{font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh);letter-spacing:.04em}
@@ -1727,6 +1729,12 @@ var FEATURE_GATES = {
 };
 function hasFeature(f){ var g=FEATURE_GATES[f]; return !g||g.indexOf(S.tier)!==-1; }
 
+// ── PER-CALCULATOR TIER GATING (from parent via postMessage) ──
+var _calcAccess = {};
+function isCalcAllowed(calcId){ if(!_calcAccess[calcId])return true; return _calcAccess[calcId].allowed; }
+function getCalcTier(calcId){ if(!_calcAccess[calcId])return 'core'; return _calcAccess[calcId].tier_required; }
+function getCalcName(calcId){ if(_calcAccess[calcId])return _calcAccess[calcId].name; return calcId.replace('render','').replace(/([A-Z])/g,' $1').trim(); }
+
 // ── PRICING CONFIG ───────────────────────────────────
 var PRICING = {
   setup: { individual:147, couple:297 },
@@ -2546,13 +2554,17 @@ function renderToolsGrid(){
     h+='<div class="sec-group"><div class="sec-group-title">'+g.title+'</div><div class="tools-grid">';
     g.items.forEach(function(t){
       var locked=t.soon?'locked':'';
+      var tierLocked=(S.mode==='client'&&t.calc&&!isCalcAllowed(t.calc));
+      if(tierLocked) locked+=' tier-locked';
+      var tierBadge='';
+      if(tierLocked){var tl=getCalcTier(t.calc);tierBadge=' <span style="font-size:7px;font-family:var(--fh);font-weight:700;letter-spacing:.08em;padding:1px 5px;border-radius:2px;text-transform:uppercase;vertical-align:middle;'+(tl==='pro_plus'?'background:rgba(249,115,22,.12);color:var(--or)':'background:rgba(91,155,255,.12);color:#5B9BFF')+'">'+(tl==='pro_plus'?'PRO+':'PRO')+'</span>';}
       var onclick='';
       if(t.panel!==null&&t.panel!==undefined) onclick="showSection(\'finances\');setTimeout(function(){openFinPanel(["+t.panel+"])},100)";
       else if(t.calc) onclick="openToolCalc('"+t.calc+"')";
       else onclick='';
       h+='<div class="tool-card '+locked+'" style="position:relative" '+(onclick?'onclick="'+onclick+'"':'')+'>';
       h+='<div class="tool-icon">'+t.icon+'</div>';
-      h+='<div style="flex:1"><div class="tool-name">'+t.name+(t.soon?' <span style="font-size:8px;color:var(--pu);background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.2);padding:1px 5px;border-radius:2px;vertical-align:middle">SOON</span>':'')+'</div>';
+      h+='<div style="flex:1"><div class="tool-name">'+t.name+tierBadge+(t.soon?' <span style="font-size:8px;color:var(--pu);background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.2);padding:1px 5px;border-radius:2px;vertical-align:middle">SOON</span>':'')+'</div>';
       h+='<div class="tool-desc">'+t.desc+'</div></div>';
       if(t.calc) h+='<span onclick="event.stopPropagation();_gridInfo(this,\x27'+t.calc+'\x27)" style="position:absolute;top:6px;right:6px;width:20px;height:20px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.3);border-radius:50%;color:#5B9BFF;font-size:11px;font-weight:800;cursor:pointer;display:flex;align-items:center;justify-content:center;z-index:2;transition:.2s" onmouseover="this.style.background=\x27rgba(91,155,255,.3)\x27" onmouseout="this.style.background=\x27rgba(91,155,255,.12)\x27">i</span>';
       h+='</div>';
@@ -7652,6 +7664,7 @@ function submitAdvisorRequestFromModal(){
     var msg=e.data;if(!msg||!msg.type)return;
     if(msg.type==='PFOS_AUTH'){clearTimeout(authTimeout);var lock=document.getElementById('pfos-lock');if(lock)lock.remove();return;}
     if(msg.type==='GENERATE_REPORT'){generateReport();return;}
+    if(msg.type==='PFOS_CALC_ACCESS'){_calcAccess=msg.calcAccess||{};if(_currentSection==='tools')renderToolsGrid();return;}
     if(msg.type!=='PFOS_LOAD')return;
     if(document.getElementById('pfos-lock'))return;
     try{
@@ -7975,6 +7988,19 @@ var _currentCalcRender='';
 var _calcForOther=false;
 
 function openToolCalc(funcName){
+  // Tier gate check — only for client mode
+  if(S.mode==='client'&&!isCalcAllowed(funcName)){
+    var needed=getCalcTier(funcName);
+    var tierLabel=needed==='pro_plus'?'PRO+':needed.toUpperCase();
+    var calcName=getCalcName(funcName);
+    var modal=document.getElementById('insuranceCalcModal');
+    if(modal) modal.style.display='flex';
+    var titleEl=document.getElementById('insCalcTitle');
+    if(titleEl) titleEl.textContent='🔒 '+calcName;
+    var el=document.getElementById('insCalcContent');
+    if(el) el.innerHTML='<div style="text-align:center;padding:40px 20px"><div style="font-size:48px;margin-bottom:12px">🔒</div><div style="font-family:var(--fd);font-size:24px;color:var(--or);margin-bottom:8px">'+tierLabel+' Feature</div><div style="font-size:12px;color:var(--mu);margin-bottom:20px;max-width:400px;margin-left:auto;margin-right:auto;line-height:1.7"><strong>'+calcName+'</strong> is available on the <strong style="color:var(--or)">'+tierLabel+'</strong> plan. Contact your advisor to upgrade.</div><button onclick="showUpgrade()" style="padding:12px 32px;background:var(--or);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer">Upgrade to '+tierLabel+' →</button></div>';
+    return;
+  }
   _currentCalcRender=funcName;
   _calcForOther=false;
   var modal=document.getElementById('insuranceCalcModal');
