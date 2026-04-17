@@ -2423,17 +2423,28 @@ window.addEventListener('message',async function(e){
   if(e.origin!==PFOS_ORIGIN) return;
   var msg=e.data; if(!msg||!msg.type) return;
   if(msg.type==='PFOS_DATA_CHANGE'){
-    if(!APP.currentClientId) return;
+    console.log('[Dashboard] Received PFOS_DATA_CHANGE','isAgent:',!!(pfosClientContext&&pfosClientContext.isAgentProfile),'clientId:',APP.currentClientId);
     try{
       var state=msg.state,calcs=state.calcs||{};
       _lastPfosState={state:state,calcs:calcs};
+      // Agent's own finances — save to agent_profiles
+      if(pfosClientContext&&pfosClientContext.isAgentProfile&&APP.user){
+        var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
+        var pp={user_id:APP.user.id,financial_data:{S:state,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
+        var ex=await db.from('agent_profiles').select('id').eq('user_id',APP.user.id).maybeSingle();
+        if(ex&&ex.data){ await db.from('agent_profiles').update(pp).eq('id',ex.data.id); console.log('[Dashboard] Agent profile UPDATED'); }
+        else { await db.from('agent_profiles').insert(pp); console.log('[Dashboard] Agent profile INSERTED'); }
+        return;
+      }
+      // Client finances — save to client_profiles
+      if(!APP.currentClientId){ console.warn('[Dashboard] No currentClientId — skipping save'); return; }
       _lastSaveClientId=APP.currentClientId;
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
       var pp={client_id:APP.currentClientId,financial_data:{S:state,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
       var ex=await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).maybeSingle();
-      if(ex&&ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); }
-      else { await db.from('client_profiles').insert(pp); }
-    }catch(err){ console.warn('Dashboard auto-save:',err); }
+      if(ex&&ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[Dashboard] Client profile UPDATED'); }
+      else { await db.from('client_profiles').insert(pp); console.log('[Dashboard] Client profile INSERTED'); }
+    }catch(err){ console.warn('Dashboard auto-save ERROR:',err); }
   }
 });
 // ── Save-on-exit: flush unsaved changes when navigating away ──
@@ -4569,7 +4580,7 @@ async function loadAgentProfileIntoPFOS(){
       pfos_tier:'pro_plus',
       clientId:'agent-'+APP.user.id,
       clientName:agentName+' (My Finances)',
-      financialData:stateData,
+      state:stateData,
       coupleData:null
     },'*');
   }catch(e){ console.warn('loadAgentProfileIntoPFOS:',e); }
