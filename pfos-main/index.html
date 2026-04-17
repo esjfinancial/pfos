@@ -1763,6 +1763,20 @@ var HH_DESCS = {
   hybrid:     '<strong style="color:var(--wh)">Hybrid:</strong> Personal finances stay private. Joint accounts and shared goals are visible to both. Best of both worlds.'
 };
 
+// ── SAVE GUARD — prevents empty state from overwriting good data on initial render ──
+var _saveGuardActive=false, _loadedWeight=0;
+function _stateWeight(){
+  var w=0;
+  w+=(S.incomeSources||[]).filter(function(s){return s.amount>0;}).length*10;
+  w+=Object.keys(S.expData||{}).length;
+  w+=(S.debts||[]).filter(function(d){return d.balance>0;}).length*10;
+  w+=(S.retAccounts||[]).length*10;
+  w+=(S.children||[]).length*5;
+  w+=(S.goals||[]).length*5;
+  if(S.profile){var p=S.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
+  if(S.assets){if(parseFloat(S.assets.checking)>0)w+=5;if(parseFloat(S.assets.savings)>0)w+=5;if(parseFloat(S.assets.invest)>0)w+=5;}
+  return w;
+}
 // ── CORE STATE ───────────────────────────────────────
 var S = {
   mode:'advisor', step:0, tier:TIERS.TRIAL,
@@ -4454,6 +4468,15 @@ function calc(){
 }
 function _doSync(){
   S._syncTimer=null;
+  // ── Save guard: block first auto-save after load if data appears lost ──
+  if(_saveGuardActive){
+    _saveGuardActive=false; // clear after first check — all future saves go through
+    var curW=_stateWeight();
+    if(curW<_loadedWeight*0.5&&_loadedWeight>10){
+      console.warn('[PFOS _doSync] BLOCKED first save — state weight '+curW+' vs loaded '+_loadedWeight+'. Likely restore failure.');
+      return;
+    }
+  }
   S.profile={
     firstName:gv('cpFirstName'),lastName:gv('cpLastName'),email:gv('cpEmail'),phone:gv('cpPhone'),dob:gv('cpDOB'),
     marital:gv('cpMarital'),spouse:gv('cpSpouse'),dependents:gv('cpDependents'),occupation:gv('cpOccupation'),
@@ -4472,9 +4495,19 @@ function _doSync(){
     umbHas:gv('umbHas'),umbAmount:gv('umbAmount'),umbPremium:gv('umbPremium'),umbCarrier:gv('umbCarrier'),
     pcType:gv('pcType'),pcHomePremium:gv('pcHomePremium'),pcAutoHas:gv('pcAutoHas'),pcAutoPremium:gv('pcAutoPremium'),
     estWill:gv('estWill'),estTrust:gv('estTrust'),estPOA:gv('estPOA'),estHealthcare:gv('estHealthcare'),estBeneficiary:gv('estBeneficiary'),estGuardian:gv('estGuardian'),
-    eduNumChildren:gv('eduNumChildren'),eduReturn:gv('eduReturn'),eduInflation:gv('eduInflation'),eduAcctType:gv('eduAcctType')
+    eduNumChildren:gv('eduNumChildren')
   };
-  try{ var pl=JSON.parse(JSON.stringify(S)); console.log('[PFOS _doSync]','expData keys:',Object.keys(S.expData||{}).length,'income:',((S.incomeSources||[]).length),'posting PFOS_DATA_CHANGE'); window.parent.postMessage({type:'PFOS_DATA_CHANGE',state:pl},'https://pfos.esjfinancial.com');window.postMessage({type:'PFOS_DATA_CHANGE',state:pl},'*'); }catch(e){ console.error('[PFOS _doSync] postMessage failed:',e); }
+  try{ var pl=JSON.parse(JSON.stringify(S));
+    console.log('[PFOS _doSync] SAVING →',
+      'income:',((S.incomeSources||[]).length),'('+((S.incomeSources||[]).reduce(function(t,s){return t+(s.amount||0);},0))+'/mo)',
+      'expData:',Object.keys(S.expData||{}).length,
+      'debts:',(S.debts||[]).length,'('+((S.debts||[]).reduce(function(t,d){return t+(d.balance||0);},0))+')',
+      'retAccounts:',(S.retAccounts||[]).length,
+      'children:',(S.children||[]).length,
+      'profile:',(S.profile&&S.profile.firstName?S.profile.firstName:'EMPTY'),
+      'assets:',JSON.stringify(S.assets||{}),
+      'weight:',_stateWeight());
+    window.parent.postMessage({type:'PFOS_DATA_CHANGE',state:pl},'https://pfos.esjfinancial.com');window.postMessage({type:'PFOS_DATA_CHANGE',state:pl},'*'); }catch(e){ console.error('[PFOS _doSync] postMessage failed:',e); }
   try{ localStorage.setItem('pfos_state', JSON.stringify(S)); }catch(e){}
   if(S.coupleLinkId&&(S.householdType==='hybrid'||S.householdType==='joint')){
     try{window.parent.postMessage({type:'JOINT_DATA_UPDATE',coupleLinkId:S.coupleLinkId,jointData:{income:S.calcs&&S.calcs.inc,netWorth:S.calcs&&S.calcs.netWorth,goals:S.goals,buckets:S.buckets}},'https://pfos.esjfinancial.com');try{window.postMessage({type:'JOINT_DATA_UPDATE',coupleLinkId:S.coupleLinkId,jointData:{income:S.calcs&&S.calcs.inc,netWorth:S.calcs&&S.calcs.netWorth,goals:S.goals,buckets:S.buckets}},'*');}catch(e2){}}catch(e){}
@@ -7795,7 +7828,15 @@ function submitAdvisorRequestFromModal(){
     if(document.getElementById('pfos-lock'))return;
     try{
       // ── Flush any pending save from previous client BEFORE resetting ──
-      _flushSync();
+      // Only flush if we previously loaded real data (prevents empty state from wiping Supabase)
+      if(_stateWeight()>10){
+        console.log('[PFOS LOAD] Flushing previous client data. Weight:',_stateWeight());
+        _flushSync();
+      } else {
+        // Just clear any pending timer without saving
+        if(S._syncTimer){clearTimeout(S._syncTimer);S._syncTimer=null;}
+        console.log('[PFOS LOAD] Skipping flush — no previous client data to save. Weight:',_stateWeight());
+      }
       // ── RESET S to clean defaults — prevents client bleed-over ──
       // Clear any pending debounce sync from previous client before wiping state
       clearTimeout(S._syncTimer); S._syncTimer=null;
@@ -7826,6 +7867,13 @@ function submitAdvisorRequestFromModal(){
       ['incomeList','expenseList','debtList','retAccountsList','childInputs','goalsList','bucketsList'].forEach(function(id){var el=document.getElementById(id);if(el)el.innerHTML='';});
       // ── Apply incoming state ──
       if(msg.state)Object.assign(S,msg.state);
+      console.log('[PFOS LOAD] State from Supabase →',
+        'income:',(S.incomeSources||[]).length,'('+((S.incomeSources||[]).reduce(function(t,s){return t+(s.amount||0);},0))+'/mo)',
+        'expData:',Object.keys(S.expData||{}).length,
+        'debts:',(S.debts||[]).length,
+        'retAccounts:',(S.retAccounts||[]).length,
+        'profile:',(S.profile?'YES':'NULL'),
+        'msg.state:',(msg.state?'YES':'NULL'));
       // If Supabase state appears empty, fall back to localStorage
       var _hasSupaData=msg.state&&((msg.state.incomeSources&&msg.state.incomeSources.length)||(msg.state.expData&&Object.keys(msg.state.expData).length)||(msg.state.debts&&msg.state.debts.length));
       if(!_hasSupaData){try{var _ls=JSON.parse(localStorage.getItem('pfos_state')||'null');if(_ls&&typeof _ls==='object'&&((_ls.incomeSources&&_ls.incomeSources.length)||(_ls.expData&&Object.keys(_ls.expData).length)||(_ls.debts&&_ls.debts.length)))Object.assign(S,_ls);}catch(e){}}
@@ -7905,8 +7953,18 @@ function submitAdvisorRequestFromModal(){
           var expQ=document.getElementById('expSharingQuestion');if(expQ)expQ.style.display='';
         }
       }
+      // ── Save guard: capture loaded data weight before renders trigger auto-save ──
+      _loadedWeight=_stateWeight();
+      _saveGuardActive=true; // blocks only the first _doSync call
+      console.log('[PFOS LOAD] Save guard armed. Loaded weight:',_loadedWeight);
       // ── Render all panels ──
       renderIncomeRow();initExpData();renderExpenses();renderDebts();renderRetAccounts();calc();
+      console.log('[PFOS LOAD] After renders →',
+        'income:',(S.incomeSources||[]).length,'('+((S.incomeSources||[]).reduce(function(t,s){return t+(s.amount||0);},0))+'/mo)',
+        'expData:',Object.keys(S.expData||{}).length,
+        'debts:',(S.debts||[]).length,
+        'retAccounts:',(S.retAccounts||[]).length,
+        'weight:',_stateWeight());
       updateModeVisibility();updateProfileSidebar();initTrial();updateTierBadge();
       if(S.goals&&S.goals.length)renderGoals();if(S.buckets&&S.buckets.length)renderBuckets();
       if(S.children&&S.children.length)renderEducation();
