@@ -3774,9 +3774,15 @@ function renderProfileSnapshot(fd, scores){
   console.log('[PFOS-CP] renderProfileSnapshot called. fd keys:', fd?Object.keys(fd):'null', 'fd.calcs:', fd&&fd.calcs?'YES':'NO', 'fd.S?.calcs:', fd&&fd.S&&fd.S.calcs?'YES':'NO');
   var kv=function(k,v,c){ return '<div class="kv"><span class="kk">'+k+'</span><span class="kv-val" style="color:'+(c||'var(--wh)')+'">'+v+'</span></div>'; };
   var c=fd.calcs||(fd.S&&fd.S.calcs)||{};
+  // Fallback: compute income from raw state if calcs.inc is missing
+  var rawS=fd.S||{};
+  if(!c.inc&&rawS.incomeSources&&rawS.incomeSources.length){
+    c.inc=rawS.incomeSources.reduce(function(t,s){return t+(parseFloat(s.amount)||0);},0);
+  }
   console.log('[PFOS-CP] calcs.inc:', c.inc, 'calcs keys:', Object.keys(c).slice(0,10));
-  var snap = c.inc
-    ? kv('Monthly Income',fmt(c.inc),'var(--gr)')+kv('Net Cash Flow',fmt(c.netCF),c.netCF>=0?'var(--gr)':'var(--rd)')+kv('Net Worth',fmtK(c.netWorth),c.netWorth>=0?'var(--gr)':'var(--rd)')+kv('Total Debt',fmtK(c.totalDebt),'var(--or)')+kv('Savings Rate',(c.savingsRate||0).toFixed(1)+'%')
+  var hasCalcs=Object.keys(c).length>0||c.inc>0;
+  var snap = hasCalcs
+    ? kv('Monthly Income',fmt(c.inc||0),'var(--gr)')+kv('Net Cash Flow',fmt(c.netCF||0),(c.netCF||0)>=0?'var(--gr)':'var(--rd)')+kv('Net Worth',fmtK(c.netWorth||0),(c.netWorth||0)>=0?'var(--gr)':'var(--rd)')+kv('Total Debt',fmtK(c.totalDebt||0),'var(--or)')+kv('Savings Rate',(c.savingsRate||0).toFixed(1)+'%')
     : '<div style="color:var(--mu);font-size:12px">No snapshot data</div>';
   set('profileSnapshotData', snap);
   var scH='';
@@ -3786,13 +3792,26 @@ function renderProfileSnapshot(fd, scores){
 }
 function renderProfileRedFlags(fd){
   var c=(fd&&fd.calcs)?fd.calcs:((fd&&fd.S&&fd.S.calcs)?fd.S.calcs:{});
+  // Fallback: compute key metrics from raw state if calcs are stale
+  var rawS=(fd&&fd.S)?fd.S:{};
+  if(!c.inc&&rawS.incomeSources&&rawS.incomeSources.length){
+    c.inc=rawS.incomeSources.reduce(function(t,s){return t+(parseFloat(s.amount)||0);},0);
+  }
+  if(!c.totalDebt&&rawS.debts&&rawS.debts.length){
+    c.totalDebt=rawS.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+  }
+  if(c.inc&&!c.dti&&c.totalDebt){
+    var totalMin=rawS.debts?rawS.debts.reduce(function(t,d){return t+(parseFloat(d.payment)||0);},0):0;
+    c.dti=c.inc>0?Math.round(totalMin/c.inc*100):0;
+  }
+  if(!c.efBal&&rawS.assets){c.efBal=(parseFloat(rawS.assets.checking)||0)+(parseFloat(rawS.assets.savings)||0);}
   console.log('[PFOS-CP] renderProfileRedFlags called. c.inc:', c.inc, 'calcs keys:', Object.keys(c).slice(0,10));
   var el=document.getElementById('redFlagCards');
   var sumEl=document.getElementById('redFlagSummary');
   if(!el){return;}
   APP._clientFD=fd; // stash for template handlers
   var rp=(fd.riskProfile||fd.risk_profile||(fd.S&&fd.S.riskProfile&&fd.S.riskProfile.label)||(fd.S&&fd.S.risk_profile)||'moderate').toLowerCase();
-  if(!c.inc){el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">No financial data yet. Open PFOS to enter client data.</div>';if(sumEl)sumEl.textContent='';return;}
+  if(Object.keys(c).length===0){el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">No financial data yet. Open PFOS to enter client data.</div>';if(sumEl)sumEl.textContent='';return;}
 
   // ── Build flags ──
   var flags=[];
@@ -4184,6 +4203,8 @@ async function generateAndSaveReport(){
 }
 function buildReportSummary(c){ if(!c||!c.inc) return 'Financial report generated.'; return ['Income:'+fmt(c.inc)+'/mo','Net CF:'+fmt(c.netCF),'Net Worth:'+fmtK(c.netWorth),c.totalDebt>0?'Debt:'+fmtK(c.totalDebt):'','CF Score:'+(c.cfScore||'?')+'/10'].filter(Boolean).join(' · '); }
 function closePFOS(){
+  // Flush PFOS sync before leaving so Supabase has fresh data
+  try{var fr=document.getElementById('pfosFrame');if(fr&&fr.contentWindow)fr.contentWindow.postMessage({type:'PFOS_FLUSH'},'*');}catch(e){}
   // Restore all scrolling
   document.documentElement.style.cssText='';
   document.body.style.cssText='background:#09092E;margin:0;padding:0;min-height:100vh;overflow-x:hidden';
@@ -4192,7 +4213,10 @@ function closePFOS(){
   var pg=document.getElementById('pg-pfos');if(pg)pg.style.cssText='padding:0';
   var ac=document.getElementById('pfosAppContainer');if(ac)ac.style.cssText='background:#09092E;min-height:100vh;width:100%';
   var sb=document.querySelector('.plat-sidebar'); if(sb) sb.style.display='';
-  if(APP.currentClientId){ openClientProfile(APP.currentClientId); } else { showPage('dashboard'); }
+  // Small delay to let PFOS flush save to Supabase before re-loading profile
+  setTimeout(function(){
+    if(APP.currentClientId){ openClientProfile(APP.currentClientId); } else { showPage('dashboard'); }
+  },400);
 }
 function showSaveIndicator(state){ var el=document.getElementById('saveIndicator'); if(!el) return; el.className='save-indicator'; if(state==='saving'){el.className='save-indicator saving';el.textContent='⟳ Saving...';} else if(state==='saved'){el.className='save-indicator saved';el.textContent='✓ Saved';setTimeout(()=>el.className='save-indicator',2500);} }
 async function removeAgentAccess(){
@@ -4651,7 +4675,7 @@ window.addEventListener('message', async function(e){
       var ind = document.getElementById('saveIndicator') || document.getElementById('clientSaveIndicator');
       if(ind){ ind.className='save-indicator saved'; ind.textContent='✓ Auto-saved'; setTimeout(function(){ind.className='save-indicator';},2000); }
       // Live-update the profile snapshot and scores on this page — only if real data
-      if(calcs.inc>0){
+      if(Object.keys(calcs).length>0){
         renderProfileSnapshot({S:state,calcs:calcs}, scores);
         renderProfileRedFlags({calcs:calcs,riskProfile:state.riskProfile||state.risk_profile||'moderate'});
       }
