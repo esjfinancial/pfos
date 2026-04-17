@@ -1353,11 +1353,6 @@ html[data-theme="light"] .pwa-bar{background:linear-gradient(0deg,#FFFFFF,#F8FAF
   <div class="sdesc">Project college savings per child with cost inflation and savings trajectory.</div>
   <div class="row">
     <div class="fi"><label class="lb">Number of Children</label><select class="sel" id="eduNumChildren" onchange="syncChildCount()"><option value="0">0</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></div>
-    <div class="fi"><label class="lb">Account Type</label><select class="sel" id="eduAcctType"><option value="529">529 Plan</option><option value="coverdell">Coverdell ESA (Education Savings Account)</option><option value="ugma">UGMA/UTMA (custodial accounts)</option><option value="roth">Roth IRA</option><option value="taxable">Taxable</option></select></div>
-  </div>
-  <div class="row">
-    <div class="fi"><label class="lb">Expected Return %</label><input class="inp" type="number" id="eduReturn" placeholder="7" value="7" min="0" max="15" oninput="renderEducation()"></div>
-    <div class="fi"><label class="lb">College Cost Inflation %</label><input class="inp" type="number" id="eduInflation" placeholder="6" value="6" min="0" max="12" oninput="renderEducation()"></div>
   </div>
   <div id="childInputs"></div>
   <div class="add-btn" onclick="addChild()">+ Add Child</div>
@@ -2674,7 +2669,7 @@ function renderPlanSection(){
   // Debt Elimination Engine link
   if(c.totalDebt>0){
     h+='<div class="sec-group"><div class="sec-group-title">Debt Elimination Strategy</div>';
-    h+='<div style="padding:16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;cursor:pointer" onclick="openFinPanel([11])">';
+    h+='<div style="padding:16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;cursor:pointer" onclick="openToolCalc(\'renderCCPayoffCalc\')">';
     h+='<div style="display:flex;justify-content:space-between;align-items:center">';
     h+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">Total Debt: '+fmt(c.totalDebt)+'</div>';
     h+='<div style="font-size:11px;color:var(--mu);margin-top:4px">Avalanche · Snowball · Hybrid · IBC — compare strategies and payoff timelines</div></div>';
@@ -3964,7 +3959,11 @@ function getInvestContribAuto(){
     return t+(parseFloat(a.contrib)||0);
   },0);
 }
-function getTotalMonthlyExp(){ return L1_CATS.reduce(function(t,c){return t+getMonthlyExp(c.key);},0)+getDebtPaymentsAuto()+getInvestContribAuto(); }
+// Auto-pull education contributions
+function getEduContribAuto(){
+  return (S.children||[]).reduce(function(t,ch){ return t+(parseFloat(ch.contrib)||0); },0);
+}
+function getTotalMonthlyExp(){ return L1_CATS.reduce(function(t,c){return t+getMonthlyExp(c.key);},0)+getDebtPaymentsAuto()+getInvestContribAuto()+getEduContribAuto(); }
 
 function getFixedBills(){
   // Extract all fixed expenses with due dates for the calendar
@@ -4137,6 +4136,14 @@ function renderExpenses(){
       +'<div class="exp-cat-icon">📊</div>'
       +'<div class="exp-cat-info"><div class="exp-cat-name">Investment Contributions</div><div class="exp-cat-sub">Auto-pulled from Retirement (excl. payroll-deducted)</div></div>'
       +'<div class="exp-cat-amt">'+(investAuto>0?fmt(isAnn?investAuto*12:investAuto):'—')+'</div>'
+    +'</div></div>';
+  }
+  var eduAuto=getEduContribAuto();
+  if(eduAuto>0||S.children&&S.children.length){
+    autoHtml+='<div class="exp-cat" style="opacity:0.85"><div class="exp-cat-hdr" style="cursor:default">'
+      +'<div class="exp-cat-icon">🎓</div>'
+      +'<div class="exp-cat-info"><div class="exp-cat-name">Education Savings</div><div class="exp-cat-sub">Auto-pulled from Education Planning</div></div>'
+      +'<div class="exp-cat-amt">'+(eduAuto>0?fmt(isAnn?eduAuto*12:eduAuto):'—')+'</div>'
     +'</div></div>';
   }
   list.innerHTML+=autoHtml;
@@ -5469,61 +5476,116 @@ function addChild(){
   var sel=document.getElementById('eduNumChildren');
   var maxAllowed=sel?parseInt(sel.options[sel.options.length-1].value)||4:4;
   if(S.children.length>=maxAllowed){alert('Maximum '+maxAllowed+' children supported.');return;}
-  S.children.push({name:'Child '+(S.children.length+1),age:0,savings:0,contrib:0,goal:100000});
-  // Keep dropdown in sync with actual array length
+  S.children.push({name:'Child '+(S.children.length+1),age:0,savings:0,contrib:0,goal:100000,acctType:'529',grossReturn:7,fundFee:0.5,advFee:0,costInflation:6});
   if(sel) sel.value=String(S.children.length);
   renderEducation();
 }
 function syncChildCount(){
   var n=parseInt(document.getElementById('eduNumChildren')?document.getElementById('eduNumChildren').value:0)||0;
   if(!S.children)S.children=[];
-  while(S.children.length<n)S.children.push({name:'Child '+(S.children.length+1),age:0,savings:0,contrib:0,goal:100000});
+  while(S.children.length<n)S.children.push({name:'Child '+(S.children.length+1),age:0,savings:0,contrib:0,goal:100000,acctType:'529',grossReturn:7,fundFee:0.5,advFee:0,costInflation:6});
   if(S.children.length>n)S.children=S.children.slice(0,n);
   renderEducation();
 }
 function updateChild(i,field,val){
   if(!S.children||!S.children[i]) return;
   S.children[i][field]=['age','savings','contrib','goal'].indexOf(field)!==-1?(pf(val)):val;
+  if(field==='contrib') calc();
   renderEducation();
 }
-function removeChild(i){ if(!S.children)return; S.children.splice(i,1); renderEducation(); }
+function removeChild(i){ if(!S.children)return; S.children.splice(i,1); calc(); renderEducation(); }
+function updEduReturn(i){
+  if(!S.children||!S.children[i]) return;
+  var ch=S.children[i];
+  var gEl=document.getElementById('eduGross_'+i);ch.grossReturn=gEl?parseFloat(gEl.value)||7:7;
+  var fEl=document.getElementById('eduFundFee_'+i);ch.fundFee=fEl?parseFloat(fEl.value)||0:0;
+  var aEl=document.getElementById('eduAdvFee_'+i);ch.advFee=aEl?parseFloat(aEl.value)||0:0;
+  var cEl=document.getElementById('eduCostInfl_'+i);ch.costInflation=cEl?parseFloat(cEl.value)||6:6;
+  var gd=document.getElementById('eduGrossDisp_'+i);if(gd)gd.textContent=ch.grossReturn+'%';
+  var fd=document.getElementById('eduFundFeeDisp_'+i);if(fd)fd.textContent=ch.fundFee+'%';
+  var ad=document.getElementById('eduAdvFeeDisp_'+i);if(ad)ad.textContent=ch.advFee+'%';
+  var cd=document.getElementById('eduCostInflDisp_'+i);if(cd)cd.textContent=ch.costInflation+'%';
+  var net=Math.round((ch.grossReturn-ch.fundFee-ch.advFee)*10)/10;
+  var nd=document.getElementById('eduNetDisp_'+i);
+  if(nd) nd.innerHTML='<div style="display:flex;justify-content:space-between"><span style="color:var(--gr)">Gross Return</span><span style="color:var(--gr);font-weight:700">'+ch.grossReturn+'%</span></div>'
+    +'<div style="display:flex;justify-content:space-between"><span style="color:var(--or)">\u2212 Fund Fees</span><span style="color:var(--or)">\u2212'+ch.fundFee+'%</span></div>'
+    +'<div style="display:flex;justify-content:space-between"><span style="color:var(--or)">\u2212 Advisory Fee</span><span style="color:var(--or)">\u2212'+ch.advFee+'%</span></div>'
+    +'<div style="display:flex;justify-content:space-between;border-top:1px solid var(--bd);padding-top:4px;margin-top:4px"><span style="color:#5B9BFF;font-weight:700">Net Return</span><span style="color:#5B9BFF;font-weight:700">'+net+'%</span></div>'
+    +'<div style="display:flex;justify-content:space-between"><span style="color:var(--yl)">\u2212 College Inflation</span><span style="color:var(--yl)">\u2212'+ch.costInflation+'%</span></div>'
+    +'<div style="display:flex;justify-content:space-between;border-top:1px solid var(--bd);padding-top:4px;margin-top:4px"><span style="color:var(--wh);font-weight:700">Real Growth</span><span style="color:var(--wh);font-weight:700">'+Math.round((net-ch.costInflation)*10)/10+'%</span></div>';
+  renderEducation();
+}
+var EDU_ACCT_TYPES=[{val:'529',label:'529 Plan'},{val:'coverdell',label:'Coverdell ESA'},{val:'ugma',label:'UGMA/UTMA'},{val:'roth',label:'Roth IRA'},{val:'taxable',label:'Taxable Account'}];
 function renderChildInputs(){
   var el=document.getElementById('childInputs'); if(!el) return;
-  if(!S.children||S.children.length===0){el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">No children added.</div>';return;}
-  var ret=(gv('eduReturn')!==''?parseFloat(gv('eduReturn')):7)/100;
-  var inf=(gv('eduInflation')!==''?parseFloat(gv('eduInflation')):6)/100;
+  if(!S.children||S.children.length===0){el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">No children added. Select a number above or click + Add Child.</div>';return;}
   var results=[];
   S.children.forEach(function(ch){
+    // Migrate old children without per-child settings
+    if(ch.grossReturn==null){ch.grossReturn=7;ch.fundFee=0.5;ch.advFee=0;ch.costInflation=6;ch.acctType=ch.acctType||'529';}
+    var net=Math.round((ch.grossReturn-ch.fundFee-ch.advFee)*10)/10;
+    var inf=(ch.costInflation||6)/100;
+    var ret=net/100;
     var yrs=Math.max(0,18-ch.age), mos=yrs*12;
-    var projCost=ch.goal*Math.pow(1+inf,yrs);
+    var projCost=(ch.goal||100000)*Math.pow(1+inf,yrs);
     var mr=ret/12;
     var projSav=mr>0&&mos>0?ch.savings*Math.pow(1+mr,mos)+ch.contrib*((Math.pow(1+mr,mos)-1)/mr):ch.savings+ch.contrib*mos;
     var gap=Math.max(0,projCost-projSav);
     var needed=gap>0&&mos>0?(mr>0?gap*mr/(Math.pow(1+mr,mos)-1):gap/mos):0;
-    results.push({name:ch.name,age:ch.age,yrs,projCost,projSav,gap,needed});
+    results.push({name:ch.name,age:ch.age,yrs:yrs,projCost:projCost,projSav:projSav,gap:gap,needed:needed});
   });
   S.eduCalcs={children:results,totalNeed:results.reduce(function(s,r){return s+r.projCost;},0),totalCost:results.reduce(function(s,r){return s+r.projCost;},0),totalSavings:results.reduce(function(s,r){return s+r.projSav;},0),totalGap:results.reduce(function(s,r){return s+r.gap;},0)};
   el.innerHTML=S.children.map(function(ch,i){
     var r=results[i];
-    return '<div class="child-card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;flex-wrap:wrap;gap:8px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+escH(ch.name||'Child '+(i+1))+'</div><button style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);color:var(--rd);padding:4px 10px;cursor:pointer;border-radius:2px;font-size:11px" onclick="removeChild('+i+')">Remove</button></div>'
-      +'<div class="row"><div class="fi"><label class="lb">Name</label><input class="inp" type="text" value="'+escH(ch.name||'')+'" placeholder="Child name" oninput="updateChild('+i+',\'name\',this.value)" style="min-height:40px;font-size:13px;padding:8px"></div><div class="fi"><label class="lb">Age</label><input class="inp" type="number" placeholder="5" value="'+(ch.age||'')+'" oninput="updateChild('+i+',\'age\',this.value)" style="min-height:40px;font-size:13px;padding:8px"></div></div>'
-      +'<div class="row"><div class="fi"><label class="lb">Current Savings</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(ch.savings||'')+'" oninput="updateChild('+i+',\'savings\',this.value)" style="padding-left:22px;min-height:40px;font-size:13px"></div></div><div class="fi"><label class="lb">Monthly Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(ch.contrib||'')+'" oninput="updateChild('+i+',\'contrib\',this.value)" style="padding-left:22px;min-height:40px;font-size:13px"></div></div></div>'
-      +'<div class="row"><div class="fi"><label class="lb">College Cost Goal</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="100000" value="'+(ch.goal||100000)+'" oninput="updateChild('+i+',\'goal\',this.value)" style="padding-left:22px;min-height:40px;font-size:13px"></div></div><div class="fi" style="justify-content:flex-end;padding-top:20px"><div style="text-align:center;background:rgba(0,68,191,.06);border:1px solid rgba(0,68,191,.12);border-radius:2px;padding:8px"><div style="font-family:var(--fh);font-size:14px;font-weight:800;color:'+(r.gap>0?'var(--rd)':'var(--gr)')+'">'+fmtK(r.gap)+'</div><div style="font-size:10px;color:var(--mu)">'+(r.gap>0?'Funding Gap':'Fully Funded')+'</div></div></div></div>'
-      +'<div style="font-size:11px;color:var(--mu)">Projected cost: '+fmtK(r.projCost)+' · Projected savings: '+fmtK(r.projSav)+' · '+r.yrs+' yrs to college'+(r.needed>0?' · Need: '+fmt(r.needed)+'/mo more':'')+'</div>'
-    +'</div>';
+    var acctOpts=EDU_ACCT_TYPES.map(function(t){return'<option value="'+t.val+'"'+(ch.acctType===t.val?' selected':'')+'>'+t.label+'</option>';}).join('');
+    var gross=ch.grossReturn||7,ff=ch.fundFee||0,af=ch.advFee||0,ci=ch.costInflation||6;
+    var net=Math.round((gross-ff-af)*10)/10;
+    var realGrowth=Math.round((net-ci)*10)/10;
+    var h='<div style="background:rgba(0,68,191,.05);border:1px solid rgba(0,68,191,.15);border-radius:2px;padding:12px;margin-bottom:8px">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">';
+    h+='<select class="sel" style="flex:1;min-width:180px" onchange="updateChild('+i+',\'acctType\',this.value)">'+acctOpts+'</select>';
+    h+='<button onclick="removeChild('+i+')" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444;padding:6px 10px;border-radius:2px;cursor:pointer;font-family:var(--fh);font-size:11px;font-weight:700">\u2715</button>';
+    h+='</div>';
+    h+='<div class="row"><div class="fi"><label class="lb">Child\'s Name</label><input class="inp" type="text" value="'+escH(ch.name||'')+'" placeholder="Name" oninput="updateChild('+i+',\'name\',this.value)"></div><div class="fi"><label class="lb">Age</label><input class="inp" type="number" placeholder="5" value="'+(ch.age||'')+'" oninput="updateChild('+i+',\'age\',this.value)"></div></div>';
+    h+='<div class="row"><div class="fi"><label class="lb">Current Savings</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(ch.savings||'')+'" oninput="updateChild('+i+',\'savings\',this.value)" style="padding-left:22px"></div></div><div class="fi"><label class="lb">Monthly Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(ch.contrib||'')+'" oninput="updateChild('+i+',\'contrib\',this.value)" style="padding-left:22px"></div></div></div>';
+    h+='<div class="row"><div class="fi"><label class="lb">College Cost Goal (Total)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="100000" value="'+(ch.goal||100000)+'" oninput="updateChild('+i+',\'goal\',this.value)" style="padding-left:22px"></div></div></div>';
+    // Return assumptions + cost inflation sliders
+    h+='<div style="margin-top:10px;padding:10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:4px">';
+    h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:6px">Return & Cost Assumptions</div>';
+    h+='<div class="row"><div class="fi"><label class="lb">Gross Return % <span id="eduGrossDisp_'+i+'" style="color:var(--gr);font-weight:700">'+gross+'%</span></label><input type="range" id="eduGross_'+i+'" min="1" max="14" step="0.5" value="'+gross+'" oninput="updEduReturn('+i+')" style="width:100%;accent-color:var(--gr)"><div style="display:flex;justify-content:space-between;font-size:8px;color:var(--mu)"><span>1%</span><span>Conservative 4-5%</span><span>Moderate 6-8%</span><span>Aggressive 9-12%</span><span>14%</span></div></div></div>';
+    h+='<div class="row"><div class="fi"><label class="lb">Fund Fees % <span id="eduFundFeeDisp_'+i+'" style="color:var(--or);font-weight:700">'+ff+'%</span></label><input type="range" id="eduFundFee_'+i+'" min="0" max="2.5" step="0.1" value="'+ff+'" oninput="updEduReturn('+i+')" style="width:100%;accent-color:var(--or)"><div style="display:flex;justify-content:space-between;font-size:8px;color:var(--mu)"><span>0%</span><span>Index 0.03-0.2%</span><span>Active 0.5-1.5%</span><span>2.5%</span></div></div>';
+    h+='<div class="fi"><label class="lb">Advisory Fee % <span id="eduAdvFeeDisp_'+i+'" style="color:var(--or);font-weight:700">'+af+'%</span></label><input type="range" id="eduAdvFee_'+i+'" min="0" max="2" step="0.25" value="'+af+'" oninput="updEduReturn('+i+')" style="width:100%;accent-color:var(--or)"><div style="display:flex;justify-content:space-between;font-size:8px;color:var(--mu)"><span>0% (self)</span><span>Flat fee</span><span>1% AUM typical</span><span>2%</span></div></div></div>';
+    h+='<div class="row"><div class="fi"><label class="lb">College Cost Inflation % <span id="eduCostInflDisp_'+i+'" style="color:var(--yl);font-weight:700">'+ci+'%</span></label><input type="range" id="eduCostInfl_'+i+'" min="2" max="10" step="0.5" value="'+ci+'" oninput="updEduReturn('+i+')" style="width:100%;accent-color:var(--yl)"><div style="display:flex;justify-content:space-between;font-size:8px;color:var(--mu)"><span>2%</span><span>Historical 5-6%</span><span>High 8-10%</span><span>10%</span></div></div></div>';
+    h+='<div id="eduNetDisp_'+i+'" style="padding:8px;background:rgba(0,0,0,.2);border-radius:4px;margin-top:6px;font-size:11px;line-height:1.8">';
+    h+='<div style="display:flex;justify-content:space-between"><span style="color:var(--gr)">Gross Return</span><span style="color:var(--gr);font-weight:700">'+gross+'%</span></div>';
+    h+='<div style="display:flex;justify-content:space-between"><span style="color:var(--or)">\u2212 Fund Fees</span><span style="color:var(--or)">\u2212'+ff+'%</span></div>';
+    h+='<div style="display:flex;justify-content:space-between"><span style="color:var(--or)">\u2212 Advisory Fee</span><span style="color:var(--or)">\u2212'+af+'%</span></div>';
+    h+='<div style="display:flex;justify-content:space-between;border-top:1px solid var(--bd);padding-top:4px;margin-top:4px"><span style="color:#5B9BFF;font-weight:700">Net Return</span><span style="color:#5B9BFF;font-weight:700">'+net+'%</span></div>';
+    h+='<div style="display:flex;justify-content:space-between"><span style="color:var(--yl)">\u2212 College Inflation</span><span style="color:var(--yl)">\u2212'+ci+'%</span></div>';
+    h+='<div style="display:flex;justify-content:space-between;border-top:1px solid var(--bd);padding-top:4px;margin-top:4px"><span style="color:var(--wh);font-weight:700">Real Growth</span><span style="color:var(--wh);font-weight:700">'+realGrowth+'%</span></div>';
+    h+='</div></div>';
+    // Funding status
+    h+='<div style="margin-top:10px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">';
+    h+='<div style="font-size:11px;color:var(--mu)">'+r.yrs+' yrs to college · Projected cost: '+fmtK(r.projCost)+' · Savings at college: '+fmtK(r.projSav)+'</div>';
+    h+='<div style="text-align:center;background:rgba(0,68,191,.06);border:1px solid rgba(0,68,191,.12);border-radius:2px;padding:6px 12px"><div style="font-family:var(--fh);font-size:14px;font-weight:800;color:'+(r.gap>0?'var(--rd)':'var(--gr)')+'">'+fmtK(r.gap)+'</div><div style="font-size:9px;color:var(--mu)">'+(r.gap>0?'Funding Gap':'Fully Funded')+'</div></div>';
+    h+='</div>';
+    if(r.needed>0) h+='<div style="font-size:11px;color:var(--yl);margin-top:6px">Need '+fmt(Math.round(r.needed))+'/mo more to close the gap</div>';
+    h+='</div>';
+    return h;
   }).join('');
 }
 function renderEducation(){ renderChildInputs(); calcEducation(); }
 function calcEducation(){
   if(!S.children||!S.children.length){S.eduCalcs={children:[],totalNeed:0,totalCost:0,totalSavings:0,totalGap:0};return;}
-  var ret=(gv('eduReturn')!==''?parseFloat(gv('eduReturn')):7)/100;
-  var inf=(gv('eduInflation')!==''?parseFloat(gv('eduInflation')):6)/100;
   var results=S.children.map(function(child){
+    // Migrate old children
+    if(child.grossReturn==null){child.grossReturn=7;child.fundFee=0.5;child.advFee=0;child.costInflation=6;child.acctType=child.acctType||'529';}
+    var net=(child.grossReturn-(child.fundFee||0)-(child.advFee||0))/100;
+    var inf=(child.costInflation||6)/100;
     var yearsUntilCollege=Math.max(0,18-(child.age||0));
-    var _collegeCosts={'public_instate':25000,'public_oos':45000,'private':55000,'community':12000};
-    var annualCost=child.goal||_collegeCosts[child.collegePlan]||100000;
+    var annualCost=child.goal||100000;
     var projCost=annualCost*Math.pow(1+inf,yearsUntilCollege);
-    var emr=ret/12, mos=yearsUntilCollege*12; // monthly rate, months to college
+    var emr=net/12, mos=yearsUntilCollege*12;
     var projSav=yearsUntilCollege>0
       ?(emr>0
         ? (child.savings||0)*Math.pow(1+emr,mos)+(child.contrib||0)*((Math.pow(1+emr,mos)-1)/emr)
@@ -5534,19 +5596,8 @@ function calcEducation(){
   });
   S.eduCalcs={children:results,totalNeed:results.reduce(function(s,r){return s+r.projCost;},0),totalCost:results.reduce(function(s,r){return s+r.projCost;},0),totalSavings:results.reduce(function(s,r){return s+r.projSav;},0),totalGap:results.reduce(function(s,r){return s+r.gap;},0)};
   var el=document.getElementById('eduResultArea');if(!el)return;
-  el.innerHTML=results.map(function(r){
-    var pct=r.projCost>0?Math.min(100,Math.round(r.projSav/r.projCost*100)):0;
-    var bc=pct>=100?'var(--gr)':pct>=60?'#5B9BFF':'var(--yl)';
-    return'<div style="background:rgba(0,68,191,.05);border:1px solid rgba(0,68,191,.12);border-radius:2px;padding:12px;margin-bottom:8px">'
-      +'<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">'+escH(r.name||'Child')+'<span style="font-size:11px;color:var(--mu);font-weight:400;margin-left:8px">'+r.yearsUntilCollege+' yrs to college</span></div>'
-      +'<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:8px">'
-      +'<div style="text-align:center"><div style="font-size:10px;color:var(--mu)">Projected Cost</div><div style="font-family:var(--fh);font-weight:700;color:var(--or)">'+fmtK(r.projCost)+'</div></div>'
-      +'<div style="text-align:center"><div style="font-size:10px;color:var(--mu)">Projected Savings</div><div style="font-family:var(--fh);font-weight:700;color:var(--gr)">'+fmtK(r.projSav)+'</div></div>'
-      +'<div style="text-align:center"><div style="font-size:10px;color:var(--mu)">Gap</div><div style="font-family:var(--fh);font-weight:700;color:'+(r.gap>0?'var(--rd)':'var(--gr)')+'">'+fmtK(r.gap)+'</div></div>'
-      +'</div>'
-      +'<div class="goal-progress"><div class="goal-bar" style="width:'+pct+'%;background:'+bc+'"></div></div>'
-      +'</div>';
-  }).join('')+'<div style="border-top:1px solid var(--bd);padding-top:10px;margin-top:4px;display:flex;justify-content:space-between;font-size:12px"><span style="color:var(--mu)">Total Education Gap</span><span style="font-family:var(--fh);font-weight:700;color:'+(S.eduCalcs.totalGap>0?'var(--rd)':'var(--gr)')+'">'+fmtK(S.eduCalcs.totalGap)+'</span></div>';
+  if(!results.length){el.innerHTML='';return;}
+  el.innerHTML='<div style="border-top:1px solid var(--bd);padding-top:10px;margin-top:4px;display:flex;justify-content:space-between;font-size:12px"><span style="color:var(--mu)">Total Education Gap</span><span style="font-family:var(--fh);font-weight:700;color:'+(S.eduCalcs.totalGap>0?'var(--rd)':'var(--gr)')+'">'+fmtK(S.eduCalcs.totalGap)+'</span></div>';
 }
 </script>
 <script>
@@ -12291,46 +12342,39 @@ function calcCCPayoff(){
   var ibcCV=Math.round((totalMin+extra)*ibcMonths*0.25);
   var ibcDB=Math.round(totalBal*3);
 
-  // Consolidation simulation — use actual offer if provided, otherwise estimate from credit score
+  // Consolidation simulation — only use actual offer, no assumptions
   var hasOffer=pf(gv('ccp_offerRate'))>0;
   var offerType=gv('ccp_loanType')||'personal';
-  var plRate,origFee,conTerm;
+  var conBest={months:0,payment:0,interest:0,total:0};
+  var conSaved=0,conMonthsSaved=0,conMakesSense=false,plRate=0,origFee=0,conTerm=0,promoMonths=0,avgDebtRate=0;
   if(hasOffer){
     plRate=pf(gv('ccp_offerRate'))/100;
     origFee=(pf(gv('ccp_offerFee'))||0)/100;
     conTerm=parseInt(gv('ccp_offerTerm'))||36;
-  } else {
-    var cs2=cCS('ccp')||680;
-    plRate=cs2>=760?0.07:cs2>=720?0.09:cs2>=700?0.11:cs2>=680?0.14:cs2>=660?0.17:cs2>=640?0.20:0.25;
-    origFee=cs2>=720?0.02:cs2>=680?0.03:0.05;
-    conTerm=36;
+    promoMonths=parseInt(gv('ccp_promoMonths'))||0;
+    var conOrigAmt=Math.round(totalBal*origFee);
+    var conEffBal=totalBal+conOrigAmt;
+    var conMr=plRate/12;var conPmt=conMr>0?conEffBal*conMr/(1-Math.pow(1+conMr,-conTerm)):conEffBal/conTerm;
+    var conTotalInt=0;
+    if(promoMonths>0&&offerType==='bt'){
+      var promoPmt=Math.round(conEffBal/conTerm);
+      var promoPaydown=promoPmt*promoMonths;
+      var remaining=conEffBal-promoPaydown;
+      var remTerm=conTerm-promoMonths;
+      if(remaining>0&&remTerm>0){
+        conPmt=conMr>0?remaining*conMr/(1-Math.pow(1+conMr,-remTerm)):remaining/remTerm;
+        conTotalInt=Math.round(conPmt*remTerm-remaining);
+      } else { conTotalInt=0;conPmt=promoPmt; }
+    } else {
+      conTotalInt=Math.round(conPmt*conTerm-totalBal);
+    }
+    conPmt=Math.round(conPmt);
+    conBest={months:conTerm,payment:conPmt,interest:conTotalInt,total:Math.round(conPmt*conTerm)};
+    conSaved=minOnly.interest-conBest.interest;
+    conMonthsSaved=minOnly.months-conBest.months;
+    avgDebtRate=totalBal>0?debts.reduce(function(t,d){return t+(d.balance||0)*(d.rate||0)/100;},0)/totalBal:0;
+    conMakesSense=plRate<avgDebtRate&&totalBal>=2000;
   }
-  var promoMonths=parseInt(gv('ccp_promoMonths'))||0;
-  var conOrigAmt=Math.round(totalBal*origFee);
-  var conEffBal=totalBal+conOrigAmt;
-  // Simulate consolidation with promo period
-  var conMonths=conTerm;var conTotalInt=0;var conBal=conEffBal;
-  var conMr=plRate/12;var conPmt=conMr>0?conEffBal*conMr/(1-Math.pow(1+conMr,-conTerm)):conEffBal/conTerm;
-  // If 0% promo, recalculate: no interest during promo, then amortize remainder
-  if(promoMonths>0&&offerType==='bt'){
-    var promoPmt=Math.round(conEffBal/conTerm);// equal payments during promo
-    var promoPaydown=promoPmt*promoMonths;
-    var remaining=conEffBal-promoPaydown;
-    var remTerm=conTerm-promoMonths;
-    if(remaining>0&&remTerm>0){
-      conPmt=conMr>0?remaining*conMr/(1-Math.pow(1+conMr,-remTerm)):remaining/remTerm;
-      conTotalInt=Math.round(conPmt*remTerm-remaining);
-    } else { conTotalInt=0;conPmt=promoPmt; }
-  } else {
-    conTotalInt=Math.round(conPmt*conTerm-totalBal);
-  }
-  conPmt=Math.round(conPmt);
-  var conBest={months:conTerm,payment:conPmt,interest:conTotalInt,total:Math.round(conPmt*conTerm)};
-  var conSaved=minOnly.interest-conBest.interest;
-  var conMonthsSaved=minOnly.months-conBest.months;
-  var conDate=new Date(now);conDate.setMonth(conDate.getMonth()+conBest.months);
-  var avgDebtRate=totalBal>0?debts.reduce(function(t,d){return t+(d.balance||0)*(d.rate||0)/100;},0)/totalBal:0;
-  var conMakesSense=plRate<avgDebtRate&&totalBal>=2000;
 
   // Savings vs minimums
   var avSaved=minOnly.interest-avRes.interest;
@@ -12351,7 +12395,7 @@ function calcCCPayoff(){
     {name:'Avalanche',desc:'Highest rate first — mathematically optimal',color:'var(--gr)',icon:'📉',months:avRes.months,interest:avRes.interest,date:avDate,wins:avRes.wins,saved:avSaved,type:'standard'},
     {name:'Snowball',desc:'Lowest balance first — psychological wins',color:'#5B9BFF',icon:'⛄',months:snRes.months,interest:snRes.interest,date:snDate,wins:snRes.wins,saved:snSaved,type:'standard'},
     {name:'Hybrid',desc:'Best of both — math + momentum',color:'var(--pu)',icon:'🔄',months:hyRes.months,interest:hyRes.interest,date:null,wins:[],saved:0,type:'standard'},
-    {name:'Consolidation',desc:'One loan, lower rate, fixed term',color:conMakesSense?'var(--gr)':'var(--or)',icon:'🔄',months:conBest.months,interest:conBest.interest,date:conDate,wins:[],saved:conSaved,type:'consolidation'},
+    {name:'Consolidation',desc:'One loan, lower rate, fixed term',color:hasOffer&&conMakesSense?'var(--gr)':'var(--mu)',icon:'🔄',months:conBest.months,interest:conBest.interest,date:hasOffer?new Date(new Date().setMonth(new Date().getMonth()+conBest.months)):null,wins:[],saved:conSaved,type:'consolidation'},
     {name:'IBC Accelerator',desc:'Policy-backed — money works twice',color:'var(--or)',icon:'🏦',months:ibcMonths,interest:0,date:null,wins:[],saved:0,type:'ibc'}
   ];
 
@@ -12361,21 +12405,25 @@ function calcCCPayoff(){
     var isLowestCost=s.type==='consolidation'&&conBest.total<avRes.interest+totalBal;
     h+='<div style="padding:10px 4px;background:var(--bg-card);border:'+(isBest||isLowestCost?'2px':'1px')+' solid '+(isBest?s.color:isLowestCost?'var(--gr)':'var(--bd)')+';border-radius:4px;text-align:center">';
     h+='<div style="font-size:16px;margin-bottom:2px">'+s.icon+'</div>';
-    h+='<div style="font-size:7px;font-family:var(--fh);font-weight:700;color:'+s.color+';letter-spacing:.06em;margin-bottom:3px">'+s.name.toUpperCase()+'</div>';
-    h+='<div style="font-family:var(--fd);font-size:18px;color:'+s.color+'">'+s.months+'<span style="font-size:8px;color:var(--mu)">mo</span></div>';
+    h+='<div style="font-size:10px;font-family:var(--fh);font-weight:700;color:'+s.color+';letter-spacing:.06em;margin-bottom:3px">'+s.name.toUpperCase()+'</div>';
+    h+='<div style="font-family:var(--fd);font-size:18px;color:'+s.color+'">'+(s.months>0?s.months+'<span style="font-size:11px;color:var(--mu)">mo</span>':'—')+'</div>';
     if(s.type==='standard'){
-      h+='<div style="font-size:8px;color:var(--mu);margin:2px 0">Int: '+fmtK(s.interest)+'</div>';
-      if(s.date) h+='<div style="font-size:7px;color:'+s.color+'">'+s.date.toLocaleDateString('en-US',{month:'short',year:'numeric'})+'</div>';
+      h+='<div style="font-size:11px;color:var(--mu);margin:2px 0">Int: '+fmtK(s.interest)+'</div>';
+      if(s.date) h+='<div style="font-size:10px;color:'+s.color+'">'+s.date.toLocaleDateString('en-US',{month:'short',year:'numeric'})+'</div>';
     } else if(s.type==='consolidation'){
-      h+='<div style="font-size:8px;color:var(--mu);margin:2px 0">Int+fee: '+fmtK(conBest.interest)+'</div>';
-      h+='<div style="font-size:7px;color:'+s.color+'">'+fmt(conBest.payment)+'/mo</div>';
-      if(!conMakesSense) h+='<div style="font-size:7px;color:var(--rd)">Rate too close</div>';
+      if(!hasOffer){
+        h+='<div style="font-size:11px;color:var(--mu);margin:4px 0;line-height:1.4">Enter offer above to compare</div>';
+      } else {
+        h+='<div style="font-size:11px;color:var(--mu);margin:2px 0">Int+fee: '+fmtK(conBest.interest)+'</div>';
+        h+='<div style="font-size:10px;color:'+s.color+'">'+fmt(conBest.payment)+'/mo</div>';
+        if(!conMakesSense) h+='<div style="font-size:10px;color:var(--rd)">Rate too close</div>';
+      }
     } else {
-      h+='<div style="font-size:8px;color:var(--gr);margin:2px 0">CV: '+fmtK(ibcCV)+'</div>';
-      h+='<div style="font-size:7px;color:var(--or)">🔒 Advisor</div>';
+      h+='<div style="font-size:11px;color:var(--gr);margin:2px 0">CV: '+fmtK(ibcCV)+'</div>';
+      h+='<div style="font-size:10px;color:var(--or)">🔒 Advisor</div>';
     }
-    if(isBest) h+='<div style="font-size:7px;color:var(--gr);margin-top:3px;font-weight:700;background:rgba(34,197,94,.1);padding:2px 4px;border-radius:2px">★ FASTEST</div>';
-    if(isLowestCost) h+='<div style="font-size:7px;color:var(--gr);margin-top:3px;font-weight:700;background:rgba(34,197,94,.1);padding:2px 4px;border-radius:2px">💰 LOWEST COST</div>';
+    if(isBest) h+='<div style="font-size:10px;color:var(--gr);margin-top:3px;font-weight:700;background:rgba(34,197,94,.1);padding:2px 4px;border-radius:2px">★ FASTEST</div>';
+    if(isLowestCost) h+='<div style="font-size:10px;color:var(--gr);margin-top:3px;font-weight:700;background:rgba(34,197,94,.1);padding:2px 4px;border-radius:2px">💰 LOWEST COST</div>';
     h+='</div>';
   });
   h+='</div>';
@@ -12389,7 +12437,7 @@ function calcCCPayoff(){
     h+='<span style="color:var(--gr);font-weight:700;width:18px">#'+(i+1)+'</span>';
     h+='<span style="color:var(--wh);flex:1">'+escH(d.name||'Card')+'</span>';
     h+='<span style="color:var(--rd)">'+fmtK(d.balance)+' @ '+(d.rate||0)+'%</span>';
-    if(win) h+='<span style="color:var(--gr);font-weight:700;font-size:8px">Paid off mo '+win.month+' ✅</span>';
+    if(win) h+='<span style="color:var(--gr);font-weight:700;font-size:11px">Paid off mo '+win.month+' ✅</span>';
     h+='</div>';
   });
 
@@ -12405,45 +12453,49 @@ function calcCCPayoff(){
   }
 
   // ── Consolidation Details ──
-  if(conMakesSense){
+  if(!hasOffer){
+    h+='<div style="padding:14px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:4px;margin-bottom:12px;text-align:center">';
+    h+='<div style="font-size:20px;margin-bottom:6px">🔄</div>';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;margin-bottom:4px">Consolidation Comparison</div>';
+    h+='<div style="font-size:11px;color:var(--mu);line-height:1.6">Enter your consolidation offer details above to see how it compares against avalanche, snowball, and other strategies.</div>';
+    h+='</div>';
+  } else if(conMakesSense){
     h+='<div style="padding:12px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:4px;margin-bottom:12px">';
     h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--gr);margin-bottom:6px">🔄 CONSOLIDATION OPTION — ONE LOAN, ONE PAYMENT</div>';
     h+='<div style="font-size:11px;color:var(--mu);line-height:1.7">';
-    h+='Your average debt rate: <strong style="color:var(--rd)">'+Math.round(avgDebtRate*1000)/10+'%</strong>. '+(hasOffer?'Your '+offerType.replace('he_loan','Home Equity Loan').replace('bt','Balance Transfer').replace('heloc','HELOC').replace('personal','Personal Loan')+' offer: <strong style="color:var(--gr)">'+Math.round(plRate*1000)/10+'%</strong>'+(promoMonths>0?' ('+promoMonths+' months 0% promo)':''):'Estimated rate (credit score): <strong style="color:var(--gr)">'+Math.round(plRate*100)+'%</strong>')+'.<br>';
+    h+='Your average debt rate: <strong style="color:var(--rd)">'+Math.round(avgDebtRate*1000)/10+'%</strong>. Your '+offerType.replace('he_loan','Home Equity Loan').replace('bt','Balance Transfer').replace('heloc','HELOC').replace('personal','Personal Loan')+' offer: <strong style="color:var(--gr)">'+Math.round(plRate*1000)/10+'%</strong>'+(promoMonths>0?' ('+promoMonths+' months 0% promo)':'')+'.<br>';
     h+='Combine all '+debts.length+' debts into one '+conBest.months+'-month loan at '+fmt(conBest.payment)+'/mo. Total interest + fee: <strong>'+fmtK(conBest.interest)+'</strong> vs '+fmtK(avRes.interest)+' (avalanche). ';
     h+=(conBest.interest<avRes.interest?'<span style="color:var(--gr)">Saves '+fmtK(avRes.interest-conBest.interest)+' vs avalanche.</span>':'<span style="color:var(--or)">Avalanche saves more, but consolidation has a fixed end date and single payment.</span>');
     h+='<br><span style="color:var(--yl)">⚠️ CRITICAL:</span> Do NOT run up your cards again after consolidating. Freeze or cut them.';
     h+='</div>';
-
     h+='</div>';
-  } else if(totalBal>=1000){
+  } else if(hasOffer){
     h+='<div style="padding:10px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:12px;font-size:10px;color:var(--mu);line-height:1.7">';
-    h+='<strong style="color:var(--yl)">🔄 Consolidation:</strong> '+(plRate>=(debts.reduce(function(t,d){return t+(d.balance||0)*(d.rate||0)/100;},0)/totalBal)?'Your estimated loan rate ('+Math.round(plRate*100)+'%) isn\'t much better than your average CC rate. Stick with avalanche or snowball.':'Your total debt is '+fmtK(totalBal)+' — '+( totalBal<2000?'too small for consolidation fees to be worth it.':'consider improving your credit score and revisiting.')+' ');
-
+    h+='<strong style="color:var(--yl)">🔄 Consolidation:</strong> Your offer rate ('+Math.round(plRate*1000)/10+'%) isn\'t better than your average debt rate. Stick with avalanche or snowball.';
     h+='</div>';
   }
 
   // ── Minimums vs Extra Comparison ──
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">';
   h+='<div style="padding:10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.12);border-radius:4px;text-align:center">';
-  h+='<div style="font-size:9px;color:var(--rd);font-family:var(--fh);font-weight:700">MINIMUMS ONLY</div>';
+  h+='<div style="font-size:11px;color:var(--rd);font-family:var(--fh);font-weight:700">MINIMUMS ONLY</div>';
   h+='<div style="font-family:var(--fd);font-size:20px;color:var(--rd)">'+minOnly.months+' mo</div>';
-  h+='<div style="font-size:9px;color:var(--rd)">Interest: '+fmtK(minOnly.interest)+'</div>';
-  h+='<div style="font-size:8px;color:var(--mu)">Free: '+minDate.toLocaleDateString('en-US',{month:'short',year:'numeric'})+'</div></div>';
+  h+='<div style="font-size:11px;color:var(--rd)">Interest: '+fmtK(minOnly.interest)+'</div>';
+  h+='<div style="font-size:11px;color:var(--mu)">Free: '+minDate.toLocaleDateString('en-US',{month:'short',year:'numeric'})+'</div></div>';
   h+='<div style="padding:10px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.12);border-radius:4px;text-align:center">';
-  h+='<div style="font-size:9px;color:var(--gr);font-family:var(--fh);font-weight:700">WITH +'+fmt(extra)+'/MO (AVALANCHE)</div>';
+  h+='<div style="font-size:11px;color:var(--gr);font-family:var(--fh);font-weight:700">WITH +'+fmt(extra)+'/MO (AVALANCHE)</div>';
   h+='<div style="font-family:var(--fd);font-size:20px;color:var(--gr)">'+avRes.months+' mo</div>';
-  h+='<div style="font-size:9px;color:var(--gr)">Save '+fmtK(avSaved)+' interest</div>';
-  h+='<div style="font-size:8px;color:var(--gr)">'+avMonthsSaved+' months sooner!</div></div>';
+  h+='<div style="font-size:11px;color:var(--gr)">Save '+fmtK(avSaved)+' interest</div>';
+  h+='<div style="font-size:11px;color:var(--gr)">'+avMonthsSaved+' months sooner!</div></div>';
   h+='</div>';
 
   // ── IBC Teaser ──
   h+='<div style="padding:14px;background:linear-gradient(135deg,rgba(249,115,22,.06),rgba(249,115,22,.02));border:2px solid rgba(249,115,22,.2);border-radius:4px;margin-bottom:12px">';
   h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--or);margin-bottom:8px">🏦 THE IBC DIFFERENCE — Your Money Works Twice</div>';
   h+='<div style="display:grid;grid-template-columns:1fr auto 1fr;gap:8px;align-items:center;margin-bottom:10px">';
-  h+='<div style="text-align:center;padding:10px;background:rgba(0,0,0,.1);border-radius:4px"><div style="font-size:9px;color:var(--mu)">Avalanche</div><div style="font-family:var(--fd);font-size:18px;color:var(--gr)">'+avRes.months+' mo</div><div style="font-size:10px;color:var(--rd);font-weight:700">$0 at the end</div></div>';
+  h+='<div style="text-align:center;padding:10px;background:rgba(0,0,0,.1);border-radius:4px"><div style="font-size:11px;color:var(--mu)">Avalanche</div><div style="font-family:var(--fd);font-size:18px;color:var(--gr)">'+avRes.months+' mo</div><div style="font-size:10px;color:var(--rd);font-weight:700">$0 at the end</div></div>';
   h+='<div style="font-size:16px;color:var(--or)">vs</div>';
-  h+='<div style="text-align:center;padding:10px;background:rgba(0,0,0,.1);border-radius:4px"><div style="font-size:9px;color:var(--mu)">IBC</div><div style="font-family:var(--fd);font-size:18px;color:var(--or)">~'+ibcMonths+' mo</div><div style="font-size:10px;color:var(--gr);font-weight:700">'+fmtK(ibcCV)+' cash value</div></div>';
+  h+='<div style="text-align:center;padding:10px;background:rgba(0,0,0,.1);border-radius:4px"><div style="font-size:11px;color:var(--mu)">IBC</div><div style="font-family:var(--fd);font-size:18px;color:var(--or)">~'+ibcMonths+' mo</div><div style="font-size:10px;color:var(--gr);font-weight:700">'+fmtK(ibcCV)+' cash value</div></div>';
   h+='</div>';
   h+='<div style="font-size:11px;color:var(--mu);line-height:1.7;margin-bottom:8px">Pay off all cards in ~'+ibcMonths+' months while simultaneously building <span style="color:var(--gr);font-weight:700">'+fmtK(ibcCV)+' in cash value</span> growing tax-free + <span style="color:#5B9BFF;font-weight:700">'+fmtK(ibcDB)+' death benefit</span> protecting your family. Your money works twice.</div>';
   h+='<div style="text-align:center"><button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else alert(\'Contact your advisor.\')" style="padding:10px 24px;background:var(--or);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer">Want to Learn How? Request Free Consultation →</button></div>';
