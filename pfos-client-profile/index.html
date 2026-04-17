@@ -1919,7 +1919,59 @@ function renderScoreTrendChart(snapshots, currentCalcs){
 // ─────────────────────────────────────────────────────────────────────────────
 async function renderDashboard(){}
 function renderPriorityDashboard(){ /* P shortcut — priority dashboard lives on /pfos-dashboard */ }
-function openEditClientModal(){ /* Edit client modal — opens inline edit or navigates to edit form */ if(!APP.currentClient) return; alert('Edit profile coming soon. Use PFOS to modify client data.'); }
+function openEditClientModal(){
+  if(!APP.currentClient) return;
+  var c=APP.currentClient;
+  var nm=(c.name||'').split(' ');
+  document.getElementById('ec-firstName').value=nm[0]||'';
+  document.getElementById('ec-lastName').value=nm.slice(1).join(' ')||'';
+  document.getElementById('ec-email').value=c.email||'';
+  document.getElementById('ec-phone').value=c.phone||'';
+  document.getElementById('ec-status').value=c.status||'new';
+  document.getElementById('ec-clientType').value=c.client_type||'advisory';
+  document.getElementById('ec-marital').value=c.marital_status||'single';
+  document.getElementById('ec-spouseName').value=c.spouse_name||'';
+  document.getElementById('ec-householdType').value=c.household_type||'joint';
+  document.getElementById('ec-nextReview').value=c.next_review_date||'';
+  toggleEcSpouse();
+  var errEl=document.getElementById('editClientErr');if(errEl)errEl.style.display='none';
+  openModal('editClientModal');
+}
+function toggleEcSpouse(){
+  var val=document.getElementById('ec-marital').value;
+  var show=val==='married'||val==='domestic_partner';
+  var sw=document.getElementById('ec-spouse-wrap');if(sw)sw.style.display=show?'':'none';
+  var hw=document.getElementById('ec-household-wrap');if(hw)hw.style.display=show?'':'none';
+}
+async function saveEditClient(){
+  var fn=v('ec-firstName'),ln=v('ec-lastName');
+  if(!fn){showModalErr('editClientErr','First name is required.');return;}
+  var errEl=document.getElementById('editClientErr');if(errEl)errEl.style.display='none';
+  var clientData={
+    name:(fn+' '+ln).trim(),email:v('ec-email'),phone:v('ec-phone'),
+    status:v('ec-status'),client_type:v('ec-clientType')||'advisory',
+    marital_status:v('ec-marital')||'single',
+    spouse_name:v('ec-spouseName')||null,
+    household_type:(v('ec-marital')==='married'||v('ec-marital')==='domestic_partner')?v('ec-householdType'):null,
+    next_review_date:v('ec-nextReview')||null
+  };
+  setBtnLoading('saveEditClientBtn',true,'Saving...');
+  try{
+    var {error}=await db.from('clients').update(clientData).eq('id',APP.currentClientId);
+    if(error){
+      // Try without newer columns
+      var safe={};Object.keys(clientData).forEach(function(k){if(['client_type','marital_status','spouse_name','household_type'].indexOf(k)===-1)safe[k]=clientData[k];});
+      var r2=await db.from('clients').update(safe).eq('id',APP.currentClientId);
+      if(r2.error){showModalErr('editClientErr',r2.error.message);setBtnLoading('saveEditClientBtn',false,'Update Client');return;}
+    }
+    Object.assign(APP.currentClient,clientData);
+    var idx=APP.myClients.findIndex(function(c){return c.id===APP.currentClientId;});
+    if(idx>=0)Object.assign(APP.myClients[idx],clientData);
+    closeModal('editClientModal');
+    openClientProfile(APP.currentClientId);
+  }catch(e){showModalErr('editClientErr',e.message);}
+  setBtnLoading('saveEditClientBtn',false,'Update Client');
+}
 function submitSituationChange(){ /* Situation changed notification to advisor */ var text=v('situationText'); if(!text){alert('Please describe what changed.');return;} alert('Your advisor has been notified. They will review your situation.'); closeModal('situationModal'); }
 function submitDeletionRequest(){ /* Account deletion request */ var confirm=v('deletionConfirmText'); if(confirm!=='DELETE'){alert('Please type DELETE to confirm.');return;} alert('Deletion request submitted. An administrator will review it.'); closeModal('deletionRequestModal'); }
 function showLoginErr(msg){ var el=document.getElementById('loginErr'); if(el){el.textContent=msg;el.style.display='block';} else console.warn('Auth:',msg); }
@@ -4594,9 +4646,11 @@ window.addEventListener('message', async function(e){
       else { await db.from('client_profiles').insert(pp); }
       var ind = document.getElementById('saveIndicator') || document.getElementById('clientSaveIndicator');
       if(ind){ ind.className='save-indicator saved'; ind.textContent='✓ Auto-saved'; setTimeout(function(){ind.className='save-indicator';},2000); }
-      // Live-update the profile snapshot and scores on this page
-      renderProfileSnapshot({S:state,calcs:calcs}, scores);
-      renderProfileRedFlags({calcs:calcs,riskProfile:state.riskProfile||state.risk_profile||'moderate'});
+      // Live-update the profile snapshot and scores on this page — only if real data
+      if(calcs.inc>0){
+        renderProfileSnapshot({S:state,calcs:calcs}, scores);
+        renderProfileRedFlags({calcs:calcs,riskProfile:state.riskProfile||state.risk_profile||'moderate'});
+      }
     } catch(err){ console.warn('Auto-save failed:', err); }
   }
   if(msg.type === 'SHARED_GOAL_UPDATE' && msg.sharedGoalData){
@@ -5093,6 +5147,39 @@ window.addEventListener('message',function(e){
   if(e.data&&e.data.type==='OPEN_FREE_REVIEW') openFreeReviewRequest();
 });
 </script>
+
+<!-- Edit Client Modal -->
+<div class="modal-bg" id="editClientModal" onclick="if(event.target===this)closeModal('editClientModal')">
+  <div class="modal" style="max-width:560px">
+    <button class="modal-close" onclick="closeModal('editClientModal')">&#x2715;</button>
+    <div class="modal-title">Edit Client Profile</div>
+    <div id="editClientErr" class="login-err"></div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fi"><label class="lb">First Name</label><input class="inp" type="text" id="ec-firstName" placeholder="First"></div>
+      <div class="fi"><label class="lb">Last Name</label><input class="inp" type="text" id="ec-lastName" placeholder="Last"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fi"><label class="lb">Email</label><input class="inp" type="email" id="ec-email" placeholder="client@email.com"></div>
+      <div class="fi"><label class="lb">Phone</label><input class="inp" type="tel" id="ec-phone" placeholder="(555) 000-0000"></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fi"><label class="lb">Status</label><select class="sel" id="ec-status"><option value="new">New</option><option value="active">Active</option><option value="review_due">Review Due</option><option value="advisory">Advisory</option><option value="sold">Sold</option></select></div>
+      <div class="fi"><label class="lb">Client Type</label><select class="sel" id="ec-clientType"><option value="advisory">Advisory</option><option value="product">Product</option></select></div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="fi"><label class="lb">Marital Status</label><select class="sel" id="ec-marital" onchange="toggleEcSpouse()"><option value="single">Single</option><option value="married">Married</option><option value="domestic_partner">Domestic Partner</option><option value="divorced">Divorced</option><option value="widowed">Widowed</option></select></div>
+      <div class="fi" id="ec-spouse-wrap" style="display:none"><label class="lb">Spouse / Partner Name</label><input class="inp" type="text" id="ec-spouseName" placeholder="Spouse name"></div>
+    </div>
+    <div id="ec-household-wrap" style="display:none">
+      <div class="fi"><label class="lb">How Do They Manage Finances?</label><select class="sel" id="ec-householdType"><option value="joint">Joint — everything together</option><option value="separate">Separate — each manages their own</option><option value="hybrid">Hybrid — mix of shared and individual</option></select></div>
+    </div>
+    <div class="fi"><label class="lb">Next Review Date</label><input class="inp" type="date" id="ec-nextReview"></div>
+    <div style="display:flex;gap:10px;margin-top:12px">
+      <button class="btn btn-gh" style="width:auto;padding:10px 20px" onclick="closeModal('editClientModal')">Cancel</button>
+      <button class="btn btn-or" onclick="saveEditClient()" id="saveEditClientBtn" style="flex:2">Update Client</button>
+    </div>
+  </div>
+</div>
 
 <!-- Free Review Request Modal -->
 <div class="modal-bg" id="freeReviewModal" onclick="if(event.target===this)closeModal('freeReviewModal')">
