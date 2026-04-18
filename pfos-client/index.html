@@ -3515,6 +3515,8 @@ async function loadClientPortalData(){
   if(profile && profile.financial_data){
     var fd = profile.financial_data, scores = profile.scores || {}, calcs = fd.calcs || {};
     APP._portalCalcs=calcs; APP._portalFd=fd;
+    // Attach allocation_plan from profile column into portal data so initClientPlan can find it
+    if(profile.allocation_plan)APP._portalFd.allocation_plan=profile.allocation_plan;
     // ── Populate global S for calculator tools ──
     var _fdS=fd.S||{};
     window.S={calcs:calcs,debts:_fdS.debts||fd.debts||[],retAccounts:_fdS.retAccounts||fd.retAccounts||[],currentAge:_fdS.currentAge||fd.currentAge||0,riskProfile:_fdS.riskProfile||fd.riskProfile||null,creditScore:scores.creditScore||_fdS.creditScore||fd.creditScore||0,children:_fdS.children||fd.children||[],insurancePolicies:_fdS.insurancePolicies||fd.insurancePolicies||[],dependents:_fdS.dependents||fd.dependents||0,protCalcs:_fdS.protCalcs||fd.protCalcs||{},snapshot:fd.snapshot||{},expData:_fdS.expData||fd.expData||{},goals:_fdS.goals||fd.goals||[],buckets:_fdS.buckets||fd.buckets||[]};
@@ -4711,8 +4713,10 @@ window.addEventListener('message',async function(e){
       if(ex&&ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); }
       else { await db.from('client_profiles').insert(pp); }
       _lastSaveDirty=false;
-      // Update dashboard snapshot with fresh data
+      // Update dashboard snapshot with fresh data — preserve allocation_plan
+      var _prevPlan=APP._portalFd&&APP._portalFd.allocation_plan;
       APP._portalFd={S:state,calcs:calcs};APP._portalCalcs=calcs;
+      if(_prevPlan)APP._portalFd.allocation_plan=_prevPlan;
       try{
         function _ckv(k,v,c){return'<div class="kv"><span class="kk">'+k+'</span><span class="kv-val" style="color:'+(c||'var(--wh)')+'">'+v+'</span></div>';}
         set('clientSnapshotData',
@@ -18072,10 +18076,16 @@ function initClientPlan(){
   CPLAN.hasAdvisor=(APP.currentClient&&APP.currentClient.client_type==='advisory')||false;
   CPLAN.tier=APP.currentClient?getEffectiveTier(APP.currentClient):'core';
   CPLAN.allocations=[];CPLAN.advisorPlan=null;CPLAN.exploring=false;
-  if(fd.allocation_plan&&fd.allocation_plan.allocations){
-    CPLAN.allocations=JSON.parse(JSON.stringify(fd.allocation_plan.allocations));
-    if(fd.allocation_plan.debtStrategy)CPLAN.debtStrategy=fd.allocation_plan.debtStrategy;
-    if(CPLAN.hasAdvisor)CPLAN.advisorPlan=JSON.parse(JSON.stringify(fd.allocation_plan.allocations));
+  // Load plan: try Supabase data first, then localStorage backup
+  var loadedPlan=fd.allocation_plan;
+  if((!loadedPlan||!loadedPlan.allocations||!loadedPlan.allocations.length)){
+    try{var backup=localStorage.getItem('pfos_plan_backup');if(backup){var parsed=JSON.parse(backup);if(parsed&&parsed.allocations&&parsed.allocations.length)loadedPlan=parsed;}}catch(e){}
+  }
+  if(loadedPlan&&loadedPlan.allocations&&loadedPlan.allocations.length){
+    CPLAN.allocations=JSON.parse(JSON.stringify(loadedPlan.allocations));
+    if(loadedPlan.debtStrategy)CPLAN.debtStrategy=loadedPlan.debtStrategy;
+    if(loadedPlan.riskProfile)CPLAN.riskProfile=loadedPlan.riskProfile;
+    if(CPLAN.hasAdvisor)CPLAN.advisorPlan=JSON.parse(JSON.stringify(loadedPlan.allocations));
   }
   CPLAN.mode=localStorage.getItem('pfos_ui_mode')||'guided';
   if(!CPLAN.allocations.length)_cpAutoSuggest();
@@ -18670,6 +18680,8 @@ function cplanSave(){
   var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,planSource:CPLAN.hasAdvisor?'advisor':'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString()};
   // Always save to localStorage as backup
   try{localStorage.setItem('pfos_plan_backup',JSON.stringify(plan));}catch(e){}
+  // Update in-memory portal data so same-session re-init works
+  if(APP._portalFd)APP._portalFd.allocation_plan=plan;
   // Save to Supabase if client ID available
   if(!APP.currentClientId){
     var b=document.getElementById('cplanSaveBtn');
