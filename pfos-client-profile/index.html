@@ -4458,8 +4458,27 @@ async function openClientProfile(clientId){
     .order('updated_at',{ascending:false}).limit(1).maybeSingle();
 
   console.log('[PFOS-CP] profile loaded:', profile?'YES':'NULL', 'financial_data:', profile&&profile.financial_data?'YES':'NULL', 'scores:', profile&&profile.scores?'YES':'NULL');
-  if(profile && profile.financial_data){ renderProfileSnapshot(profile.financial_data, profile.scores||{}); renderProfileRedFlags(profile.financial_data); }
-  else { console.log('[PFOS-CP] No financial_data — showing empty state'); set('profileSnapshotData','<div style="color:var(--mu);font-size:12px">No data yet. Open PFOS to enter data.</div>'); set('redFlagCards','<div style="color:var(--mu);font-size:13px;padding:12px 0">No financial data yet. Open PFOS to enter client data.</div>'); }
+  // Use cached PFOS state if available (more current than Supabase)
+  var renderFD=null,renderScores={};
+  if(_lastPfosState&&_lastPfosState.state&&_lastPfosState.calcs&&Object.keys(_lastPfosState.calcs).length>0){
+    renderFD={S:_lastPfosState.state,calcs:_lastPfosState.calcs};
+    renderScores={cfScore:_lastPfosState.calcs.cfScore,protScore:_lastPfosState.calcs.protScore,growScore:_lastPfosState.calcs.growScore,effScore:_lastPfosState.calcs.effScore};
+    console.log('[PFOS-CP] Using cached PFOS state (memory). calcs.inc:',_lastPfosState.calcs.inc);
+  } else {
+    // Check sessionStorage for cached data from a previous page load
+    try{var _cached=JSON.parse(sessionStorage.getItem('pfos_cached_'+clientId)||'null');
+      if(_cached&&_cached.calcs&&(_cached.calcs.inc>0||Object.keys(_cached.calcs).length>5)){
+        renderFD={S:_cached.S||{},calcs:_cached.calcs};renderScores=_cached.scores||{};
+        console.log('[PFOS-CP] Using cached PFOS state (sessionStorage). calcs.inc:',_cached.calcs.inc);
+      }
+    }catch(e){}
+    if(!renderFD&&profile&&profile.financial_data){
+      renderFD=profile.financial_data;renderScores=profile.scores||{};
+      console.log('[PFOS-CP] Using Supabase data.');
+    }
+  }
+  if(renderFD){ renderProfileSnapshot(renderFD, renderScores); renderProfileRedFlags(renderFD); }
+  else { set('profileSnapshotData','<div style="color:var(--mu);font-size:12px">No data yet. <a href="#" onclick="openPFOSForClient();return false" style="color:#5B9BFF">Open PFOS</a> to enter data.</div>'); set('redFlagCards','<div style="color:var(--mu);font-size:13px;padding:12px 0">No financial data yet. Open PFOS to enter client data.</div>'); }
 
   set('profileReviewDates',
     '<div class="kv"><span class="kk">Last Review</span><span class="kv-val">'+fmtDate(client.last_review_date)+'</span></div>'
@@ -4664,11 +4683,13 @@ window.addEventListener('message', async function(e){
       var calcs  = state.calcs || {};
       // Cache latest state so saveClientData/clientSaveOwnData can use it
       _lastPfosState = { state: state, calcs: calcs };
+      // Also cache in sessionStorage so data survives page navigation
+      try{sessionStorage.setItem('pfos_cached_'+saveToId,JSON.stringify({calcs:calcs,S:state,scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},ts:Date.now()}));}catch(e){}
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
       var pp     = {client_id:saveToId, financial_data:{S:state, calcs}, scores, updated_at:new Date().toISOString()};
       var ex = await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-      if(ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); }
-      else { await db.from('client_profiles').insert(pp); }
+      if(ex.data){ var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[PFOS-CP] Supabase SAVE:',_r.error?'FAILED: '+_r.error.message:'OK — calcs.inc='+calcs.inc+' for '+saveToId); }
+      else { var _r2=await db.from('client_profiles').insert(pp); console.log('[PFOS-CP] Supabase INSERT:',_r2.error?'FAILED: '+_r2.error.message:'OK'); }
       var ind = document.getElementById('saveIndicator') || document.getElementById('clientSaveIndicator');
       if(ind){ ind.className='save-indicator saved'; ind.textContent='✓ Auto-saved'; setTimeout(function(){ind.className='save-indicator';},2000); }
       // Live-update the profile snapshot and scores on this page — only if real data
