@@ -3810,19 +3810,55 @@ function renderProfileRedFlags(fd){
   var rp=(fd.riskProfile||fd.risk_profile||(fd.S&&fd.S.riskProfile&&fd.S.riskProfile.label)||(fd.S&&fd.S.risk_profile)||'moderate').toLowerCase();
   if(Object.keys(c).length===0){el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">No financial data yet. Open PFOS to enter client data.</div>';if(sumEl)sumEl.textContent='';return;}
 
-  // ── Build flags ──
+  // ── Build flags from calcs AND raw state ──
   var flags=[];
+  var prof=rawS.profile||{};
+  var debts=rawS.debts||[];
+  var retAccounts=rawS.retAccounts||[];
+  var protCalcs=rawS.protCalcs||{};
+  var policies=rawS.policies||[];
+
   if(c.netCF<0) flags.push({id:'cashflow_neg',sev:'critical',title:'Cash Flow Deficit',detail:'Monthly spend exceeds income by '+fmt(Math.abs(c.netCF))+'. This means the client is going deeper into debt every month.',section:'expenses'});
-  if(c.efMonths<1) flags.push({id:'ef_none',sev:'critical',title:'No Emergency Fund',detail:'Client has less than 1 month of expenses saved. Any unexpected event forces debt.',section:'emergency_fund'});
-  else if(c.efMonths<3) flags.push({id:'ef_low',sev:'high',title:'Emergency Fund Below 3 Months',detail:'Only '+(c.efMonths).toFixed(1)+' months of expenses covered. Target is 3–6 months.',section:'emergency_fund'});
+  if(c.efMonths!==undefined&&c.efMonths<1) flags.push({id:'ef_none',sev:'critical',title:'No Emergency Fund',detail:'Client has less than 1 month of expenses saved. Any unexpected event forces debt.',section:'emergency_fund'});
+  else if(c.efMonths!==undefined&&c.efMonths<3) flags.push({id:'ef_low',sev:'high',title:'Emergency Fund Below 3 Months',detail:'Only '+(c.efMonths).toFixed(1)+' months of expenses covered. Target is 3–6 months.',section:'emergency_fund'});
   if(c.dti>43) flags.push({id:'dti_danger',sev:'critical',title:'DTI in Danger Zone — '+c.dti.toFixed(0)+'%',detail:'Debt-to-income above 43% blocks mortgage qualification and signals financial distress.',section:'debt'});
   else if(c.dti>36) flags.push({id:'dti_high',sev:'high',title:'DTI Above Healthy Threshold — '+c.dti.toFixed(0)+'%',detail:'DTI above 36% limits borrowing power and increases financial stress.',section:'debt'});
-  if(c.savingsRate<5&&c.inc>0) flags.push({id:'savings_low',sev:'high',title:'Savings Rate Only '+(c.savingsRate).toFixed(1)+'%',detail:'Below 5% savings rate. Target is 15–20% for wealth building.',section:'income'});
+
+  // Protection gap — from S.protCalcs
+  var _protGap=protCalcs.gap||c.protGap||0;
+  if(_protGap>0) flags.push({id:'protection_gap',sev:'high',title:'Protection Gap — '+fmtK(_protGap),detail:'Family underinsured by '+fmtK(_protGap)+'.',section:'protection'});
+
+  // High-interest debt — from S.debts
+  var hiDebts=debts.filter(function(d){return(parseFloat(d.rate)||0)>=15&&(parseFloat(d.balance)||0)>0;});
+  if(hiDebts.length>0){
+    var hiTotal=hiDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+    var hiInterest=hiDebts.reduce(function(t,d){return t+((parseFloat(d.balance)||0)*(parseFloat(d.rate)||0)/100/12);},0);
+    flags.push({id:'high_interest_debt',sev:'high',title:'High-Interest Debt: '+fmtK(hiTotal),detail:hiDebts.length+' account(s) at 15%+ APR. ~'+fmt(Math.round(hiInterest))+'/mo in interest.',section:'debt'});
+  }
+
+  // Savings rate
+  if(c.savingsRate!==undefined&&c.savingsRate<5&&c.inc>0) flags.push({id:'savings_low',sev:'high',title:'Savings Rate Below Target: '+(c.savingsRate).toFixed(1)+'%',detail:'Financial experts recommend 15–20%. Current rate limits wealth building.',section:'income'});
+
+  // Retirement gap
   if(c.retGap>0) flags.push({id:'ret_gap',sev:'medium',title:'Retirement Funding Gap — '+fmtK(c.retGap),detail:'Current trajectory falls short of retirement income goal. Gap widens with inflation.',section:'retirement'});
-  if(c.totalDebt>c.inc*12) flags.push({id:'debt_exceeds',sev:'medium',title:'Debt Exceeds Annual Income',detail:'Total debt of '+fmtK(c.totalDebt)+' exceeds yearly income of '+fmtK(c.inc*12)+'. Payoff timeline is extended.',section:'debt'});
+
+  // No retirement accounts
+  if(retAccounts.length===0&&c.inc>0) flags.push({id:'no_retirement',sev:'high',title:'No Retirement Savings',detail:'No retirement accounts detected. Compounding time is being lost.',section:'retirement'});
+
+  // Debt exceeds annual income
+  if(c.totalDebt>0&&c.inc>0&&c.totalDebt>c.inc*12) flags.push({id:'debt_exceeds',sev:'medium',title:'Debt Exceeds Annual Income',detail:'Total debt of '+fmtK(c.totalDebt)+' exceeds yearly income of '+fmtK(c.inc*12)+'. Payoff timeline is extended.',section:'debt'});
+
+  // No disability insurance — from S.profile
+  if(c.inc>=3000&&(!prof.diHasCoverage||prof.diHasCoverage==='no')) flags.push({id:'no_disability',sev:'medium',title:'No Disability Insurance',detail:'1 in 4 workers become disabled before retirement. Income depends on ability to work.',section:'protection'});
+
+  // No LTC coverage for older clients
+  if((rawS.currentAge||0)>=50&&(!prof.ltcHasCoverage||prof.ltcHasCoverage==='no')) flags.push({id:'no_ltc',sev:'medium',title:'No Long-Term Care Coverage',detail:'At age '+(rawS.currentAge||50)+', LTC planning becomes critical. 70% of people over 65 will need some form of long-term care.',section:'protection'});
+
+  // No umbrella policy with significant assets
+  if((c.totalAssets||0)>100000&&(!prof.umbHas||prof.umbHas==='no')) flags.push({id:'no_umbrella',sev:'low',title:'No Umbrella Policy',detail:'Assets of '+fmtK(c.totalAssets)+' are exposed beyond standard liability limits.',section:'protection'});
+
+  // Idle cash
   if(c.idleCash>5000) flags.push({id:'idle_cash',sev:'low',title:'Idle Cash — '+fmt(c.idleCash),detail:'Cash sitting in checking/low-yield accounts losing purchasing power to inflation.',section:'investment'});
-  if(c.protGap>0) flags.push({id:'protection_gap',sev:'high',title:'Protection Gap — '+fmtK(c.protGap),detail:'Life insurance coverage falls short of income replacement + debt obligations.',section:'protection'});
-  if(c.noRetirement) flags.push({id:'no_retirement',sev:'high',title:'No Retirement Savings',detail:'No retirement accounts detected. Compounding time is being lost.',section:'retirement'});
 
   if(!flags.length){
     el.innerHTML='<div style="padding:16px;background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.15);border-radius:2px;text-align:center"><span style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--gr)">✓ No Red Flags Detected</span><div style="font-size:12px;color:var(--mu);margin-top:4px">Client financials look healthy. Focus on optimization.</div></div>';
@@ -3897,6 +3933,23 @@ function renderProfileRedFlags(fd){
       {label:'Open Roth IRA Immediately',sec:'retirement',text:'Establish Roth IRA and begin contributions. Even small amounts benefit from decades of tax-free compounding.'},
       {label:'Employer Plan Enrollment',sec:'retirement',text:'Enroll in employer 401(k)/403(b) at minimum match level. Automate contributions to prevent decision fatigue.'},
       {label:'IBC as Retirement Foundation',sec:'retirement',ibc:true,text:'Start '+ibcType+' policy as tax-free retirement income vehicle. No contribution limits, no RMDs, no market loss risk'+(ibcType==='IUL'?' with index-linked upside':'')+'. Complements traditional accounts.'}
+    ],
+    high_interest_debt:[
+      {label:'Avalanche Payoff — Highest Rate First',sec:'debt',text:'Target highest-interest balances first while paying minimums on everything else. Saves the most in total interest.'},
+      {label:'Balance Transfer or Consolidation',sec:'debt',text:'Transfer high-rate balances to a 0% introductory rate card or consolidate into a lower-rate personal loan.'},
+      {label:'IBC Policy Loan to Eliminate High-Rate Debt',sec:'debt',ibc:true,text:'Use '+ibcType+' cash value to pay off high-rate balances via policy loan. Net cost significantly lower than 15%+ APR.'}
+    ],
+    no_disability:[
+      {label:'Employer Group Disability',sec:'protection',text:'Check if employer offers group disability — often low cost or employer-paid. Typically covers 60% of income.'},
+      {label:'Private Disability Policy',sec:'protection',text:'Secure individual own-occupation disability policy. Protects income regardless of employer changes.'},
+      {label:'IBC + Disability Strategy',sec:'protection',ibc:true,text:ibcType+' cash value provides supplemental income access during disability via policy loans.'}
+    ],
+    no_ltc:[
+      {label:'Traditional LTC Policy',sec:'protection',text:'Secure standalone long-term care policy. Earlier purchase locks in lower premiums.'},
+      {label:'Hybrid Life/LTC Policy',sec:'protection',ibc:true,text:ibcType+' with LTC rider provides both death benefit and long-term care coverage.'}
+    ],
+    no_umbrella:[
+      {label:'Umbrella Liability Policy',sec:'protection',text:'Add $1M+ umbrella policy — typically $200-400/year. Protects assets beyond standard liability limits.'}
     ]
   };
 
@@ -4027,6 +4080,23 @@ function _getRedFlagTemplates(rp,ibcType){
       {label:'Open Roth IRA Immediately',sec:'retirement',text:'Establish Roth IRA and begin contributions. Even small amounts benefit from decades of tax-free compounding.'},
       {label:'Employer Plan Enrollment',sec:'retirement',text:'Enroll in employer 401(k)/403(b) at minimum match level. Automate contributions to prevent decision fatigue.'},
       {label:'IBC as Retirement Foundation',sec:'retirement',ibc:true,text:'Start '+ibcType+' policy as tax-free retirement income vehicle. No contribution limits, no RMDs, no market loss risk'+(ibcType==='IUL'?' with index-linked upside':'')+'. Complements traditional accounts.'}
+    ],
+    high_interest_debt:[
+      {label:'Avalanche Payoff — Highest Rate First',sec:'debt',text:'Target highest-interest balances first while paying minimums on everything else. Saves the most in total interest.'},
+      {label:'Balance Transfer or Consolidation',sec:'debt',text:'Transfer high-rate balances to a 0% introductory rate card or consolidate into a lower-rate personal loan.'},
+      {label:'IBC Policy Loan to Eliminate High-Rate Debt',sec:'debt',ibc:true,text:'Use '+ibcType+' cash value to pay off high-rate balances via policy loan. Net cost significantly lower than 15%+ APR.'}
+    ],
+    no_disability:[
+      {label:'Employer Group Disability',sec:'protection',text:'Check if employer offers group disability — often low cost or employer-paid. Typically covers 60% of income.'},
+      {label:'Private Disability Policy',sec:'protection',text:'Secure individual own-occupation disability policy. Protects income regardless of employer changes.'},
+      {label:'IBC + Disability Strategy',sec:'protection',ibc:true,text:ibcType+' cash value provides supplemental income access during disability via policy loans.'}
+    ],
+    no_ltc:[
+      {label:'Traditional LTC Policy',sec:'protection',text:'Secure standalone long-term care policy. Earlier purchase locks in lower premiums.'},
+      {label:'Hybrid Life/LTC Policy',sec:'protection',ibc:true,text:ibcType+' with LTC rider provides both death benefit and long-term care coverage.'}
+    ],
+    no_umbrella:[
+      {label:'Umbrella Liability Policy',sec:'protection',text:'Add $1M+ umbrella policy — typically $200-400/year. Protects assets beyond standard liability limits.'}
     ]
   };
 }
