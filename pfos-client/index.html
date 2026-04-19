@@ -2580,6 +2580,7 @@ function setMobileTab(el){
 }
 function fmtDate(d){ if(!d) return '—'; try{ var s=String(d); if(/^\d{4}-\d{2}-\d{2}$/.test(s)) s+='T12:00:00'; return new Date(s).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }catch(e){ return d; } }
 function esc(s){ if(s===null||s===undefined||s===''||s===false) return ''; return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+function ordinal(n){var s=["th","st","nd","rd"];var v=n%100;return n+(s[(v-20)%10]||s[v]||s[0]);}
 function set(id,html){ var el=document.getElementById(id); if(el) el.innerHTML=html; }
 function v(id){ var el=document.getElementById(id); return el?(el.value||'').trim():''; }
 function openModal(id){ var el=document.getElementById(id); if(el){el.classList.add('open');el.style.display='flex';} document.body.style.overflow='hidden'; }
@@ -17250,6 +17251,49 @@ function renderClientTracking(){
     });
   }
 
+  // Bills this month (from bill_calendar if available)
+  if(APP.currentClientId){
+    h+='<div id="trkBillsSummary" style="margin:16px 0 0"></div>';
+    // Async load bills
+    setTimeout(function(){
+      db.from('bill_calendar').select('*').eq('client_id',APP.currentClientId).eq('is_active',true).then(function(res){
+        var bEl=document.getElementById('trkBillsSummary');if(!bEl)return;
+        var bills=(res.data||[]);if(!bills.length){bEl.innerHTML='';return;}
+        var now2=new Date();var curDay=now2.getDate();var curMonth=now2.getMonth();
+        var totalDue=0;var paidCount=0;var dueCount=0;
+        bills.forEach(function(b){
+          totalDue+=parseFloat(b.amount)||0;
+          if(b.last_paid_date){var lp=new Date(b.last_paid_date);if(lp.getMonth()===curMonth)paidCount++;}
+          if((b.due_day||1)<=curDay&&!(b.last_paid_date&&new Date(b.last_paid_date).getMonth()===curMonth))dueCount++;
+        });
+        var bh='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Bills this month</div>';
+        bh+='<div class="info-card" style="padding:14px 16px">';
+        bh+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+        bh+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+bills.length+' bill'+(bills.length>1?'s':'')+'</div>';
+        bh+='<div style="font-size:11px;color:var(--mu)">'+fmt(totalDue)+'/mo total</div></div>';
+        bh+='<div style="text-align:right"><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr)">'+paidCount+' paid</span>';
+        if(dueCount>0)bh+=' · <span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--or)">'+dueCount+' due</span>';
+        bh+='</div></div>';
+        // Progress bar
+        var billPct=bills.length>0?Math.round(paidCount/bills.length*100):0;
+        bh+='<div style="height:6px;background:rgba(0,68,191,.06);border-radius:3px;overflow:hidden;margin-bottom:8px"><div style="height:100%;width:'+billPct+'%;background:'+(billPct>=80?'var(--gr)':billPct>=50?'var(--yl)':'var(--or)')+';border-radius:3px"></div></div>';
+        // Individual bills (collapsed, show first 5)
+        var shown=bills.sort(function(a,b){return(a.due_day||1)-(b.due_day||1);}).slice(0,5);
+        shown.forEach(function(b2){
+          var isPaid=b2.last_paid_date&&new Date(b2.last_paid_date).getMonth()===curMonth;
+          var pastDue=(b2.due_day||1)<curDay&&!isPaid;
+          bh+='<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid rgba(0,68,191,.04);font-size:11px">';
+          bh+='<div style="display:flex;align-items:center;gap:6px"><span style="color:'+(isPaid?'var(--gr)':pastDue?'var(--rd)':'var(--mu)')+';font-size:10px">'+(isPaid?'✓':pastDue?'⚠':'○')+'</span><span style="color:var(--wh)">'+esc(b2.name)+'</span></div>';
+          bh+='<div style="display:flex;align-items:center;gap:8px"><span style="color:var(--mu);font-size:10px">Due '+ordinal(b2.due_day||1)+'</span><span style="font-family:var(--fd);color:'+(isPaid?'var(--gr)':'var(--wh)')+'">'+fmt(parseFloat(b2.amount)||0)+'</span></div>';
+          bh+='</div>';
+        });
+        if(bills.length>5)bh+='<div style="font-size:10px;color:#5B9BFF;text-align:center;margin-top:6px;cursor:pointer">+'+(bills.length-5)+' more</div>';
+        bh+='</div>';
+        bEl.innerHTML=bh;
+      });
+    },100);
+  }
+
   // Financial snapshot (key numbers at a glance)
   h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:16px 0 10px">Snapshot</div>';
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">';
@@ -17265,7 +17309,7 @@ function renderClientTracking(){
 }
 
 // ── PROJECTIONS PAGE — PLAN SIMULATOR ──────────────────
-var _cpSim={scenarios:{},active:[]};
+var _cpSim={scenarios:{},custom:{incPct:0,expPct:0,lump:0,extraMo:0},rental:{on:false,price:250000,down:20,rent:1800,vacancy:8,expenses:35,rate:7}};
 function renderClientProjections(){
   var el=document.getElementById('clientProjectionsContent');if(!el)return;
   var fd=APP._portalFd;if(!fd){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your financial data first.</div>';return;}
@@ -17273,8 +17317,6 @@ function renderClientProjections(){
   if(!c.inc){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your income to see projections.</div>';return;}
   var hasPlan=typeof CPLAN!=='undefined'&&CPLAN.allocations&&CPLAN.allocations.some(function(a){return a.amount>0;});
   var h='';var yrs=20;
-
-  // Core tier: read-only projection
   if(!_cpTierHas('debt_scenarios')){
     h+='<div class="info-card" style="padding:20px;margin-bottom:14px;text-align:center">';
     h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:14px">';
@@ -17282,30 +17324,16 @@ function renderClientProjections(){
     h+='<div style="padding:14px;background:rgba(0,68,191,.04);border:1px solid var(--bd);border-radius:2px"><div style="font-family:var(--fd);font-size:24px;color:'+(c.retGap<=0?'var(--gr)':'var(--or)')+'">'+fmtK(c.projRetBal||0)+'</div><div style="font-size:10px;color:var(--mu)">Projected</div></div>';
     h+='</div>';
     if(hasPlan)h+='<div style="font-size:12px;color:var(--mu);line-height:1.6">Your trajectory chart is in <a href="#" onclick="showClientPage(\'plan\');initClientPlan();return false" style="color:#5B9BFF">My Financial Plan</a>.</div>';
-    h+='</div>';
-    h+=_cpUpgradeHint('Plan Simulator','pro');
-    el.innerHTML=h;return;
+    h+='</div>';h+=_cpUpgradeHint('Plan Simulator','pro');el.innerHTML=h;return;
   }
-
-  // Plan baseline simulation
-  function simPlan(incMod,expMod,rateMod,lumpSum,contribDelay,simYrs){
-    var total=0;var yr2=simYrs||yrs;
-    if(hasPlan){
-      CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;
-        var rate=_cpGetNetRate(a)*rateMod;var cf2=_cpGetCF(a);var bal=0;
-        var adjAmt=Math.max(0,a.amount*incMod);
-        for(var y=1;y<=yr2;y++){var contrib=(y<=contribDelay)?0:adjAmt*12*cf2;if((a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target)contrib=0;bal=(bal+contrib)*(1+rate);}
-        if(a.type!=='debt')total+=bal;
-      });
-    } else {
-      var surp=Math.max(0,(c.inc||0)*incMod-(c.baseExp||0)*expMod);
-      for(var y2=1;y2<=yr2;y2++)total=(total+surp*12)*(1+0.06*rateMod);
-    }
+  function simPlan(incMod,expMod,rateMod,lumpSum,contribDelay,simYrs,extraMonthly){
+    var total=0;var yr2=simYrs||yrs;var extra=extraMonthly||0;
+    if(hasPlan){CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;var rate=_cpGetNetRate(a)*rateMod;var cf2=_cpGetCF(a);var bal=0;var adjAmt=Math.max(0,a.amount*incMod);for(var y=1;y<=yr2;y++){var contrib=(y<=contribDelay)?0:adjAmt*12*cf2;if((a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target)contrib=0;bal=(bal+contrib)*(1+rate);}if(a.type!=='debt')total+=bal;});}
+    else{var surp=Math.max(0,(c.inc||0)*incMod-(c.baseExp||0)*expMod);for(var y2=1;y2<=yr2;y2++)total=(total+surp*12)*(1+0.06*rateMod);}
+    if(extra>0){var eb=0;for(var ye=1;ye<=yr2;ye++)eb=(eb+extra*12)*(1+0.07);total+=eb;}
     total-=(c.totalDebt||0);total+=lumpSum;return Math.round(total);
   }
-  var basePlan=simPlan(1,1,1,0,0,yrs);
-
-  // Combined scenario computation
+  var basePlan=simPlan(1,1,1,0,0,yrs,0);
   var scenarios=[
     {id:'child',icon:'👶',label:'Have another child',incMod:1,expMod:1.15,rateMod:1,lump:0,delay:0,desc:'+15% expenses'},
     {id:'house',icon:'🏠',label:'Buy a house',incMod:1,expMod:1.1,rateMod:1,lump:-30000,delay:0,desc:'$30k down + 10% expenses'},
@@ -17319,90 +17347,95 @@ function renderClientProjections(){
     {id:'early_ret',icon:'🏖️',label:'Retire 5yr early',incMod:1,expMod:1,rateMod:1,lump:0,delay:0,desc:'-5yr accumulation',yrsOverride:Math.max(5,yrs-5)}
   ];
   var activeScenarios=scenarios.filter(function(s){return _cpSim.scenarios[s.id];});
-  var combInc=1,combExp=1,combRate=1,combLump=0,combDelay=0,combYrs=yrs;
+  var combInc=1,combExp=1,combRate=1,combLump=0,combDelay=0,combYrs=yrs,combExtra=0;
   activeScenarios.forEach(function(s){combInc*=s.incMod;combExp*=s.expMod;combRate*=s.rateMod;combLump+=s.lump;combDelay=Math.max(combDelay,s.delay);if(s.yrsOverride)combYrs=Math.min(combYrs,s.yrsOverride);});
-  var simResult=simPlan(combInc,combExp,combRate,combLump,combDelay,combYrs);
+  var cu=_cpSim.custom;var hasCustom=cu.incPct!==0||cu.expPct!==0||cu.lump!==0||cu.extraMo!==0;
+  if(hasCustom){combInc*=(1+cu.incPct/100);combExp*=(1+cu.expPct/100);combLump+=cu.lump;combExtra+=cu.extraMo;}
+  var rn=_cpSim.rental;
+  if(rn.on){var rnMort=rn.price*(1-rn.down/100)*(rn.rate/100/12)/(1-Math.pow(1+rn.rate/100/12,-360));var rnGR=rn.rent*(1-rn.vacancy/100);var rnEx=rnGR*(rn.expenses/100);var rnCF=Math.round(rnGR-rnEx-rnMort);combLump-=Math.round(rn.price*rn.down/100);if(rnCF>0)combExtra+=rnCF;else combInc*=Math.max(0.5,1+(rnCF/(c.inc||1)));}
+  var simResult=simPlan(combInc,combExp,combRate,combLump,combDelay,combYrs,combExtra);
   var diff=simResult-basePlan;var diffPct=basePlan!==0?Math.round(diff/Math.abs(basePlan)*100):0;
+  var anyActive=activeScenarios.length>0||hasCustom||rn.on;
   var verdict=diff>=0?'green':diff>-Math.abs(basePlan)*0.15?'yellow':'red';
   var verdictLabel=verdict==='green'?'Plan absorbs this':verdict==='yellow'?'Plan survives — milestones shift':'Plan needs restructuring';
   var verdictCol=verdict==='green'?'var(--gr)':verdict==='yellow'?'var(--yl)':'var(--rd)';
-
-  // ── Mini projection chart ──
+  // Mini chart
   h+='<div class="info-card" style="padding:16px;margin-bottom:14px">';
-  var W=500,H=140,pL=45,pR=8,pT=16,pB=20;
-  var baseYr=[],simYr=[];
-  for(var yr3=0;yr3<=yrs;yr3++){baseYr.push(simPlan(1,1,1,0,0,yr3));simYr.push(simPlan(combInc,combExp,combRate,combLump,combDelay,Math.min(yr3,combYrs)));}
+  var W=500,H=140,pL=45,pR=50,pT=16,pB=20;var baseYr=[],simYr=[];
+  for(var yr3=0;yr3<=yrs;yr3++){baseYr.push(simPlan(1,1,1,0,0,yr3,0));simYr.push(simPlan(combInc,combExp,combRate,combLump,combDelay,Math.min(yr3,combYrs),combExtra));}
   var allV=baseYr.concat(simYr);var mnV=Math.min.apply(null,allV);var mxV=Math.max.apply(null,allV);if(mxV===mnV)mxV=mnV+1;
   var cW2=W-pL-pR,cH2=H-pT-pB;
   function xc(yr4){return pL+yr4/yrs*cW2;}function yc(v){return pT+cH2-(v-mnV)/(mxV-mnV)*cH2;}
   var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;display:block;max-height:180px">';
   for(var g2=0;g2<=3;g2++){var gv2=mnV+(mxV-mnV)*g2/3;svg+='<line x1="'+pL+'" y1="'+yc(gv2)+'" x2="'+(W-pR)+'" y2="'+yc(gv2)+'" stroke="rgba(0,68,191,.05)" stroke-width="0.5"/>';svg+='<text x="'+(pL-3)+'" y="'+(yc(gv2)+3)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(gv2))+'</text>';}
-  // Fill between lines
-  if(activeScenarios.length){
-    var fillPts=baseYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ')+' '+simYr.map(function(v,i){return xc(yrs-i)+','+yc(simYr[yrs-i]);}).join(' ');
-    svg+='<polygon points="'+fillPts+'" fill="'+(diff>=0?'rgba(34,197,94,.08)':'rgba(239,68,68,.08)')+'"/>';
-  }
-  // Base line
-  var basePts2=baseYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ');
-  svg+='<polyline points="'+basePts2+'" fill="none" stroke="#5B9BFF" stroke-width="2" stroke-linejoin="round"/>';
-  svg+='<text x="'+(xc(yrs)+2)+'" y="'+(yc(baseYr[yrs])-4)+'" fill="#5B9BFF" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(baseYr[yrs])+'</text>';
-  // Sim line
-  if(activeScenarios.length){
-    var simPts2=simYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ');
-    svg+='<polyline points="'+simPts2+'" fill="none" stroke="'+verdictCol+'" stroke-width="2" stroke-dasharray="4,3" stroke-linejoin="round"/>';
-    svg+='<text x="'+(xc(yrs)+2)+'" y="'+(yc(simYr[yrs])+8)+'" fill="'+verdictCol+'" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(simYr[yrs])+'</text>';
-  }
-  svg+='</svg>';
-  h+=svg;
-  // Legend
+  if(anyActive){var fillPts=baseYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ')+' '+simYr.map(function(v,i){return xc(yrs-i)+','+yc(simYr[yrs-i]);}).join(' ');svg+='<polygon points="'+fillPts+'" fill="'+(diff>=0?'rgba(34,197,94,.08)':'rgba(239,68,68,.08)')+'"/>';}
+  svg+='<polyline points="'+baseYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ')+'" fill="none" stroke="#5B9BFF" stroke-width="2" stroke-linejoin="round"/>';
+  svg+='<text x="'+(W-pR+4)+'" y="'+(yc(baseYr[yrs])+4)+'" fill="#5B9BFF" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(baseYr[yrs])+'</text>';
+  if(anyActive){svg+='<polyline points="'+simYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ')+'" fill="none" stroke="'+verdictCol+'" stroke-width="2" stroke-dasharray="4,3" stroke-linejoin="round"/>';svg+='<text x="'+(W-pR+4)+'" y="'+(yc(simYr[yrs])+14)+'" fill="'+verdictCol+'" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(simYr[yrs])+'</text>';}
+  svg+='</svg>';h+=svg;
   h+='<div style="display:flex;gap:12px;justify-content:center;font-size:10px;color:var(--mu);margin-top:4px">';
   h+='<span><span style="display:inline-block;width:12px;height:2px;background:#5B9BFF;margin-right:4px;vertical-align:middle"></span>Your plan</span>';
-  if(activeScenarios.length)h+='<span><span style="display:inline-block;width:12px;height:2px;background:'+verdictCol+';margin-right:4px;vertical-align:middle;border-top:1px dashed '+verdictCol+'"></span>Simulated</span>';
+  if(anyActive)h+='<span><span style="display:inline-block;width:12px;height:2px;background:'+verdictCol+';margin-right:4px;vertical-align:middle;border-top:1px dashed '+verdictCol+'"></span>Simulated</span>';
   h+='</div></div>';
-
-  // ── Impact dashboard ──
+  // Impact dashboard
   h+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px">';
   h+='<div class="info-card" style="text-align:center;padding:14px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;margin-bottom:4px">BASE PLAN</div><div style="font-family:var(--fd);font-size:22px;color:#5B9BFF">'+fmtK(basePlan)+'</div><div style="font-size:9px;color:var(--mu)">'+yrs+' year projection</div></div>';
-  h+='<div class="info-card" style="text-align:center;padding:14px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;margin-bottom:4px">SIMULATED</div><div style="font-family:var(--fd);font-size:22px;color:'+verdictCol+'">'+fmtK(simResult)+'</div><div style="font-size:9px;color:var(--mu)">'+activeScenarios.length+' scenario'+(activeScenarios.length!==1?'s':'')+' active</div></div>';
+  h+='<div class="info-card" style="text-align:center;padding:14px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;margin-bottom:4px">SIMULATED</div><div style="font-family:var(--fd);font-size:22px;color:'+(anyActive?verdictCol:'#5B9BFF')+'">'+fmtK(simResult)+'</div><div style="font-size:9px;color:var(--mu)">'+(anyActive?(activeScenarios.length+(hasCustom?1:0)+(rn.on?1:0))+' active':'0 scenarios')+'</div></div>';
   h+='<div class="info-card" style="text-align:center;padding:14px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;margin-bottom:4px">IMPACT</div><div style="font-family:var(--fd);font-size:22px;color:'+(diff>=0?'var(--gr)':'var(--rd)')+'">'+(diff>=0?'+':'')+fmtK(diff)+'</div><div style="font-size:9px;color:var(--mu)">'+diffPct+'% change</div></div>';
   h+='</div>';
-
-  // Verdict banner
-  if(activeScenarios.length){
-    h+='<div class="info-card" style="padding:12px 16px;margin-bottom:14px;text-align:center;border-color:'+(verdict==='green'?'rgba(34,197,94,.2)':verdict==='yellow'?'rgba(234,179,8,.2)':'rgba(239,68,68,.2)')+';background:'+(verdict==='green'?'rgba(34,197,94,.04)':verdict==='yellow'?'rgba(234,179,8,.04)':'rgba(239,68,68,.04)')+'">';
-    h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+verdictCol+'">'+verdictLabel+'</div>';
-    h+='<div style="font-size:11px;color:var(--mu);margin-top:2px">'+(verdict==='green'?'Your financial plan can handle this scenario.':verdict==='yellow'?'Your plan survives but some milestones will shift. Consider adjusting.':'This scenario would significantly impact your plan. Restructuring recommended.')+'</div></div>';
-  }
-
-  // ── Scenario toggles ──
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">What happens to your plan if you...</div>';
+  if(anyActive){h+='<div class="info-card" style="padding:12px 16px;margin-bottom:14px;text-align:center;border-color:'+(verdict==='green'?'rgba(34,197,94,.2)':verdict==='yellow'?'rgba(234,179,8,.2)':'rgba(239,68,68,.2)')+';background:'+(verdict==='green'?'rgba(34,197,94,.04)':verdict==='yellow'?'rgba(234,179,8,.04)':'rgba(239,68,68,.04)')+'"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+verdictCol+'">'+verdictLabel+'</div></div>';}
+  // Preset toggles
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Life event scenarios</div>';
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px">';
-  scenarios.forEach(function(s){
-    var isOn=_cpSim.scenarios[s.id]||false;
-    var indivResult=simPlan(s.incMod,s.expMod,s.rateMod,s.lump,s.delay,s.yrsOverride||yrs);
-    var indivDiff=indivResult-basePlan;
-    var iCol=indivDiff>=0?'var(--gr)':'var(--rd)';
+  scenarios.forEach(function(s){var isOn=_cpSim.scenarios[s.id]||false;var indivResult=simPlan(s.incMod,s.expMod,s.rateMod,s.lump,s.delay,s.yrsOverride||yrs,0);var indivDiff=indivResult-basePlan;var iCol=indivDiff>=0?'var(--gr)':'var(--rd)';
     h+='<div onclick="_cpSimToggle(\''+s.id+'\')" style="padding:14px;cursor:pointer;border-radius:2px;border:1px solid '+(isOn?'rgba(91,155,255,.4)':'var(--bd)')+';background:'+(isOn?'rgba(91,155,255,.06)':'var(--bg-card)')+';transition:all .15s">';
-    h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">';
-    h+='<div style="display:flex;align-items:center;gap:6px"><span style="font-size:18px">'+s.icon+'</span><span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(isOn?'#5B9BFF':'var(--wh)')+'">'+s.label+'</span></div>';
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:18px">'+s.icon+'</span><span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(isOn?'#5B9BFF':'var(--wh)')+'">'+s.label+'</span></div>';
     if(isOn)h+='<span style="font-size:10px;color:#5B9BFF;font-family:var(--fh);font-weight:700">ON</span>';
-    h+='</div>';
-    h+='<div style="font-size:10px;color:var(--mu);margin-bottom:4px">'+s.desc+'</div>';
-    h+='<div style="font-family:var(--fd);font-size:15px;color:'+iCol+'">'+(indivDiff>=0?'+':'')+fmtK(indivDiff)+'</div>';
-    h+='</div>';
-  });
+    h+='</div><div style="font-size:10px;color:var(--mu);margin-bottom:4px">'+s.desc+'</div>';
+    h+='<div style="font-family:var(--fd);font-size:15px;color:'+iCol+'">'+(indivDiff>=0?'+':'')+fmtK(indivDiff)+'</div></div>';});
   h+='</div>';
-
-  // Reset + Apply buttons
-  if(activeScenarios.length){
-    h+='<div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">';
-    h+='<button onclick="_cpSim.scenarios={};renderClientProjections()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(100,116,139,.06);border:1px solid rgba(100,116,139,.2);color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px">Reset All</button>';
-    if(_cpTierHas('stress_tests')&&diff>0)h+='<button onclick="showClientPage(\'plan\');initClientPlan()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:var(--gr);cursor:pointer;border-radius:2px;min-height:36px">'+(CPLAN.hasAdvisor?'Propose to Advisor':'Update My Plan')+'</button>';
+  // Custom scenario builder
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Build your own scenario</div>';
+  h+='<div class="info-card" style="padding:16px;margin-bottom:14px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Income change</span><span style="font-family:var(--fd);color:'+(cu.incPct>=0?'var(--gr)':'var(--rd)')+'">'+(cu.incPct>=0?'+':'')+cu.incPct+'%</span></div><input type="range" min="-50" max="100" step="5" value="'+cu.incPct+'" oninput="_cpSimCustom(\'incPct\',this.value)" style="width:100%;accent-color:#5B9BFF;height:4px"></div>';
+  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Expense change</span><span style="font-family:var(--fd);color:'+(cu.expPct<=0?'var(--gr)':'var(--rd)')+'">'+(cu.expPct>=0?'+':'')+cu.expPct+'%</span></div><input type="range" min="-30" max="50" step="5" value="'+cu.expPct+'" oninput="_cpSimCustom(\'expPct\',this.value)" style="width:100%;accent-color:var(--or);height:4px"></div>';
+  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Lump sum</span><span style="font-family:var(--fd);color:'+(cu.lump>=0?'var(--gr)':'var(--rd)')+'">'+fmt(cu.lump)+'</span></div><input type="range" min="-100000" max="200000" step="5000" value="'+cu.lump+'" oninput="_cpSimCustom(\'lump\',this.value)" style="width:100%;accent-color:var(--yl);height:4px"></div>';
+  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Extra monthly savings</span><span style="font-family:var(--fd);color:var(--gr)">+'+fmt(cu.extraMo)+'</span></div><input type="range" min="0" max="3000" step="50" value="'+cu.extraMo+'" oninput="_cpSimCustom(\'extraMo\',this.value)" style="width:100%;accent-color:var(--gr);height:4px"></div>';
+  h+='</div>';
+  if(hasCustom){var cuRes=simPlan(1+cu.incPct/100,1+cu.expPct/100,1,cu.lump,0,yrs,cu.extraMo);var cuDiff=cuRes-basePlan;h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding-top:10px;border-top:1px solid var(--bd)"><span style="font-size:11px;color:var(--mu)">Custom scenario impact</span><span style="font-family:var(--fd);font-size:16px;color:'+(cuDiff>=0?'var(--gr)':'var(--rd)')+'">'+(cuDiff>=0?'+':'')+fmtK(cuDiff)+'</span></div>';}
+  h+='</div>';
+  // Rental property
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Rental property scenario</div>';
+  h+='<div class="info-card" style="padding:16px;margin-bottom:14px;border-color:'+(rn.on?'rgba(91,155,255,.3)':'var(--bd)')+';background:'+(rn.on?'rgba(91,155,255,.03)':'var(--bg-card)')+'">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:'+(rn.on?'12':'0')+'px"><div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🏘️</span><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+(rn.on?'#5B9BFF':'var(--wh)')+'">Add Rental Property</span></div>';
+  h+='<div style="width:36px;height:20px;border-radius:10px;background:'+(rn.on?'var(--gr)':'rgba(100,116,139,.3)')+';position:relative;cursor:pointer" onclick="_cpSim.rental.on=!_cpSim.rental.on;renderClientProjections()"><div style="width:16px;height:16px;border-radius:50%;background:#fff;position:absolute;top:2px;left:'+(rn.on?'18':'2')+'px;transition:left .2s"></div></div></div>';
+  if(rn.on){
+    var rnM2=rn.price*(1-rn.down/100)*(rn.rate/100/12)/(1-Math.pow(1+rn.rate/100/12,-360));var rnG2=rn.rent*(1-rn.vacancy/100);var rnE2=rnG2*(rn.expenses/100);var rnCF2=Math.round(rnG2-rnE2-rnM2);
+    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">';
+    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Purchase price</div><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" value="'+rn.price+'" oninput="_cpSimRental(\'price\',this.value)" style="padding-left:22px;min-height:36px;font-size:13px"></div></div>';
+    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Down payment %</div><input class="inp" type="number" value="'+rn.down+'" min="0" max="100" oninput="_cpSimRental(\'down\',this.value)" style="min-height:36px;font-size:13px"></div>';
+    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Monthly rent</div><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" value="'+rn.rent+'" oninput="_cpSimRental(\'rent\',this.value)" style="padding-left:22px;min-height:36px;font-size:13px"></div></div>';
+    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Mortgage rate %</div><input class="inp" type="number" value="'+rn.rate+'" step="0.25" oninput="_cpSimRental(\'rate\',this.value)" style="min-height:36px;font-size:13px"></div>';
+    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Vacancy %</div><input class="inp" type="number" value="'+rn.vacancy+'" min="0" max="50" oninput="_cpSimRental(\'vacancy\',this.value)" style="min-height:36px;font-size:13px"></div>';
+    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Expense ratio %</div><input class="inp" type="number" value="'+rn.expenses+'" min="0" max="80" oninput="_cpSimRental(\'expenses\',this.value)" style="min-height:36px;font-size:13px"></div>';
     h+='</div>';
-  }
+    h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding-top:10px;border-top:1px solid var(--bd)">';
+    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Down Pmt</div><div style="font-family:var(--fd);font-size:14px;color:var(--rd)">-'+fmtK(Math.round(rn.price*rn.down/100))+'</div></div>';
+    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Mortgage</div><div style="font-family:var(--fd);font-size:14px;color:var(--or)">'+fmt(Math.round(rnM2))+'/mo</div></div>';
+    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Net Rent</div><div style="font-family:var(--fd);font-size:14px;color:var(--wh)">'+fmt(Math.round(rnG2-rnE2))+'/mo</div></div>';
+    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Cash Flow</div><div style="font-family:var(--fd);font-size:14px;color:'+(rnCF2>=0?'var(--gr)':'var(--rd)')+'">'+(rnCF2>=0?'+':'')+fmt(rnCF2)+'/mo</div></div>';
+    h+='</div>';}
+  h+='</div>';
+  if(anyActive){h+='<div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">';
+    h+='<button onclick="_cpSim.scenarios={};_cpSim.custom={incPct:0,expPct:0,lump:0,extraMo:0};_cpSim.rental.on=false;renderClientProjections()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(100,116,139,.06);border:1px solid rgba(100,116,139,.2);color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px">Reset All</button>';
+    if(_cpTierHas('stress_tests')&&diff>0)h+='<button onclick="showClientPage(\'plan\');initClientPlan()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:var(--gr);cursor:pointer;border-radius:2px;min-height:36px">'+(CPLAN.hasAdvisor?'Propose to Advisor':'Update My Plan')+'</button>';
+    h+='</div>';}
   el.innerHTML=h;
 }
 function _cpSimToggle(id){_cpSim.scenarios[id]=!_cpSim.scenarios[id];renderClientProjections();}
+function _cpSimCustom(key,val){_cpSim.custom[key]=parseFloat(val)||0;clearTimeout(_cpSim._custTimer);_cpSim._custTimer=setTimeout(renderClientProjections,150);}
+function _cpSimRental(key,val){_cpSim.rental[key]=parseFloat(val)||0;clearTimeout(_cpSim._rentTimer);_cpSim._rentTimer=setTimeout(renderClientProjections,200);}
+
 
 // ── FULL ANALYSIS PAGE ────────────────────────────────
 function renderClientAnalysis(){
@@ -17697,18 +17730,54 @@ function _cpExtractRedFlags(){
 function _cpRenderRedFlags(){
   var el=document.getElementById('cplanRedFlags');if(!el)return;
   var flags=_cpExtractRedFlags();
-  if(!flags.length){el.innerHTML='';return;}
-  var h='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Issues driving your plan</div>';
+  if(!flags.length){el.innerHTML='<div class="info-card" style="padding:14px;text-align:center;border-color:rgba(34,197,94,.2)"><div style="font-size:20px;margin-bottom:4px">✅</div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--gr)">No red flags</div><div style="font-size:11px;color:var(--mu)">Your plan addresses all detected issues.</div></div>';return;}
+  var h='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Issues & Recommended Actions</div>';
+  // Map action types to allocation types and solution text
+  var solMap={
+    ef:{type:'ef',label:'Build emergency fund',icon:'🛡️'},
+    debt:{type:'debt',label:'Pay off debt',icon:'⚡'},
+    '401k':{type:'401k',label:'Start 401(k)',icon:'💼'},
+    retirement:{type:'roth',label:'Open retirement account',icon:'🎯'},
+    savings:{type:'invest',label:'Start saving/investing',icon:'📊'},
+    edu:{type:'edu',label:'Start education fund',icon:'🎓'}
+  };
   flags.forEach(function(f){
     var bg=f.type==='crit'?'rgba(239,68,68,.06)':f.type==='warn'?'rgba(234,179,8,.04)':'rgba(34,197,94,.04)';
     var bd=f.type==='crit'?'rgba(239,68,68,.18)':f.type==='warn'?'rgba(234,179,8,.15)':'rgba(34,197,94,.15)';
     var titleCol=f.type==='crit'?'var(--rd)':f.type==='warn'?'var(--yl)':'var(--gr)';
-    h+='<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px;background:'+bg+';border:1px solid '+bd+';border-radius:2px;margin-bottom:6px">';
+    h+='<div style="background:'+bg+';border:1px solid '+bd+';border-radius:2px;margin-bottom:8px;overflow:hidden">';
+    // Problem
+    h+='<div style="display:flex;gap:10px;align-items:flex-start;padding:10px 12px">';
     h+='<span style="font-size:16px;flex-shrink:0;margin-top:1px">'+f.icon+'</span>';
     h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+titleCol+'">'+f.title+'</div>';
-    h+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin-top:2px">'+f.desc+'</div>';
-    if(f.action==='protection')h+='<button onclick="document.getElementById(\'frTopic\').value=\'insurance\';openFreeReviewRequest()" style="margin-top:6px;padding:5px 12px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:30px">Talk to a Licensed Professional</button>';
-    h+='</div></div>';
+    h+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin-top:2px">'+f.desc+'</div></div></div>';
+    // Solution — paired inline
+    var sol=solMap[f.action];
+    if(sol){
+      var existing=CPLAN.allocations.find(function(a){return a.type===sol.type&&a.amount>0;});
+      if(existing){
+        // Already addressed in plan
+        h+='<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:rgba(34,197,94,.04);border-top:1px solid '+bd+'">';
+        h+='<span style="color:var(--gr);font-size:12px">✓</span>';
+        h+='<span style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--gr)">Addressed: '+fmt(existing.amount)+'/mo → '+(existing.customName||CP_NM[existing.type]||sol.label)+'</span></div>';
+      } else {
+        // Not yet in plan — offer to add
+        h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:rgba(91,155,255,.04);border-top:1px solid '+bd+'">';
+        h+='<div style="display:flex;align-items:center;gap:6px"><span style="font-size:12px">'+sol.icon+'</span><span style="font-family:var(--fh);font-size:10px;font-weight:700;color:#5B9BFF">Recommended: '+sol.label+'</span></div>';
+        h+='<button onclick="_cpAdd(\''+sol.type+'\');_cpRender()" style="padding:5px 14px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:28px;white-space:nowrap">+ Add to Plan</button>';
+        h+='</div>';
+      }
+    } else if(f.action==='protection'){
+      h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:rgba(91,155,255,.04);border-top:1px solid '+bd+'">';
+      h+='<span style="font-family:var(--fh);font-size:10px;font-weight:700;color:#5B9BFF">→ Requires licensed professional guidance</span>';
+      h+='<button onclick="document.getElementById(\'frTopic\').value=\'insurance\';openFreeReviewRequest()" style="padding:5px 14px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:28px;white-space:nowrap">Request Free Review</button>';
+      h+='</div>';
+    } else if(f.action==='expenses'){
+      h+='<div style="padding:8px 12px;background:rgba(91,155,255,.04);border-top:1px solid '+bd+'">';
+      h+='<span style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--yl)">→ Review expenses in My Financial Data to free up surplus</span>';
+      h+='</div>';
+    }
+    h+='</div>';
   });
   el.innerHTML=h;
 }
@@ -18174,16 +18243,15 @@ function _cpTierLevel(){
 function _cpTierHas(feature){
   var lv=_cpTierLevel();
   var gates={
-    detailed_mode:2,     // Pro+
-    sliders:2,           // Pro+
-    return_fee:2,        // Pro+
-    debt_detailed:2,     // Pro+
-    debt_scenarios:2,    // Pro+
-    stress_tests:3,      // Pro+ only
-    rebalance:3,         // Pro+ only
-    displacement_bands:2,// Pro+
-    milestones_extra:2,  // Pro+
-    ibc_detail:2         // Pro+
+    detailed_mode:2,     // Pro+ (waterfall, year table, tax breakdown)
+    return_fee:2,        // Pro+ (per-allocation return/fee sliders)
+    debt_detailed:2,     // Pro+ (full 5-strategy comparison)
+    debt_scenarios:2,    // Pro+ (scenario modeling in debt engine)
+    stress_tests:3,      // Pro+ only (stress test cards)
+    rebalance:3,         // Pro+ only (rebalance triggers)
+    displacement_bands:2,// Pro+ (per-allocation chart bands)
+    milestones_extra:2,  // Pro+ ($100k and FI markers)
+    ibc_detail:2         // Pro+ (IBC detail view)
   };
   return lv>=(gates[feature]||1);
 }
@@ -18318,7 +18386,7 @@ function _cpRenderCards(){
     h+='<span style="font-size:20px">💰</span>';
     h+='<div style="flex:1;min-width:200px"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--gr)">Free money available</div>';
     h+='<div style="font-size:11px;color:var(--mu);line-height:1.5">Your employer'+(CPLAN.employer?' ('+CPLAN.employer+')':'')+' may match 401(k) contributions — a guaranteed 50–100% return. This should be captured before anything else.</div></div>';
-    if(_cpTierHas('sliders'))h+='<button onclick="_cpAdd(\'401k\');_cpRender()" style="padding:8px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:2px;min-height:36px;white-space:nowrap">+ Add 401(k)</button>';
+    h+='<button onclick="_cpAdd(\'401k\');_cpRender()" style="padding:8px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:2px;min-height:36px;white-space:nowrap">+ Add 401(k)</button>';
     h+='</div>';
   }
   CPLAN.allocations.forEach(function(a,i){
@@ -18342,10 +18410,9 @@ function _cpRenderCards(){
     h+='<span style="font-size:11px;color:var(--mu)">/mo</span>';
     if(isD&&!locked)h+='<button onclick="_cpRemove('+i+')" style="background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);color:var(--rd);padding:3px 7px;border-radius:2px;cursor:pointer;font-size:10px;min-height:28px;margin-left:4px">✕</button>';
     h+='</div></div>';
-    // Slider (gated: Core sees values only, Pro+ gets sliders)
-    if(!locked&&_cpTierHas('sliders')){var _slMax=_cpSliderMax(a.type);h+='<input type="range" min="0" max="'+_slMax+'" step="1" value="'+Math.min(a.amount,_slMax)+'" oninput="_cpSlide('+i+',this.value)" onchange="_cpSlideEnd()" style="width:100%;accent-color:'+color+';height:6px;margin:4px 0">';
+    // Slider (all tiers — customization is universal)
+    if(!locked){var _slMax=_cpSliderMax(a.type);h+='<input type="range" min="0" max="'+_slMax+'" step="1" value="'+Math.min(a.amount,_slMax)+'" oninput="_cpSlide('+i+',this.value)" onchange="_cpSlideEnd()" style="width:100%;accent-color:'+color+';height:6px;margin:4px 0">';
       var irsNote=_cpIRSNote(a.type);if(irsNote)h+='<div style="font-size:10px;color:rgba(91,155,255,.6);margin-top:2px;line-height:1.4">'+irsNote+'</div>';}
-    else if(!locked&&!_cpTierHas('sliders')){h+='<div style="margin:6px 0;height:6px;background:rgba(0,68,191,.06);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+Math.min(100,Math.round(a.amount/Math.max(CPLAN.surplus,1)*100))+'%;background:'+color+';border-radius:3px;opacity:0.5"></div></div>';h+='<div style="font-size:9px;color:rgba(168,85,247,.6);margin-top:2px">🔒 Upgrade to PRO to customize allocations</div>';}
     // Debt strategy — full engine
     if(a.type==='debt'&&a.amount>0){
       h+=_cpRenderDebtEngine(a,i);
@@ -18493,9 +18560,20 @@ function _cpRenderChart(){
   var allocatedTotal=active.reduce(function(t,a){return t+a.amount;},0);
   var unallocated=Math.max(0,CPLAN.surplus-allocatedTotal);
 
-  // ── Compute "do nothing" baseline: FULL surplus at 2% ──
+  // ── Debt payoff math (used by both baseline and plan) ──
+  var debtAlloc=active.find(function(a){return a.type==='debt';});
+  var debtMonthlyPmt=(debtAlloc?(debtAlloc.amount+CPLAN.debtMin):CPLAN.debtMin)||0;
+  var avgDebtRate=0;
+  if(CPLAN.totalDebt>0&&CPLAN.debts.length){avgDebtRate=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.rate)||0)*(parseFloat(d.balance)||0);},0)/CPLAN.totalDebt/100/12;}
+
+  // ── Compute "do nothing" baseline: FULL surplus at 2%, debt decreasing with min payments ──
   var baselineData=[];
-  for(var yr=0;yr<=years;yr++){var b=0;for(var y=1;y<=yr;y++)b=(b+CPLAN.surplus*12)*(1+0.02);baselineData.push(Math.round(b-CPLAN.totalDebt));}
+  for(var yr=0;yr<=years;yr++){
+    var b=0;for(var y=1;y<=yr;y++)b=(b+CPLAN.surplus*12)*(1+0.02);
+    var bRemDebt=CPLAN.totalDebt;
+    for(var bdm=0;bdm<yr*12;bdm++){bRemDebt=Math.max(0,bRemDebt*(1+avgDebtRate)-CPLAN.debtMin);if(bRemDebt<1)bRemDebt=0;}
+    baselineData.push(Math.round(b-bRemDebt));
+  }
 
   // ── Compute plan total: each allocation at its rate + unallocated at 2% ──
   var rawSeries={};var totalData=[];
@@ -18506,11 +18584,15 @@ function _cpRenderChart(){
       var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var bal=0;
       for(var y2=1;y2<=yr2;y2++){var c2=(a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target?0:a.amount*12*cf;bal=(bal+c2)*(1+rate);}
       if(a.type==='debt')bal=Math.min(CPLAN.totalDebt,(a.amount+CPLAN.debtMin)*yr2*12);
-      rawSeries[a.type].push(Math.round(bal));total+=bal;
+      rawSeries[a.type].push(Math.round(bal));
+      if(a.type!=='debt')total+=bal;// Don't add debt payoff to total — handle separately
     });
+    // Compute remaining debt at this year (amortized with interest)
+    var remDebt=CPLAN.totalDebt;
+    for(var dm=0;dm<yr2*12;dm++){remDebt=Math.max(0,remDebt*(1+avgDebtRate)-debtMonthlyPmt);if(remDebt<1)remDebt=0;}
     // Add unallocated surplus compounding at 2%
     var unBal=0;for(var y3=1;y3<=yr2;y3++)unBal=(unBal+unallocated*12)*(1+0.02);
-    totalData.push(Math.round(total+unBal-CPLAN.totalDebt));
+    totalData.push(Math.round(total+unBal-remDebt));
   }
 
   // ── Scale — include both lines ──
