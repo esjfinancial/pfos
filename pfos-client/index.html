@@ -1966,7 +1966,14 @@ function showScreen(id){
   var _lm=document.getElementById('loginMsg');if(_lm){_lm.style.display='none';_lm.textContent='';}
   var _le=document.getElementById('loginErr');if(_le){_le.style.display='none';_le.textContent='';}
 }
+var _currentClientPage='overview';
 function showClientPage(id){
+  // Flush PFOS iframe data when navigating AWAY from My Financial Data
+  if(_currentClientPage==='pfos'&&id!=='pfos'){
+    var flushFrame=getPFOSFrame();
+    if(flushFrame&&flushFrame.contentWindow){try{flushFrame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}}
+  }
+  _currentClientPage=id;
   document.querySelectorAll('.plat-content .pg').forEach(p=>p.classList.remove('active'));
   var el=document.getElementById('cpg-'+id); if(el) el.classList.add('active');
   document.querySelectorAll('.sb-item').forEach(s=>s.classList.remove('active'));
@@ -3419,6 +3426,19 @@ async function loadClientDataIntoPFOS(clientId){
 
   var mode = APP.role === 'client' ? 'client' : 'advisor';
   var stateData = (profile && profile.financial_data && profile.financial_data.S) ? profile.financial_data.S : null;
+
+  // Check if localStorage has newer data than Supabase (handles debounce race on refresh)
+  try{
+    var fdBackup=localStorage.getItem('pfos_fd_backup');
+    if(fdBackup){
+      var parsed2=JSON.parse(fdBackup);
+      if(parsed2&&parsed2.S&&parsed2.ts){
+        var supaTs=profile&&profile.updated_at?new Date(profile.updated_at).getTime():0;
+        if(parsed2.ts>supaTs){stateData=parsed2.S;}
+      }
+    }
+  }catch(e){}
+
   var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'core';
   if(clientEffTier === 'none') clientEffTier = 'core';
   var pfosTier = (mode === 'advisor') ? 'pro_plus' : clientEffTier;
@@ -3512,6 +3532,22 @@ async function loadClientPortalData(){
   var pData = await db.from('client_profiles').select('*').eq('client_id',_profileQueryId)
     .order('updated_at',{ascending:false}).limit(1).maybeSingle();
   var profile = pData.data;
+  // Check if localStorage has a newer backup (handles debounce race on refresh)
+  try{
+    var fdBackup2=localStorage.getItem('pfos_fd_backup');
+    if(fdBackup2){
+      var pb=JSON.parse(fdBackup2);
+      if(pb&&pb.S&&pb.ts){
+        var supaTs2=profile&&profile.updated_at?new Date(profile.updated_at).getTime():0;
+        if(pb.ts>supaTs2){
+          // localStorage is newer — merge it into the profile
+          if(!profile)profile={financial_data:{},scores:{},allocation_plan:null};
+          profile.financial_data={S:pb.S,calcs:pb.calcs||{}};
+          if(pb.calcs)profile.scores={cfScore:pb.calcs.cfScore,protScore:pb.calcs.protScore,growScore:pb.calcs.growScore,effScore:pb.calcs.effScore};
+        }
+      }
+    }
+  }catch(e){}
   if(profile && profile.financial_data){
     var fd = profile.financial_data, scores = profile.scores || {}, calcs = fd.calcs || {};
     APP._portalCalcs=calcs; APP._portalFd=fd;
@@ -4713,6 +4749,8 @@ window.addEventListener('message',async function(e){
       if(ex&&ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); }
       else { await db.from('client_profiles').insert(pp); }
       _lastSaveDirty=false;
+      // Backup to localStorage for fast reload
+      try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:state,calcs:calcs,ts:Date.now()}));}catch(e3){}
       // Update dashboard snapshot with fresh data — preserve allocation_plan
       var _prevPlan=APP._portalFd&&APP._portalFd.allocation_plan;
       APP._portalFd={S:state,calcs:calcs};APP._portalCalcs=calcs;
@@ -4738,6 +4776,8 @@ var _lastSaveDirty=false;
 window.addEventListener('beforeunload',function(){
   // Send PFOS_FLUSH to iframe to trigger immediate sync
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
+  // Save latest state to localStorage as a fast backup for next page load
+  if(_lastPfosState&&_lastPfosState.state){try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:_lastPfosState.state,calcs:_lastPfosState.calcs||{},ts:Date.now()}));}catch(e){}}
   // Also save _lastPfosState directly as backup (fetch+keepalive survives page unload)
   if(_lastSaveClientId&&_lastPfosState&&_lastPfosState.state){
     try{
