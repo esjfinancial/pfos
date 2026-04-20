@@ -946,6 +946,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
 ══════════════════════════════════════════════════════ */
 @keyframes planFadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulseGlow{0%,100%{box-shadow:0 0 0 0 rgba(91,155,255,0)}50%{box-shadow:0 0 12px 2px rgba(91,155,255,.15)}}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 @keyframes cardEntrance{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
 @keyframes streakBounce{0%{transform:scale(1)}50%{transform:scale(1.15)}100%{transform:scale(1)}}
 @keyframes shimmer{0%{background-position:-400px 0}100%{background-position:400px 0}}
@@ -17992,75 +17993,141 @@ function _cpConfirmedAIGen(){
 }
 
 // ── AI GENERATE (uses local logic for structure, can later add API for reasoning) ──
+// ── Convert AI recs to CPLAN allocations (reusable) ──
+function _cpConvertAIRecs(aiData){
+  CPLAN.allocations=[];
+  var brPct3=CPLAN._breathingPct||15;var pool=Math.round(CPLAN.surplus*(1-brPct3/100));
+  var secMap={emergency_fund:{type:'ef',phase:1},debt:{type:'debt',phase:1},protection:{type:'protection',phase:1},retirement:{type:'roth',phase:3},investment:{type:'invest',phase:3},insurance:{type:'protection',phase:1},education:{type:'edu',phase:3},tax:{type:'invest',phase:4},estate:{type:'custom',phase:2},general:{type:'custom',phase:3}};
+  var stratMap={'roth_ira':{type:'roth'},'roth_401k':{type:'roth401k'},'401k':{type:'401k'},'traditional_ira':{type:'trad_ira'},'solo_401k':{type:'solo401k'},'sep_ira':{type:'sep_ira'},'iul':{type:'iul'},'whole_life':{type:'wl'},'ibc_wl':{type:'ibc'},'ibc_iul':{type:'ibc'},'ibc':{type:'ibc'},'hsa':{type:'hsa'},'529':{type:'edu'},'coverdell':{type:'edu'},'utma':{type:'edu'},'emergency_fund':{type:'ef'},'debt_payoff':{type:'debt'},'term_life':{type:'protection'},'estate_planning':{type:'custom'},'protection_review':{type:'protection'},'rollover_myga':{type:'rollover'},'rollover_fia':{type:'rollover'},'rollover_roth_conversion':{type:'rollover'}};
+  var usedPool=0;
+  var sortedRecs=aiData.recommendations.slice().sort(function(a2,b2){var p2={high:0,medium:1,low:2};return(p2[a2.priority]||1)-(p2[b2.priority]||1);});
+  sortedRecs.forEach(function(r){
+    var map=secMap[r.section]||{type:'custom',phase:3};
+    if(r.strategy&&stratMap[r.strategy])map.type=stratMap[r.strategy].type;
+    var phase=r.phase||map.phase;
+    var amt=r.monthly_cost||0;
+    if(amt===0&&r.section!=='protection'&&r.section!=='estate'&&r.section!=='general'){
+      amt=Math.round(Math.max(0,pool-usedPool)/Math.max(1,sortedRecs.length-CPLAN.allocations.length));
+    }
+    amt=Math.min(amt,Math.max(0,pool-usedPool));
+    var reason=r.recommendation||'';
+    if(r.outcome)reason+='\n📊 '+r.outcome;
+    if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
+    if(r.fee_impact&&r.fee_impact!=='None')reason+='\n💰 Fees: '+r.fee_impact;
+    if(r.tax_impact&&r.tax_impact!=='None')reason+='\n🏛️ Tax: '+r.tax_impact;
+    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':''});
+    usedPool+=amt;
+  });
+  if(aiData.summary)CPLAN._aiSummary=aiData.summary;
+  if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
+  if(aiData.debtStrategy)CPLAN.debtStrategy=aiData.debtStrategy;
+}
+
+// ── Select an approach from the 3 generated options ──
+function _cpSelectApproach(key){
+  if(!CPLAN._approaches||!CPLAN._approaches[key])return;
+  var aiData=CPLAN._approaches[key];
+  CPLAN._selectedApproach=key;
+  _cpConvertAIRecs(aiData);
+  // Record generation
+  var plan=APP._portalFd&&APP._portalFd.allocation_plan;
+  if(!plan)plan={};if(!plan.ai_generations)plan.ai_generations=[];
+  plan.ai_generations.push({date:new Date().toISOString(),tier:CPLAN.tier});
+  if(APP._portalFd)APP._portalFd.allocation_plan=plan;
+  var tier2=CPLAN.tier||'core';var maxG=tier2==='pro_plus'||tier2==='comp'?9999:tier2==='pro'?2:1;
+  var used=plan.ai_generations.length;var remain=Math.max(0,maxG-used);
+  var tierNames={core:'Core',pro:'Pro',pro_plus:'Pro+',comp:'Comp',trial:'Trial'};
+  CPLAN._aiTierMsg=(tierNames[tier2]||'Core')+' tier: '+remain+' AI generation'+(remain!==1?'s':'')+' remaining';
+  CPLAN._originalAIPlan=JSON.parse(JSON.stringify(CPLAN.allocations));
+  _cpRenderPlanV2();
+  cplanSave();
+}
+
+// ── Show approach fork page with 3 cards ──
+function _cpShowApproachFork(){
+  var root=document.getElementById('cplanRoot');if(!root)return;
+  var ap=CPLAN._approaches||{};
+  var cards=[
+    {key:'traditional',label:'Traditional',icon:'📊',desc:'401k, Roth IRA, index funds, 529 plans, term life. Proven, widely-accepted vehicles.',color:'#5B9BFF',taxLabel:'Mostly taxable on withdrawal'},
+    {key:'tax_free',label:'Tax-Free Income',icon:'🛡️',desc:'Roth IRA, HSA, IUL, Whole Life, IBC. Tax-free access via policy loans and Roth withdrawals.',color:'#22C55E',taxLabel:'Mostly tax-free access'},
+    {key:'hybrid',label:'Hybrid',icon:'⚡',desc:'Best vehicle for each purpose regardless of category. AI recommended based on your specific numbers.',color:'#A855F7',taxLabel:'Blended tax treatment'}
+  ];
+  var h='<div style="padding:20px">';
+  h+='<div style="text-align:center;margin-bottom:24px">';
+  h+='<div style="font-family:var(--fh);font-size:22px;font-weight:800;color:var(--wh);margin-bottom:6px">Choose Your Strategy</div>';
+  h+='<div style="font-size:13px;color:var(--mu);line-height:1.6">Three approaches built from your exact financial data. Same surplus, different vehicles. Pick the one that fits your philosophy — or build your own.</div>';
+  h+='</div>';
+  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px">';
+  cards.forEach(function(cd){
+    var data=ap[cd.key];
+    var hl=data&&data.headline?data.headline:{};
+    var retVal=hl.projected_retirement_value||0;
+    var retInc=hl.projected_monthly_income||0;
+    var monthlyCost=hl.total_monthly_cost||0;
+    var isHybrid=cd.key==='hybrid';
+    var failed=!data||!data.recommendations;
+    h+='<div style="background:'+(isHybrid?'linear-gradient(145deg,rgba(168,85,247,.08),rgba(91,155,255,.04))':'rgba(0,68,191,.04)')+';border:2px solid '+(isHybrid?'rgba(168,85,247,.3)':'rgba(0,68,191,.1)')+';border-radius:8px;padding:24px 20px;text-align:center;position:relative;transition:border-color .2s;cursor:pointer" onmouseover="this.style.borderColor=\''+cd.color+'\'" onmouseout="this.style.borderColor=\''+(isHybrid?'rgba(168,85,247,.3)':'rgba(0,68,191,.1)')+'\'">';
+    if(isHybrid)h+='<div style="position:absolute;top:-10px;left:50%;transform:translateX(-50%);background:var(--pu);color:#fff;font-family:var(--fh);font-size:8px;font-weight:800;padding:3px 10px;border-radius:10px;letter-spacing:.1em">AI RECOMMENDED</div>';
+    h+='<div style="font-size:32px;margin-bottom:8px">'+cd.icon+'</div>';
+    h+='<div style="font-family:var(--fh);font-size:16px;font-weight:800;color:var(--wh);margin-bottom:4px">'+cd.label+'</div>';
+    h+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin-bottom:16px;min-height:36px">'+cd.desc+'</div>';
+    if(failed){
+      h+='<div style="font-size:12px;color:var(--rd);margin-bottom:12px">Generation failed — try again</div>';
+    } else {
+      h+='<div style="margin-bottom:16px">';
+      h+='<div style="font-family:var(--fd);font-size:28px;color:'+cd.color+'">'+fmtK(retVal)+'</div>';
+      h+='<div style="font-size:10px;color:var(--mu)">projected at retirement</div>';
+      h+='</div>';
+      h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:16px">';
+      h+='<div><div style="font-family:var(--fd);font-size:16px;color:var(--wh)">'+fmt(retInc)+'</div><div style="font-size:9px;color:var(--mu)">/mo retirement income</div></div>';
+      h+='<div><div style="font-family:var(--fd);font-size:16px;color:var(--wh)">'+fmt(monthlyCost)+'</div><div style="font-size:9px;color:var(--mu)">/mo deployed</div></div>';
+      h+='</div>';
+      h+='<div style="font-size:10px;color:'+cd.color+';font-weight:700;margin-bottom:14px">'+cd.taxLabel+'</div>';
+    }
+    h+='<button onclick="_cpSelectApproach(\''+cd.key+'\')" style="width:100%;padding:10px;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px;border:1px solid '+(isHybrid?'rgba(168,85,247,.4)':'rgba(91,155,255,.25)')+';background:'+(isHybrid?'rgba(168,85,247,.12)':'rgba(91,155,255,.08)')+';color:'+(isHybrid?'var(--pu)':'#5B9BFF')+'"'+(failed?' disabled':'')+'>'+(failed?'Unavailable':'Use This Plan')+'</button>';
+    h+='</div>';
+  });
+  h+='</div>';
+  // Build own + Agent buttons
+  h+='<div style="display:flex;gap:10px;justify-content:center">';
+  h+='<button onclick="_cpStartSelfBuild()" style="padding:10px 24px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:40px">Build My Own Plan</button>';
+  h+='<button onclick="_cpRequestAgent()" style="padding:10px 24px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.15);color:var(--gr);cursor:pointer;border-radius:4px;min-height:40px">Connect With an Agent</button>';
+  h+='</div></div>';
+  root.innerHTML=h;
+}
+
 function _cpDoAIGenerate(){
   CPLAN.allocations=[];
-  // Try Supabase edge function for AI reasoning
   var fd=APP._portalFd;var c=fd&&fd.calcs||(fd&&fd.S&&fd.S.calcs)||{};
   var rawS=(fd&&fd.S)||{};
   var flags=_cpExtractRedFlags();
   var prevPlan=(fd&&fd.allocation_plan)||null;
-  db.functions.invoke('generate-recommendations',{body:{
-    clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',
-    existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),
-    householdType:CPLAN.marital||'single',previousPlan:prevPlan
-  }}).then(function(res){
-    var aiData=res.data;
-    if(aiData&&aiData.recommendations&&aiData.recommendations.length){
-      // Convert AI recs to CPLAN allocations with phases — concurrent with breathing room
-      var brPct3=CPLAN._breathingPct||15;var pool=Math.round(CPLAN.surplus*(1-brPct3/100));
-      var secMap={emergency_fund:{type:'ef',phase:1},debt:{type:'debt',phase:1},protection:{type:'protection',phase:1},retirement:{type:'roth',phase:3},investment:{type:'invest',phase:3},insurance:{type:'protection',phase:1},education:{type:'edu',phase:3},tax:{type:'invest',phase:4},estate:{type:'custom',phase:2},general:{type:'custom',phase:3}};
-      // Detect specific vehicle types from strategy names
-      var stratMap={'roth_ira':{type:'roth'},'roth_401k':{type:'roth401k'},'401k':{type:'401k'},'traditional_ira':{type:'trad_ira'},'solo_401k':{type:'solo401k'},'sep_ira':{type:'sep_ira'},'iul':{type:'iul'},'whole_life':{type:'wl'},'ibc_wl':{type:'ibc'},'ibc_iul':{type:'ibc'},'ibc':{type:'ibc'},'hsa':{type:'hsa'},'529':{type:'edu'},'coverdell':{type:'edu'},'utma':{type:'edu'},'emergency_fund':{type:'ef'},'debt_payoff':{type:'debt'},'term_life':{type:'protection'},'estate_planning':{type:'custom'},'protection_review':{type:'protection'},'rollover_myga':{type:'rollover'},'rollover_fia':{type:'rollover'},'rollover_roth_conversion':{type:'rollover'}};
-      var usedPool=0;
-      // Sort by priority: high first
-      var sortedRecs=aiData.recommendations.slice().sort(function(a2,b2){var p2={high:0,medium:1,low:2};return(p2[a2.priority]||1)-(p2[b2.priority]||1);});
-      sortedRecs.forEach(function(r){
-        var map=secMap[r.section]||{type:'custom',phase:3};
-        // Override type if strategy matches a specific vehicle
-        if(r.strategy&&stratMap[r.strategy])map.type=stratMap[r.strategy].type;
-        // Use AI's phase assignment if provided, otherwise fall back to secMap
-        var phase=r.phase||map.phase;
-        var amt=r.monthly_cost||0;
-        if(amt===0&&r.section!=='protection'&&r.section!=='estate'&&r.section!=='general'){
-          amt=Math.round(Math.max(0,pool-usedPool)/Math.max(1,sortedRecs.length-CPLAN.allocations.length));
-        }
-        amt=Math.min(amt,Math.max(0,pool-usedPool));
-        // Build rich reasoning from AI fields
-        var reason=r.recommendation||'';
-        if(r.outcome)reason+='\n📊 '+r.outcome;
-        if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
-        if(r.fee_impact&&r.fee_impact!=='None')reason+='\n💰 Fees: '+r.fee_impact;
-        if(r.tax_impact&&r.tax_impact!=='None')reason+='\n🏛️ Tax: '+r.tax_impact;
-        CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':''});
-        usedPool+=amt;
-      });
-      if(aiData.summary)CPLAN._aiSummary=aiData.summary;
-      if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
-    } else {
-      // Fallback to local logic
+  var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:CPLAN.marital||'single',previousPlan:prevPlan};
+  // Show loading state
+  var root=document.getElementById('cplanRoot');
+  if(root)root.innerHTML='<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:400px;padding:40px"><div style="width:48px;height:48px;border:3px solid rgba(168,85,247,.15);border-top:3px solid var(--pu);border-radius:50%;animation:spin 1s linear infinite;margin-bottom:20px"></div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Building 3 Strategy Options</div><div style="font-size:12px;color:var(--mu);text-align:center;line-height:1.6">Analyzing your financial data across traditional,<br>tax-free, and hybrid approaches...</div></div>';
+  // Fire 3 parallel calls
+  Promise.all([
+    db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:'traditional'})}).then(function(r){return r.data;}).catch(function(){return null;}),
+    db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:'tax_free'})}).then(function(r){return r.data;}).catch(function(){return null;}),
+    db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:'hybrid'})}).then(function(r){return r.data;}).catch(function(){return null;})
+  ]).then(function(results){
+    CPLAN._approaches={
+      traditional:results[0]&&results[0].recommendations?results[0]:null,
+      tax_free:results[1]&&results[1].recommendations?results[1]:null,
+      hybrid:results[2]&&results[2].recommendations?results[2]:null
+    };
+    // If all failed, fall back to local logic
+    if(!CPLAN._approaches.traditional&&!CPLAN._approaches.tax_free&&!CPLAN._approaches.hybrid){
       _cpAutoSuggestV2();
+      _cpRenderPlanV2();
+      cplanSave();
+      return;
     }
-    // Record generation
-    var plan=APP._portalFd&&APP._portalFd.allocation_plan;
-    if(!plan)plan={};if(!plan.ai_generations)plan.ai_generations=[];
-    plan.ai_generations.push({date:new Date().toISOString(),tier:CPLAN.tier});
-    if(APP._portalFd)APP._portalFd.allocation_plan=plan;
-    // Set tier info for display
-    var tier2=CPLAN.tier||'core';var maxG=tier2==='pro_plus'||tier2==='comp'?12:tier2==='pro'?2:1;
-    var used=plan.ai_generations.length;var remain=Math.max(0,maxG-used);
-    var tierNames={core:'Core',pro:'Pro',pro_plus:'Pro+',comp:'Comp',trial:'Trial'};
-    CPLAN._aiTierMsg=(tierNames[tier2]||'Core')+' tier: '+remain+' AI generation'+(remain!==1?'s':'')+' remaining'+(tier2==='pro'?' (next available in 6 months)':tier2==='pro_plus'?' (resets monthly)':'');
-    // Save original AI plan for comparison
-    CPLAN._originalAIPlan=JSON.parse(JSON.stringify(CPLAN.allocations));
-    _cpRenderPlanV2();
-    cplanSave();
+    _cpShowApproachFork();
   }).catch(function(err){
-    console.warn('AI recommendation failed, using local logic:',err);
+    console.warn('AI recommendation failed:',err);
     _cpAutoSuggestV2();
-    var plan=APP._portalFd&&APP._portalFd.allocation_plan;
-    if(!plan)plan={};if(!plan.ai_generations)plan.ai_generations=[];
-    plan.ai_generations.push({date:new Date().toISOString(),tier:CPLAN.tier});
-    if(APP._portalFd)APP._portalFd.allocation_plan=plan;
     _cpRenderPlanV2();
     cplanSave();
   });
@@ -18696,14 +18763,14 @@ function _cpBuildCard(a,idx,isUnassigned){
 // ── TIMELINE ──
 // ── SHARED DEBT SIMULATION — extracted from pfos-main debt engine ──
 function _cpDebtSimulate(debtArr,extraPmt){
-  var ds=debtArr.map(function(d,i){return{name:d.name||(d.type||('Debt '+(i+1))),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,min:Math.max(parseFloat(d.min)||parseFloat(d.payment)||0,10),paid:false,paidMonth:0};});
-  var months=0,totalInt=0,order=[];
+  var ds=debtArr.map(function(d,i){return{name:d.name||(d.type||('Debt '+(i+1))),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,min:Math.max(parseFloat(d.min)||parseFloat(d.payment)||0,10),oMin:Math.max(parseFloat(d.min)||parseFloat(d.payment)||0,10),paid:false,paidMonth:0};});
+  var months=0,totalInt=0,order=[],freed=0;
   while(ds.some(function(d){return d.bal>0.01;})&&months<600){
     months++;
     ds.forEach(function(d){if(d.bal<=0)return;var interest=d.bal*d.rate;totalInt+=interest;d.bal+=interest;});
-    ds.forEach(function(d){if(d.bal<=0)return;var pmt=Math.min(d.min,d.bal);d.bal-=pmt;if(d.bal<0.01)d.bal=0;});
-    var extraLeft=extraPmt;
-    for(var i=0;i<ds.length;i++){if(ds[i].bal>0){var pay=Math.min(extraLeft,ds[i].bal);ds[i].bal-=pay;extraLeft-=pay;if(ds[i].bal<0.01)ds[i].bal=0;if(extraLeft<=0)break;}}
+    ds.forEach(function(d){if(d.bal<=0)return;var pmt=Math.min(d.min,d.bal);d.bal-=pmt;if(d.bal<0.01){d.bal=0;freed+=d.oMin;}});
+    var extraLeft=extraPmt+freed;
+    for(var i=0;i<ds.length;i++){if(ds[i].bal>0){var pay=Math.min(extraLeft,ds[i].bal);ds[i].bal-=pay;extraLeft-=pay;if(ds[i].bal<0.01){ds[i].bal=0;freed+=ds[i].oMin;}if(extraLeft<=0)break;}}
     ds.forEach(function(d){if(d.bal<0.01&&!d.paid){d.paid=true;d.paidMonth=months;order.push({name:d.name,month:months});}});
   }
   return{months:months,interest:Math.round(totalInt),order:order,perDebt:ds};
