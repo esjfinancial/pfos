@@ -17998,18 +17998,19 @@ function _cpDoAIGenerate(){
   var fd=APP._portalFd;var c=fd&&fd.calcs||(fd&&fd.S&&fd.S.calcs)||{};
   var rawS=(fd&&fd.S)||{};
   var flags=_cpExtractRedFlags();
+  var prevPlan=(fd&&fd.allocation_plan)||null;
   db.functions.invoke('generate-recommendations',{body:{
     clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',
     existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),
-    householdType:CPLAN.marital||'single',currentRecs:[]
+    householdType:CPLAN.marital||'single',previousPlan:prevPlan
   }}).then(function(res){
     var aiData=res.data;
     if(aiData&&aiData.recommendations&&aiData.recommendations.length){
       // Convert AI recs to CPLAN allocations with phases — concurrent with breathing room
       var brPct3=CPLAN._breathingPct||15;var pool=Math.round(CPLAN.surplus*(1-brPct3/100));
-      var secMap={emergency_fund:{type:'ef',phase:1},debt:{type:'debt',phase:1},protection:{type:'protection',phase:2},retirement:{type:'roth',phase:3},investment:{type:'invest',phase:3},insurance:{type:'protection',phase:2},education:{type:'edu',phase:3},tax:{type:'invest',phase:4},estate:{type:'custom',phase:4},general:{type:'custom',phase:3}};
+      var secMap={emergency_fund:{type:'ef',phase:1},debt:{type:'debt',phase:1},protection:{type:'protection',phase:1},retirement:{type:'roth',phase:3},investment:{type:'invest',phase:3},insurance:{type:'protection',phase:1},education:{type:'edu',phase:3},tax:{type:'invest',phase:4},estate:{type:'custom',phase:2},general:{type:'custom',phase:3}};
       // Detect specific vehicle types from strategy names
-      var stratMap={'roth_ira':{type:'roth'},'roth_401k':{type:'roth401k'},'401k':{type:'401k'},'traditional_ira':{type:'trad_ira'},'iul':{type:'iul'},'whole_life':{type:'wl'},'ibc':{type:'ibc'},'hsa':{type:'hsa'},'529':{type:'edu'},'emergency_fund':{type:'ef'},'debt_payoff':{type:'debt'}};
+      var stratMap={'roth_ira':{type:'roth'},'roth_401k':{type:'roth401k'},'401k':{type:'401k'},'traditional_ira':{type:'trad_ira'},'solo_401k':{type:'solo401k'},'sep_ira':{type:'sep_ira'},'iul':{type:'iul'},'whole_life':{type:'wl'},'ibc_wl':{type:'ibc'},'ibc_iul':{type:'ibc'},'ibc':{type:'ibc'},'hsa':{type:'hsa'},'529':{type:'edu'},'coverdell':{type:'edu'},'utma':{type:'edu'},'emergency_fund':{type:'ef'},'debt_payoff':{type:'debt'},'term_life':{type:'protection'},'estate_planning':{type:'custom'},'protection_review':{type:'protection'},'rollover_myga':{type:'rollover'},'rollover_fia':{type:'rollover'},'rollover_roth_conversion':{type:'rollover'}};
       var usedPool=0;
       // Sort by priority: high first
       var sortedRecs=aiData.recommendations.slice().sort(function(a2,b2){var p2={high:0,medium:1,low:2};return(p2[a2.priority]||1)-(p2[b2.priority]||1);});
@@ -18017,16 +18018,20 @@ function _cpDoAIGenerate(){
         var map=secMap[r.section]||{type:'custom',phase:3};
         // Override type if strategy matches a specific vehicle
         if(r.strategy&&stratMap[r.strategy])map.type=stratMap[r.strategy].type;
-        var amt=r.monthly_cost||Math.round(Math.max(0,pool-usedPool)/Math.max(1,sortedRecs.length-CPLAN.allocations.length));
+        // Use AI's phase assignment if provided, otherwise fall back to secMap
+        var phase=r.phase||map.phase;
+        var amt=r.monthly_cost||0;
+        if(amt===0&&r.section!=='protection'&&r.section!=='estate'&&r.section!=='general'){
+          amt=Math.round(Math.max(0,pool-usedPool)/Math.max(1,sortedRecs.length-CPLAN.allocations.length));
+        }
         amt=Math.min(amt,Math.max(0,pool-usedPool));
-        if(amt<=0&&r.monthly_cost<=0)return;
         // Build rich reasoning from AI fields
         var reason=r.recommendation||'';
         if(r.outcome)reason+='\n📊 '+r.outcome;
         if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
         if(r.fee_impact&&r.fee_impact!=='None')reason+='\n💰 Fees: '+r.fee_impact;
         if(r.tax_impact&&r.tax_impact!=='None')reason+='\n🏛️ Tax: '+r.tax_impact;
-        CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:map.phase,cascade:'',customName:map.type==='custom'||map.type==='protection'?(r.title||''):'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:''});
+        CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':''});
         usedPool+=amt;
       });
       if(aiData.summary)CPLAN._aiSummary=aiData.summary;
@@ -18091,7 +18096,7 @@ function _cpAutoSuggestV2(){
   if(needsDebt){
     var debtShare=p12Pool>0?Math.round(p12Pool*(hiDebts.length?0.35:0.25)):0;
     debtShare=Math.min(debtShare,pool);
-    CPLAN.allocations.push({type:'debt',amount:debtShare,target:0,phase:hiDebts.length?1:2,cascade:'roth',reason:'Your '+fmtK(CPLAN.totalDebt)+' in debt'+(hiDebts.length?' includes '+hiDebts.length+' account(s) at 15%+ APR':'')+'. Running '+CPLAN.debtStrategy+' strategy concurrently with savings — paying debt while building safety net simultaneously.'});
+    CPLAN.allocations.push({type:'debt',amount:debtShare,target:CPLAN.totalDebt,phase:hiDebts.length?1:2,cascade:'roth',reason:'Your '+fmtK(CPLAN.totalDebt)+' in debt'+(hiDebts.length?' includes '+hiDebts.length+' account(s) at 15%+ APR':'')+'. Running '+CPLAN.debtStrategy+' strategy concurrently with savings — paying debt while building safety net simultaneously.'});
   }
   if(hasEmployer){
     var matchShare=p12Pool>0?Math.round(p12Pool*0.25):0;
@@ -18099,29 +18104,85 @@ function _cpAutoSuggestV2(){
     CPLAN.allocations.push({type:'401k',amount:matchShare,target:0,phase:2,cascade:'',reason:'Your employer ('+CPLAN.employer+') likely offers matching contributions. Even while building your emergency fund and paying debt, capturing the match is essential — it\'s an immediate 50-100% return.'});
   }
 
-  // ── CONCURRENT Phase 3: Growth — runs in parallel from day one ──
+  // ── CONCURRENT Phase 3: Growth — SELECT best vehicles for THIS person ──
   var growPool=Math.max(0,pool-p12Pool);
   if(growPool>0){
-    // Primary retirement vehicle
-    var retType=isCon?'wl':isAgg?'roth':'roth';
-    var retPct=0.35;// 35% of growth pool
-    var retAmt=Math.min(Math.round(growPool*retPct),retType==='roth'?_cpIRSMax('roth'):growPool);
-    var retReason=isCon?'Based on your conservative risk profile, Whole Life provides guaranteed growth every year plus dividends. Starting now — even while building your safety net — lets compounding work from day one.':isAgg?'Based on your aggressive risk profile, maximizing Roth IRA contributions gives you tax-free growth with market exposure. Starting now alongside debt payoff captures growth you\'d otherwise miss.':'A Roth IRA provides tax-free growth and withdrawals in retirement. Starting immediately alongside your other priorities means you don\'t sacrifice years of compounding.';
-    CPLAN.allocations.push({type:retType,amount:retAmt,target:0,phase:3,cascade:'',reason:retReason});
+    // ── Profile factors ──
+    var _age=CPLAN.age||35;
+    var _hasDeps=CPLAN.children.length>0||CPLAN.marital!=='single';
+    var _nKids=CPLAN.children.length;
+    var _debtRatio=CPLAN.income>0?CPLAN.totalDebt/(CPLAN.income*12):0;
+    var _fAge=Math.min(1,Math.max(0,(_age-22)/38));
+    var _fYoung=1-_fAge;
+    var _fDep=_hasDeps?Math.min(1,0.3+_nKids*0.2):0;
+    var _fDebt=Math.min(1,_debtRatio/2);
 
-    // Secondary retirement supplement (optional — smaller allocation)
-    var supPool=growPool-retAmt;
-    if(supPool>150){
-      var supType=isCon?'wl':(isAgg?'iul':'iul');
-      var supAmt=Math.min(Math.round(supPool*0.25),supPool);
-      CPLAN.allocations.push({type:supType,amount:supAmt,target:0,phase:3,cascade:'',reason:'As a supplemental tax-free retirement vehicle, '+(supType==='iul'?'an IUL provides market-linked growth with a 0% floor — your money grows when markets are up but never goes backward.':'Whole Life from a mutual company provides guaranteed growth and dividends.')+' This is optional — adjust or remove based on your preferences.'});
-      supPool-=supAmt;
+    // ── Score each vehicle's FIT for this person (0-100) ──
+    var _vehicles=[
+      {type:'roth',phase:3,score:0,reason:''},
+      {type:'iul',phase:3,score:0,reason:''},
+      {type:'wl',phase:3,score:0,reason:''},
+      {type:'ibc',phase:2,score:0,reason:''},
+      {type:'invest',phase:3,score:0,reason:''}
+    ];
+
+    // Roth: broadly useful. Tax-free growth. Better with time.
+    _vehicles[0].score=50+_fYoung*25+(isAgg?10:isCon?-5:5);
+    _vehicles[0].reason='Tax-free growth and withdrawals in retirement.'+((_fYoung>0.5)?' At age '+_age+', you have decades for compounding to work.':' Tax diversification in retirement gives you flexibility.');
+
+    // IUL: market-linked with 0% floor + death benefit. Best when protection + growth both matter.
+    _vehicles[1].score=30+(isCon?15:isAgg?5:25)+_fDep*20+(_fAge>0.3&&_fAge<0.8?10:0);
+    _vehicles[1].reason='Market-linked growth with a 0% floor — upside participation without downside risk.'+((_fDep>0.2)?' The death benefit protects your '+(CPLAN.children.length>0?'family':'household')+' while building tax-free retirement income.':' Builds tax-free retirement income through policy loans.');
+
+    // WL: guaranteed growth, dividends, certainty. Best for conservative or older.
+    _vehicles[2].score=20+(isCon?35:isAgg?0:10)+_fAge*25+_fDep*5;
+    _vehicles[2].reason='Guaranteed cash value growth every year plus dividends.'+((_fAge>0.5)?' With retirement closer, guaranteed growth provides certainty your other vehicles don\'t.':' Provides a stable foundation regardless of market conditions.');
+
+    // IBC: banking system. Only scores high when debt is significant or person values financial control.
+    _vehicles[3].score=10+_fDebt*40+_fDep*10+(isCon?10:isAgg?0:5);
+    _vehicles[3].reason='A Whole Life policy structured for banking — recapture interest through policy loans instead of paying banks.'+((_fDebt>0.3)?' With '+fmtK(CPLAN.totalDebt)+' in debt, this lets you pay yourself back instead of a lender.':' Provides a personal credit line, emergency fund backup, and death benefit.');
+
+    // Invest: pure market exposure. Best for aggressive with long horizon.
+    _vehicles[4].score=25+(isAgg?30:isCon?0:12)+_fYoung*20-_fDep*8;
+    _vehicles[4].reason='Diversified investment portfolio with full market exposure.'+(isAgg?' Your aggressive profile favors growth potential.':' Provides broad market diversification alongside your other vehicles.');
+
+    // ── Select top 2-3 vehicles above threshold ──
+    _vehicles.sort(function(a,b){return b.score-a.score;});
+    var _selected=[];var _minScore=40;
+    _vehicles.forEach(function(v){
+      if(v.score>=_minScore)_selected.push(v);
+    });
+    // Always have at least 2
+    if(_selected.length<2){_selected=_vehicles.slice(0,2);}
+
+    // ── Distribute growth pool proportionally across selected vehicles ──
+    var _selTotal=_selected.reduce(function(t,v){return t+v.score;},0);
+    var _allocated=0;
+    _selected.forEach(function(v,i){
+      var share=i===_selected.length-1?growPool-_allocated:Math.round(growPool*v.score/_selTotal);
+      if(v.type==='roth')share=Math.min(share,_cpIRSMax('roth'));
+      if(share<50)return;
+      var pct=Math.round(share/growPool*100);
+      CPLAN.allocations.push({type:v.type,amount:share,target:0,phase:v.phase,cascade:'',reason:v.reason+' Your profile directs '+pct+'% of growth here.'});
+      _allocated+=share;
+    });
+
+    // Anything unallocated from Roth cap or rounding → add to the top remaining vehicle
+    var _leftover=growPool-_allocated;
+    if(_leftover>50&&_selected.length>0){
+      var _topType=_selected[0].type;
+      var _existing=CPLAN.allocations.find(function(a){return a.type===_topType&&a.phase>=2;});
+      if(_existing)_existing.amount+=_leftover;
     }
+
+    var supPool=Math.max(0,growPool-_allocated-(_leftover>50?_leftover:0));
 
     // Education (if kids)
     if(CPLAN.children.length>0&&supPool>100){
-      var eduAmt=Math.min(Math.round(supPool*0.20),supPool);var eduVeh=isCon?'wl':isAgg?'iul':'529';
-      CPLAN.allocations.push({type:'edu',amount:eduAmt,target:0,phase:3,cascade:'',eduVehicle:eduVeh,reason:'With '+CPLAN.children.length+' child'+(CPLAN.children.length>1?'ren':'')+', starting education savings now alongside your other goals maximizes compounding.'});
+      var eduAmt=Math.min(Math.round(supPool*0.20),supPool);
+      // Education vehicle not pre-selected — user picks in self-build, AI picks in AI path
+      var eduVeh='';
+      CPLAN.allocations.push({type:'edu',amount:eduAmt,target:0,phase:3,cascade:'',eduVehicle:eduVeh,reason:'With '+CPLAN.children.length+' child'+(CPLAN.children.length>1?'ren':'')+', starting education savings now alongside your other goals maximizes compounding.'+(eduVeh==='iul'||eduVeh==='wl'?' Using '+(eduVeh==='iul'?'IUL':'Whole Life')+' cash value provides death benefit protection — if something happens to you, the education fund is guaranteed.':'')});
       supPool-=eduAmt;
     }
 
@@ -18138,9 +18199,7 @@ function _cpAutoSuggestV2(){
     var oldAccts=retAccts.filter(function(ra){return ra.type&&ra.type.indexOf('_old')>=0&&(parseFloat(ra.balance)||0)>0;});
     if(oldAccts.length>0){
       var oldBal2=oldAccts.reduce(function(t2,a2){return t2+(parseFloat(a2.balance)||0);},0);
-      var rollType=isCon?'rollover_myga':isAgg?'rollover_roth':'rollover_fia';
-      var rollReason2=isCon?'Your '+fmtK(oldBal2)+' in old retirement accounts could be rolled into a Multi-Year Guaranteed Annuity (MYGA) for guaranteed 4-5% growth with no market risk. This aligns with your conservative profile. Discuss with a licensed professional.':isAgg?'Consider a Roth conversion for your '+fmtK(oldBal2)+' in old accounts — you pay taxes now but never again. Or roll into your current 401(k)/IRA. Discuss tax implications with a qualified professional.':'Your '+fmtK(oldBal2)+' in old accounts could move to a Fixed Indexed Annuity — market-linked growth with a 0% floor. Your money grows when markets are up but never goes backward. Discuss with a licensed professional.';
-      CPLAN.allocations.push({type:'rollover',amount:0,target:oldBal2,phase:2,cascade:'',reason:rollReason2,customName:rollType.replace('rollover_','').toUpperCase()+' Rollover'});
+      CPLAN.allocations.push({type:'rollover',amount:0,target:oldBal2,phase:2,cascade:'',reason:'You have '+fmtK(oldBal2)+' in '+oldAccts.length+' old retirement account'+(oldAccts.length>1?'s':'')+' that may benefit from consolidation. Options include: rolling into your current employer plan, a Traditional or Roth IRA, a Fixed Indexed Annuity, or a MYGA. Each has different tax implications, growth characteristics, and fee structures. Discuss with a licensed financial professional to determine the best fit for your situation.',customName:'Rollover Review'});
     }
 
     // HSA (Phase 2 — conditional on HDHP)
@@ -18160,9 +18219,9 @@ function _cpAutoSuggestV2(){
       CPLAN.allocations.push({type:'ibc',amount:0,target:0,phase:3,cascade:'',reason:'Your existing '+(ibcPols[0].type||'policy')+' from '+(ibcPols[0].company||'your carrier')+' ('+fmt(ibcPrem)+'/mo premium) is designed for Infinite Banking. This single policy can serve as: tax-free retirement supplement, debt recapture via policy loans, major purchase financing, and emergency fund backup. Upload to Policy Audit for a structural analysis and IBC suitability rating.',customName:'IBC — '+(ibcPols[0].company||'Existing Policy')});
     }
 
-    // Invest remaining growth pool
+    // Any remaining surplus after education, goals, HSA → invest
     if(supPool>100){
-      CPLAN.allocations.push({type:'invest',amount:Math.round(supPool),target:0,phase:3,cascade:'',reason:'Remaining growth allocation deployed to a diversified investment portfolio. Your risk profile ('+rp+') guides the allocation mix.'});
+      CPLAN.allocations.push({type:'invest',amount:Math.round(supPool),target:0,phase:3,cascade:'',reason:'Remaining surplus directed to a diversified portfolio. Adjust this allocation using the slider — you can move it to any vehicle above.'});
     }
   }
 
@@ -18177,16 +18236,16 @@ function _cpAutoSuggestV2(){
     CPLAN.allocations.push({type:'protection',amount:0,target:0,phase:1,cascade:'',customName:'Disability Insurance Review',reason:'Your income of '+fmt(Math.round(CPLAN.income))+'/mo is your biggest asset. 1 in 4 workers become disabled before retirement. Disability insurance protects your earning power and every plan built on top of it.',flagTitle:'No disability coverage detected',flagType:'warn',flagIcon:'⚡'});
   }
 
-  // ── ESTATE PLANNING — Phase 4: action items, no dollar allocation ──
+  // ── ESTATE PLANNING — Phase 2: protect your family now, not later ──
   var rawEst=rawS||{};
   var hasWill=rawEst.willStatus&&rawEst.willStatus!=='none';
   var hasPOA=false;var hasBenReview=false;
   try{hasPOA=rawEst.estateDocs&&rawEst.estateDocs.poa;hasBenReview=rawEst.estateDocs&&rawEst.estateDocs.beneficiary;}catch(e){}
   if(!hasWill){
-    CPLAN.allocations.push({type:'custom',amount:0,target:0,phase:4,cascade:'',customName:'Draft a Will',reason:'No will on file. Without one, the state decides who gets your assets and who raises your children. This is a one-time action — most estate attorneys charge $300-$1,500 for a basic will and trust package.'});
+    CPLAN.allocations.push({type:'custom',amount:0,target:0,phase:2,cascade:'',customName:'Draft a Will',reason:'No will on file. Without one, the state decides who gets your assets and who raises your children. This is a one-time action — most estate attorneys charge $300-$1,500 for a basic will and trust package.'});
   }
   if(!hasBenReview){
-    CPLAN.allocations.push({type:'custom',amount:0,target:0,phase:4,cascade:'',customName:'Beneficiary Review',reason:'Review and update beneficiary designations on all retirement accounts, life insurance policies, and bank accounts. Beneficiary designations override your will — outdated ones are one of the most common estate planning mistakes.'});
+    CPLAN.allocations.push({type:'custom',amount:0,target:0,phase:2,cascade:'',customName:'Beneficiary Review',reason:'Review and update beneficiary designations on all retirement accounts, life insurance policies, and bank accounts. Beneficiary designations override your will — outdated ones are one of the most common estate planning mistakes.'});
   }
 
   // Note the breathing room
@@ -18198,6 +18257,27 @@ function _cpAutoSuggestV2(){
 // ── PLAN v2 RENDERER ──
 function _cpRenderPlanV2(){
   var root=document.getElementById('cplanRoot');if(!root)return;
+  // ── Live data refresh: pull current balances from financial data ──
+  try{
+    var _liveS=(APP._portalFd&&APP._portalFd.S)||{};
+    if(_liveS.calcs){
+      var _lc=_liveS.calcs;
+      CPLAN.income=parseFloat(_lc.income)||CPLAN.income;
+      CPLAN.expenses=parseFloat(_lc.expenses)||CPLAN.expenses;
+      CPLAN.surplus=Math.max(0,CPLAN.income-CPLAN.expenses);
+    }
+    if(_liveS.debts&&_liveS.debts.length){
+      CPLAN.debts=_liveS.debts;
+      CPLAN.totalDebt=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+      CPLAN.debtMin=CPLAN.debts.reduce(function(t,x){return t+(parseFloat(x.min)||parseFloat(x.payment)||0);},0);
+      // Update debt card target to current balance
+      CPLAN.allocations.forEach(function(a){if(a.type==='debt')a.target=CPLAN.totalDebt;});
+    }
+    if(_liveS.assets){
+      var _efBal=0;if(_liveS.assets.savings)_efBal=parseFloat(_liveS.assets.savings)||0;
+      if(_efBal>0)CPLAN.efBal=_efBal;
+    }
+  }catch(e){}
   if(!CPLAN.allocations.length&&!CPLAN.hasAdvisor){_cpRenderFork();return;}
   var h='';
   var allocated=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
@@ -18408,27 +18488,35 @@ function _cpRenderPlanV2(){
 }
 
 // ── BUILD CARD ──
+function _cpHex2Rgba(hex,alpha){var r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);return'rgba('+r+','+g+','+b+','+alpha+')';}
 function _cpBuildCard(a,idx,isUnassigned){
   var icon=CP_IC[a.type]||'⭐';var color=CP_COL[a.type]||'#94A3B8';var name=a.customName||CP_NM[a.type]||a.type;
   var isD=CPLAN.mode==='detailed';
-  var h='<div style="margin-bottom:10px;border-left:4px solid '+color+';background:'+color+'12;border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+color+'25;border-right:1px solid '+color+'25;border-bottom:1px solid '+color+'25;position:relative;overflow:hidden;transition:border-color .2s">';
+  var h='<div style="margin-bottom:10px;border-left:4px solid '+color+';background:'+_cpHex2Rgba(color,0.08)+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_cpHex2Rgba(color,0.15)+';border-right:1px solid '+_cpHex2Rgba(color,0.15)+';border-bottom:1px solid '+_cpHex2Rgba(color,0.15)+';position:relative;overflow:hidden;transition:border-color .2s">';
   // Red flag source
   if(a.flagTitle){h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;padding:7px 10px;border-radius:3px;background:'+(a.flagType==='crit'?'rgba(239,68,68,.08)':'rgba(234,179,8,.05)')+';border:1px solid '+(a.flagType==='crit'?'rgba(239,68,68,.15)':'rgba(234,179,8,.12)')+'"><span style="font-size:12px">'+(a.flagIcon||'⚠️')+'</span><span style="font-size:10px;font-weight:600;color:'+(a.flagType==='crit'?'var(--rd)':'var(--yl)')+'">'+a.flagTitle+'</span></div>';}
   // Header
   h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">';
-  h+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0"><div style="width:40px;height:40px;border-radius:10px;background:'+color+'18;display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+icon+'</div><div style="flex:1;min-width:0">';
+  h+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0"><div style="width:40px;height:40px;border-radius:10px;background:'+_cpHex2Rgba(color,0.15)+';display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+icon+'</div><div style="flex:1;min-width:0">';
   if(a.type==='custom')h+='<input type="text" value="'+esc(name)+'" onchange="_cpSetName('+idx+',this.value)" style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);background:transparent;border:none;border-bottom:1px dashed var(--bd);width:100%;padding:2px 0;min-height:28px">';
   else h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+name+'</div>';
   // "Why this" in guided or AI reasoning
   if(a.reason)h+='<div style="font-size:10px;color:var(--mu);line-height:1.4;margin-top:2px">'+a.reason+'</div>';
   else{var why=_cpWhy(a.type);if(why)h+='<div style="font-size:10px;color:var(--mu);line-height:1.4;margin-top:2px">'+why+'</div>';}
   h+='</div></div>';
-  // Amount display
-  h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+color+'10;border-radius:4px"><div id="cpAmt'+idx+'" style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(a.amount)+'</div><div style="font-size:9px;color:var(--mu)">/mo</div></div>';
+  // Amount display + Slider — skip for action-only items (protection, estate)
+  var _isActionOnly=a.type==='protection'||(a.type==='custom'&&a.target===0&&a.amount===0);
+  if(_isActionOnly){
+    h+='<div style="padding:10px 12px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.15);border-radius:4px;margin-top:8px;font-size:11px;color:var(--yl);line-height:1.5;display:flex;align-items:center;gap:8px"><span style="font-size:16px">📋</span><span>Action required — no monthly cost. Review and complete this item.</span></div>';
+  } else {
+    h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_cpHex2Rgba(color,0.08)+';border-radius:4px"><div id="cpAmt'+idx+'" style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(a.amount)+'</div><div style="font-size:9px;color:var(--mu)">/mo</div></div>';
+  }
   h+='</div>';
-  // Slider
+  // Slider — hide for action-only items
+  if(!_isActionOnly){
   var _slMax=_cpSliderMax(a.type);
   h+='<input type="range" min="0" max="'+_slMax+'" step="1" value="'+Math.min(a.amount,_slMax)+'" oninput="_cpSlide('+idx+',this.value)" onchange="_cpSlideEnd()" style="width:100%;accent-color:'+color+';height:6px;margin:4px 0">';
+  }
   var irsNote=_cpIRSNote(a.type);if(irsNote)h+='<div style="font-size:9px;color:rgba(91,155,255,.5);margin-bottom:4px">'+irsNote+'</div>';
   // EF → HYSA note
   if(a.type==='ef')h+='<div style="font-size:9px;color:rgba(91,155,255,.5);margin-bottom:4px">→ Direct to a High-Yield Savings Account (HYSA) for liquidity + interest</div>';
@@ -18439,7 +18527,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _nRate=Math.round((_gRate-_fRate)*100)/100;
     var _yr5=0,_yr10=0,_yr20=0;var _mr=_nRate/100;for(var _yp=1;_yp<=20;_yp++){var _c=a.amount*12;_yr5=_yp<=5?(_yr5+_c)*(1+_mr):_yr5;_yr10=_yp<=10?(_yr10+_c)*(1+_mr):_yr10;_yr20=(_yr20+_c)*(1+_mr);}
     h+='<div style="margin-top:6px;padding:8px 10px;background:rgba(91,155,255,.03);border:1px solid rgba(91,155,255,.08);border-radius:2px">';
-    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-size:9px;color:var(--mu)">Based on <strong style="color:#5B9BFF">'+_gRate.toFixed(1)+'%</strong> gross · <strong style="color:var(--gr)">'+_nRate.toFixed(1)+'%</strong> net return</span></div>';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-size:9px;color:var(--mu)">Avg return <strong style="color:#5B9BFF">'+_gRate.toFixed(1)+'%</strong> before fees · <strong style="color:var(--gr)">'+_nRate.toFixed(1)+'%</strong> after fees</span></div>';
     h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px">';
     [{y:'5yr',v:_yr5},{y:'10yr',v:_yr10},{y:'20yr',v:_yr20}].forEach(function(yp2){h+='<div style="text-align:center;padding:5px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:8px;color:var(--mu)">'+yp2.y+'</div><div style="font-family:var(--fd);font-size:13px;color:var(--gr)">'+fmtK(Math.round(yp2.v))+'</div></div>';});
     h+='</div></div>';
@@ -18449,12 +18537,50 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<div style="display:flex;gap:4px;flex-wrap:wrap;margin:6px 0">';
     ['529','coverdell','utma','wl','iul'].forEach(function(v){var sel2=a.eduVehicle===v;h+='<button onclick="CPLAN.allocations['+idx+'].eduVehicle=\''+v+'\';_cpRenderPlanV2()" style="padding:4px 8px;font-family:var(--fh);font-size:9px;font-weight:700;border-radius:2px;cursor:pointer;min-height:28px;border:1px solid '+(sel2?'rgba(6,182,212,.4)':'var(--bd)')+';background:'+(sel2?'rgba(6,182,212,.12)':'transparent')+';color:'+(sel2?'#06B6D4':'var(--mu)')+'">'+CP_EDU_VEH_NM[v]+'</button>';});
     h+='</div>';
+    // Education projection chart
+    if(a.amount>0&&CPLAN.children.length>0){
+      var _child=CPLAN.children[0];var _cAge=parseInt(_child.age)||5;
+      var _yrsToCollege=Math.max(1,18-_cAge);
+      var _eduInflation=0.05;var _baseCost=25000;
+      var _projCost=Math.round(_baseCost*4*Math.pow(1+_eduInflation,_yrsToCollege));
+      var _eduRate=_cpGetNetRate(a);var _eduCF=_cpGetCF(a);
+      var _eduPts=[];var _costPts=[];var _eBal=0;
+      for(var _ey=0;_ey<=_yrsToCollege;_ey++){
+        _eBal=(_eBal+a.amount*12*_eduCF)*(1+_eduRate);
+        _eduPts.push(Math.round(_eBal));
+        _costPts.push(Math.round(_baseCost*4*Math.pow(1+_eduInflation,_ey)));
+      }
+      var _eMax=Math.max(_projCost,_eduPts[_eduPts.length-1],1);
+      var _eW=340,_eH=100,_ePL=6,_ePR=6,_ePT=6,_ePB=18;
+      var _ecW=_eW-_ePL-_ePR,_ecH=_eH-_ePT-_ePB;
+      function _ex(i){return _ePL+i/_yrsToCollege*_ecW;}
+      function _ey2(v){return _ePT+_ecH-(v/_eMax*_ecH);}
+      var _savLine=_eduPts.map(function(v,i){return _ex(i)+','+_ey2(v);}).join(' ');
+      var _costLine=_costPts.map(function(v,i){return _ex(i)+','+_ey2(v);}).join(' ');
+      h+='<div style="margin:8px 0;padding:12px;background:rgba(6,182,212,.04);border:1px solid rgba(6,182,212,.12);border-radius:4px">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+      h+='<div><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#06B6D4;margin-bottom:2px">EDUCATION PROJECTION</div>';
+      h+='<div style="font-size:9px;color:var(--mu)">Child age '+_cAge+' · College in '+_yrsToCollege+' years</div></div>';
+      h+='<div style="text-align:right"><div style="font-family:var(--fd);font-size:16px;color:var(--or)">'+fmtK(_projCost)+'</div><div style="font-size:8px;color:var(--mu)">projected 4yr cost</div></div></div>';
+      h+='<svg viewBox="0 0 '+_eW+' '+_eH+'" style="width:100%;height:auto;display:block">';
+      h+='<polyline points="'+_costLine+'" fill="none" stroke="rgba(249,115,22,.4)" stroke-width="1.5" stroke-dasharray="3,2"/>';
+      h+='<polyline points="'+_savLine+'" fill="none" stroke="#06B6D4" stroke-width="2"/>';
+      h+='<polygon points="'+_ePL+','+_ey2(0)+' '+_savLine+' '+_ex(_yrsToCollege)+','+_ey2(0)+'" fill="rgba(6,182,212,.1)"/>';
+      h+='<text x="'+_ex(_yrsToCollege)+'" y="'+(_ey2(_eduPts[_eduPts.length-1])-4)+'" fill="#06B6D4" font-size="9" text-anchor="end" font-family="var(--fh)" font-weight="700">'+fmtK(_eduPts[_eduPts.length-1])+'</text>';
+      h+='<text x="'+_ex(_yrsToCollege)+'" y="'+(_ey2(_projCost)-4)+'" fill="rgba(249,115,22,.7)" font-size="8" text-anchor="end" font-family="var(--fh)">'+fmtK(_projCost)+'</text>';
+      h+='<text x="'+_ePL+'" y="'+(_eH-4)+'" fill="var(--mu)" font-size="7" font-family="var(--fh)">Now</text>';
+      h+='<text x="'+_ex(_yrsToCollege)+'" y="'+(_eH-4)+'" fill="var(--mu)" font-size="7" text-anchor="end" font-family="var(--fh)">Age 18</text>';
+      h+='</svg>';
+      var _eduGap=_projCost-_eduPts[_eduPts.length-1];
+      h+='<div style="display:flex;justify-content:space-between;margin-top:6px;font-size:10px">';
+      h+='<span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:2px;background:#06B6D4;display:inline-block"></span><span style="color:var(--mu)">Your savings</span></span>';
+      h+='<span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:2px;background:rgba(249,115,22,.5);display:inline-block;border-top:1px dashed rgba(249,115,22,.8)"></span><span style="color:var(--mu)">Projected cost</span></span>';
+      h+='<span style="font-weight:700;color:'+(_eduGap>0?'var(--or)':'var(--gr)')+'">'+(_eduGap>0?'Gap: '+fmtK(_eduGap):'Surplus: '+fmtK(Math.abs(_eduGap)))+'</span>';
+      h+='</div></div>';
+    }
   }
-  // Debt: strategy + ongoing usage
+  // Debt: strategy comparison (big clickable grid handles selection)
   if(a.type==='debt'&&CPLAN.debts.length){
-    h+='<div style="display:flex;gap:4px;flex-wrap:wrap;margin:6px 0">';
-    ['avalanche','snowball','hybrid','consolidation','ibc'].forEach(function(st){var sel3=CPLAN.debtStrategy===st;var lblMap={avalanche:'Avalanche',snowball:'Snowball',hybrid:'Hybrid',consolidation:'Consolidation',ibc:'IBC'};var colMap={consolidation:'rgba(91,155,255',ibc:'rgba(168,85,247'};var bc=colMap[st]||'rgba(249,115,22';h+='<button onclick="CPLAN.debtStrategy=\''+st+'\';_cpRenderPlanV2()" style="padding:4px 8px;font-family:var(--fh);font-size:9px;font-weight:700;border-radius:2px;cursor:pointer;min-height:28px;border:1px solid '+(sel3?bc+',.4)':'var(--bd)')+';background:'+(sel3?bc+',.1)':'transparent')+';color:'+(sel3?bc+',1)':'var(--mu)')+'">'+lblMap[st]+'</button>';});
-    h+='</div>';
     // Strategy timeframe comparison
     if(a.amount>0&&CPLAN.totalDebt>0){
       var _dPmt=a.amount+CPLAN.debtMin;var _dAvgR=0;
@@ -18488,17 +18614,22 @@ function _cpBuildCard(a,idx,isUnassigned){
       });
       h+='</div></div>';
     }
-    // Ongoing usage field
-    h+='<div style="display:flex;align-items:center;gap:6px;margin:4px 0"><span style="font-size:9px;color:var(--mu)">Still spending on cards?</span>';
-    h+='<div class="inp-prefix" style="width:100px"><span class="pfx" style="font-size:10px">$</span><input class="inp" type="number" value="'+(a.ongoingSpend||0)+'" placeholder="0" oninput="CPLAN.allocations['+idx+'].ongoingSpend=parseFloat(this.value)||0" style="padding-left:18px;min-height:28px;font-size:11px;width:100%"></div>';
-    h+='<span style="font-size:9px;color:var(--mu)">/mo</span></div>';
-    if(a.ongoingSpend>0){var eff=a.amount-a.ongoingSpend;h+='<div style="font-size:9px;color:'+(eff>0?'var(--yl)':'var(--rd)')+'">Effective paydown: '+(eff>0?fmt(eff)+'/mo net reduction':'⚠ Debt increasing — spending exceeds payment')+'</div>';}
   }
   // Completion estimate
-  if(a.target>0&&a.amount>0){var adj=a.type==='debt'?(a.ongoingSpend||0):0;var effAmt=Math.max(1,a.amount-adj);var moLeft=Math.ceil((a.target-(a.goalCurrent||0))/effAmt);
-    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:6px 8px;background:rgba(0,68,191,.03);border-radius:2px">';
+  if(a.target>0&&a.amount>0){
+    var moLeft;
+    if(a.type==='debt'&&CPLAN.totalDebt>0){
+      // Use amortization for debt payoff estimate
+      var _ceAvgR=0;if(CPLAN.debts.length)_ceAvgR=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.rate)||0)*(parseFloat(d.balance)||0);},0)/CPLAN.totalDebt/100/12;
+      var _ceBal=CPLAN.totalDebt,_ceMo=0,_cePmt=a.amount+CPLAN.debtMin;
+      while(_ceBal>0&&_ceMo<600){_ceMo++;_ceBal=Math.max(0,_ceBal*(1+_ceAvgR)-_cePmt);}
+      moLeft=_ceMo;
+    } else {
+      var effAmt=Math.max(1,a.amount);moLeft=Math.ceil((a.target-(a.goalCurrent||0))/effAmt);
+    }
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding:8px 10px;background:'+_cpHex2Rgba(color,0.06)+';border-radius:3px">';
     h+='<span style="font-size:10px;color:var(--mu)">Estimated completion</span>';
-    h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">~'+moLeft+' month'+(moLeft!==1?'s':'')+' <span style="font-size:9px;color:var(--mu)">('+new Date(Date.now()+moLeft*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+')</span></span>';
+    h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">~'+moLeft+' month'+(moLeft!==1?'s':'')+' <span style="font-size:9px;color:var(--mu)">('+new Date(Date.now()+moLeft*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+')</span></span>';
     h+='</div>';
   }
   // Detailed mode: return/fee breakdown
@@ -18506,9 +18637,9 @@ function _cpBuildCard(a,idx,isUnassigned){
     var gRate=Math.round(_cpGetGrossRate(a)*10000)/100;var fRate=Math.round(_cpGetFeeRate(a)*10000)/100;var nRate=Math.round((gRate-fRate)*100)/100;var rRate=Math.round((nRate-3)*100)/100;
     h+='<div style="margin-top:10px;padding:12px 14px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.1);border-radius:4px">';
     h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">RETURN ASSUMPTIONS</div>';
-    h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span style="font-size:10px;color:var(--mu);min-width:50px;font-weight:600">Gross</span><input type="range" min="0" max="15" step="0.25" value="'+gRate+'" oninput="_cpSetGrossReturn('+idx+',this.value)" style="flex:1;accent-color:#5B9BFF;color:#5B9BFF;height:5px"><span style="font-family:var(--fd);font-size:14px;color:#5B9BFF;min-width:45px;text-align:right">'+gRate.toFixed(1)+'%</span></div>';
+    h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span style="font-size:10px;color:var(--mu);min-width:50px;font-weight:600">Avg Return</span><input type="range" min="0" max="15" step="0.25" value="'+gRate+'" oninput="_cpSetGrossReturn('+idx+',this.value)" style="flex:1;accent-color:#5B9BFF;color:#5B9BFF;height:5px"><span style="font-family:var(--fd);font-size:14px;color:#5B9BFF;min-width:45px;text-align:right">'+gRate.toFixed(1)+'%</span></div>';
     h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span style="font-size:10px;color:var(--mu);min-width:50px;font-weight:600">Fees</span><input type="range" min="0" max="3" step="0.05" value="'+fRate+'" oninput="_cpSetFeeRate('+idx+',this.value)" style="flex:1;accent-color:var(--or);color:var(--or);height:5px"><span style="font-family:var(--fd);font-size:14px;color:var(--or);min-width:45px;text-align:right">-'+fRate.toFixed(2)+'%</span></div>';
-    h+='<div style="display:flex;gap:8px;font-size:10px;color:var(--mu);padding:8px;background:rgba(0,0,0,.15);border-radius:3px"><span>Gross <strong style="color:var(--gr)">'+gRate.toFixed(1)+'%</strong></span><span>→</span><span>Fees <strong style="color:var(--or)">-'+fRate.toFixed(2)+'%</strong></span><span>→</span><span>Net <strong style="color:#5B9BFF">'+nRate.toFixed(1)+'%</strong></span><span>→</span><span>Real <strong style="color:var(--yl)">'+rRate.toFixed(1)+'%</strong></span></div>';
+    h+='<div style="display:flex;gap:8px;font-size:10px;color:var(--mu);padding:8px;background:rgba(0,0,0,.15);border-radius:3px"><span>Return <strong style="color:var(--gr)">'+gRate.toFixed(1)+'%</strong></span><span>→</span><span>Fees <strong style="color:var(--or)">-'+fRate.toFixed(2)+'%</strong></span><span>→</span><span>After fees <strong style="color:#5B9BFF">'+nRate.toFixed(1)+'%</strong></span><span>→</span><span>After inflation <strong style="color:var(--yl)">'+rRate.toFixed(1)+'%</strong></span></div>';
     h+='</div>';
     // Year projections inline
     var rate2=_cpGetNetRate(a);var cf2=_cpGetCF(a);var b5=0,b10=0,b20=0;for(var yp=1;yp<=20;yp++){var cp2=a.amount*12*cf2;b5=yp<=5?(b5+cp2)*(1+rate2):b5;b10=yp<=10?(b10+cp2)*(1+rate2):b10;b20=(b20+cp2)*(1+rate2);}
@@ -19345,7 +19476,7 @@ function initClientPlan(){
   var c=fd.calcs||(fd.S&&fd.S.calcs)||{};var rawS=fd.S||{};
   CPLAN.income=c.inc||(rawS.incomeSources?rawS.incomeSources.reduce(function(t,s){return t+(parseFloat(s.amount)||0);},0):0);
   CPLAN.expenses=c.baseExp||0;if(!CPLAN.expenses&&rawS.expData){Object.keys(rawS.expData).forEach(function(k){CPLAN.expenses+=(parseFloat((rawS.expData[k]||{}).amount)||0);});}
-  CPLAN.debts=rawS.debts||[];CPLAN.debtMin=CPLAN.debts.reduce(function(t,x){return t+(parseFloat(x.payment)||0);},0);
+  CPLAN.debts=rawS.debts||[];CPLAN.debtMin=CPLAN.debts.reduce(function(t,x){return t+(parseFloat(x.min)||parseFloat(x.payment)||0);},0);
   CPLAN.totalDebt=c.totalDebt||CPLAN.debts.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);
   CPLAN.surplus=Math.max(0,CPLAN.income-CPLAN.expenses);CPLAN.age=parseInt(rawS.currentAge)||30;
   CPLAN.efBal=c.efBal||(rawS.assets?((parseFloat(rawS.assets.checking)||0)+(parseFloat(rawS.assets.savings)||0)):0);
