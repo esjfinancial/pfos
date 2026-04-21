@@ -18208,6 +18208,28 @@ function _cpConvertAIRecs(aiData){
 
   // ── POST-PROCESSING ──
 
+  // Fix PP1: Debt type force — any allocation with debt-related title MUST be type:'debt'
+  CPLAN.allocations.forEach(function(a){
+    if(a.type!=='debt'&&a.customName){
+      var nm=a.customName.toLowerCase();
+      if(nm.indexOf('debt')>=0||nm.indexOf('eliminate')>=0||nm.indexOf('payoff')>=0||nm.indexOf('pay off')>=0||nm.indexOf('credit card')>=0||nm.indexOf('negative amortization')>=0||nm.indexOf('high-interest')>=0||nm.indexOf('high interest')>=0){
+        a.type='debt';
+      }
+    }
+  });
+
+  // Fix PP1b: Protection type force — any allocation with protection-related title MUST be type:'protection' and $0
+  CPLAN.allocations.forEach(function(a){
+    if(a.customName){
+      var nm=a.customName.toLowerCase();
+      var isProtTitle=(nm.indexOf('term life')>=0||nm.indexOf('life insurance')>=0||nm.indexOf('disability')>=0||nm.indexOf('ltc')>=0||nm.indexOf('long-term care')>=0||nm.indexOf('long term care')>=0||nm.indexOf('umbrella')>=0);
+      // Only force to protection if it's NOT a growth vehicle (IBC/WL/IUL with funded amount)
+      if(isProtTitle&&a.type!=='wl'&&a.type!=='iul'&&a.type!=='ibc'){
+        a.type='protection';a.amount=0;
+      }
+    }
+  });
+
   // Fix 4: cascade fallback — freed money redistributes proportionally to ALL growth items
   // Empty cascade = simulation engine distributes proportionally (no single-destination override)
   CPLAN.allocations.forEach(function(a){
@@ -18292,6 +18314,34 @@ function _cpConvertAIRecs(aiData){
       }
     }
   });
+
+  // Fix PP8: Plan health minimum — ensure all major categories are funded for minimum 80 score
+  var _deployPool=Math.round((CPLAN.surplus||0)*0.85);
+  var _currentTotal=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
+  var _remaining=Math.max(0,_deployPool-_currentTotal);
+  var _hasDebt=CPLAN.allocations.some(function(a){return a.type==='debt'&&a.amount>0;});
+  var _hasRet=CPLAN.allocations.some(function(a){return(a.type==='roth'||a.type==='401k'||a.type==='roth401k'||a.type==='trad_ira'||a.type==='iul'||a.type==='wl'||a.type==='ibc')&&a.amount>0;});
+  var _hasEdu=!CPLAN.children.length||CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;});
+  var _hasProt=CPLAN.allocations.some(function(a){return a.type==='protection';});
+  // If missing critical categories and there's remaining pool, add minimum allocations
+  if(!_hasDebt&&CPLAN.totalDebt>0&&CPLAN.debts.some(function(d){return(parseFloat(d.rate)||0)>10;})&&_remaining>=100){
+    var dAmt=Math.min(_remaining,Math.round(_deployPool*0.3));
+    CPLAN.allocations.push({type:'debt',amount:dAmt,target:CPLAN.totalDebt,phase:1,cascade:'',customName:'Debt Payoff',reason:'Auto-added: high-rate debt must be addressed for plan health.'});
+    _remaining-=dAmt;
+  }
+  if(!_hasRet&&_remaining>=50){
+    var rAmt=Math.min(_remaining,Math.round(_deployPool*0.15));
+    CPLAN.allocations.push({type:'roth',amount:rAmt,target:0,phase:1,cascade:'',customName:'Roth IRA',reason:'Auto-added: retirement savings required for plan health.'});
+    _remaining-=rAmt;
+  }
+  if(!_hasEdu&&CPLAN.children.length>0&&_remaining>=50){
+    var eAmt=Math.min(_remaining,Math.round(_deployPool*0.08));
+    CPLAN.allocations.push({type:'edu',amount:eAmt,target:0,phase:1,cascade:'',eduVehicle:'529',reason:'Auto-added: education savings for children required for plan health.'});
+    _remaining-=eAmt;
+  }
+  if(!_hasProt&&(CPLAN.children.length>0||CPLAN.income>3000)){
+    CPLAN.allocations.push({type:'protection',amount:0,target:0,phase:1,cascade:'',customName:'Life Insurance Review',reason:'Auto-added: protection review required for plan health.'});
+  }
 
   if(aiData.summary)CPLAN._aiSummary=aiData.summary;
   if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
@@ -18777,11 +18827,12 @@ function _cpRenderPlanV2(){
   var _sim=CPLAN._sim||{};var _simEvents=(_sim.events||[]).filter(function(e){return e.freed>0&&e.type!=='debt_milestone';});
   var _allocPhases={};CPLAN.allocations.forEach(function(a){if(a.phase>0)_allocPhases[a.phase]=true;});
   var _availablePhases=[1];// Phase 1 always exists
-  // Phase 2 exists if: simulation has cascade events OR allocations are assigned to Phase 2+
+  // Phase 2 exists if: simulation has cascade events OR allocations assigned to Phase 2
   if(_simEvents.length>0||_allocPhases[2])_availablePhases.push(2);
-  if(_allocPhases[3]||(_simEvents.length>1))_availablePhases.push(3);
-  if(_allocPhases[4]||(_simEvents.length>2))_availablePhases.push(4);
-  // Support additional phases beyond 4
+  // Phase 3+ only if allocations are actually assigned there (not just cascade event count)
+  if(_allocPhases[3])_availablePhases.push(3);
+  if(_allocPhases[4])_availablePhases.push(4);
+  // Support additional phases beyond 4 only if items exist
   Object.keys(_allocPhases).forEach(function(k){var pn=parseInt(k);if(pn>4&&_availablePhases.indexOf(pn)<0)_availablePhases.push(pn);});
   _availablePhases.sort(function(a,b){return a-b;});
   // Ensure active tab is valid
@@ -18877,32 +18928,47 @@ function _cpRenderPlanV2(){
     h+='<div style="text-align:center;margin-top:8px"><button onclick="_cpShowAddMenu(1)" style="padding:6px 16px;font-family:var(--fh);font-size:10px;font-weight:700;background:transparent;border:1px dashed '+p.border+';color:'+p.color+';cursor:pointer;border-radius:2px;min-height:32px">+ Add to Phase 1</button></div>';
     h+='</div>';
   } else {
-    // Phase 2+: show Phase 1 cards grayed with boost amounts, then phase-specific items
+    // Phase 2+: SAME sheet — full cards with grayed completing items + boost indicators
     var _pCur2=CP_PHASE[_activeTab]||{name:'Phase '+_activeTab,color:'#94A3B8',border:'rgba(100,116,139,.2)',icon:'📌'};
     h+='<div id="cpPhase'+_activeTab+'" style="margin-bottom:14px">';
 
-    // Grayed Phase 1 cards with Phase 2 boost
-    if(_p1Items.length>0&&_sim.allocFuture){
+    // Render ALL Phase 1 allocations as full cards with Phase 2 treatment
+    if(_p1Items.length>0){
       _p1Items.forEach(function(a){
         var idx=CPLAN.allocations.indexOf(a);
-        var af=_sim.allocFuture?_sim.allocFuture[idx]:null;
+        var af=(_sim&&_sim.allocFuture)?_sim.allocFuture[idx]:null;
         var futureAmt=(af&&af.futureAmount>a.amount)?af.futureAmount:a.amount;
         var boost=futureAmt-a.amount;
-        var color=CP_COL[a.type]||'#94A3B8';var icon=CP_IC[a.type]||'⭐';
-        var nm=a.customName||CP_NM[a.type]||a.type;
+        var isCompleting=(a.type==='debt'||a.type==='ef'||(a.type==='custom'&&a.target>0));
+        var isActionOnly=(a.type==='protection'||(a.amount===0&&boost===0));
+        var color=CP_COL[a.type]||'#94A3B8';
 
-        h+='<div style="margin-bottom:6px;border-left:3px solid rgba(100,116,139,.2);background:rgba(100,116,139,.03);border-radius:0 4px 4px 0;padding:10px 14px;border-top:1px solid rgba(100,116,139,.06);border-right:1px solid rgba(100,116,139,.06);border-bottom:1px solid rgba(100,116,139,.06);opacity:0.7">';
-        h+='<div style="display:flex;align-items:center;justify-content:space-between">';
-        h+='<div style="display:flex;align-items:center;gap:6px"><span style="font-size:14px;opacity:0.5">'+icon+'</span><span style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--mu)">'+nm+'</span></div>';
-        h+='<div style="display:flex;align-items:center;gap:8px">';
-        h+='<span style="font-family:var(--fd);font-size:14px;color:var(--mu);text-decoration:line-through">'+fmt(a.amount)+'</span>';
-        if(boost>0)h+='<span style="font-family:var(--fd);font-size:18px;color:'+color+'">'+fmt(futureAmt)+'<span style="font-size:10px;color:var(--gr);margin-left:4px">+'+fmt(boost)+'</span></span>';
-        else h+='<span style="font-family:var(--fd);font-size:16px;color:var(--mu)">'+fmt(a.amount)+'</span>';
-        h+='</div></div>';
-        if(boost>0&&af&&af.boosts&&af.boosts.length>0){
-          h+='<div style="margin-top:4px;font-size:9px;color:var(--gr)">↑ Increased after: '+af.boosts.map(function(b){return b.from;}).join(', ')+'</div>';
+        // Skip $0 action items with no boost (term life, disability, estate — don't clutter Phase 2)
+        if(isActionOnly&&boost===0)return;
+
+        // Boost banner — shows Phase 1 → Phase 2 amount change
+        if(boost>0){
+          h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 10px;margin-bottom:-1px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.1);border-bottom:none;border-radius:4px 4px 0 0;font-size:10px">';
+          h+='<span style="color:var(--mu)">Phase 1:</span><span style="color:var(--mu);text-decoration:line-through">'+fmt(a.amount)+'/mo</span>';
+          h+='<span style="color:var(--gr)">→</span>';
+          h+='<span style="color:var(--gr);font-weight:700">Phase '+_activeTab+': '+fmt(futureAmt)+'/mo</span>';
+          h+='<span style="color:var(--gr);font-size:9px">(+'+fmt(boost)+')</span>';
+          if(af&&af.boosts&&af.boosts.length>0)h+='<span style="color:var(--mu);font-size:8px;margin-left:4px">after '+af.boosts[0].from+'</span>';
+          h+='</div>';
         }
-        h+='</div>';
+
+        // Completing items get grayed wrapper
+        if(isCompleting&&_sim&&_sim.debtFreeMonth>0){
+          h+='<div style="opacity:0.45;filter:grayscale(0.5)">';
+          h+=_cpBuildCard(a,idx,false);
+          h+='</div>';
+        } else {
+          // Active growth items — render full card (with boosted amount temporarily if Phase 2)
+          var origAmount=a.amount;
+          if(boost>0)a.amount=futureAmt;// Temporarily show future amount
+          h+=_cpBuildCard(a,idx,false);
+          if(boost>0)a.amount=origAmount;// Restore original
+        }
       });
     }
 
@@ -19028,7 +19094,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   if(a.type==='ef')h+='<div style="font-size:9px;color:rgba(91,155,255,.5);margin-bottom:4px">→ Direct to a High-Yield Savings Account (HYSA) for liquidity + interest</div>';
   // Guided mode: show growth rate + quick projections for growth cards
   if(!isD&&['roth','401k','roth401k','invest','iul','wl','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(a.type)>=0&&a.amount>0){
-    var _isInsurance=a.type==='iul'||a.type==='wl'||a.type==='ibc';
+    var _isInsurance=a.type==='iul'||a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&(a.eduVehicle==='wl'||a.eduVehicle==='iul'));
     var _gRate=Math.round((typeof _cpGetGrossRate==='function'?_cpGetGrossRate(a):0.07)*10000)/100;
     var _fRate=_isInsurance?0:Math.round((typeof _cpGetFeeRate==='function'?_cpGetFeeRate(a):0)*10000)/100;
     var _nRate=_isInsurance?_gRate:Math.round((_gRate-_fRate)*100)/100;
@@ -19167,6 +19233,94 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<span style="font-size:10px;color:var(--mu)">Estimated completion</span>';
     h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">~'+moLeft+' month'+(moLeft!==1?'s':'')+' <span style="font-size:9px;color:var(--mu)">('+new Date(Date.now()+moLeft*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+')</span></span>';
     h+='</div>';
+  }
+  // ── IBC Projection Chart — AV line + CV staircase ──
+  if(a.type==='debt'&&CPLAN.debtStrategy==='ibc'&&a.amount>0){
+    var _ibcPrem=a._ibcPremium||Math.round(a.amount*0.35);
+    var _ibcGrowthRate=0.04/12;// 4% WL illustrated rate monthly
+    var _ibcLoanRate=0.05/12;// 5% policy loan rate monthly
+    var _ibcHiDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.rate)||0)>10&&(parseFloat(d.balance)||0)>0;});
+    var _ibcSorted=_cpDebtSort(_ibcHiDebts,CPLAN.debtStrategy);
+    var _ibcDebtSim=_cpDebtSimulate(_ibcSorted,a.amount);
+    var _ibcTotalMonths=Math.min(360,(_ibcDebtSim.months||18)*3);// Show 3x debt payoff period
+    var _avData=[],_cvData=[],_ibcMilestones=[];
+    var _av=0,_outstandingLoans=0,_freedMins=0;
+    var _ibcCardOrder=(_ibcDebtSim.order||[]).slice();
+    for(var _im=0;_im<=_ibcTotalMonths;_im++){
+      // AV grows every month (premium + compound)
+      _av=(_av+_ibcPrem)*(1+_ibcGrowthRate);
+      // Check if a card is paid off this month — take policy loan for its balance
+      _ibcCardOrder.forEach(function(card){
+        if(card.month===_im){
+          _outstandingLoans+=(parseFloat(card.balance)||parseFloat(card.bal)||0);
+          _freedMins+=(parseFloat(card.min)||parseFloat(card.payment)||0);
+          _ibcMilestones.push({month:_im,label:card.name||'Card paid off',type:'payoff'});
+        }
+      });
+      // Loans accrue interest, freed mins repay loans
+      if(_outstandingLoans>0){
+        _outstandingLoans=_outstandingLoans*(1+_ibcLoanRate)-_freedMins;
+        if(_outstandingLoans<=0){
+          _outstandingLoans=0;
+          // CV = AV recovery point
+          if(_ibcMilestones.every(function(m){return m.type!=='recovery';})){
+            _ibcMilestones.push({month:_im,label:'Loans repaid (CV=AV)',type:'recovery'});
+          }
+        }
+      }
+      _avData.push(Math.round(_av));
+      _cvData.push(Math.round(Math.max(0,_av-_outstandingLoans)));
+    }
+    // Break-even milestone (CV > total premiums paid)
+    var _totalPremPaid=0;
+    for(var _be=0;_be<=_ibcTotalMonths;_be++){
+      _totalPremPaid+=_ibcPrem;
+      if(_cvData[_be]>=_totalPremPaid&&_be>12){_ibcMilestones.push({month:_be,label:'Break-even',type:'breakeven'});break;}
+    }
+    // Render SVG chart
+    var _iW=500,_iH=180,_iPL=45,_iPR=50,_iPT=16,_iPB=24;
+    var _iCW=_iW-_iPL-_iPR,_iCH=_iH-_iPT-_iPB;
+    var _iMaxV=Math.max.apply(null,_avData)||1;
+    function _ix(m){return _iPL+m/_ibcTotalMonths*_iCW;}
+    function _iy(v){return _iPT+_iCH-(v/_iMaxV)*_iCH;}
+    h+='<div style="margin-top:10px;padding:12px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.1);border-radius:4px">';
+    h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:2px">IBC POLICY PROJECTION</div>';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+    h+='<div style="font-size:9px;color:var(--mu)">Premium: '+fmt(_ibcPrem)+'/mo · Loan rate: 5% · Growth: 4%</div>';
+    h+='<div style="font-family:var(--fd);font-size:14px;color:#A855F7">'+fmtK(_avData[_ibcTotalMonths])+'<span style="font-size:9px;color:var(--mu)"> AV at yr '+Math.round(_ibcTotalMonths/12)+'</span></div>';
+    h+='</div>';
+    var _iSvg='<svg viewBox="0 0 '+_iW+' '+_iH+'" style="width:100%;height:auto;display:block;max-height:200px">';
+    // Grid lines
+    for(var _ig=0;_ig<=4;_ig++){var _gv=_iMaxV*_ig/4;_iSvg+='<line x1="'+_iPL+'" y1="'+_iy(_gv)+'" x2="'+(_iW-_iPR)+'" y2="'+_iy(_gv)+'" stroke="rgba(168,85,247,.06)" stroke-width="0.5"/>';_iSvg+='<text x="'+(_iPL-4)+'" y="'+(_iy(_gv)+3)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(_gv))+'</text>';}
+    // CV shaded area (drops and recovers)
+    var _cvPts='';for(var _ic=0;_ic<=_ibcTotalMonths;_ic++)_cvPts+=_ix(_ic)+','+_iy(_cvData[_ic])+' ';
+    var _cvBotPts='';for(var _ic2=_ibcTotalMonths;_ic2>=0;_ic2--)_cvBotPts+=_ix(_ic2)+','+_iy(0)+' ';
+    _iSvg+='<polygon points="'+_cvPts+_cvBotPts+'" fill="rgba(34,197,94,.12)"/>';
+    // CV line
+    _iSvg+='<polyline points="'+_cvPts.trim()+'" fill="none" stroke="rgba(34,197,94,.7)" stroke-width="1.5"/>';
+    // AV line (solid, always rising)
+    var _avPts='';for(var _ia=0;_ia<=_ibcTotalMonths;_ia++)_avPts+=_ix(_ia)+','+_iy(_avData[_ia])+' ';
+    _iSvg+='<polyline points="'+_avPts.trim()+'" fill="none" stroke="#A855F7" stroke-width="2"/>';
+    // Milestones
+    _ibcMilestones.forEach(function(ms){
+      if(ms.month<=0||ms.month>=_ibcTotalMonths)return;
+      var msCol=ms.type==='payoff'?'rgba(249,115,22,.5)':ms.type==='recovery'?'rgba(34,197,94,.6)':'rgba(91,155,255,.5)';
+      _iSvg+='<line x1="'+_ix(ms.month)+'" y1="'+_iPT+'" x2="'+_ix(ms.month)+'" y2="'+(_iH-_iPB)+'" stroke="'+msCol+'" stroke-width="0.5" stroke-dasharray="2,2"/>';
+      _iSvg+='<text x="'+_ix(ms.month)+'" y="'+(_iPT-3)+'" fill="'+msCol+'" font-size="6" text-anchor="middle" font-family="var(--fh)">'+ms.label+'</text>';
+    });
+    // End labels
+    _iSvg+='<text x="'+(_iW-_iPR+4)+'" y="'+(_iy(_avData[_ibcTotalMonths])+3)+'" fill="#A855F7" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(_avData[_ibcTotalMonths])+'</text>';
+    _iSvg+='<text x="'+(_iW-_iPR+4)+'" y="'+(_iy(_cvData[_ibcTotalMonths])+3)+'" fill="rgba(34,197,94,.8)" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(_cvData[_ibcTotalMonths])+'</text>';
+    // X axis labels (years)
+    var _ibcYrs=Math.round(_ibcTotalMonths/12);
+    for(var _yx=0;_yx<=_ibcYrs;_yx+=Math.max(1,Math.round(_ibcYrs/5))){_iSvg+='<text x="'+_ix(_yx*12)+'" y="'+(_iH-_iPB+14)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="middle" font-family="var(--fh)">Yr '+_yx+'</text>';}
+    _iSvg+='</svg>';
+    h+=_iSvg;
+    // Legend
+    h+='<div style="display:flex;gap:12px;font-size:9px;color:var(--mu);margin-top:4px">';
+    h+='<span><span style="display:inline-block;width:10px;height:2px;background:#A855F7;margin-right:3px;vertical-align:middle"></span>Accumulated Value</span>';
+    h+='<span><span style="display:inline-block;width:10px;height:8px;background:rgba(34,197,94,.2);border:1px solid rgba(34,197,94,.5);margin-right:3px;vertical-align:middle;border-radius:1px"></span>Cash Value (net of loans)</span>';
+    h+='</div></div>';
   }
   // Detailed mode: return/fee breakdown
   if(isD&&_cpTierHas('return_fee')&&['roth','401k','roth401k','invest','iul','wl','edu','trad_ira','solo401k','sep_ira'].indexOf(a.type)>=0&&a.amount>0){
@@ -19795,16 +19949,19 @@ function _cpRenderEFRunway(){
 function _cpRenderIncomeReplacement(){
   var el=document.getElementById('cplanIncomeReplace');if(!el)return;
   if(CPLAN.income<=0){el.innerHTML='';return;}
-  // Use simulation's projected retirement income if available (accounts for cascade boosts)
+  var _retVehicles=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
+  // Use simulation's retirement-only data if available
   var retIncome=0;
-  if(CPLAN._sim&&CPLAN._sim.projRetIncome>0){
-    retIncome=CPLAN._sim.projRetIncome;
+  if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length>0){
+    var retAtRetire=CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
+    retIncome=Math.round(retAtRetire*0.04/12);
   } else {
     var yrs=Math.max(1,65-CPLAN.age);
     CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;
+      if(_retVehicles.indexOf(a.type)<0)return;// Only retirement vehicles
       var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var bal=0;
       for(var y=1;y<=Math.min(yrs,40);y++){var c2=a.amount*12*cf;bal=(bal+c2)*(1+rate);}
-      if(a.type!=='ef'&&a.type!=='debt'&&a.type!=='house')retIncome+=Math.round(bal*0.04/12);
+      retIncome+=Math.round(bal*0.04/12);
     });
   }
   var replacePct=CPLAN.income>0?Math.round(retIncome/CPLAN.income*100):0;
@@ -20301,7 +20458,25 @@ function _cpRunSimulation(){
       _ibcPremiumPortion=debtA._ibcPremium||Math.round(debtA.amount*0.35);
       // Only the actual credit card payment portion gets freed (extra + minimums), NOT the IBC premium
       var _creditCardFreed=Math.max(0,debtA.amount-_ibcPremiumPortion)+hiRateMin;
-      events.push({month:debtSim.months,type:'debt',freed:_creditCardFreed,cascade:debtA.cascade,label:'High-rate debt free (IBC premium continues as growth)',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion});
+      // Calculate CV = AV recovery: freed minimums repay policy loans before redistributing
+      var _totalLoans=hiRateDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+      var _loanRate=0.05/12;// 5% policy loan rate
+      var _loanBal=_totalLoans;
+      var _cvAvMonths=0;
+      for(var _lm=0;_lm<360&&_loanBal>0;_lm++){
+        _loanBal=_loanBal*(1+_loanRate)-_creditCardFreed;
+        if(_loanBal<=0){_cvAvMonths=_lm+1;break;}
+      }
+      var _cvAvRecoveryMonth=debtSim.months+_cvAvMonths;
+      // Event 1: At debt-free — IBC premium continues, but freed mins go to loan repayment (freed=0 for redistribution)
+      events.push({month:debtSim.months,type:'debt',freed:0,cascade:'',label:'High-rate debt free — freed minimums repaying IBC policy loans',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion,_ibcLoanRepayment:_creditCardFreed});
+      // Event 2: At CV=AV recovery — NOW freed minimums redistribute to growth
+      if(_cvAvRecoveryMonth>debtSim.months){
+        events.push({month:_cvAvRecoveryMonth,type:'ibc_recovery',freed:_creditCardFreed,cascade:debtA.cascade,label:'IBC loans repaid (CV=AV) — freed minimums now redistributing',_ibcRecovery:true});
+      } else {
+        // Instant recovery (unlikely but handle gracefully)
+        events.push({month:debtSim.months,type:'debt',freed:_creditCardFreed,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion});
+      }
     } else {
       // Non-IBC: full debt allocation + minimums freed
       events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order});
@@ -20427,6 +20602,13 @@ function _cpRunSimulation(){
   var hiRatePmt=debtA?(debtA.amount+hiRateMin):hiRateMin;// Extra + high-rate minimums
   // Per-allocation balance tracking for chart bands
   var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt')allocSeries[a.type+'_'+i]=[];});
+  var _retOnlyByYear={};
+  var retirementData=[];
+  // Home equity tracking — get home value from profile if homeowner
+  var _rawS2=(APP._portalFd&&APP._portalFd.S)||{};
+  var _homeValue=parseFloat((_rawS2.assets&&_rawS2.assets.re)||0);
+  var _homeAppreciation=0.035;// 3.5% annual appreciation
+  var _mortgageBal=loRateDebts.filter(function(d){var nm=(d.name||d.type||'').toLowerCase();return nm.indexOf('house')>=0||nm.indexOf('mortgage')>=0||nm.indexOf('home')>=0;}).reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
 
   for(var yr=0;yr<=years;yr++){
     // Baseline: idle cash at 0%, ALL debt with min payments only
@@ -20452,6 +20634,11 @@ function _cpRunSimulation(){
       var key=a.type+'_'+idx;
       if(allocSeries[key])allocSeries[key].push(Math.round(bal));
       totalAssets+=bal;
+      // Track retirement-only assets separately
+      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'].indexOf(a.type)>=0){
+        if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
+        _retOnlyByYear[yr]+=bal;
+      }
     });
     // Remaining high-rate debt (accelerated payments)
     var remHi=hiRateTotal;
@@ -20460,7 +20647,19 @@ function _cpRunSimulation(){
     var remLo=loRateTotal;
     for(var dm2=0;dm2<yr*12;dm2++){remLo=Math.max(0,remLo*(1+avgLoRate)-loRateMin);if(remLo<1)remLo=0;}
     var unBal=Math.max(0,CPLAN.surplus-CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0))*12*yr;
-    netWorthData.push(Math.round(totalAssets+unBal-remHi-remLo));
+    // Home equity for NW: home value appreciates, mortgage amortizes
+    var _homeEq=0;
+    if(_homeValue>0){
+      var _curHomeVal=Math.round(_homeValue*Math.pow(1+_homeAppreciation,yr));
+      var _remMortgage=_mortgageBal;
+      var _mortRate=avgLoRate>0?avgLoRate:0.052/12;
+      var _mortPmt=loRateMin>0?loRateMin:0;
+      for(var _hm=0;_hm<yr*12;_hm++){_remMortgage=Math.max(0,_remMortgage*(1+_mortRate)-_mortPmt);if(_remMortgage<1)_remMortgage=0;}
+      _homeEq=Math.max(0,_curHomeVal-_remMortgage);
+    }
+    netWorthData.push(Math.round(totalAssets+unBal-remHi-remLo+_homeEq));
+    // Retirement-only projection (excludes edu, invest bridge, EF, custom goals, home equity)
+    retirementData.push(Math.round(_retOnlyByYear[yr]||0));
   }
 
   // ── 4. Calculate trajectory metrics for health score ──
@@ -20478,6 +20677,7 @@ function _cpRunSimulation(){
   // Store result
   CPLAN._sim={
     netWorth:netWorthData,
+    retirement:retirementData,
     baseline:baselineData,
     allocFuture:allocFuture,
     allocSeries:allocSeries,
@@ -20493,16 +20693,27 @@ function _cpRunSimulation(){
 
 function _cpRenderChart(){
   var el=document.getElementById('cplanChart');if(!el)return;
-  var _chartGrowthTypes=['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','ef','house','rental'];
+  if(!CPLAN._chartView)CPLAN._chartView='nw';
+  var _isRetView=CPLAN._chartView==='retirement';
+  var _retTypes=['roth','401k','roth401k','iul','wl','invest','trad_ira','solo401k','sep_ira','hsa','ibc'];
+  var _chartGrowthTypes=_isRetView?_retTypes:['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','ef','house','rental'];
   var active=CPLAN.allocations.filter(function(a){
     if(a.type==='protection'||a.type==='debt')return false;
     if(a.type==='custom'&&a.amount===0)return false;
+    if(_isRetView&&_retTypes.indexOf(a.type)<0)return false;// Retirement view: only retirement vehicles
     if(_chartGrowthTypes.indexOf(a.type)<0&&a.type!=='custom')return false;
     if(a.amount>0)return true;
     if(CPLAN._sim&&CPLAN._sim.allocFuture){var idx=CPLAN.allocations.indexOf(a);return CPLAN._sim.allocFuture[idx]&&CPLAN._sim.allocFuture[idx].futureAmount>0;}
     return false;
   });
   if(!active.length&&!CPLAN._sim){el.innerHTML='';return;}
+  // ── Chart toggle: Net Worth vs Retirement ──
+  var _toggleH='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+  _toggleH+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">'+(_isRetView?'RETIREMENT PROJECTION':'NET WORTH PROJECTION')+'</div>';
+  _toggleH+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
+  _toggleH+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderChart()" style="padding:4px 12px;font-family:var(--fh);font-size:9px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
+  _toggleH+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderChart()" style="padding:4px 12px;font-family:var(--fh);font-size:9px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
+  _toggleH+='</div></div>';
   var W=600,H=260,padL=50,padR=55,padT=24,padB=28;var years=30;
 
   // ── Use simulation data if available, else fall back to static ──
@@ -20510,7 +20721,7 @@ function _cpRenderChart(){
   var baselineData,totalData,rawSeries;
   if(sim&&sim.netWorth&&sim.netWorth.length>0){
     baselineData=sim.baseline;
-    totalData=sim.netWorth;
+    totalData=_isRetView?(sim.retirement||sim.netWorth):sim.netWorth;
     // Build rawSeries from sim.allocSeries for displacement bands
     rawSeries={};
     active.forEach(function(a,aIdx){
@@ -20656,8 +20867,8 @@ function _cpRenderChart(){
   svg+='<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;font-size:10px;color:var(--mu);margin-top:6px">';
   svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:rgba(100,116,139,.4);margin-right:4px;vertical-align:middle;border-top:1px dashed rgba(100,116,139,.5)"></span>Do nothing ('+fmtK(baselineData[years])+')</span>';
   active.forEach(function(a){svg+='<span><span style="display:inline-block;width:12px;height:8px;border-radius:1px;background:'+CP_COL[a.type]+';opacity:0.4;margin-right:4px;vertical-align:middle"></span>'+(a.customName||CP_NM[a.type])+'</span>';});
-  svg+='<span><span style="display:inline-block;width:12px;height:3px;border-radius:1px;background:#5B9BFF;margin-right:4px;vertical-align:middle"></span>This plan ('+fmtK(totalData[years])+')</span></div>';
-  el.innerHTML=svg;
+  svg+='<span><span style="display:inline-block;width:12px;height:3px;border-radius:1px;background:#5B9BFF;margin-right:4px;vertical-align:middle"></span>'+(_isRetView?'Retirement':'This plan')+' ('+fmtK(totalData[years])+')</span></div>';
+  el.innerHTML=_toggleH+svg;
 }
 
 function _cpRenderOutcomes(){
