@@ -18964,6 +18964,23 @@ function _cpRenderPlanV2(){
     });
     h+='</div></div>';
     h+='<div style="font-size:8px;color:var(--gr);margin-top:2px">Phase '+_activeTab+': '+fmt(_futureTotal)+'/mo (same surplus — redistributed)</div>';
+    // Phase 2+ deployment legend — show each allocation's future amount
+    h+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:4px;margin-bottom:4px">';
+    _sim.allocFuture.forEach(function(af){
+      var a=CPLAN.allocations[af.idx];
+      if(a.type==='debt'||a.type==='ef')return;
+      if(a.type==='protection'&&a.amount===0)return;
+      var fa=af.futureAmount||af.currentAmount||0;
+      if(fa<=0)return;
+      var nm=a.customName||CP_NM[a.type]||a.type;
+      var boost=fa-(af.currentAmount||0);
+      h+='<div style="display:flex;align-items:center;gap:4px;font-size:9px;color:var(--mu)">';
+      h+='<div style="width:8px;height:8px;border-radius:2px;background:'+(CP_COL[a.type]||'#94A3B8')+';opacity:0.7;flex-shrink:0"></div>';
+      h+=nm+' <span style="color:'+(CP_COL[a.type]||'#94A3B8')+';font-weight:700">'+fmt(fa)+'</span>';
+      if(boost>0)h+=' <span style="color:var(--gr);font-size:8px">(+'+fmt(boost)+')</span>';
+      h+='</div>';
+    });
+    h+='</div>';
     h+='</div>';
   }
 
@@ -18994,22 +19011,30 @@ function _cpRenderPlanV2(){
     h+='<div id="cpPhase'+_activeTab+'" style="margin-bottom:14px">';
 
     // Render ALL Phase 1 allocations as full cards with current phase treatment
-    // Calculate current phase trigger month for base amount calculation
+    // Calculate current and next phase trigger months for boost filtering
     var _curPhaseTrigger=_phaseTriggers[_activeTab];
     var _curTriggerMonth=(_curPhaseTrigger&&_curPhaseTrigger.month)||0;
+    var _nextPhaseTrigger=_phaseTriggers[_activeTab+1];
+    var _nextTriggerMonth=(_nextPhaseTrigger&&_nextPhaseTrigger.month)||9999;
     if(_p1Items.length>0){
       _p1Items.forEach(function(a){
         var idx=CPLAN.allocations.indexOf(a);
         var af=(_sim&&_sim.allocFuture)?_sim.allocFuture[idx]:null;
-        var futureAmt=(af&&af.futureAmount>a.amount)?af.futureAmount:a.amount;
-        // For Phase 3+: calculate base as amount after previous phase boosts
+        // Calculate amount for THIS phase only (not future phases)
         var baseAmt=a.amount;
-        if(_activeTab>2&&af&&af.boosts&&af.boosts.length>0){
+        var phaseAmt=a.amount;
+        if(af&&af.boosts&&af.boosts.length>0){
           af.boosts.forEach(function(b){
-            if(b.month<_curTriggerMonth)baseAmt+=b.amount;
+            if(b.month<_curTriggerMonth)baseAmt+=b.amount;// Previous phase boosts → base
+            if(b.month>=_curTriggerMonth&&b.month<_nextTriggerMonth)phaseAmt+=b.amount;// This phase boosts
+          });
+          if(_activeTab===2)baseAmt=a.amount;// Phase 2 base is always Phase 1 amount
+          phaseAmt=baseAmt;// Start from base
+          af.boosts.forEach(function(b){
+            if(b.month>=_curTriggerMonth&&b.month<_nextTriggerMonth)phaseAmt+=b.amount;
           });
         }
-        var boost=futureAmt-baseAmt;
+        var boost=phaseAmt-baseAmt;
         var isCompleting=(a.type==='debt'||a.type==='ef'||(a.type==='custom'&&a.target>0));
         var isActionOnly=(a.type==='protection'||(baseAmt===0&&boost<=0));
         var color=CP_COL[a.type]||'#94A3B8';
@@ -19023,13 +19048,14 @@ function _cpRenderPlanV2(){
           h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 10px;margin-bottom:-1px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.1);border-bottom:none;border-radius:4px 4px 0 0;font-size:10px">';
           h+='<span style="color:var(--mu)">'+_prevPhaseLabel+':</span><span style="color:var(--mu);text-decoration:line-through">'+fmt(baseAmt)+'/mo</span>';
           h+='<span style="color:var(--gr)">→</span>';
-          h+='<span style="color:var(--gr);font-weight:700">Phase '+_activeTab+': '+fmt(futureAmt)+'/mo</span>';
+          h+='<span style="color:var(--gr);font-weight:700">Phase '+_activeTab+': '+fmt(phaseAmt)+'/mo</span>';
           h+='<span style="color:var(--gr);font-size:9px">(+'+fmt(boost)+')</span>';
           if(af&&af.boosts&&af.boosts.length>0){
-            // Find the boost relevant to THIS phase
-            var _relevantBoost=af.boosts.find(function(b){return b.month>=_curTriggerMonth;})||af.boosts[af.boosts.length-1];
-            var _bDate=_relevantBoost.month?new Date(Date.now()+_relevantBoost.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'}):'';
-            h+='<span style="color:var(--mu);font-size:8px;margin-left:4px">after '+_relevantBoost.from+(_bDate?' ('+_bDate+')':'')+'</span>';
+            var _relevantBoost=af.boosts.find(function(b){return b.month>=_curTriggerMonth&&b.month<_nextTriggerMonth;})||af.boosts.find(function(b){return b.month>=_curTriggerMonth;});
+            if(_relevantBoost){
+              var _bDate=_relevantBoost.month?new Date(Date.now()+_relevantBoost.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'}):'';
+              h+='<span style="color:var(--mu);font-size:8px;margin-left:4px">after '+_relevantBoost.from+(_bDate?' ('+_bDate+')':'')+'</span>';
+            }
           }
           h+='</div>';
         }
@@ -19040,9 +19066,9 @@ function _cpRenderPlanV2(){
           h+=_cpBuildCard(a,idx,false);
           h+='</div>';
         } else {
-          // Active growth items — render full card (with boosted amount temporarily if Phase 2)
+          // Active growth items — render full card (with phase-appropriate amount)
           var origAmount=a.amount;
-          if(boost>0)a.amount=futureAmt;// Temporarily show future amount
+          if(boost>0)a.amount=phaseAmt;// Temporarily show phase-specific amount
           h+=_cpBuildCard(a,idx,false);
           if(boost>0)a.amount=origAmount;// Restore original
         }
@@ -20786,7 +20812,7 @@ function _cpRenderChart(){
   var el=document.getElementById('cplanChart');if(!el)return;
   if(!CPLAN._chartView)CPLAN._chartView='nw';
   var _isRetView=CPLAN._chartView==='retirement';
-  var _retTypes=['roth','401k','roth401k','iul','wl','invest','trad_ira','solo401k','sep_ira','hsa','ibc'];
+  var _retTypes=['roth','401k','roth401k','iul','wl','trad_ira','solo401k','sep_ira','hsa','ibc'];
   var _chartGrowthTypes=_isRetView?_retTypes:['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','ef','house','rental'];
   var active=CPLAN.allocations.filter(function(a){
     if(a.type==='protection'||a.type==='debt')return false;
