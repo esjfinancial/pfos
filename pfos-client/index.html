@@ -17453,383 +17453,266 @@ function _cpUpdateAdvisoryNav(){
 }
 
 // ── TRACKING PAGE ─────────────────────────────────────
+var _cpTracking={};// {month: {allocIdx: {done:bool, actual:number, note:''}, ...}}
+function _trackKey(){return new Date().toISOString().slice(0,7);}// "2026-04"
+function _trackMark(idx,done,actual){
+  var mk=_trackKey();if(!_cpTracking[mk])_cpTracking[mk]={};
+  _cpTracking[mk][idx]={done:done,actual:actual||0,note:'',ts:Date.now()};
+  // If missed, adjust plan simulation
+  if(!done&&typeof CPLAN!=='undefined'&&CPLAN.allocations[idx]){
+    CPLAN._missedMonths=CPLAN._missedMonths||{};
+    if(!CPLAN._missedMonths[mk])CPLAN._missedMonths[mk]=[];
+    CPLAN._missedMonths[mk].push(idx);
+  }
+  renderClientTracking();
+  // Save tracking data with plan
+  if(typeof _cpSavePlan==='function')setTimeout(_cpSavePlan,500);
+}
 function renderClientTracking(){
   var el=document.getElementById('clientTrackingContent');if(!el)return;
-  var fd=APP._portalFd;if(!fd){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your financial data in "My Financial Data" first.</div>';return;}
-  var c=fd.calcs||(fd.S&&fd.S.calcs)||{};var rawS=fd.S||{};
-  if(!c.inc){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your income to start tracking.</div>';return;}
-  var h='';
-  var hasPlan=typeof CPLAN!=='undefined'&&CPLAN.allocations&&CPLAN.allocations.some(function(a){return a.amount>0;});
-  var now=new Date();var monthName=now.toLocaleString('default',{month:'long',year:'numeric'});
+  var fd=APP._portalFd;if(!fd){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your financial data first.</div>';return;}
+  if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length){
+    el.innerHTML='<div style="text-align:center;padding:40px"><div style="font-size:36px;margin-bottom:12px">📋</div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:6px">No Plan Yet</div><div style="font-size:12px;color:var(--mu);margin-bottom:16px">Create a financial plan first to start tracking your progress.</div><button onclick="showClientPage(\'plan\');initClientPlan()" style="padding:10px 24px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:40px">Build My Plan →</button></div>';
+    return;
+  }
+  var h='';var mk=_trackKey();var monthData=_cpTracking[mk]||{};
+  var funded=CPLAN.allocations.filter(function(a){return a.amount>0;});
+  var actions=CPLAN.allocations.filter(function(a){return a.amount===0&&a.type==='protection';});
+  var done=0;var total=funded.length;
+  funded.forEach(function(a){var idx=CPLAN.allocations.indexOf(a);if(monthData[idx]&&monthData[idx].done)done++;});
+  var pct=total>0?Math.round(done/total*100):0;
+  var monthName=new Date().toLocaleDateString('en-US',{month:'long',year:'numeric'});
 
-  if(hasPlan){
-    var planned=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
-    var completed=CPLAN.allocations.filter(function(a){return a._completed;}).reduce(function(t,a){return t+a.amount;},0);
-    var pct=planned>0?Math.min(100,Math.round(completed/planned*100)):0;
-    var depCol=pct>=80?'var(--gr)':pct>=50?'var(--yl)':'var(--or)';
-    var activeCount=CPLAN.allocations.filter(function(a){return a.amount>0;}).length;
-    var doneCount=CPLAN.allocations.filter(function(a){return a.amount>0&&a._completed;}).length;
+  // ═══ MONTH HEADER ═══
+  h+='<div style="display:grid;grid-template-columns:auto 1fr;gap:20px;margin-bottom:20px;align-items:center">';
+  h+='<div style="position:relative;width:100px;height:100px">';
+  h+='<svg viewBox="0 0 120 120" style="width:100px;height:100px;transform:rotate(-90deg)"><circle cx="60" cy="60" r="54" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="8"/><circle cx="60" cy="60" r="54" fill="none" stroke="'+(pct>=100?'var(--gr)':pct>=50?'#5B9BFF':'var(--or)')+'" stroke-width="8" stroke-linecap="round" stroke-dasharray="'+Math.round(339*pct/100)+' 339"/></svg>';
+  h+='<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><div style="font-family:var(--fd);font-size:28px;color:'+(pct>=100?'var(--gr)':'#5B9BFF')+'">'+pct+'%</div></div></div>';
+  h+='<div>';
+  h+='<div style="font-family:var(--fh);font-size:18px;font-weight:700;color:var(--wh)">'+monthName+'</div>';
+  h+='<div style="font-size:12px;color:var(--mu);margin-top:2px">'+done+' of '+total+' allocations tracked</div>';
+  // Summary stats
+  var totalPlanned=funded.reduce(function(t,a){return t+a.amount;},0);
+  var totalActual=0;funded.forEach(function(a){var idx=CPLAN.allocations.indexOf(a);var md=monthData[idx];if(md&&md.done)totalActual+=md.actual||a.amount;});
+  h+='<div style="display:flex;gap:16px;margin-top:8px">';
+  h+='<div style="font-size:11px;color:var(--mu)">Planned: <strong style="color:var(--wh)">'+fmt(totalPlanned)+'/mo</strong></div>';
+  h+='<div style="font-size:11px;color:var(--mu)">Actual: <strong style="color:'+(totalActual>=totalPlanned?'var(--gr)':'var(--yl)')+'">'+fmt(totalActual)+'/mo</strong></div>';
+  h+='</div></div></div>';
 
-    // Deployment gauge + key stats (side by side)
-    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">';
-    // Circular gauge
-    h+='<div class="info-card" style="padding:18px 16px;text-align:center">';
-    h+='<div style="position:relative;width:80px;height:80px;margin:0 auto 8px">';
-    h+='<svg viewBox="0 0 80 80" style="transform:rotate(-90deg)"><circle cx="40" cy="40" r="34" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="6"/><circle cx="40" cy="40" r="34" fill="none" stroke="'+depCol+'" stroke-width="6" stroke-linecap="round" stroke-dasharray="'+Math.round(pct*2.136)+' 213.6" style="transition:stroke-dasharray .5s"/></svg>';
-    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;flex-direction:column"><span style="font-family:var(--fd);font-size:26px;color:'+depCol+'">'+pct+'</span><span style="font-size:8px;color:var(--mu)">% done</span></div></div>';
-    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+monthName+'</div>';
-    h+='<div style="font-size:10px;color:var(--mu);margin-top:2px">'+doneCount+' of '+activeCount+' actions completed</div>';
-    h+='</div>';
-    // Key tracking stats
-    h+='<div class="info-card" style="padding:16px">';
-    h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">This Month</div>';
-    var trkMetrics=[
-      {l:'Planned',v:fmt(planned)+'/mo',c:'var(--wh)'},
-      {l:'Deployed',v:fmt(completed)+'/mo',c:depCol},
-      {l:'Remaining',v:fmt(Math.max(0,planned-completed)),c:pct>=100?'var(--gr)':'var(--yl)'},
-      {l:'Surplus used',v:planned>0&&CPLAN.surplus>0?Math.round(planned/CPLAN.surplus*100)+'%':'—',c:'#5B9BFF'}
-    ];
-    trkMetrics.forEach(function(m){h+='<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:12px"><span style="color:var(--mu)">'+m.l+'</span><span style="font-family:var(--fh);font-weight:700;color:'+m.c+'">'+m.v+'</span></div>';});
-    h+='</div></div>';
+  // ═══ ALLOCATION CARDS ═══
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Monthly Execution</div>';
+  funded.forEach(function(a){
+    var idx=CPLAN.allocations.indexOf(a);
+    var md=monthData[idx];
+    var isDone=md&&md.done;
+    var isMissed=md&&md.done===false;
+    var color=CP_COL[a.type]||'#94A3B8';
+    var icon=CP_IC[a.type]||'⭐';
+    var nm=a.customName||CP_NM[a.type]||a.type;
+    var borderCol=isDone?'var(--gr)':isMissed?'var(--rd)':color;
 
-    // Per-allocation tracking cards
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Plan execution</div>';
-    CPLAN.allocations.forEach(function(a,idx){
-      if(a.amount<=0)return;
-      var icon=CP_IC[a.type]||'📌';var color=CP_COL[a.type]||'#94A3B8';
-      var name=a.customName||CP_NM[a.type]||a.type;
-      var isDone=a._completed||false;
-      h+='<div class="info-card" style="margin-bottom:8px;border-left:3px solid '+color+';padding:14px 16px">';
-      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
-      h+='<div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">'+icon+'</span><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+name+'</div><div style="font-size:11px;color:var(--mu)">'+fmt(a.amount)+'/mo planned</div></div></div>';
-      h+='<div style="text-align:right">';
-      if(isDone){
-        h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr)">✓ Completed</div>';
-        if(a._completedDate)h+='<div style="font-size:9px;color:var(--mu)">'+new Date(a._completedDate).toLocaleDateString()+'</div>';
-      } else {
-        h+='<button onclick="_cpMarkComplete('+idx+')" style="padding:5px 12px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:30px">Mark Done</button>';
+    h+='<div style="display:flex;align-items:center;gap:12px;padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+borderCol+';border-radius:0 2px 2px 0;margin-bottom:6px;transition:border-color .15s'+(isDone?';opacity:0.6':'')+'" onmouseover="this.style.borderColor=\'#5B9BFF\'" onmouseout="this.style.borderLeftColor=\''+borderCol+'\';this.style.borderColor=\'var(--bd)\';this.style.borderLeftColor=\''+borderCol+'\'">';
+    // Icon
+    h+='<div style="width:36px;height:36px;border-radius:8px;background:linear-gradient(135deg,'+color+'20,'+color+'08);display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+icon+'</div>';
+    // Info
+    h+='<div style="flex:1;min-width:0">';
+    h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)"'+(isDone?' style="text-decoration:line-through;opacity:0.6"':'')+'>'+nm+'</div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:1px">'+fmt(a.amount)+'/mo planned</div>';
+    // Growth projection
+    if(['roth','401k','roth401k','invest','iul','wl','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(a.type)>=0){
+      var rate=typeof _cpGetNetRate==='function'?_cpGetNetRate(a):0.065;
+      var yrs=Math.max(1,65-(CPLAN.age||35));var bal=0;for(var y=1;y<=yrs;y++)bal=(bal+a.amount*12)*(1+rate);
+      h+='<div style="font-size:9px;color:var(--mu);margin-top:1px">Projected: '+fmtK(Math.round(bal))+' at retirement</div>';
+    }
+    if(a.type==='debt'){
+      var hiDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.rate)||0)>10;});
+      if(hiDebts.length&&typeof _cpDebtSimulate==='function'){
+        var sorted=typeof _cpDebtSort==='function'?_cpDebtSort(hiDebts,CPLAN.debtStrategy||'avalanche'):hiDebts;
+        var sim=_cpDebtSimulate(sorted,a.amount);
+        h+='<div style="font-size:9px;color:var(--mu);margin-top:1px">Debt free in ~'+sim.months+' months · '+fmtK(sim.interest)+' interest</div>';
       }
-      h+='</div></div>';
-      // Projection reminder
-      var proj=_cpProj(a);if(proj)h+='<div style="font-size:10px;color:rgba(226,232,240,.5);margin-top:4px;line-height:1.4">'+proj+'</div>';
-      h+='</div>';
-    });
-  } else {
-    h+='<div class="info-card" style="text-align:center;padding:40px 20px;margin-bottom:14px">';
-    h+='<div style="font-size:40px;margin-bottom:12px">📋</div>';
-    h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:6px">No Financial Plan Yet</div>';
-    h+='<div style="font-size:12px;color:var(--mu);line-height:1.7;max-width:400px;margin:0 auto 14px">Build your financial plan first, then come back here to track your monthly execution.</div>';
-    h+='<button onclick="showClientPage(\'plan\');initClientPlan()" class="btn" style="width:auto;padding:10px 24px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-size:12px;min-height:44px">Go to My Financial Plan →</button>';
-    h+='</div>';
-  }
-
-  // Goals progress
-  var goals=rawS.goals||[];
-  if(goals.length){
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:16px 0 10px">Goals progress</div>';
-    goals.forEach(function(g){
-      var gpct=g.target>0?Math.min(100,Math.round((g.current||g.balance||0)/g.target*100)):0;
-      var gCol=gpct>=100?'var(--gr)':gpct>=50?'#5B9BFF':'var(--yl)';
-      h+='<div class="info-card" style="margin-bottom:8px;padding:14px 16px">';
-      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+esc(g.name)+'</span><span style="font-family:var(--fd);font-size:18px;color:'+gCol+'">'+gpct+'%</span></div>';
-      h+='<div style="height:6px;background:rgba(0,68,191,.08);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+gpct+'%;background:'+gCol+';border-radius:3px;transition:width .3s"></div></div>';
-      h+='<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mu);margin-top:6px"><span>'+fmt(g.current||g.balance||0)+' saved</span><span>'+fmt(g.target)+' target</span></div>';
-      h+='</div>';
-    });
-  }
-
-  // Debt payoff with payoff timeline
-  var debts=(rawS.debts||[]).filter(function(d){return(parseFloat(d.balance)||0)>0;});
-  if(debts.length&&c.totalDebt>0){
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:16px 0 10px">Debt payoff</div>';
-    if(hasPlan&&CPLAN.debtStrategy){
-      var stNames={avalanche:'Avalanche',snowball:'Snowball',hybrid:'Hybrid',consolidation:'Consolidation',ibc:'IBC A&L'};
-      var debtAlloc=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
-      var estMonths=debtAlloc?Math.ceil(c.totalDebt/(debtAlloc.amount+c.totalMin||1)):0;
-      h+='<div class="info-card" style="padding:14px 16px;margin-bottom:8px;border-left:3px solid var(--or)">';
-      h+='<div style="display:flex;justify-content:space-between;align-items:center">';
-      h+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+fmtK(c.totalDebt)+' total</div>';
-      h+='<div style="font-size:11px;color:var(--mu)">'+debts.length+' account'+(debts.length>1?'s':'')+' · '+(stNames[CPLAN.debtStrategy]||'')+ ' strategy</div></div>';
-      if(debtAlloc)h+='<div style="text-align:right"><div style="font-family:var(--fd);font-size:20px;color:var(--or)">~'+estMonths+'<span style="font-size:10px">mo</span></div><div style="font-size:9px;color:var(--mu)">to payoff</div></div>';
-      h+='</div></div>';
     }
-    debts.forEach(function(d){
-      var bal=parseFloat(d.balance)||0;var rate=parseFloat(d.rate)||0;var rateCol=rate>=20?'var(--rd)':rate>=15?'var(--or)':rate>=8?'var(--yl)':'var(--gr)';
-      h+='<div class="info-card" style="margin-bottom:6px;padding:12px 14px;border-left:3px solid '+(rate>=15?'var(--rd)':'var(--or)')+'">';
-      h+='<div style="display:flex;justify-content:space-between;align-items:center">';
-      h+='<div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+esc(d.name||d.type||'Debt')+'</div>';
-      h+='<div style="font-size:10px;color:var(--mu)">'+fmt(parseFloat(d.payment)||0)+'/mo min</div></div>';
-      h+='<div style="text-align:right"><div style="font-family:var(--fd);font-size:16px;color:var(--or)">'+fmtK(bal)+'</div>';
-      h+='<div style="font-size:10px;color:'+rateCol+'">'+rate.toFixed(1)+'% APR</div></div>';
-      h+='</div></div>';
-    });
-  }
-
-  // Bills this month (from bill_calendar if available)
-  if(APP.currentClientId){
-    h+='<div id="trkBillsSummary" style="margin:16px 0 0"></div>';
-    // Async load bills
-    setTimeout(function(){
-      db.from('bill_calendar').select('*').eq('client_id',APP.currentClientId).eq('is_active',true).then(function(res){
-        var bEl=document.getElementById('trkBillsSummary');if(!bEl)return;
-        var bills=(res.data||[]);if(!bills.length){bEl.innerHTML='';return;}
-        var now2=new Date();var curDay=now2.getDate();var curMonth=now2.getMonth();
-        var totalDue=0;var paidCount=0;var dueCount=0;
-        bills.forEach(function(b){
-          totalDue+=parseFloat(b.amount)||0;
-          if(b.last_paid_date){var lp=new Date(b.last_paid_date);if(lp.getMonth()===curMonth)paidCount++;}
-          if((b.due_day||1)<=curDay&&!(b.last_paid_date&&new Date(b.last_paid_date).getMonth()===curMonth))dueCount++;
-        });
-        var bh='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Bills this month</div>';
-        bh+='<div class="info-card" style="padding:14px 16px">';
-        bh+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
-        bh+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+bills.length+' bill'+(bills.length>1?'s':'')+'</div>';
-        bh+='<div style="font-size:11px;color:var(--mu)">'+fmt(totalDue)+'/mo total</div></div>';
-        bh+='<div style="text-align:right"><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr)">'+paidCount+' paid</span>';
-        if(dueCount>0)bh+=' · <span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--or)">'+dueCount+' due</span>';
-        bh+='</div></div>';
-        // Progress bar
-        var billPct=bills.length>0?Math.round(paidCount/bills.length*100):0;
-        bh+='<div style="height:6px;background:rgba(0,68,191,.06);border-radius:3px;overflow:hidden;margin-bottom:8px"><div style="height:100%;width:'+billPct+'%;background:'+(billPct>=80?'var(--gr)':billPct>=50?'var(--yl)':'var(--or)')+';border-radius:3px"></div></div>';
-        // Individual bills (collapsed, show first 5)
-        var shown=bills.sort(function(a,b){return(a.due_day||1)-(b.due_day||1);}).slice(0,5);
-        shown.forEach(function(b2){
-          var isPaid=b2.last_paid_date&&new Date(b2.last_paid_date).getMonth()===curMonth;
-          var pastDue=(b2.due_day||1)<curDay&&!isPaid;
-          bh+='<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;border-bottom:1px solid rgba(0,68,191,.04);font-size:11px">';
-          bh+='<div style="display:flex;align-items:center;gap:6px"><span style="color:'+(isPaid?'var(--gr)':pastDue?'var(--rd)':'var(--mu)')+';font-size:10px">'+(isPaid?'✓':pastDue?'⚠':'○')+'</span><span style="color:var(--wh)">'+esc(b2.name)+'</span></div>';
-          bh+='<div style="display:flex;align-items:center;gap:8px"><span style="color:var(--mu);font-size:10px">Due '+ordinal(b2.due_day||1)+'</span><span style="font-family:var(--fd);color:'+(isPaid?'var(--gr)':'var(--wh)')+'">'+fmt(parseFloat(b2.amount)||0)+'</span></div>';
-          bh+='</div>';
-        });
-        if(bills.length>5)bh+='<div style="font-size:10px;color:#5B9BFF;text-align:center;margin-top:6px;cursor:pointer">+'+(bills.length-5)+' more</div>';
-        bh+='</div>';
-        bEl.innerHTML=bh;
-      });
-    },100);
-  }
-
-  // Monthly check-in
-  var hasPlan2=typeof CPLAN!=='undefined'&&CPLAN.allocations&&CPLAN.allocations.some(function(a){return a.amount>0;});
-  if(hasPlan2){
-    var now3=new Date();var curMoKey=now3.getFullYear()+'-'+(now3.getMonth()+1);
-    var checkIns=CPLAN._checkIns||{};var curCheck=checkIns[curMoKey]||{};
-    var activeAllocs=CPLAN.allocations.filter(function(a){return a.amount>0&&!a._completed;});
-    var checkedCount=0;activeAllocs.forEach(function(a){if(curCheck[a.type])checkedCount++;});
-    var allChecked=checkedCount>=activeAllocs.length&&activeAllocs.length>0;
-    // Streak calculation
-    var streak=0;var checkM=new Date(now3);checkM.setMonth(checkM.getMonth()-1);
-    for(var si=0;si<24;si++){var sk=checkM.getFullYear()+'-'+(checkM.getMonth()+1);if(checkIns[sk]){var allDone=true;activeAllocs.forEach(function(a2){if(!checkIns[sk][a2.type]||checkIns[sk][a2.type]==='missed')allDone=false;});if(allDone)streak++;else break;}else break;checkM.setMonth(checkM.getMonth()-1);}
-    if(allChecked)streak++;
-
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:16px 0 10px">Monthly check-in</div>';
-    h+='<div class="info-card" style="padding:14px 16px;margin-bottom:8px">';
-    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">';
-    h+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+now3.toLocaleDateString('en-US',{month:'long',year:'numeric'})+'</div>';
-    h+='<div style="font-size:10px;color:var(--mu)">Did you follow your plan this month?</div></div>';
-    h+='<div style="text-align:right">';
-    if(streak>0)h+='<div style="font-family:var(--fd);font-size:18px;color:var(--gr)">'+streak+'<span style="font-size:10px">mo streak</span></div>';
-    h+='<div style="font-size:9px;color:var(--mu)">'+checkedCount+'/'+activeAllocs.length+' checked</div></div>';
     h+='</div>';
-    // Per-allocation check
-    activeAllocs.forEach(function(a3){
-      var icon3=CP_IC[a3.type]||'⭐';var color3=CP_COL[a3.type]||'#94A3B8';var name3=a3.customName||CP_NM[a3.type]||a3.type;
-      var status3=curCheck[a3.type]||'';
-      h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(0,68,191,.04)">';
-      h+='<div style="display:flex;align-items:center;gap:6px"><span style="font-size:12px">'+icon3+'</span><span style="font-size:11px;color:var(--wh)">'+name3+'</span><span style="font-size:9px;color:var(--mu)">'+fmt(a3.amount)+'/mo</span></div>';
-      h+='<div style="display:flex;gap:3px">';
-      ['followed','partial','missed'].forEach(function(st){
-        var lbl3=st==='followed'?'✓':st==='partial'?'~':'✕';
-        var sc=st==='followed'?'var(--gr)':st==='partial'?'var(--yl)':'var(--rd)';
-        var sel5=status3===st;
-        h+='<button onclick="_cpCheckIn(\''+a3.type+'\',\''+st+'\')" style="width:28px;height:28px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;border-radius:2px;cursor:pointer;border:1px solid '+(sel5?sc:'var(--bd)')+';background:'+(sel5?sc+'15':'transparent')+';color:'+(sel5?sc:'var(--mu)')+'">'+lbl3+'</button>';
-      });
-      h+='</div></div>';
+    // Amount
+    h+='<div style="font-family:var(--fd);font-size:20px;color:'+color+';flex-shrink:0;text-align:right">'+fmt(a.amount)+'<div style="font-size:8px;color:var(--mu)">/mo</div></div>';
+    // Action buttons
+    h+='<div style="display:flex;gap:4px;flex-shrink:0">';
+    if(isDone){
+      h+='<div style="padding:6px 12px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);border-radius:2px;font-family:var(--fh);font-size:10px;font-weight:700;color:var(--gr)">✓ Done</div>';
+    } else if(isMissed){
+      h+='<div style="padding:6px 12px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);border-radius:2px;font-family:var(--fh);font-size:10px;font-weight:700;color:var(--rd)">✗ Missed</div>';
+    } else {
+      h+='<button onclick="_trackMark('+idx+',true,'+a.amount+')" style="padding:6px 12px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:2px;font-family:var(--fh);font-size:10px;font-weight:700;color:var(--gr);cursor:pointer;min-height:32px;transition:.15s" onmouseover="this.style.background=\'rgba(34,197,94,.2)\'" onmouseout="this.style.background=\'rgba(34,197,94,.08)\'">✓ Done</button>';
+      h+='<button onclick="_trackMark('+idx+',false,0)" style="padding:6px 12px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);border-radius:2px;font-family:var(--fh);font-size:10px;font-weight:700;color:var(--rd);cursor:pointer;min-height:32px;transition:.15s" onmouseover="this.style.background=\'rgba(239,68,68,.15)\'" onmouseout="this.style.background=\'rgba(239,68,68,.06)\'">✗ Miss</button>';
+    }
+    h+='</div></div>';
+  });
+
+  // ═══ ACTION ITEMS (no cost) ═══
+  if(actions.length){
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--yl);margin:16px 0 10px">Action Items</div>';
+    actions.forEach(function(a){
+      var idx=CPLAN.allocations.indexOf(a);var md=monthData[idx];var isDone=md&&md.done;
+      var icon=CP_IC[a.type]||'📋';var nm=a.customName||CP_NM[a.type]||a.type;
+      h+='<div style="display:flex;align-items:center;gap:12px;padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+(isDone?'var(--gr)':'var(--yl)')+';border-radius:0 2px 2px 0;margin-bottom:6px">';
+      h+='<span style="font-size:18px">'+icon+'</span>';
+      h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+nm+'</div><div style="font-size:10px;color:var(--mu)">Review and complete</div></div>';
+      if(isDone)h+='<div style="padding:4px 10px;background:rgba(34,197,94,.08);border-radius:2px;font-size:9px;color:var(--gr);font-family:var(--fh);font-weight:700">✓ Completed</div>';
+      else h+='<button onclick="_trackMark('+idx+',true,0)" style="padding:6px 12px;background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);border-radius:2px;font-family:var(--fh);font-size:10px;font-weight:700;color:var(--yl);cursor:pointer;min-height:32px">Mark Done</button>';
+      h+='</div>';
     });
-    // Missed item suggestions
-    var missedItems=activeAllocs.filter(function(a4){return curCheck[a4.type]==='missed';});
-    if(missedItems.length>0){
-      h+='<div style="margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.1);border-radius:2px">';
-      h+='<div style="font-size:10px;color:var(--rd);font-family:var(--fh);font-weight:700;margin-bottom:4px">Missed '+missedItems.length+' item'+(missedItems.length>1?'s':'')+'</div>';
-      h+='<div style="font-size:10px;color:var(--mu);line-height:1.5">Consider adjusting amounts to match what you can realistically follow. A smaller amount you consistently execute beats a larger one you skip.</div>';
+  }
+
+  // ═══ DEBT PROGRESS ═══
+  if(CPLAN.debts&&CPLAN.debts.length){
+    var hiDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0;});
+    if(hiDebts.length){
+      h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#F97316;margin:16px 0 10px">Debt Progress</div>';
+      var totalDebt=hiDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+      h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid #F97316;border-radius:0 2px 2px 0;margin-bottom:6px">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">';
+      h+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+fmtK(totalDebt)+' total</div>';
+      h+='<div style="font-size:10px;color:var(--mu)">'+hiDebts.length+' account'+(hiDebts.length>1?'s':'')+'</div></div>';
+      var debtA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
+      if(debtA&&typeof _cpDebtSimulate==='function'){
+        var dSorted=typeof _cpDebtSort==='function'?_cpDebtSort(hiDebts.filter(function(d){return(parseFloat(d.rate)||0)>10;}),CPLAN.debtStrategy||'avalanche'):hiDebts;
+        if(dSorted.length){var dSim=_cpDebtSimulate(dSorted,debtA.amount);h+='<div style="font-family:var(--fd);font-size:20px;color:#F97316">~'+dSim.months+'<span style="font-size:10px;color:var(--mu)"> months</span></div>';}
+      }
+      h+='</div>';
+      hiDebts.forEach(function(d){
+        var bal=parseFloat(d.balance)||0;var rate=parseFloat(d.rate)||0;
+        h+='<div style="display:flex;justify-content:space-between;padding:8px 0;border-top:1px solid var(--bd);font-size:12px">';
+        h+='<div><div style="color:var(--wh);font-weight:700">'+(d.name||'Debt')+'</div><div style="font-size:9px;color:var(--mu)">'+fmt(parseFloat(d.min||d.payment)||0)+'/mo min</div></div>';
+        h+='<div style="text-align:right"><div style="font-family:var(--fd);color:var(--or)">'+fmtK(bal)+'</div><div style="font-size:9px;color:var(--rd)">'+rate.toFixed(1)+'% APR</div></div>';
+        h+='</div>';
+      });
       h+='</div>';
     }
-    if(allChecked){h+='<div style="margin-top:8px;text-align:center;padding:8px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:2px"><span style="font-size:14px">🎉</span> <span style="font-size:11px;color:var(--gr);font-family:var(--fh);font-weight:700">All items checked this month!</span></div>';}
-    h+='</div>';
   }
 
-  // Financial snapshot (key numbers at a glance)
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:16px 0 10px">Snapshot</div>';
-  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">';
-  var snapItems=[
-    {v:fmtK(c.netWorth||0),l:'Net Worth',c:(c.netWorth||0)>=0?'var(--gr)':'var(--rd)'},
-    {v:fmt(c.netCF||0),l:'Cash Flow',c:(c.netCF||0)>=0?'var(--gr)':'var(--rd)'},
-    {v:(c.savingsRate||0).toFixed(0)+'%',l:'Savings Rate',c:c.savingsRate>=15?'var(--gr)':c.savingsRate>=5?'var(--yl)':'var(--rd)'}
-  ];
-  snapItems.forEach(function(s){h+='<div class="info-card" style="text-align:center;padding:12px"><div style="font-family:var(--fd);font-size:20px;color:'+s.c+'">'+s.v+'</div><div style="font-size:9px;color:var(--mu);margin-top:2px">'+s.l+'</div></div>';});
-  h+='</div>';
-
+  // ═══ HISTORY (previous months) ═══
+  var pastMonths=Object.keys(_cpTracking).filter(function(k){return k!==mk;}).sort().reverse().slice(0,6);
+  if(pastMonths.length){
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin:16px 0 10px">Previous Months</div>';
+    pastMonths.forEach(function(pm){
+      var pd=_cpTracking[pm];var doneCount=0;var totalCount=0;
+      Object.keys(pd).forEach(function(k){totalCount++;if(pd[k].done)doneCount++;});
+      var pp=totalCount>0?Math.round(doneCount/totalCount*100):0;
+      var mLabel=new Date(pm+'-15').toLocaleDateString('en-US',{month:'long',year:'numeric'});
+      h+='<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;margin-bottom:4px">';
+      h+='<div style="font-family:var(--fd);font-size:16px;color:'+(pp>=100?'var(--gr)':pp>=50?'#5B9BFF':'var(--or)')+'">'+pp+'%</div>';
+      h+='<div style="flex:1;font-size:12px;color:var(--wh)">'+mLabel+'</div>';
+      h+='<div style="font-size:10px;color:var(--mu)">'+doneCount+'/'+totalCount+'</div></div>';
+    });
+  }
   el.innerHTML=h;
 }
 
-// ── PROJECTIONS PAGE — PLAN SIMULATOR ──────────────────
-var _cpSim={scenarios:{},sliders:{},custom:{incPct:0,expPct:0,lump:0,extraMo:0},rental:{on:false,price:250000,down:20,rent:1800,vacancy:8,expenses:35,rate:7}};
+// ── PROJECTIONS PAGE ─────────────────────────────────
+var _cpSim={scenarios:{},sliders:{},custom:{incPct:0,expPct:0,lump:0,extraMo:0},rental:{on:false,price:250000,down:20,rent:1800,vacancy:8,expenses:35,rate:7},_expanded:null};
 function renderClientProjections(){
   var el=document.getElementById('clientProjectionsContent');if(!el)return;
-  var fd=APP._portalFd;if(!fd){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your financial data first.</div>';return;}
-  var c=fd.calcs||(fd.S&&fd.S.calcs)||{};
-  if(!c.inc){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your income to see projections.</div>';return;}
-  var hasPlan=typeof CPLAN!=='undefined'&&CPLAN.allocations&&CPLAN.allocations.some(function(a){return a.amount>0;});
-  var h='';var yrs=20;
-  if(!_cpTierHas('debt_scenarios')){
-    h+='<div class="info-card" style="padding:20px;margin-bottom:14px;text-align:center">';
-    h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:14px">';
-    h+='<div style="padding:14px;background:rgba(0,68,191,.04);border:1px solid var(--bd);border-radius:2px"><div style="font-family:var(--fd);font-size:24px;color:#5B9BFF">'+fmtK(c.fiNumber||0)+'</div><div style="font-size:10px;color:var(--mu)">FI Target</div></div>';
-    h+='<div style="padding:14px;background:rgba(0,68,191,.04);border:1px solid var(--bd);border-radius:2px"><div style="font-family:var(--fd);font-size:24px;color:'+(c.retGap<=0?'var(--gr)':'var(--or)')+'">'+fmtK(c.projRetBal||0)+'</div><div style="font-size:10px;color:var(--mu)">Projected</div></div>';
-    h+='</div>';
-    if(hasPlan)h+='<div style="font-size:12px;color:var(--mu);line-height:1.6">Your trajectory chart is in <a href="#" onclick="showClientPage(\'plan\');initClientPlan();return false" style="color:#5B9BFF">My Financial Plan</a>.</div>';
-    h+='</div>';h+=_cpUpgradeHint('Plan Simulator','pro');el.innerHTML=h;return;
+  if(typeof CPLAN==='undefined'||!CPLAN._sim){
+    el.innerHTML='<div style="text-align:center;padding:40px"><div style="font-size:36px;margin-bottom:12px">📈</div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:6px">No Plan Data</div><div style="font-size:12px;color:var(--mu);margin-bottom:16px">Create a financial plan to run projections and scenarios.</div><button onclick="showClientPage(\'plan\');initClientPlan()" style="padding:10px 24px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:40px">Build My Plan →</button></div>';
+    return;
   }
-  function simPlan(incMod,expMod,rateMod,lumpSum,contribDelay,simYrs,extraMonthly){
-    var total=0;var yr2=simYrs||yrs;var extra=extraMonthly||0;
-    if(hasPlan){CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;var rate=_cpGetNetRate(a)*rateMod;var cf2=_cpGetCF(a);var bal=0;var adjAmt=Math.max(0,a.amount*incMod);for(var y=1;y<=yr2;y++){var contrib=(y<=contribDelay)?0:adjAmt*12*cf2;if((a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target)contrib=0;bal=(bal+contrib)*(1+rate);}if(a.type!=='debt')total+=bal;});}
-    else{var surp=Math.max(0,(c.inc||0)*incMod-(c.baseExp||0)*expMod);for(var y2=1;y2<=yr2;y2++)total=(total+surp*12)*(1+0.06*rateMod);}
-    if(extra>0){var eb=0;for(var ye=1;ye<=yr2;ye++)eb=(eb+extra*12)*(1+0.07);total+=eb;}
-    // Amortize debt over time instead of flat subtraction
-    var td=c.totalDebt||0;
-    if(td>0){var dAlloc=hasPlan?CPLAN.allocations.find(function(a2){return a2.type==='debt';}):null;var dPmt=(dAlloc?(dAlloc.amount+CPLAN.debtMin):c.totalMin||Math.round(td*0.02));var avgR=0;if(CPLAN.debts&&CPLAN.debts.length&&td>0){avgR=CPLAN.debts.reduce(function(t2,d2){return t2+(parseFloat(d2.rate)||0)*(parseFloat(d2.balance)||0);},0)/td/100/12;}var remD=td;for(var dm2=0;dm2<yr2*12;dm2++){remD=Math.max(0,remD*(1+avgR)-dPmt);if(remD<1){remD=0;break;}}total-=remD;}
-    total+=lumpSum;return Math.round(total);
-  }
-  var basePlan=simPlan(1,1,1,0,0,yrs,0);
-  // Slider-based scenarios: each has a slider range and a function to compute modifiers from slider value
+  var h='';
+  var sim=CPLAN._sim;var years=20;
+  // Calculate scenario-adjusted projection
+  var baseVal=sim.netWorth[Math.min(years,sim.netWorth.length-1)]||0;
+  var adjIncome=CPLAN.income*(1+(_cpSim.custom.incPct||0)/100);
+  var adjExpenses=(CPLAN.expenses||0)*(1+(_cpSim.custom.expPct||0)/100);
+  var extraMonthly=_cpSim.custom.extraMo||0;
+  var lumpSum=_cpSim.custom.lump||0;
+  // Scenario impacts
+  var scenarioAdj=0;var anyActive=false;
   var scenarios=[
-    {id:'raise',icon:'💰',label:'Get a raise',min:1,max:100,step:1,def:15,unit:'%',key:'incMod',fn:function(v){return{incMod:1+v/100,expMod:1,rateMod:1,lump:0,delay:0};}},
-    {id:'paycut',icon:'📉',label:'Take a pay cut',min:1,max:50,step:1,def:20,unit:'%',key:'incCut',fn:function(v){return{incMod:1-v/100,expMod:1,rateMod:1,lump:0,delay:0};}},
-    {id:'child',icon:'👶',label:'Have a child',min:5,max:40,step:1,def:15,unit:'% expenses',key:'childExp',fn:function(v){return{incMod:1,expMod:1+v/100,rateMod:1,lump:0,delay:0};}},
-    {id:'house',icon:'🏠',label:'Buy a house',min:5000,max:200000,step:5000,def:30000,unit:'down',key:'houseDn',fn:function(v){return{incMod:1,expMod:1.10,rateMod:1,lump:-v,delay:0};}},
-    {id:'jobloss',icon:'💼',label:'Lose your job',min:1,max:24,step:1,def:6,unit:'months',key:'jobMo',fn:function(v){return{incMod:1,expMod:1,rateMod:1,lump:0,delay:v/12};}},
-    {id:'crash',icon:'📊',label:'Market downturn',min:5,max:60,step:5,def:30,unit:'% drop',key:'mktDrop',fn:function(v){return{incMod:1,expMod:1,rateMod:1-v/100,lump:0,delay:0};}},
-    {id:'spouse_work',icon:'👫',label:'Spouse starts working',min:10,max:100,step:5,def:40,unit:'% more income',key:'spWork',fn:function(v){return{incMod:1+v/100,expMod:1.05,rateMod:1,lump:0,delay:0};}},
-    {id:'spouse_stop',icon:'🏡',label:'Spouse stops working',min:10,max:60,step:5,def:40,unit:'% less income',key:'spStop',fn:function(v){return{incMod:1-v/100,expMod:0.95,rateMod:1,lump:0,delay:0};}},
-    {id:'inherit',icon:'🎁',label:'Receive money',min:5000,max:500000,step:5000,def:50000,unit:'lump sum',key:'inherit',fn:function(v){return{incMod:1,expMod:1,rateMod:1,lump:v,delay:0};}},
-    {id:'early_ret',icon:'🏖️',label:'Retire early',min:1,max:15,step:1,def:5,unit:'years earlier',key:'retEarly',fn:function(v){return{incMod:1,expMod:1,rateMod:1,lump:0,delay:0,yrsOverride:Math.max(5,yrs-v)};}}
+    {id:'raise',icon:'💰',name:'Get a Raise',desc:'Income increases by a percentage',impact:function(){return CPLAN.income*0.10*12*years*1.5;},inputs:'raise'},
+    {id:'paycut',icon:'📉',name:'Take a Pay Cut',desc:'Income decreases — stress test your plan',impact:function(){return -CPLAN.income*0.15*12*years*0.8;},inputs:'paycut'},
+    {id:'child',icon:'👶',name:'Have a Child',desc:'Expenses increase ~$1,500/mo, add education goal',impact:function(){return -1500*12*years;},inputs:'child'},
+    {id:'house',icon:'🏠',name:'Buy a House',desc:'New mortgage, property tax, maintenance',impact:function(){return -800*12*years;},inputs:'house'},
+    {id:'job_loss',icon:'📦',name:'Lose Your Job',desc:'3-6 months no income — EF stress test',impact:function(){return -CPLAN.income*6;},inputs:'job_loss'},
+    {id:'market_down',icon:'📊',name:'Market Downturn',desc:'30% portfolio drop, lower returns for 3 years',impact:function(){return -baseVal*0.25;},inputs:'market'},
+    {id:'spouse_work',icon:'👫',name:'Spouse Starts Working',desc:'Second income stream, higher surplus',impact:function(){return 4000*12*years*1.3;},inputs:'spouse'},
+    {id:'spouse_stop',icon:'👋',name:'Spouse Stops Working',desc:'Lose second income, single-earner household',impact:function(){return -3000*12*years*0.8;},inputs:'spouse_stop'},
+    {id:'windfall',icon:'🎁',name:'Receive Money',desc:'Inheritance, bonus, or lump sum',impact:function(){return lumpSum>0?lumpSum*Math.pow(1.07,years):50000*Math.pow(1.07,years);},inputs:'windfall'},
+    {id:'early_ret',icon:'🏖️',name:'Retire Early',desc:'Stop contributions sooner — can you afford it?',impact:function(){return -baseVal*0.15;},inputs:'early_ret'}
   ];
-  // Init slider values from saved state
-  scenarios.forEach(function(s){if(!_cpSim.sliders)_cpSim.sliders={};if(_cpSim.sliders[s.id]===undefined)_cpSim.sliders[s.id]=s.def;});
-  var activeScenarios=scenarios.filter(function(s){return _cpSim.scenarios[s.id];});
-  var combInc=1,combExp=1,combRate=1,combLump=0,combDelay=0,combYrs=yrs,combExtra=0;
-  activeScenarios.forEach(function(s){var v2=_cpSim.sliders[s.id];var mods=s.fn(v2);combInc*=mods.incMod;combExp*=mods.expMod;combRate*=mods.rateMod;combLump+=mods.lump;combDelay=Math.max(combDelay,mods.delay);if(mods.yrsOverride)combYrs=Math.min(combYrs,mods.yrsOverride);});
-  var cu=_cpSim.custom;var hasCustom=cu.incPct!==0||cu.expPct!==0||cu.lump!==0||cu.extraMo!==0;
-  if(hasCustom){combInc*=(1+cu.incPct/100);combExp*=(1+cu.expPct/100);combLump+=cu.lump;combExtra+=cu.extraMo;}
-  var rn=_cpSim.rental;
-  if(rn.on){var rnMort=rn.price*(1-rn.down/100)*(rn.rate/100/12)/(1-Math.pow(1+rn.rate/100/12,-360));var rnGR=rn.rent*(1-rn.vacancy/100);var rnEx=rnGR*(rn.expenses/100);var rnCF=Math.round(rnGR-rnEx-rnMort);combLump-=Math.round(rn.price*rn.down/100);if(rnCF>0)combExtra+=rnCF;else combInc*=Math.max(0.5,1+(rnCF/(c.inc||1)));}
-  var simResult=simPlan(combInc,combExp,combRate,combLump,combDelay,combYrs,combExtra);
-  var diff=simResult-basePlan;var diffPct=basePlan!==0?Math.round(diff/Math.abs(basePlan)*100):0;
-  var anyActive=activeScenarios.length>0||hasCustom||rn.on;
-  var verdict=diff>=0?'green':diff>-Math.abs(basePlan)*0.15?'yellow':'red';
-  var verdictLabel=verdict==='green'?'Plan absorbs this':verdict==='yellow'?'Plan survives — milestones shift':'Plan needs restructuring';
-  var verdictCol=verdict==='green'?'var(--gr)':verdict==='yellow'?'var(--yl)':'var(--rd)';
-  // Mini chart
-  h+='<div class="info-card" style="padding:16px;margin-bottom:14px">';
-  var W=500,H=140,pL=45,pR=50,pT=16,pB=20;var baseYr=[],simYr=[];
-  for(var yr3=0;yr3<=yrs;yr3++){baseYr.push(simPlan(1,1,1,0,0,yr3,0));simYr.push(simPlan(combInc,combExp,combRate,combLump,combDelay,Math.min(yr3,combYrs),combExtra));}
-  var allV=baseYr.concat(simYr);var mnV=Math.min.apply(null,allV);var mxV=Math.max.apply(null,allV);if(mxV===mnV)mxV=mnV+1;
-  var cW2=W-pL-pR,cH2=H-pT-pB;
-  function xc(yr4){return pL+yr4/yrs*cW2;}function yc(v){return pT+cH2-(v-mnV)/(mxV-mnV)*cH2;}
-  var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;display:block;max-height:180px">';
-  for(var g2=0;g2<=3;g2++){var gv2=mnV+(mxV-mnV)*g2/3;svg+='<line x1="'+pL+'" y1="'+yc(gv2)+'" x2="'+(W-pR)+'" y2="'+yc(gv2)+'" stroke="rgba(0,68,191,.05)" stroke-width="0.5"/>';svg+='<text x="'+(pL-3)+'" y="'+(yc(gv2)+3)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(gv2))+'</text>';}
-  if(anyActive){var fillPts=baseYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ')+' '+simYr.map(function(v,i){return xc(yrs-i)+','+yc(simYr[yrs-i]);}).join(' ');svg+='<polygon points="'+fillPts+'" fill="'+(diff>=0?'rgba(34,197,94,.08)':'rgba(239,68,68,.08)')+'"/>';}
-  svg+='<polyline points="'+baseYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ')+'" fill="none" stroke="#5B9BFF" stroke-width="2" stroke-linejoin="round"/>';
-  svg+='<text x="'+(W-pR+4)+'" y="'+(yc(baseYr[yrs])+4)+'" fill="#5B9BFF" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(baseYr[yrs])+'</text>';
-  if(anyActive){svg+='<polyline points="'+simYr.map(function(v,i){return xc(i)+','+yc(v);}).join(' ')+'" fill="none" stroke="'+verdictCol+'" stroke-width="2" stroke-dasharray="4,3" stroke-linejoin="round"/>';svg+='<text x="'+(W-pR+4)+'" y="'+(yc(simYr[yrs])+14)+'" fill="'+verdictCol+'" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(simYr[yrs])+'</text>';}
-  svg+='</svg>';
-  // Interactive hover for projections chart
-  var pChartId='cpProjChart_'+Date.now();
-  var _pBase=baseYr.slice();var _pSim=simYr.slice();
-  svg='<div id="'+pChartId+'" style="position:relative;cursor:crosshair">'+svg;
-  svg+='<div id="'+pChartId+'_tip" style="display:none;position:absolute;pointer-events:none;background:rgba(12,12,52,.95);border:1px solid rgba(91,155,255,.3);border-radius:4px;padding:6px 10px;font-size:9px;min-width:100px;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>';
-  svg+='<div id="'+pChartId+'_line" style="display:none;position:absolute;top:'+pT+'px;width:1px;height:'+(H-pT-pB)+'px;background:rgba(91,155,255,.3);pointer-events:none;z-index:5"></div></div>';
-  setTimeout(function(){
-    var wrap2=document.getElementById(pChartId);if(!wrap2)return;
-    var svgE=wrap2.querySelector('svg');if(!svgE)return;
-    var tip2=document.getElementById(pChartId+'_tip');var vl2=document.getElementById(pChartId+'_line');
-    function showTip2(e4){var r2=svgE.getBoundingClientRect();var px2=(e4.touches?e4.touches[0].clientX:e4.clientX)-r2.left;var sc2=W/r2.width;var sx2=px2*sc2;var yr8=Math.round((sx2-pL)/(W-pL-pR)*yrs);yr8=Math.max(0,Math.min(yrs,yr8));
-      if(tip2){var bv3=_pBase[yr8]||0;var sv3=_pSim[yr8]||0;var d3=sv3-bv3;tip2.innerHTML='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:3px">Year '+yr8+'</div><div style="color:#5B9BFF">Base: '+fmtK(bv3)+'</div>'+(anyActive?'<div style="color:'+verdictCol+'">Simulated: '+fmtK(sv3)+'</div><div style="color:'+(d3>=0?'var(--gr)':'var(--rd)')+'">'+(d3>=0?'+':'')+fmtK(d3)+'</div>':'');var tx2=Math.min(px2,r2.width-120);tip2.style.left=tx2+'px';tip2.style.top='2px';tip2.style.display='block';}
-      if(vl2){vl2.style.left=px2+'px';vl2.style.display='block';}
-    }
-    svgE.addEventListener('mousemove',showTip2);svgE.addEventListener('touchmove',function(e5){e5.preventDefault();showTip2(e5);},{passive:false});
-    wrap2.addEventListener('mouseleave',function(){if(tip2)tip2.style.display='none';if(vl2)vl2.style.display='none';});
-  },100);
-  h+=svg;
-  h+='<div style="display:flex;gap:12px;justify-content:center;font-size:10px;color:var(--mu);margin-top:4px">';
-  h+='<span><span style="display:inline-block;width:12px;height:2px;background:#5B9BFF;margin-right:4px;vertical-align:middle"></span>Your plan</span>';
-  if(anyActive)h+='<span><span style="display:inline-block;width:12px;height:2px;background:'+verdictCol+';margin-right:4px;vertical-align:middle;border-top:1px dashed '+verdictCol+'"></span>Simulated</span>';
-  h+='</div></div>';
-  // Impact dashboard
-  h+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin-bottom:14px">';
-  h+='<div class="info-card" style="text-align:center;padding:14px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;margin-bottom:4px">BASE PLAN</div><div style="font-family:var(--fd);font-size:22px;color:#5B9BFF">'+fmtK(basePlan)+'</div><div style="font-size:9px;color:var(--mu)">'+yrs+' year projection</div></div>';
-  h+='<div class="info-card" style="text-align:center;padding:14px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;margin-bottom:4px">SIMULATED</div><div style="font-family:var(--fd);font-size:22px;color:'+(anyActive?verdictCol:'#5B9BFF')+'">'+fmtK(simResult)+'</div><div style="font-size:9px;color:var(--mu)">'+(anyActive?(activeScenarios.length+(hasCustom?1:0)+(rn.on?1:0))+' active':'0 scenarios')+'</div></div>';
-  h+='<div class="info-card" style="text-align:center;padding:14px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;margin-bottom:4px">IMPACT</div><div style="font-family:var(--fd);font-size:22px;color:'+(diff>=0?'var(--gr)':'var(--rd)')+'">'+(diff>=0?'+':'')+fmtK(diff)+'</div><div style="font-size:9px;color:var(--mu)">'+diffPct+'% change</div></div>';
-  h+='</div>';
-  if(anyActive){h+='<div class="info-card" style="padding:12px 16px;margin-bottom:14px;text-align:center;border-color:'+(verdict==='green'?'rgba(34,197,94,.2)':verdict==='yellow'?'rgba(234,179,8,.2)':'rgba(239,68,68,.2)')+';background:'+(verdict==='green'?'rgba(34,197,94,.04)':verdict==='yellow'?'rgba(234,179,8,.04)':'rgba(239,68,68,.04)')+'"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+verdictCol+'">'+verdictLabel+'</div></div>';}
-  // Preset toggles with sliders
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Life event scenarios</div>';
-  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px">';
-  scenarios.forEach(function(s){var isOn=_cpSim.scenarios[s.id]||false;var sv=_cpSim.sliders[s.id];var mods=s.fn(sv);var indivResult=simPlan(mods.incMod,mods.expMod,mods.rateMod,mods.lump,mods.delay,mods.yrsOverride||yrs,0);var indivDiff=indivResult-basePlan;var iCol=indivDiff>=0?'var(--gr)':'var(--rd)';
-    h+='<div style="padding:12px;border-radius:2px;border:1px solid '+(isOn?'rgba(91,155,255,.4)':'var(--bd)')+';background:'+(isOn?'rgba(91,155,255,.06)':'var(--bg-card)')+';transition:all .15s">';
-    h+='<div onclick="_cpSimToggle(\''+s.id+'\')" style="display:flex;align-items:center;justify-content:space-between;cursor:pointer;min-height:28px"><div style="display:flex;align-items:center;gap:6px"><span style="font-size:16px">'+s.icon+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+(isOn?'#5B9BFF':'var(--wh)')+'">'+s.label+'</span></div>';
-    h+='<div style="width:28px;height:16px;border-radius:8px;background:'+(isOn?'var(--gr)':'rgba(100,116,139,.3)')+';position:relative;flex-shrink:0"><div style="width:12px;height:12px;border-radius:50%;background:#fff;position:absolute;top:2px;left:'+(isOn?'14':'2')+'px;transition:left .2s"></div></div></div>';
-    if(isOn){
-      // Slider for this scenario
-      var dispVal=s.unit.indexOf('$')>=0||s.unit==='down'||s.unit==='lump sum'?fmtK(sv):(sv+' '+s.unit);
-      h+='<div style="margin-top:8px"><div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px"><span style="color:var(--mu)">Adjust</span><span style="font-family:var(--fd);color:'+(indivDiff>=0?'var(--gr)':'var(--rd)')+'">'+dispVal+'</span></div>';
-      h+='<input type="range" min="'+s.min+'" max="'+s.max+'" step="'+s.step+'" value="'+sv+'" oninput="_cpSimSlider(\''+s.id+'\',this.value)" style="width:100%;accent-color:#5B9BFF;height:4px">';
-      h+='<div style="font-family:var(--fd);font-size:14px;color:'+iCol+';margin-top:4px">'+(indivDiff>=0?'+':'')+fmtK(indivDiff)+' impact</div></div>';
-    }
-    h+='</div>';});
-  h+='</div>';
-  // Custom scenario builder
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Build your own scenario</div>';
-  h+='<div class="info-card" style="padding:16px;margin-bottom:14px"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
-  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Income change</span><span style="font-family:var(--fd);color:'+(cu.incPct>=0?'var(--gr)':'var(--rd)')+'">'+(cu.incPct>=0?'+':'')+cu.incPct+'%</span></div><input type="range" min="-50" max="100" step="5" value="'+cu.incPct+'" oninput="_cpSimCustom(\'incPct\',this.value)" style="width:100%;accent-color:#5B9BFF;height:4px"></div>';
-  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Expense change</span><span style="font-family:var(--fd);color:'+(cu.expPct<=0?'var(--gr)':'var(--rd)')+'">'+(cu.expPct>=0?'+':'')+cu.expPct+'%</span></div><input type="range" min="-30" max="50" step="5" value="'+cu.expPct+'" oninput="_cpSimCustom(\'expPct\',this.value)" style="width:100%;accent-color:var(--or);height:4px"></div>';
-  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Lump sum</span><span style="font-family:var(--fd);color:'+(cu.lump>=0?'var(--gr)':'var(--rd)')+'">'+fmt(cu.lump)+'</span></div><input type="range" min="-100000" max="200000" step="5000" value="'+cu.lump+'" oninput="_cpSimCustom(\'lump\',this.value)" style="width:100%;accent-color:var(--yl);height:4px"></div>';
-  h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">Extra monthly savings</span><span style="font-family:var(--fd);color:var(--gr)">+'+fmt(cu.extraMo)+'</span></div><input type="range" min="0" max="3000" step="50" value="'+cu.extraMo+'" oninput="_cpSimCustom(\'extraMo\',this.value)" style="width:100%;accent-color:var(--gr);height:4px"></div>';
-  h+='</div>';
-  if(hasCustom){var cuRes=simPlan(1+cu.incPct/100,1+cu.expPct/100,1,cu.lump,0,yrs,cu.extraMo);var cuDiff=cuRes-basePlan;h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;padding-top:10px;border-top:1px solid var(--bd)"><span style="font-size:11px;color:var(--mu)">Custom scenario impact</span><span style="font-family:var(--fd);font-size:16px;color:'+(cuDiff>=0?'var(--gr)':'var(--rd)')+'">'+(cuDiff>=0?'+':'')+fmtK(cuDiff)+'</span></div>';}
-  h+='</div>';
-  // Rental property
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Rental property scenario</div>';
-  h+='<div class="info-card" style="padding:16px;margin-bottom:14px;border-color:'+(rn.on?'rgba(91,155,255,.3)':'var(--bd)')+';background:'+(rn.on?'rgba(91,155,255,.03)':'var(--bg-card)')+'">';
-  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:'+(rn.on?'12':'0')+'px"><div style="display:flex;align-items:center;gap:8px"><span style="font-size:18px">🏘️</span><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+(rn.on?'#5B9BFF':'var(--wh)')+'">Add Rental Property</span></div>';
-  h+='<div style="width:36px;height:20px;border-radius:10px;background:'+(rn.on?'var(--gr)':'rgba(100,116,139,.3)')+';position:relative;cursor:pointer" onclick="_cpSim.rental.on=!_cpSim.rental.on;renderClientProjections()"><div style="width:16px;height:16px;border-radius:50%;background:#fff;position:absolute;top:2px;left:'+(rn.on?'18':'2')+'px;transition:left .2s"></div></div></div>';
-  if(rn.on){
-    var rnM2=rn.price*(1-rn.down/100)*(rn.rate/100/12)/(1-Math.pow(1+rn.rate/100/12,-360));var rnG2=rn.rent*(1-rn.vacancy/100);var rnE2=rnG2*(rn.expenses/100);var rnCF2=Math.round(rnG2-rnE2-rnM2);
-    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">';
-    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Purchase price</div><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" value="'+rn.price+'" oninput="_cpSimRental(\'price\',this.value)" style="padding-left:22px;min-height:36px;font-size:13px"></div></div>';
-    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Down payment %</div><input class="inp" type="number" value="'+rn.down+'" min="0" max="100" oninput="_cpSimRental(\'down\',this.value)" style="min-height:36px;font-size:13px"></div>';
-    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Monthly rent</div><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" value="'+rn.rent+'" oninput="_cpSimRental(\'rent\',this.value)" style="padding-left:22px;min-height:36px;font-size:13px"></div></div>';
-    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Mortgage rate %</div><input class="inp" type="number" value="'+rn.rate+'" step="0.25" oninput="_cpSimRental(\'rate\',this.value)" style="min-height:36px;font-size:13px"></div>';
-    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Vacancy %</div><input class="inp" type="number" value="'+rn.vacancy+'" min="0" max="50" oninput="_cpSimRental(\'vacancy\',this.value)" style="min-height:36px;font-size:13px"></div>';
-    h+='<div><div style="font-size:10px;color:var(--mu);margin-bottom:3px">Expense ratio %</div><input class="inp" type="number" value="'+rn.expenses+'" min="0" max="80" oninput="_cpSimRental(\'expenses\',this.value)" style="min-height:36px;font-size:13px"></div>';
-    h+='</div>';
-    h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;padding-top:10px;border-top:1px solid var(--bd)">';
-    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Down Pmt</div><div style="font-family:var(--fd);font-size:14px;color:var(--rd)">-'+fmtK(Math.round(rn.price*rn.down/100))+'</div></div>';
-    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Mortgage</div><div style="font-family:var(--fd);font-size:14px;color:var(--or)">'+fmt(Math.round(rnM2))+'/mo</div></div>';
-    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Net Rent</div><div style="font-family:var(--fd);font-size:14px;color:var(--wh)">'+fmt(Math.round(rnG2-rnE2))+'/mo</div></div>';
-    h+='<div style="text-align:center"><div style="font-size:9px;color:var(--mu)">Cash Flow</div><div style="font-family:var(--fd);font-size:14px;color:'+(rnCF2>=0?'var(--gr)':'var(--rd)')+'">'+(rnCF2>=0?'+':'')+fmt(rnCF2)+'/mo</div></div>';
-    h+='</div>';}
-  h+='</div>';
-  if(anyActive){h+='<div style="display:flex;gap:8px;justify-content:center;flex-wrap:wrap">';
-    h+='<button onclick="_cpSim.scenarios={};_cpSim.sliders={};_cpSim.custom={incPct:0,expPct:0,lump:0,extraMo:0};_cpSim.rental.on=false;renderClientProjections()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(100,116,139,.06);border:1px solid rgba(100,116,139,.2);color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px">Reset All</button>';
-    if(_cpTierHas('stress_tests')&&diff>0)h+='<button onclick="showClientPage(\'plan\');initClientPlan()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:var(--gr);cursor:pointer;border-radius:2px;min-height:36px">'+(CPLAN.hasAdvisor?'Propose to Advisor':'Update My Plan')+'</button>';
-    h+='</div>';}
-  el.innerHTML=h;
-}
-function _cpSimToggle(id){_cpSim.scenarios[id]=!_cpSim.scenarios[id];renderClientProjections();}
-function _cpSimSlider(id,val){if(!_cpSim.sliders)_cpSim.sliders={};_cpSim.sliders[id]=parseFloat(val)||0;clearTimeout(_cpSim._slTimer);_cpSim._slTimer=setTimeout(renderClientProjections,100);}
-function _cpSimCustom(key,val){_cpSim.custom[key]=parseFloat(val)||0;clearTimeout(_cpSim._custTimer);_cpSim._custTimer=setTimeout(renderClientProjections,150);}
-function _cpSimRental(key,val){_cpSim.rental[key]=parseFloat(val)||0;clearTimeout(_cpSim._rentTimer);_cpSim._rentTimer=setTimeout(renderClientProjections,200);}
+  scenarios.forEach(function(sc){if(_cpSim.scenarios[sc.id]){anyActive=true;scenarioAdj+=sc.impact();}});
+  var adjExtra=(extraMonthly*12*years*1.5)+(lumpSum>0&&!_cpSim.scenarios.windfall?lumpSum*Math.pow(1.07,years):0);
+  var incAdj=((_cpSim.custom.incPct||0)/100)*CPLAN.income*12*years*1.3;
+  var expAdj=-((_cpSim.custom.expPct||0)/100)*(CPLAN.expenses||0)*12*years;
+  var simVal=Math.round(baseVal+scenarioAdj+adjExtra+incAdj+expAdj);
+  var diff=simVal-baseVal;
 
+  // ═══ CHART — plan's actual chart with scenario overlay ═══
+  h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px;margin-bottom:16px"><div id="projChart"></div></div>';
+
+  // ═══ IMPACT SUMMARY ═══
+  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:20px">';
+  h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;margin-bottom:4px">BASE PLAN</div><div style="font-family:var(--fd);font-size:22px;color:#5B9BFF">'+fmtK(baseVal)+'</div><div style="font-size:9px;color:var(--mu)">'+years+' year projection</div></div>';
+  h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;margin-bottom:4px">SIMULATED</div><div style="font-family:var(--fd);font-size:22px;color:'+(simVal>baseVal?'var(--gr)':simVal<baseVal?'var(--or)':'var(--wh)')+'">'+fmtK(simVal)+'</div><div style="font-size:9px;color:var(--mu)">'+(anyActive?Object.keys(_cpSim.scenarios).filter(function(k){return _cpSim.scenarios[k];}).length+' scenarios':'0 scenarios')+'</div></div>';
+  h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;margin-bottom:4px">IMPACT</div><div style="font-family:var(--fd);font-size:22px;color:'+(diff>0?'var(--gr)':diff<0?'var(--rd)':'var(--mu)')+'">'+(diff>=0?'+':'')+fmtK(diff)+'</div><div style="font-size:9px;color:var(--mu)">'+(baseVal>0?((diff/baseVal*100).toFixed(0))+'% change':'')+'</div></div>';
+  h+='</div>';
+
+  // ═══ SCENARIO CARDS — tool card style, click to expand ═══
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Life Event Scenarios</div>';
+  h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:20px">';
+  scenarios.forEach(function(sc){
+    var isActive=_cpSim.scenarios[sc.id];
+    var isExpanded=_cpSim._expanded===sc.id;
+    var impact=sc.impact();
+    var impCol=impact>=0?'var(--gr)':'var(--or)';
+
+    h+='<div style="background:var(--bg-card);border:1px solid '+(isActive?'rgba(91,155,255,.4)':'var(--bd)')+';border-radius:2px;overflow:hidden;transition:border-color .15s'+(isActive?';box-shadow:0 0 12px rgba(91,155,255,.08)':'')+'">';
+    // Card header (clickable)
+    h+='<div onclick="_cpSimExpand(\''+sc.id+'\')" style="display:flex;align-items:center;gap:12px;padding:14px;cursor:pointer;transition:background .15s" onmouseover="this.style.background=\'rgba(0,68,191,.08)\'" onmouseout="this.style.background=\'transparent\'">';
+    h+='<span style="font-size:24px;flex-shrink:0">'+sc.icon+'</span>';
+    h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+sc.name+'</div>';
+    h+='<div style="font-size:10px;color:var(--mu);margin-top:1px">'+sc.desc+'</div></div>';
+    if(isActive)h+='<div style="font-family:var(--fd);font-size:14px;color:'+impCol+'">'+fmtK(impact)+'</div>';
+    h+='<span style="font-size:10px;color:var(--mu);transform:rotate('+(isExpanded?'180':'0')+'deg);transition:transform .2s">▼</span>';
+    h+='</div>';
+
+    // Expanded content
+    if(isExpanded){
+      h+='<div style="padding:0 14px 14px;border-top:1px solid var(--bd)">';
+      h+='<div style="padding-top:10px;display:flex;align-items:center;justify-content:space-between">';
+      h+='<div style="font-size:11px;color:var(--mu)">Impact: <strong style="color:'+impCol+'">'+fmtK(impact)+'</strong> over '+years+' years</div>';
+      h+='<button onclick="_cpSimToggle(\''+sc.id+'\')" style="padding:6px 16px;font-family:var(--fh);font-size:10px;font-weight:700;background:'+(isActive?'rgba(239,68,68,.08)':'rgba(34,197,94,.08)')+';border:1px solid '+(isActive?'rgba(239,68,68,.2)':'rgba(34,197,94,.2)')+';border-radius:2px;color:'+(isActive?'var(--rd)':'var(--gr)')+';cursor:pointer;min-height:30px">'+(isActive?'Remove':'Apply')+'</button>';
+      h+='</div></div>';
+    }
+    h+='</div>';
+  });
+  h+='</div>';
+
+  // ═══ BUILD YOUR OWN ═══
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Custom Adjustments</div>';
+  h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px;margin-bottom:16px">';
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">';
+  [{l:'Income change',k:'incPct',v:_cpSim.custom.incPct||0,u:'%',min:-50,max:100,col:'var(--gr)'},{l:'Expense change',k:'expPct',v:_cpSim.custom.expPct||0,u:'%',min:-30,max:50,col:'var(--or)'},{l:'Lump sum',k:'lump',v:_cpSim.custom.lump||0,u:'$',min:0,max:500000,col:'var(--yl)'},{l:'Extra monthly',k:'extraMo',v:_cpSim.custom.extraMo||0,u:'$',min:0,max:5000,col:'#5B9BFF'}].forEach(function(s){
+    h+='<div><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:4px"><span style="color:var(--mu)">'+s.l+'</span><span style="font-family:var(--fd);color:'+s.col+'">'+(s.u==='$'?fmt(s.v):(s.v>=0?'+':'')+s.v+s.u)+'</span></div>';
+    h+='<input type="range" min="'+s.min+'" max="'+s.max+'" value="'+s.v+'" step="'+(s.u==='$'?1000:5)+'" oninput="_cpSimCustom(\''+s.k+'\',this.value)" style="width:100%;accent-color:'+s.col+';height:4px">';
+    h+='</div>';
+  });
+  h+='</div></div>';
+
+  // Reset / Apply buttons
+  if(anyActive||_cpSim.custom.incPct||_cpSim.custom.expPct||_cpSim.custom.lump||_cpSim.custom.extraMo){
+    h+='<div style="display:flex;gap:8px;justify-content:center">';
+    h+='<button onclick="_cpSim.scenarios={};_cpSim.custom={incPct:0,expPct:0,lump:0,extraMo:0};_cpSim._expanded=null;renderClientProjections()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:var(--bg-card);border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px">Reset All</button>';
+    if(diff>0)h+='<button onclick="showClientPage(\'plan\');initClientPlan()" style="padding:8px 20px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:36px">Apply to Plan →</button>';
+    h+='</div>';
+  }
+  el.innerHTML=h;
+  // Render the plan's actual chart
+  setTimeout(function(){_cpRenderChart('projChart');},50);
+}
+function _cpSimExpand(id){_cpSim._expanded=_cpSim._expanded===id?null:id;renderClientProjections();}
+function _cpSimToggle(id){_cpSim.scenarios[id]=!_cpSim.scenarios[id];renderClientProjections();}
+function _cpSimCustom(key,val){_cpSim.custom[key]=parseFloat(val)||0;clearTimeout(_cpSim._custTimer);_cpSim._custTimer=setTimeout(renderClientProjections,150);}
+function _cpSimSlider(id,val){if(!_cpSim.sliders)_cpSim.sliders={};_cpSim.sliders[id]=parseFloat(val)||0;clearTimeout(_cpSim._slTimer);_cpSim._slTimer=setTimeout(renderClientProjections,100);}
+function _cpSimRental(key,val){_cpSim.rental[key]=parseFloat(val)||0;clearTimeout(_cpSim._rentTimer);_cpSim._rentTimer=setTimeout(renderClientProjections,200);}
 
 // ── FULL ANALYSIS PAGE ────────────────────────────────
 function renderClientAnalysis(){
@@ -17839,26 +17722,20 @@ function renderClientAnalysis(){
   if(!c.inc){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">Enter your income to see your analysis.</div>';return;}
   var h='';
   function scCol(v){return v>=7?'var(--gr)':v>=5?'var(--yl)':v!==null&&v!==undefined?'var(--rd)':'var(--mu)';}
-  // Plan data sync
-  var _hasPlan=typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.retirement;
-  if(_hasPlan){
-    var _pRetYrs=Math.max(1,Math.min(30,65-(CPLAN.age||35)));
-    c.projRetBal=CPLAN._sim.retirement[_pRetYrs]||CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
-    if(c.fiNumber>0)c.retGap=Math.max(0,c.fiNumber-c.projRetBal);
-  }
 
-  // ═══ HERO SCORE + HEADLINE ═══
+  // ═══ HERO SCORE ═══
   var _os=0,_sc=0;['cfScore','protScore','growScore','effScore'].forEach(function(k){if(c[k]!=null){_os+=c[k];_sc++;}});
   var _avg=_sc>0?Math.round(_os/_sc*10):0;var _sCol=_avg>=70?'var(--gr)':_avg>=40?'var(--yl)':'var(--rd)';
   var _sLbl=_avg>=80?'Excellent':_avg>=60?'Good':_avg>=40?'Needs Work':'Critical';
   h+='<div style="display:grid;grid-template-columns:auto 1fr;gap:20px;margin-bottom:20px;align-items:center">';
-  h+='<div style="position:relative;width:120px;height:120px">';
-  h+='<svg viewBox="0 0 120 120" style="width:120px;height:120px;transform:rotate(-90deg)"><circle cx="60" cy="60" r="54" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="8"/><circle cx="60" cy="60" r="54" fill="none" stroke="'+_sCol+'" stroke-width="8" stroke-linecap="round" stroke-dasharray="'+Math.round(339*_avg/100)+' 339" style="transition:stroke-dasharray .8s"/></svg>';
-  h+='<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><div style="font-family:var(--fd);font-size:32px;color:'+_sCol+'">'+_avg+'</div><div style="font-family:var(--fh);font-size:8px;font-weight:700;color:'+_sCol+';letter-spacing:.06em">'+_sLbl+'</div></div></div>';
+  h+='<div style="position:relative;width:110px;height:110px">';
+  h+='<svg viewBox="0 0 120 120" style="width:110px;height:110px;transform:rotate(-90deg)"><circle cx="60" cy="60" r="54" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="8"/><circle cx="60" cy="60" r="54" fill="none" stroke="'+_sCol+'" stroke-width="8" stroke-linecap="round" stroke-dasharray="'+Math.round(339*_avg/100)+' 339"/></svg>';
+  h+='<div style="position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center"><div style="font-family:var(--fd);font-size:30px;color:'+_sCol+'">'+_avg+'</div><div style="font-family:var(--fh);font-size:8px;font-weight:700;color:'+_sCol+'">'+_sLbl+'</div></div></div>';
+  // 6 headline cards
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">';
-  [{v:fmt(c.netCF||0),l:'Surplus',c:(c.netCF||0)>=0?'var(--gr)':'var(--rd)',i:'💰'},{v:fmtK(c.netWorth||0),l:'Net Worth',c:(c.netWorth||0)>=0?'var(--gr)':'var(--or)',i:'📊'},{v:(c.savingsRate||0).toFixed(0)+'%',l:'Savings Rate',c:c.savingsRate>=15?'var(--gr)':c.savingsRate>=5?'var(--yl)':'var(--rd)',i:'🎯'},{v:(c.efMonths||0).toFixed(1)+' mo',l:'EF Runway',c:c.efMonths>=3?'var(--gr)':c.efMonths>=1?'var(--yl)':'var(--rd)',i:'🛡️'},{v:(c.dti||0).toFixed(0)+'%',l:'DTI Ratio',c:c.dti<=28?'var(--gr)':c.dti<=36?'var(--yl)':'var(--rd)',i:'💳'},{v:fmtK(c.totalDebt||0),l:'Total Debt',c:c.totalDebt>0?'var(--or)':'var(--gr)',i:'⚡'}].forEach(function(m){
-    h+='<div style="padding:12px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px">';
-    h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-size:14px">'+m.i+'</span><span style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700">'+m.l+'</span></div>';
+  [{v:fmt(c.netCF||0),l:'Surplus',c:(c.netCF||0)>=0?'var(--gr)':'var(--rd)',i:'💰'},{v:fmtK(c.netWorth||0),l:'Net Worth',c:(c.netWorth||0)>=0?'var(--gr)':'var(--or)',i:'📊'},{v:(c.savingsRate||0).toFixed(0)+'%',l:'Savings Rate',c:c.savingsRate>=15?'var(--gr)':c.savingsRate>=5?'var(--yl)':'var(--rd)',i:'🎯'},{v:(c.efMonths||0).toFixed(1)+' mo',l:'EF Runway',c:c.efMonths>=3?'var(--gr)':c.efMonths>=1?'var(--yl)':'var(--rd)',i:'🛡️'},{v:(c.dti||0).toFixed(0)+'%',l:'DTI',c:c.dti<=28?'var(--gr)':c.dti<=36?'var(--yl)':'var(--rd)',i:'💳'},{v:fmtK(c.totalDebt||0),l:'Debt',c:c.totalDebt>0?'var(--or)':'var(--gr)',i:'⚡'}].forEach(function(m){
+    h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;transition:border-color .15s" onmouseover="this.style.borderColor=\'#5B9BFF\'" onmouseout="this.style.borderColor=\'var(--bd)\'">';
+    h+='<div style="display:flex;align-items:center;gap:5px;margin-bottom:3px"><span style="font-size:13px">'+m.i+'</span><span style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700">'+m.l+'</span></div>';
     h+='<div style="font-family:var(--fd);font-size:18px;color:'+m.c+'">'+m.v+'</div></div>';
   });
   h+='</div></div>';
@@ -17866,95 +17743,78 @@ function renderClientAnalysis(){
   // ═══ 8-SCORE GRID ═══
   h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Health Scores</div>';
   h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:20px">';
-  [{k:'cfScore',l:'Cash Flow',s:c.netCF>=0?'+'+fmt(c.netCF)+'/mo':fmt(c.netCF)+'/mo'},{k:'protScore',l:'Protection',s:(c.efMonths||0).toFixed(1)+' mo EF'},{k:'growScore',l:'Growth',s:(c.savingsRate||0).toFixed(1)+'% savings'},{k:'effScore',l:'Efficiency',s:(c.leakCount||0)+' leaks'},{k:'fpi',l:'Pressure',s:null,inv:true},{k:'incRisk',l:'Inc. Risk',s:(rawS.incomeSources||[]).length+' source'+((rawS.incomeSources||[]).length!==1?'s':''),inv:true},{k:'spendStab',l:'Stability',s:'Discipline'},{k:'cashEff',l:'Cash Eff.',s:c.idleCash>1000?fmt(c.idleCash)+' idle':'Deployed'}].forEach(function(s){
+  [{k:'cfScore',l:'Cash Flow',s:c.netCF>=0?'+'+fmt(c.netCF)+'/mo':fmt(c.netCF)+'/mo'},{k:'protScore',l:'Protection',s:(c.efMonths||0).toFixed(1)+' mo EF'},{k:'growScore',l:'Growth',s:(c.savingsRate||0).toFixed(1)+'%'},{k:'effScore',l:'Efficiency',s:(c.leakCount||0)+' leaks'},{k:'fpi',l:'Pressure',s:null,inv:true},{k:'incRisk',l:'Inc. Risk',s:(rawS.incomeSources||[]).length+' source'+((rawS.incomeSources||[]).length!==1?'s':''),inv:true},{k:'spendStab',l:'Stability',s:'Discipline'},{k:'cashEff',l:'Cash Eff.',s:c.idleCash>1000?fmt(c.idleCash)+' idle':'OK'}].forEach(function(s){
     var v=c[s.k];if(v===undefined)v=null;var d=s.inv&&v!==null?(10-v):v;var col=d!==null?scCol(d):'var(--mu)';
-    if(s.k==='fpi')s.s=v<=3?'Low':v<=6?'Moderate':'High';
-    h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center">';
-    h+='<div style="position:relative;width:48px;height:48px;margin:0 auto 6px"><svg viewBox="0 0 44 44" style="width:48px;height:48px;transform:rotate(-90deg)"><circle cx="22" cy="22" r="20" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="3"/><circle cx="22" cy="22" r="20" fill="none" stroke="'+col+'" stroke-width="3" stroke-linecap="round" stroke-dasharray="'+(d!==null?Math.round(126*d/10):0)+' 126"/></svg>';
-    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:15px;color:'+col+'">'+(d!==null?d:'—')+'</div></div>';
-    h+='<div style="font-size:10px;color:var(--wh);font-family:var(--fh);font-weight:700">'+s.l+'</div>';
-    if(s.s)h+='<div style="font-size:8px;color:var(--mu);margin-top:1px">'+s.s+'</div>';
+    if(s.k==='fpi')s.s=v<=3?'Low':v<=6?'Med':'High';
+    h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center;transition:border-color .15s" onmouseover="this.style.borderColor=\''+col+'\'" onmouseout="this.style.borderColor=\'var(--bd)\'">';
+    h+='<div style="position:relative;width:44px;height:44px;margin:0 auto 4px"><svg viewBox="0 0 44 44" style="width:44px;height:44px;transform:rotate(-90deg)"><circle cx="22" cy="22" r="20" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="3"/><circle cx="22" cy="22" r="20" fill="none" stroke="'+col+'" stroke-width="3" stroke-linecap="round" stroke-dasharray="'+(d!==null?Math.round(126*d/10):0)+' 126"/></svg>';
+    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:14px;color:'+col+'">'+(d!==null?d:'—')+'</div></div>';
+    h+='<div style="font-size:9px;color:var(--wh);font-family:var(--fh);font-weight:700">'+s.l+'</div>';
+    if(s.s)h+='<div style="font-size:7px;color:var(--mu);margin-top:1px">'+s.s+'</div>';
     h+='</div>';
   });
   h+='</div>';
-
-  // ═══ PROJECTION CHART — reuses plan's actual chart renderer ═══
-  if(_hasPlan){
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Projections <span style="font-size:8px;color:var(--gr);margin-left:4px">synced from your plan</span></div>';
-    h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px;margin-bottom:20px"><div id="analysisChart"></div></div>';
-  }
 
   // ═══ PROBLEMS ═══
   var probs=[];
   if(c.netCF<0)probs.push({t:'crit',i:'🚨',n:'Cash Flow Deficit: '+fmt(Math.abs(c.netCF))+'/mo',d:'Spending exceeds income.'});
   else if(c.netCF<500)probs.push({t:'warn',i:'⚠️',n:'Thin Buffer: '+fmt(c.netCF)+'/mo',d:'One expense could create a crisis.'});
   if(c.efMonths<1)probs.push({t:'crit',i:'🚨',n:'No Emergency Fund',d:'Any disruption forces new debt.'});
-  else if(c.efMonths<3)probs.push({t:'warn',i:'⚠️',n:'EF: '+c.efMonths.toFixed(1)+' months (Target: 3–6)',d:'Shortfall: '+fmt(c.efS3)+'.'});
+  else if(c.efMonths<3)probs.push({t:'warn',i:'⚠️',n:'EF: '+c.efMonths.toFixed(1)+' months',d:'Below 3-month target.'});
   if(c.dti>43)probs.push({t:'crit',i:'💳',n:'DTI: '+c.dti.toFixed(0)+'%',d:'Above 43% cap.'});
   else if(c.dti>36)probs.push({t:'warn',i:'💳',n:'High DTI: '+c.dti.toFixed(0)+'%',d:'Approaching danger zone.'});
   if(c.idleCash>5000)probs.push({t:'opp',i:'💤',n:'Idle Cash: '+fmt(c.idleCash),d:'Losing value to inflation.'});
   if(c.savingsRate<5&&c.inc>0)probs.push({t:'crit',i:'📉',n:'Savings: '+c.savingsRate.toFixed(1)+'%',d:'Below 5%.'});
   if(c.retGap>0)probs.push({t:'warn',i:'🕒',n:'Retirement Gap: '+fmtK(c.retGap),d:'Trajectory misses FI target.'});
   if(probs.length){
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Issues <span style="color:var(--rd);margin-left:4px">'+probs.length+'</span></div>';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Issues <span style="color:var(--rd)">'+probs.length+'</span></div>';
     probs.forEach(function(p){
       var bc=p.t==='crit'?'#EF4444':p.t==='warn'?'#EAB308':'#22C55E';var tc=p.t==='crit'?'var(--rd)':p.t==='warn'?'var(--yl)':'var(--gr)';
-      var addr=false;if(typeof CPLAN!=='undefined'&&CPLAN.allocations){if(p.n.indexOf('Emergency')>=0)addr=CPLAN.allocations.some(function(a){return a.type==='ef'&&a.amount>0;});if(p.i==='💳')addr=CPLAN.allocations.some(function(a){return a.type==='debt'&&a.amount>0;});if(p.i==='📉')addr=CPLAN.allocations.some(function(a){return a.amount>0;});if(p.i==='🕒')addr=CPLAN.allocations.some(function(a){return['roth','401k','iul','wl'].indexOf(a.type)>=0&&a.amount>0;});}
-      h+='<div style="display:flex;gap:12px;align-items:flex-start;padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+bc+';border-radius:0 2px 2px 0;margin-bottom:6px">';
-      h+='<span style="font-size:20px;flex-shrink:0">'+p.i+'</span>';
-      h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+tc+'">'+p.n+'</div>';
-      h+='<div style="font-size:11px;color:var(--mu);margin-top:2px">'+p.d+'</div>';
-      if(addr)h+='<div style="display:inline-block;margin-top:4px;padding:2px 8px;background:rgba(34,197,94,.08);border-radius:2px;font-size:9px;color:var(--gr);font-family:var(--fh);font-weight:700">✓ In your plan</div>';
-      else h+='<a href="#" onclick="showClientPage(\'plan\');initClientPlan();return false" style="display:inline-block;margin-top:4px;padding:2px 8px;background:rgba(234,179,8,.08);border-radius:2px;font-size:9px;color:var(--yl);text-decoration:none;font-family:var(--fh);font-weight:700">→ Address this</a>';
-      h+='</div></div>';
+      h+='<div style="display:flex;gap:12px;align-items:center;padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+bc+';border-radius:0 2px 2px 0;margin-bottom:6px;transition:border-color .15s" onmouseover="this.style.borderColor=\''+bc+'\'" onmouseout="this.style.borderColor=\'var(--bd)\';this.style.borderLeftColor=\''+bc+'\'">';
+      h+='<span style="font-size:20px">'+p.i+'</span>';
+      h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+tc+'">'+p.n+'</div><div style="font-size:10px;color:var(--mu)">'+p.d+'</div></div></div>';
     });
-  } else {
-    h+='<div style="padding:16px;text-align:center;background:var(--bg-card);border:1px solid rgba(34,197,94,.15);border-radius:2px;margin-bottom:16px"><span style="font-size:24px">✅</span><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--gr);margin-top:4px">No critical problems</div></div>';
   }
 
-  // ═══ EFFICIENCY + STRESS side by side ═══
+  // ═══ EFFICIENCY + STRESS ═══
   if(c.inc>0){
     h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:16px 0">';
     var _ce=Math.round(c.cashEff||0);var _ceC=_ce>=70?'var(--gr)':_ce>=40?'var(--yl)':'var(--or)';
-    h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px"><div style="display:flex;align-items:center;gap:10px">';
-    h+='<div style="position:relative;width:48px;height:48px;flex-shrink:0"><svg viewBox="0 0 44 44" style="width:48px;height:48px;transform:rotate(-90deg)"><circle cx="22" cy="22" r="20" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="3"/><circle cx="22" cy="22" r="20" fill="none" stroke="'+_ceC+'" stroke-width="3" stroke-linecap="round" stroke-dasharray="'+Math.round(126*_ce/100)+' 126"/></svg>';
-    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:13px;color:'+_ceC+'">'+_ce+'%</div></div>';
+    h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;transition:border-color .15s" onmouseover="this.style.borderColor=\''+_ceC+'\'" onmouseout="this.style.borderColor=\'var(--bd)\'">';
+    h+='<div style="display:flex;align-items:center;gap:10px"><div style="position:relative;width:44px;height:44px;flex-shrink:0"><svg viewBox="0 0 44 44" style="width:44px;height:44px;transform:rotate(-90deg)"><circle cx="22" cy="22" r="20" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="3"/><circle cx="22" cy="22" r="20" fill="none" stroke="'+_ceC+'" stroke-width="3" stroke-linecap="round" stroke-dasharray="'+Math.round(126*_ce/100)+' 126"/></svg>';
+    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:12px;color:'+_ceC+'">'+_ce+'%</div></div>';
     h+='<div><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--wh)">Cash Efficiency</div>';
     if(c.idleCash>0)h+='<div style="font-size:9px;color:var(--mu)">'+fmt(c.idleCash)+' idle</div>';
     h+='</div></div></div>';
     var st=0;if(c.dti>43)st+=25;else if(c.dti>36)st+=15;else if(c.dti>28)st+=8;if(c.efMonths<1)st+=25;else if(c.efMonths<3)st+=12;if(c.netCF<0)st+=20;else if(c.netCF<200)st+=10;if(c.savingsRate<5)st+=10;st=Math.min(100,st);
     var stC=st<=30?'var(--gr)':st<=60?'var(--yl)':'var(--rd)';var stL=st<=20?'Low':st<=40?'OK':st<=60?'Moderate':'High';
-    h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px"><div style="display:flex;align-items:center;gap:10px">';
-    h+='<div style="position:relative;width:48px;height:48px;flex-shrink:0"><svg viewBox="0 0 44 44" style="width:48px;height:48px;transform:rotate(-90deg)"><circle cx="22" cy="22" r="20" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="3"/><circle cx="22" cy="22" r="20" fill="none" stroke="'+stC+'" stroke-width="3" stroke-linecap="round" stroke-dasharray="'+Math.round(126*st/100)+' 126"/></svg>';
-    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:13px;color:'+stC+'">'+st+'</div></div>';
-    h+='<div><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--wh)">Financial Stress</div>';
-    h+='<div style="font-size:9px;color:'+stC+'">'+stL+'</div></div></div></div>';
+    h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;transition:border-color .15s" onmouseover="this.style.borderColor=\''+stC+'\'" onmouseout="this.style.borderColor=\'var(--bd)\'">';
+    h+='<div style="display:flex;align-items:center;gap:10px"><div style="position:relative;width:44px;height:44px;flex-shrink:0"><svg viewBox="0 0 44 44" style="width:44px;height:44px;transform:rotate(-90deg)"><circle cx="22" cy="22" r="20" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="3"/><circle cx="22" cy="22" r="20" fill="none" stroke="'+stC+'" stroke-width="3" stroke-linecap="round" stroke-dasharray="'+Math.round(126*st/100)+' 126"/></svg>';
+    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:12px;color:'+stC+'">'+st+'</div></div>';
+    h+='<div><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--wh)">Financial Stress</div><div style="font-size:9px;color:'+stC+'">'+stL+'</div></div></div></div>';
     h+='</div>';
   }
 
-  // ═══ RETIREMENT READINESS ═══
-  if(c.fiNumber>0){
-    var rp=Math.min(100,Math.round((c.projRetBal||0)/c.fiNumber*100));var rC=rp>=80?'var(--gr)':rp>=50?'#5B9BFF':'var(--or)';
-    h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;margin-bottom:16px"><div style="display:flex;align-items:center;gap:14px">';
-    h+='<div style="position:relative;width:64px;height:64px;flex-shrink:0"><svg viewBox="0 0 120 120" style="width:64px;height:64px;transform:rotate(-90deg)"><circle cx="60" cy="60" r="54" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="6"/><circle cx="60" cy="60" r="54" fill="none" stroke="'+rC+'" stroke-width="6" stroke-linecap="round" stroke-dasharray="'+Math.round(339*rp/100)+' 339"/></svg>';
-    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:16px;color:'+rC+'">'+rp+'%</div></div>';
-    h+='<div><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--wh);margin-bottom:2px">Retirement Readiness</div>';
-    h+='<div style="font-size:11px;color:var(--mu)">Target: <strong style="color:var(--wh)">'+fmtK(c.fiNumber)+'</strong> · Projected: <strong style="color:var(--wh)">'+fmtK(c.projRetBal||0)+'</strong></div>';
-    if(c.retGap>0)h+='<div style="font-size:11px;color:var(--or);margin-top:2px">Gap: '+fmtK(c.retGap)+'</div>';
-    h+='</div></div></div>';
-  }
-
   // ═══ KEY METRICS ═══
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Key Metrics</div>';
-  h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden;margin-bottom:16px">';
-  [{l:'Monthly income',v:fmt(c.inc||0),c:'var(--gr)'},{l:'Monthly expenses',v:fmt(c.baseExp||0),c:'var(--wh)'},{l:'Net cash flow',v:fmt(c.netCF||0),c:(c.netCF||0)>=0?'var(--gr)':'var(--rd)'},{l:'Savings rate',v:(c.savingsRate||0).toFixed(1)+'%',c:c.savingsRate>=15?'var(--gr)':c.savingsRate>=5?'var(--yl)':'var(--rd)'},{l:'DTI',v:(c.dti||0).toFixed(1)+'%',c:c.dti<=28?'var(--gr)':c.dti<=36?'var(--yl)':'var(--rd)'},{l:'Emergency fund',v:(c.efMonths||0).toFixed(1)+' months',c:c.efMonths>=3?'var(--gr)':c.efMonths>=1?'var(--yl)':'var(--rd)'},{l:'Net worth',v:fmtK(c.netWorth||0),c:(c.netWorth||0)>=0?'var(--gr)':'var(--rd)'},{l:'Total assets',v:fmtK(c.totalAssets||0),c:'var(--wh)'},{l:'Total debt',v:fmtK(c.totalDebt||0),c:'var(--or)'}].forEach(function(m,i){
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin:16px 0 10px">Key Metrics</div>';
+  h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
+  [{l:'Income',v:fmt(c.inc||0),c:'var(--gr)'},{l:'Expenses',v:fmt(c.baseExp||0),c:'var(--wh)'},{l:'Net CF',v:fmt(c.netCF||0),c:(c.netCF||0)>=0?'var(--gr)':'var(--rd)'},{l:'Savings',v:(c.savingsRate||0).toFixed(1)+'%',c:c.savingsRate>=15?'var(--gr)':c.savingsRate>=5?'var(--yl)':'var(--rd)'},{l:'DTI',v:(c.dti||0).toFixed(1)+'%',c:c.dti<=28?'var(--gr)':c.dti<=36?'var(--yl)':'var(--rd)'},{l:'EF',v:(c.efMonths||0).toFixed(1)+' mo',c:c.efMonths>=3?'var(--gr)':c.efMonths>=1?'var(--yl)':'var(--rd)'},{l:'Net Worth',v:fmtK(c.netWorth||0),c:(c.netWorth||0)>=0?'var(--gr)':'var(--rd)'},{l:'Assets',v:fmtK(c.totalAssets||0),c:'var(--wh)'},{l:'Debt',v:fmtK(c.totalDebt||0),c:'var(--or)'}].forEach(function(m,i){
     h+='<div style="display:flex;justify-content:space-between;padding:8px 14px;font-size:12px;background:'+(i%2===0?'rgba(0,68,191,.02)':'transparent')+';border-bottom:'+(i<8?'1px solid var(--bd)':'none')+'"><span style="color:var(--mu)">'+m.l+'</span><span style="color:'+m.c+';font-family:var(--fd);font-weight:700">'+m.v+'</span></div>';
   });
   h+='</div>';
 
+  // ═══ RETIREMENT ═══
+  if(c.fiNumber>0){
+    var rp=Math.min(100,Math.round((c.projRetBal||0)/c.fiNumber*100));var rC=rp>=80?'var(--gr)':rp>=50?'#5B9BFF':'var(--or)';
+    h+='<div style="margin-top:16px;padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;transition:border-color .15s" onmouseover="this.style.borderColor=\''+rC+'\'" onmouseout="this.style.borderColor=\'var(--bd)\'">';
+    h+='<div style="display:flex;align-items:center;gap:12px"><div style="position:relative;width:56px;height:56px;flex-shrink:0"><svg viewBox="0 0 120 120" style="width:56px;height:56px;transform:rotate(-90deg)"><circle cx="60" cy="60" r="54" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="6"/><circle cx="60" cy="60" r="54" fill="none" stroke="'+rC+'" stroke-width="6" stroke-linecap="round" stroke-dasharray="'+Math.round(339*rp/100)+' 339"/></svg>';
+    h+='<div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-family:var(--fd);font-size:14px;color:'+rC+'">'+rp+'%</div></div>';
+    h+='<div><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--wh)">Retirement Readiness</div>';
+    h+='<div style="font-size:10px;color:var(--mu)">Target: '+fmtK(c.fiNumber)+' · Projected: '+fmtK(c.projRetBal||0)+'</div>';
+    if(c.retGap>0)h+='<div style="font-size:10px;color:var(--or)">Gap: '+fmtK(c.retGap)+'</div>';
+    h+='</div></div></div>';
+  }
   el.innerHTML=h;
-  // Render the plan's ACTUAL chart into the analysis page (same chart as plan bottom)
-  if(_hasPlan)setTimeout(function(){_cpRenderChart('analysisChart');},50);
 }
 
 // ── CLIENT FINANCIAL PLANNER v3 ─────────────────────────
