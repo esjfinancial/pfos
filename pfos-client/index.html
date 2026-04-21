@@ -18058,6 +18058,59 @@ function _cpConvertAIRecs(aiData){
     CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':'')});
     usedPool+=amt;
   });
+
+  // ── POST-PROCESSING ──
+
+  // Fix 4: cascade_to fallback — auto-set to largest growth item if AI left it empty
+  var _largestGrowth='';var _largestAmt=0;
+  CPLAN.allocations.forEach(function(a){
+    if(a.amount>0&&['roth','401k','roth401k','invest','edu','iul','wl','ibc','trad_ira','solo401k','sep_ira','hsa'].indexOf(a.type)>=0){
+      if(a.amount>_largestAmt){_largestAmt=a.amount;_largestGrowth=a.type;}
+    }
+  });
+  CPLAN.allocations.forEach(function(a){
+    if((a.type==='debt'||a.type==='ef')&&!a.cascade&&_largestGrowth){a.cascade=_largestGrowth;}
+  });
+
+  // Fix 5: Deployment total normalization — pro-rate if AI total ≠ target
+  var _deployTarget=Math.round((CPLAN.surplus||0)*0.85);
+  var _fundedAllocs=CPLAN.allocations.filter(function(a){return a.amount>0;});
+  var _actualTotal=_fundedAllocs.reduce(function(t,a){return t+a.amount;},0);
+  if(_deployTarget>0&&_actualTotal>0&&Math.abs(_actualTotal-_deployTarget)>5){
+    var _scale=_deployTarget/_actualTotal;
+    _fundedAllocs.forEach(function(a){a.amount=Math.round(a.amount*_scale);});
+    // Fix rounding — adjust largest item to hit exact target
+    var _newTotal=_fundedAllocs.reduce(function(t,a){return t+a.amount;},0);
+    if(_newTotal!==_deployTarget&&_fundedAllocs.length>0){
+      _fundedAllocs.sort(function(a,b){return b.amount-a.amount;})[0].amount+=(_deployTarget-_newTotal);
+    }
+  }
+
+  // Fix 6: Premium text scrub — strip dollar estimates from protection descriptions
+  CPLAN.allocations.forEach(function(a){
+    if(a.type==='protection'||(a.type==='custom'&&a.amount===0)){
+      if(a.reason)a.reason=a.reason.replace(/\$\d[\d,]*[-–]\$?\d[\d,]*\s*\/?\s*mo(?:nth)?/gi,'Discuss costs with a licensed insurance professional').replace(/estimated\s+\$\d[\d,]*/gi,'Discuss costs with a licensed professional').replace(/(?:typically|usually|budget|expect|approximately)\s+\$\d[\d,]*/gi,'Discuss costs with a licensed professional');
+    }
+  });
+
+  // Fix 7: Phase 2 "Increase X" merge — merge same-type Phase 2 items into Phase 1
+  var _toRemove=[];
+  CPLAN.allocations.forEach(function(a2,i2){
+    if(a2.phase>1&&a2.amount>0){
+      var _match=-1;
+      CPLAN.allocations.forEach(function(a1,i1){
+        if(a1.phase===1&&a1.type===a2.type&&a1.amount>0&&a1.type!=='protection'&&a1.type!=='custom')_match=i1;
+      });
+      if(_match>=0){
+        CPLAN.allocations[_match].amount+=a2.amount;
+        _toRemove.push(i2);
+      }
+    }
+  });
+  if(_toRemove.length>0){
+    CPLAN.allocations=CPLAN.allocations.filter(function(_,idx){return _toRemove.indexOf(idx)<0;});
+  }
+
   if(aiData.summary)CPLAN._aiSummary=aiData.summary;
   if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
   if(aiData.debtStrategy)CPLAN.debtStrategy=aiData.debtStrategy;
@@ -18536,49 +18589,6 @@ function _cpRenderPlanV2(){
     var p=CP_PHASE[pn];
     var phaseAlloc=phaseItems.reduce(function(t,a){return t+a.amount;},0);
     var isExpanded=CPLAN['_phase'+pn+'Open']!==false;
-
-    // ── Cascade Transition Sections — inject after Phase 1 ──
-    if(pn===2&&CPLAN._sim&&CPLAN._sim.cascadeLog&&CPLAN._sim.cascadeLog.length>0){
-      CPLAN._sim.cascadeLog.forEach(function(cl,clIdx){
-        var evDate=new Date(Date.now()+cl.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'});
-        var evColor=cl.month<=12?'#F97316':cl.month<=36?'#5B9BFF':'#22C55E';
-        var evIsOpen=CPLAN['_cascadeOpen'+clIdx]!==false;
-        h+='<div id="cpCascade'+clIdx+'" style="margin-bottom:14px;border:1px solid '+evColor+'30;border-radius:6px;overflow:hidden;background:var(--bg-card)">';
-        // Cascade header
-        h+='<div onclick="CPLAN._cascadeOpen'+clIdx+'='+(!evIsOpen)+';_cpRenderPlanV2()" style="display:flex;align-items:center;justify-content:space-between;padding:16px 18px;cursor:pointer;min-height:52px;background:linear-gradient(135deg,'+evColor+'08,transparent)">';
-        h+='<div style="display:flex;align-items:center;gap:12px"><div style="width:40px;height:40px;border-radius:10px;background:'+evColor+'18;display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">🔄</div>';
-        h+='<div><div style="display:flex;align-items:center;gap:6px"><span style="font-family:var(--fh);font-size:12px;font-weight:800;color:#fff;background:'+evColor+';padding:2px 10px;border-radius:3px;letter-spacing:.04em">'+evDate+'</span><span style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">After '+cl.source+'</span></div>';
-        h+='<div style="font-size:10px;color:var(--mu)">'+fmt(cl.freed)+'/mo freed and redistributed to '+cl.destinations.length+' account'+(cl.destinations.length!==1?'s':'')+'</div></div></div>';
-        h+='<span style="font-size:12px;color:var(--mu);transform:rotate('+(evIsOpen?'180':'0')+'deg);transition:transform .2s">▼</span>';
-        h+='</div>';
-        if(evIsOpen){
-          h+='<div style="padding:12px 18px">';
-          // Redistribution table
-          h+='<div style="border:1px solid '+evColor+'20;border-radius:4px;overflow:hidden">';
-          h+='<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:0;font-family:var(--fh);font-size:10px">';
-          h+='<div style="padding:8px 12px;background:'+evColor+'08;color:var(--mu);font-weight:700;border-bottom:1px solid '+evColor+'15">Account</div>';
-          h+='<div style="padding:8px 12px;background:'+evColor+'08;color:var(--mu);font-weight:700;text-align:right;border-bottom:1px solid '+evColor+'15">Before</div>';
-          h+='<div style="padding:8px 12px;background:'+evColor+'08;color:var(--mu);font-weight:700;text-align:center;border-bottom:1px solid '+evColor+'15">→</div>';
-          h+='<div style="padding:8px 12px;background:'+evColor+'08;color:var(--gr);font-weight:700;text-align:right;border-bottom:1px solid '+evColor+'15">After</div>';
-          cl.destinations.forEach(function(dest){
-            var beforeAmt=0;
-            CPLAN.allocations.forEach(function(a2){if(a2.type===dest.type)beforeAmt=Math.max(beforeAmt,a2.amount);});
-            h+='<div style="padding:6px 12px;border-bottom:1px solid rgba(100,116,139,.06);color:var(--wh);font-size:11px">'+dest.name+'</div>';
-            h+='<div style="padding:6px 12px;border-bottom:1px solid rgba(100,116,139,.06);text-align:right;color:var(--mu);font-family:var(--fd)">'+fmt(beforeAmt)+'</div>';
-            h+='<div style="padding:6px 12px;border-bottom:1px solid rgba(100,116,139,.06);text-align:center;color:'+evColor+'">→</div>';
-            h+='<div style="padding:6px 12px;border-bottom:1px solid rgba(100,116,139,.06);text-align:right;color:var(--gr);font-family:var(--fd);font-weight:700">'+fmt(beforeAmt+dest.amount)+'/mo</div>';
-          });
-          h+='</div></div>';
-          h+='<div style="font-size:9px;color:var(--mu);margin-top:8px;text-align:right">Total redistributed: '+fmt(cl.destinations.reduce(function(t,d){return t+d.amount;},0))+'/mo</div>';
-          h+='</div>';
-        }
-        h+='</div>';
-      });
-    }
-
-    // Hide empty Phase 2/3/4 when cascade transitions exist
-    if(pn>1&&!phaseItems.length&&CPLAN._sim&&CPLAN._sim.cascadeLog&&CPLAN._sim.cascadeLog.length>0)return;
-
     h+='<div id="cpPhase'+pn+'" style="margin-bottom:14px;border:1px solid var(--bd);border-radius:6px;overflow:hidden;background:var(--bg-card)">';
     // Phase header (clickable)
     h+='<div onclick="CPLAN._phase'+pn+'Open='+(!isExpanded)+';_cpRenderPlanV2()" style="display:flex;align-items:center;justify-content:space-between;padding:16px 18px;cursor:pointer;min-height:52px">';
@@ -18645,23 +18655,11 @@ function _cpRenderPlanV2(){
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:12px"><div class="info-card" id="cplanEFRunway"></div><div class="info-card" id="cplanIncomeReplace"></div></div>';
   // Mobile phase quick-jump bar (sticky on small screens)
   h+='<div id="cpPhaseJump" style="display:none;position:sticky;bottom:60px;z-index:50;padding:6px 0;margin:12px 0">';
-  h+='<div style="display:flex;gap:4px;justify-content:center;padding:6px 12px;background:rgba(12,12,52,.95);border:1px solid var(--bd);border-radius:20px;backdrop-filter:blur(8px);box-shadow:0 4px 16px rgba(0,0,0,.3);flex-wrap:wrap">';
-  // Phase 1 button
-  var _p1Items=CPLAN.allocations.filter(function(a){return a.phase===1;});
-  h+='<button onclick="document.getElementById(\'cpPhase1\').scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="display:flex;align-items:center;gap:4px;padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;border:1px solid '+CP_PHASE[1].border+';background:'+CP_PHASE[1].color+'12;color:'+CP_PHASE[1].color+';border-radius:12px;cursor:pointer;min-height:28px;white-space:nowrap">'+CP_PHASE[1].icon+' Day 1</button>';
-  // Cascade transition buttons
-  if(CPLAN._sim&&CPLAN._sim.cascadeLog){
-    CPLAN._sim.cascadeLog.forEach(function(cl2,cli2){
-      var _cDate=new Date(Date.now()+cl2.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'2-digit'});
-      h+='<button onclick="document.getElementById(\'cpCascade'+cli2+'\').scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="display:flex;align-items:center;gap:4px;padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;border:1px solid rgba(91,155,255,.2);background:rgba(91,155,255,.08);color:#5B9BFF;border-radius:12px;cursor:pointer;min-height:28px;white-space:nowrap">🔄 '+_cDate+'</button>';
-    });
-  }
-  // Remaining phase buttons (only if they have items)
-  [2,3,4].forEach(function(pn2){
-    var pi2=CPLAN.allocations.filter(function(a){return a.phase===pn2;});
-    if(!pi2.length)return;
-    var p2=CP_PHASE[pn2];
-    h+='<button onclick="document.getElementById(\'cpPhase'+pn2+'\').scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="display:flex;align-items:center;gap:4px;padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;border:1px solid '+p2.border+';background:'+p2.color+'12;color:'+p2.color+';border-radius:12px;cursor:pointer;min-height:28px;white-space:nowrap">'+p2.icon+' P'+pn2+'</button>';
+  h+='<div style="display:flex;gap:4px;justify-content:center;padding:6px 12px;background:rgba(12,12,52,.95);border:1px solid var(--bd);border-radius:20px;backdrop-filter:blur(8px);box-shadow:0 4px 16px rgba(0,0,0,.3)">';
+  [1,2,3,4].forEach(function(pn2){
+    var p2=CP_PHASE[pn2];var pi2=CPLAN.allocations.filter(function(a){return a.phase===pn2;});
+    var dc=pi2.filter(function(a){return a._completed;}).length;var pp2=pi2.length>0?Math.round(dc/pi2.length*100):0;
+    h+='<button onclick="document.getElementById(\'cpPhase'+pn2+'\').scrollIntoView({behavior:\'smooth\',block:\'center\'})" style="display:flex;align-items:center;gap:4px;padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;border:1px solid '+p2.border+';background:'+p2.color+'12;color:'+p2.color+';border-radius:12px;cursor:pointer;min-height:28px;white-space:nowrap">'+p2.icon+' P'+pn2+(pp2>0?' <span style="font-size:7px">'+pp2+'%</span>':'')+'</button>';
   });
   h+='</div></div>';
 
@@ -20090,10 +20088,15 @@ function _cpRunSimulation(){
         });
       }
     }
-    // Then: fund any remaining unfunded growth items (skip action-only: protection, estate)
+    // Then: fund any remaining unfunded growth items (skip action-only items)
     if(freed>0){
       var unfunded=CPLAN.allocations.map(function(a3,i3){return{a:a3,i:i3};})
-        .filter(function(x){return allocAmounts[x.i]===0&&['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','custom','house','rental'].indexOf(x.a.type)>=0&&!x.a._completed;})
+        .filter(function(x){
+          if(allocAmounts[x.i]>0||x.a._completed)return false;
+          if(x.a.type==='protection')return false;
+          if(x.a.type==='custom'&&(!x.a.target||x.a.target<=0))return false;
+          return['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;
+        })
         .sort(function(a4,b4){return(a4.a.phase||99)-(b4.a.phase||99);});
       unfunded.forEach(function(uf){
         if(freed<=0)return;
