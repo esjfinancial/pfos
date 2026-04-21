@@ -18324,6 +18324,30 @@ function _cpConvertAIRecs(aiData){
     }
   });
 
+  // Fix PP10: Tax-Free approach should not include taxable investment accounts
+  if(CPLAN._selectedApproach==='tax_free'||CPLAN._viewingApproach==='tax_free'){
+    var _taxableRemoved=0;
+    CPLAN.allocations=CPLAN.allocations.filter(function(a){
+      if(a.type==='invest'){_taxableRemoved+=a.amount;return false;}
+      return true;
+    });
+    // Redistribute removed amount to Roth IRA if it exists, capped at IRS limit
+    if(_taxableRemoved>0){
+      var _rothA=CPLAN.allocations.find(function(a){return a.type==='roth';});
+      if(_rothA){
+        var _rothMax=_cpIRSMax('roth');
+        var _addToRoth=Math.min(_taxableRemoved,Math.max(0,_rothMax-_rothA.amount));
+        _rothA.amount+=_addToRoth;
+        _taxableRemoved-=_addToRoth;
+      }
+      // Any remaining goes to existing IUL/WL/IBC (no IRS cap)
+      if(_taxableRemoved>0){
+        var _tfGrowth=CPLAN.allocations.find(function(a){return a.type==='iul'||a.type==='wl'||a.type==='ibc';});
+        if(_tfGrowth)_tfGrowth.amount+=_taxableRemoved;
+      }
+    }
+  }
+
   // Fix PP8: Plan health minimum — ensure all major categories are funded for minimum 80 score
   var _deployPool=Math.round((CPLAN.surplus||0)*0.85);
   var _currentTotal=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
@@ -18855,14 +18879,20 @@ function _cpRenderPlanV2(){
   // Determine available phases dynamically from allocations + simulation cascade events
   var _sim=CPLAN._sim||{};var _simEvents=(_sim.events||[]).filter(function(e){return e.freed>0&&e.type!=='debt_milestone';});
   var _allocPhases={};CPLAN.allocations.forEach(function(a){if(a.phase>0)_allocPhases[a.phase]=true;});
+  // Check if phase has MEANINGFUL items (funded or genuinely new, not just $0 action items)
+  function _phaseHasContent(pn){
+    var items=CPLAN.allocations.filter(function(a){return a.phase===pn;});
+    if(!items.length)return false;
+    return items.some(function(a){return a.amount>0||a.type!=='protection';});
+  }
   var _availablePhases=[1];// Phase 1 always exists
   // Phase 2 exists if: simulation has cascade events OR allocations assigned to Phase 2
-  if(_simEvents.length>0||_allocPhases[2])_availablePhases.push(2);
-  // Phase 3+ only if allocations are actually assigned there (not just cascade event count)
-  if(_allocPhases[3])_availablePhases.push(3);
-  if(_allocPhases[4])_availablePhases.push(4);
-  // Support additional phases beyond 4 only if items exist
-  Object.keys(_allocPhases).forEach(function(k){var pn=parseInt(k);if(pn>4&&_availablePhases.indexOf(pn)<0)_availablePhases.push(pn);});
+  if(_simEvents.length>0||(_allocPhases[2]&&_phaseHasContent(2)))_availablePhases.push(2);
+  // Phase 3+ only if they have meaningful content
+  if(_allocPhases[3]&&_phaseHasContent(3))_availablePhases.push(3);
+  if(_allocPhases[4]&&_phaseHasContent(4))_availablePhases.push(4);
+  // Support additional phases beyond 4 only if items exist with content
+  Object.keys(_allocPhases).forEach(function(k){var pn=parseInt(k);if(pn>4&&_availablePhases.indexOf(pn)<0&&_phaseHasContent(pn))_availablePhases.push(pn);});
   _availablePhases.sort(function(a,b){return a-b;});
   // Ensure active tab is valid
   if(_availablePhases.indexOf(CPLAN._activePhaseTab)<0)CPLAN._activePhaseTab=1;
@@ -19281,54 +19311,57 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">~'+moLeft+' month'+(moLeft!==1?'s':'')+' <span style="font-size:9px;color:var(--mu)">('+new Date(Date.now()+moLeft*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+')</span></span>';
     h+='</div>';
   }
-  // ── IBC Projection Chart — AV line + CV staircase ──
+  // ── IBC Projection Chart — AV line + CV staircase with policy loan drops ──
   if(a.type==='debt'&&CPLAN.debtStrategy==='ibc'&&a.amount>0){
     var _ibcPrem=a._ibcPremium||Math.round(a.amount*0.35);
     var _ibcGrowthRate=0.04/12;// 4% WL illustrated rate monthly
     var _ibcLoanRate=0.05/12;// 5% policy loan rate monthly
     var _ibcHiDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.rate)||0)>10&&(parseFloat(d.balance)||0)>0;});
-    var _ibcSorted=_cpDebtSort(_ibcHiDebts,CPLAN.debtStrategy);
-    var _ibcDebtSim=_cpDebtSimulate(_ibcSorted,a.amount);
-    var _ibcTotalMonths=Math.min(360,(_ibcDebtSim.months||18)*3);// Show 3x debt payoff period
+    // Use IBC-specific simulation (policy loans when CV is large enough)
+    var _ibcResult=_cpCalcIBCDebt(_ibcHiDebts,_ibcPrem);
+    var _ibcPayoffLog=(_ibcResult&&_ibcResult.payoffLog)||[];
+    var _ibcFullFree=(_ibcResult&&_ibcResult.fullFreeMonth)||60;
+    var _ibcTotalMonths=Math.min(360,Math.max(_ibcFullFree+24,48));
     var _avData=[],_cvData=[],_ibcMilestones=[];
     var _av=0,_outstandingLoans=0,_freedMins=0;
-    var _ibcCardOrder=(_ibcDebtSim.order||[]).slice();
-    // Enrich order with balances and minimums from original debt data
-    _ibcCardOrder.forEach(function(card){
-      var match=_ibcHiDebts.find(function(d){return(d.name||d.type||'')===(card.name||'');});
-      card.balance=match?(parseFloat(match.balance)||0):0;
-      card.min=match?(parseFloat(match.min)||parseFloat(match.payment)||0):0;
-    });
+    // WL surrender value factor — CV as % of AV (front-loaded costs)
+    function _svFactor(month){
+      var yr=month/12;
+      if(yr<=1)return 0.30+yr*0.15;
+      if(yr<=3)return 0.45+(yr-1)*0.10;
+      if(yr<=5)return 0.65+(yr-3)*0.075;
+      if(yr<=7)return 0.80+(yr-5)*0.05;
+      if(yr<=10)return 0.90+(yr-7)*0.027;
+      return Math.min(1.0,0.98+(yr-10)*0.004);
+    }
     for(var _im=0;_im<=_ibcTotalMonths;_im++){
-      // AV grows every month (premium + compound)
       _av=(_av+_ibcPrem)*(1+_ibcGrowthRate);
-      // Check if a card is paid off this month — take policy loan for its balance
-      _ibcCardOrder.forEach(function(card){
-        if(card.month===_im){
-          _outstandingLoans+=(card.balance||0);
-          _freedMins+=(card.min||0);
-          _ibcMilestones.push({month:_im,label:(card.name||'Card')+'',type:'payoff'});
+      // Policy loan taken when IBC sim says so (CV large enough to cover card balance)
+      _ibcPayoffLog.forEach(function(pl){
+        if(pl.month===_im){
+          _outstandingLoans+=(pl.balAtLoan||0);
+          var matchD=_ibcHiDebts.find(function(d){return(d.name||d.type||'')===(pl.name||'');});
+          _freedMins+=(matchD?(parseFloat(matchD.min)||parseFloat(matchD.payment)||0):0);
+          _ibcMilestones.push({month:_im,label:pl.name||'Paid off',type:'payoff'});
         }
       });
-      // Loans accrue interest, freed mins repay loans
       if(_outstandingLoans>0){
         _outstandingLoans=_outstandingLoans*(1+_ibcLoanRate)-_freedMins;
         if(_outstandingLoans<=0){
           _outstandingLoans=0;
-          // CV = AV recovery point
           if(_ibcMilestones.every(function(m){return m.type!=='recovery';})){
-            _ibcMilestones.push({month:_im,label:'Loans repaid (CV=AV)',type:'recovery'});
+            _ibcMilestones.push({month:_im,label:'CV=AV recovered',type:'recovery'});
           }
         }
       }
+      var _rawCV=_av*_svFactor(_im)-_outstandingLoans;
       _avData.push(Math.round(_av));
-      _cvData.push(Math.round(Math.max(0,_av-_outstandingLoans)));
+      _cvData.push(Math.round(Math.max(0,_rawCV)));
     }
-    // Break-even milestone (CV > total premiums paid)
     var _totalPremPaid=0;
     for(var _be=0;_be<=_ibcTotalMonths;_be++){
       _totalPremPaid+=_ibcPrem;
-      if(_cvData[_be]>=_totalPremPaid&&_be>12){_ibcMilestones.push({month:_be,label:'Break-even',type:'breakeven'});break;}
+      if(_cvData[_be]>=_totalPremPaid&&_be>24){_ibcMilestones.push({month:_be,label:'Break-even',type:'breakeven'});break;}
     }
     // Render SVG chart
     var _iW=500,_iH=180,_iPL=45,_iPR=50,_iPT=16,_iPB=24;
