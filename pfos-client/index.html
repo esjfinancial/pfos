@@ -18315,6 +18315,15 @@ function _cpConvertAIRecs(aiData){
     }
   });
 
+  // Fix PP9: IRS limit enforcement — cap AI allocations at legal maximums
+  var _irsTypes2=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'];
+  CPLAN.allocations.forEach(function(a){
+    if(a.amount>0&&_irsTypes2.indexOf(a.type)>=0){
+      var max=_cpIRSMax(a.type);
+      if(a.amount>max)a.amount=max;
+    }
+  });
+
   // Fix PP8: Plan health minimum — ensure all major categories are funded for minimum 80 score
   var _deployPool=Math.round((CPLAN.surplus||0)*0.85);
   var _currentTotal=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
@@ -18414,8 +18423,28 @@ function _cpShowApproachFork(){
       // Success — show data with tax breakdown
       var hl=data.headline||{};
       var retVal=hl.projected_retirement_value||0;
-      var retInc=hl.projected_monthly_income||0;
       var monthlyCost=hl.total_monthly_cost||0;
+      // Calculate retirement income using SAME formula as bottom bar (retirement-only vehicles, 4% rule)
+      var _retVehiclesAppr=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
+      var _apprStratMap={'roth_ira':'roth','roth_401k':'roth401k','401k':'401k','traditional_ira':'trad_ira','solo_401k':'solo401k','sep_ira':'sep_ira','iul':'iul','whole_life':'wl','ibc_wl':'ibc','ibc_iul':'ibc','ibc':'ibc','hsa':'hsa'};
+      var _apprYrs=Math.max(1,65-(CPLAN.age||35));
+      var _apprRetVal=0;
+      if(data.allocations&&data.allocations.length>0){
+        data.allocations.forEach(function(al){
+          var amt=al.monthly_cost||al.amount||0;if(amt<=0)return;
+          var rawStrat=al.strategy||al.type||'';
+          var aType=_apprStratMap[rawStrat]||rawStrat;
+          if(_retVehiclesAppr.indexOf(aType)<0)return;
+          var rate=0.065;// Default net return assumption
+          if(aType==='wl'||aType==='ibc')rate=0.04;
+          else if(aType==='iul')rate=0.055;
+          var bal=0;for(var _ay=1;_ay<=_apprYrs;_ay++){bal=(bal+amt*12)*(1+rate);}
+          _apprRetVal+=bal;
+        });
+      }
+      var retInc=_apprRetVal>0?Math.round(_apprRetVal*0.04/12):(hl.projected_monthly_income||0);
+      // Also recalculate retVal from our formula if we have allocation data
+      if(_apprRetVal>0)retVal=Math.round(_apprRetVal);
       // Tax breakdown
       var taxAmt=Math.round(retInc*cd.taxRatio*_taxPct/100);
       var netInc=retInc-taxAmt;
@@ -18839,18 +18868,17 @@ function _cpRenderPlanV2(){
   if(_availablePhases.indexOf(CPLAN._activePhaseTab)<0)CPLAN._activePhaseTab=1;
   var _activeTab=CPLAN._activePhaseTab;
 
-  // Phase trigger info from simulation
+  // Phase trigger info from simulation — map all events to phase triggers
   var _phaseTriggers={};
-  if(_simEvents.length>0){
-    var _triggerMonth=_simEvents[0].month||0;
-    var _triggerDate=new Date(Date.now()+_triggerMonth*30*86400000);
-    _phaseTriggers[2]={month:_triggerMonth,date:_triggerDate.toLocaleDateString('en-US',{month:'short',year:'numeric'}),label:_simEvents[0].label||'Completing items finish'};
-  }
-  if(_simEvents.length>1){
-    var _triggerMonth2=_simEvents[1].month||0;
-    var _triggerDate2=new Date(Date.now()+_triggerMonth2*30*86400000);
-    _phaseTriggers[3]={month:_triggerMonth2,date:_triggerDate2.toLocaleDateString('en-US',{month:'short',year:'numeric'}),label:_simEvents[1].label||'Additional items complete'};
-  }
+  var _triggerIdx=0;
+  _simEvents.forEach(function(ev){
+    if(ev.type==='debt_milestone')return;// Skip individual card milestones
+    _triggerIdx++;
+    var pn=_triggerIdx+1;// Event 1 → Phase 2, Event 2 → Phase 3, etc.
+    var _trigMonth=ev.month||0;
+    var _trigDate=new Date(Date.now()+_trigMonth*30*86400000);
+    _phaseTriggers[pn]={month:_trigMonth,date:_trigDate.toLocaleDateString('en-US',{month:'short',year:'numeric'}),label:ev.label||'Cascade event'};
+  });
 
   // ── Phase Tab Bar ──
   h+='<div style="display:flex;gap:4px;margin-bottom:14px;border-bottom:2px solid var(--bd);padding-bottom:0">';
@@ -18894,12 +18922,15 @@ function _cpRenderPlanV2(){
     CPLAN.allocations.forEach(function(a){if(a.amount>0&&CPLAN.surplus>0){var w=Math.max(1,Math.round(a.amount/CPLAN.surplus*100));h+='<div style="height:100%;width:'+w+'%;background:'+CP_COL[a.type]+';opacity:0.2"></div>';}});
     h+='</div></div>';
     h+='<div style="font-size:8px;color:var(--mu);margin-bottom:4px">Phase 1: '+fmt(allocated)+'/mo</div>';
-    // Phase 2 layer (colored — future amounts)
+    // Phase 2 layer (colored — future amounts, excluding completed items)
     var _futureTotal=0;
     h+='<div style="position:relative;height:14px;background:rgba(100,116,139,.06);border-radius:3px;overflow:hidden"><div style="display:flex;height:100%">';
     _sim.allocFuture.forEach(function(af){
+      var a=CPLAN.allocations[af.idx];
+      if(a.type==='debt'||a.type==='ef')return;// Exclude completed items from Phase 2 bar
+      if(a.type==='protection'&&a.amount===0)return;// Exclude action-only items
       var fa=af.futureAmount||af.currentAmount||0;
-      if(fa>0&&CPLAN.surplus>0){var w=Math.max(1,Math.round(fa/CPLAN.surplus*100));var a=CPLAN.allocations[af.idx];h+='<div style="height:100%;width:'+w+'%;background:'+(CP_COL[a.type]||'#94A3B8')+';opacity:0.7;transition:width .3s"></div>';_futureTotal+=fa;}
+      if(fa>0&&CPLAN.surplus>0){var w=Math.max(1,Math.round(fa/CPLAN.surplus*100));h+='<div style="height:100%;width:'+w+'%;background:'+(CP_COL[a.type]||'#94A3B8')+';opacity:0.7;transition:width .3s"></div>';_futureTotal+=fa;}
     });
     h+='</div></div>';
     h+='<div style="font-size:8px;color:var(--gr);margin-top:2px">Phase '+_activeTab+': '+fmt(_futureTotal)+'/mo (same surplus — redistributed)</div>';
@@ -18932,28 +18963,44 @@ function _cpRenderPlanV2(){
     var _pCur2=CP_PHASE[_activeTab]||{name:'Phase '+_activeTab,color:'#94A3B8',border:'rgba(100,116,139,.2)',icon:'📌'};
     h+='<div id="cpPhase'+_activeTab+'" style="margin-bottom:14px">';
 
-    // Render ALL Phase 1 allocations as full cards with Phase 2 treatment
+    // Render ALL Phase 1 allocations as full cards with current phase treatment
+    // Calculate current phase trigger month for base amount calculation
+    var _curPhaseTrigger=_phaseTriggers[_activeTab];
+    var _curTriggerMonth=(_curPhaseTrigger&&_curPhaseTrigger.month)||0;
     if(_p1Items.length>0){
       _p1Items.forEach(function(a){
         var idx=CPLAN.allocations.indexOf(a);
         var af=(_sim&&_sim.allocFuture)?_sim.allocFuture[idx]:null;
         var futureAmt=(af&&af.futureAmount>a.amount)?af.futureAmount:a.amount;
-        var boost=futureAmt-a.amount;
+        // For Phase 3+: calculate base as amount after previous phase boosts
+        var baseAmt=a.amount;
+        if(_activeTab>2&&af&&af.boosts&&af.boosts.length>0){
+          af.boosts.forEach(function(b){
+            if(b.month<_curTriggerMonth)baseAmt+=b.amount;
+          });
+        }
+        var boost=futureAmt-baseAmt;
         var isCompleting=(a.type==='debt'||a.type==='ef'||(a.type==='custom'&&a.target>0));
-        var isActionOnly=(a.type==='protection'||(a.amount===0&&boost===0));
+        var isActionOnly=(a.type==='protection'||(baseAmt===0&&boost<=0));
         var color=CP_COL[a.type]||'#94A3B8';
+        var _prevPhaseLabel=_activeTab>2?'Phase '+(_activeTab-1):'Phase 1';
 
-        // Skip $0 action items with no boost (term life, disability, estate — don't clutter Phase 2)
-        if(isActionOnly&&boost===0)return;
+        // Skip $0 action items with no boost
+        if(isActionOnly&&boost<=0)return;
 
-        // Boost banner — shows Phase 1 → Phase 2 amount change
+        // Boost banner — shows previous phase → current phase amount change
         if(boost>0){
           h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 10px;margin-bottom:-1px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.1);border-bottom:none;border-radius:4px 4px 0 0;font-size:10px">';
-          h+='<span style="color:var(--mu)">Phase 1:</span><span style="color:var(--mu);text-decoration:line-through">'+fmt(a.amount)+'/mo</span>';
+          h+='<span style="color:var(--mu)">'+_prevPhaseLabel+':</span><span style="color:var(--mu);text-decoration:line-through">'+fmt(baseAmt)+'/mo</span>';
           h+='<span style="color:var(--gr)">→</span>';
           h+='<span style="color:var(--gr);font-weight:700">Phase '+_activeTab+': '+fmt(futureAmt)+'/mo</span>';
           h+='<span style="color:var(--gr);font-size:9px">(+'+fmt(boost)+')</span>';
-          if(af&&af.boosts&&af.boosts.length>0)h+='<span style="color:var(--mu);font-size:8px;margin-left:4px">after '+af.boosts[0].from+'</span>';
+          if(af&&af.boosts&&af.boosts.length>0){
+            // Find the boost relevant to THIS phase
+            var _relevantBoost=af.boosts.find(function(b){return b.month>=_curTriggerMonth;})||af.boosts[af.boosts.length-1];
+            var _bDate=_relevantBoost.month?new Date(Date.now()+_relevantBoost.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'}):'';
+            h+='<span style="color:var(--mu);font-size:8px;margin-left:4px">after '+_relevantBoost.from+(_bDate?' ('+_bDate+')':'')+'</span>';
+          }
           h+='</div>';
         }
 
@@ -19246,15 +19293,21 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _avData=[],_cvData=[],_ibcMilestones=[];
     var _av=0,_outstandingLoans=0,_freedMins=0;
     var _ibcCardOrder=(_ibcDebtSim.order||[]).slice();
+    // Enrich order with balances and minimums from original debt data
+    _ibcCardOrder.forEach(function(card){
+      var match=_ibcHiDebts.find(function(d){return(d.name||d.type||'')===(card.name||'');});
+      card.balance=match?(parseFloat(match.balance)||0):0;
+      card.min=match?(parseFloat(match.min)||parseFloat(match.payment)||0):0;
+    });
     for(var _im=0;_im<=_ibcTotalMonths;_im++){
       // AV grows every month (premium + compound)
       _av=(_av+_ibcPrem)*(1+_ibcGrowthRate);
       // Check if a card is paid off this month — take policy loan for its balance
       _ibcCardOrder.forEach(function(card){
         if(card.month===_im){
-          _outstandingLoans+=(parseFloat(card.balance)||parseFloat(card.bal)||0);
-          _freedMins+=(parseFloat(card.min)||parseFloat(card.payment)||0);
-          _ibcMilestones.push({month:_im,label:card.name||'Card paid off',type:'payoff'});
+          _outstandingLoans+=(card.balance||0);
+          _freedMins+=(card.min||0);
+          _ibcMilestones.push({month:_im,label:(card.name||'Card')+'',type:'payoff'});
         }
       });
       // Loans accrue interest, freed mins repay loans
@@ -19284,7 +19337,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     function _ix(m){return _iPL+m/_ibcTotalMonths*_iCW;}
     function _iy(v){return _iPT+_iCH-(v/_iMaxV)*_iCH;}
     h+='<div style="margin-top:10px;padding:12px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.1);border-radius:4px">';
-    h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:2px">IBC POLICY PROJECTION</div>';
+    h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:2px">IBC POLICY PROJECTION (WHOLE LIFE)</div>';
     h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
     h+='<div style="font-size:9px;color:var(--mu)">Premium: '+fmt(_ibcPrem)+'/mo · Loan rate: 5% · Growth: 4%</div>';
     h+='<div style="font-family:var(--fd);font-size:14px;color:#A855F7">'+fmtK(_avData[_ibcTotalMonths])+'<span style="font-size:9px;color:var(--mu)"> AV at yr '+Math.round(_ibcTotalMonths/12)+'</span></div>';
@@ -19953,7 +20006,8 @@ function _cpRenderIncomeReplacement(){
   // Use simulation's retirement-only data if available
   var retIncome=0;
   if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length>0){
-    var retAtRetire=CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
+    var _retYrsToAge65=Math.max(1,Math.min(30,65-(CPLAN.age||35)));
+    var retAtRetire=CPLAN._sim.retirement[_retYrsToAge65]||CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
     retIncome=Math.round(retAtRetire*0.04/12);
   } else {
     var yrs=Math.max(1,65-CPLAN.age);
@@ -20190,8 +20244,8 @@ function _cpRenderDebtEngine(debtAlloc,idx){
     // IBC side note
     if(ibc&&ibc.eligible){
       h+='<div style="padding:8px 10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.1);border-radius:2px;margin-bottom:6px;display:flex;align-items:center;gap:8px">';
-      h+='<span style="font-size:14px">🏛️</span><div style="flex:1"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#A855F7">IBC: Accumulate & Loan</div>';
-      h+='<div style="font-size:10px;color:var(--mu)">Build cash value, pay debts via policy loans → debts gone month '+ibc.months+', keep '+fmtK(ibc.vehicle)+' vehicle</div></div>';
+      h+='<span style="font-size:14px">🏛️</span><div style="flex:1"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#A855F7">IBC (Whole Life): Accumulate & Loan</div>';
+      h+='<div style="font-size:10px;color:var(--mu)">Build cash value, pay debts via policy loans → debts gone month '+ibc.months+', keep '+fmtK(ibc.vehicle)+' cash value</div></div>';
       h+='<button onclick="CPLAN.debtStrategy=\'ibc\';_cpRender()" style="padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;background:'+(CPLAN.debtStrategy==='ibc'?'rgba(168,85,247,.15)':'transparent')+';border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:2px;min-height:28px">Select</button></div>';
     } else if(ibc&&!ibc.eligible){
       h+='<div style="font-size:10px;color:var(--mu);padding:4px 0">🏛️ IBC: '+ibc.reason+'</div>';
@@ -20215,7 +20269,7 @@ function _cpRenderDebtEngine(debtAlloc,idx){
       {key:'hybrid',label:'Hybrid',data:hybrid}
     ];
     if(consol&&consol.eligible)allPlans.push({key:'consolidation',label:'Consolidation',data:{months:consol.months,interest:consol.interest,intSaved:Math.max(0,base.interest-consol.interest)}});
-    if(ibc&&ibc.eligible)allPlans.push({key:'ibc',label:'IBC A&L',data:{months:ibc.months,interest:ibc.interest,intSaved:Math.max(0,base.interest-ibc.interest),vehicle:ibc.vehicle}});
+    if(ibc&&ibc.eligible)allPlans.push({key:'ibc',label:'IBC (WL)',data:{months:ibc.months,interest:ibc.interest,intSaved:Math.max(0,base.interest-ibc.interest),vehicle:ibc.vehicle}});
 
     h+='<div style="overflow-x:auto;margin-bottom:10px"><table style="width:100%;border-collapse:collapse;font-size:11px;min-width:400px">';
     h+='<thead><tr><th style="padding:6px 8px;text-align:left;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);border-bottom:1px solid var(--bd)">Strategy</th><th style="padding:6px 8px;text-align:center;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);border-bottom:1px solid var(--bd)">Months</th><th style="padding:6px 8px;text-align:center;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);border-bottom:1px solid var(--bd)">Interest</th><th style="padding:6px 8px;text-align:center;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);border-bottom:1px solid var(--bd)">Saved</th><th style="padding:6px 8px;text-align:center;border-bottom:1px solid var(--bd)"></th></tr></thead><tbody>';
@@ -20527,14 +20581,16 @@ function _cpRunSimulation(){
       if(tIdx>=0){
         var irsMax=_cpIRSMax(CPLAN.allocations[tIdx].type);
         var maxAdd=Math.max(0,irsMax-allocAmounts[tIdx]);
-        var add=Math.min(freed,maxAdd>0?maxAdd:freed);
-        allocAmounts[tIdx]+=add;
-        if(allocFuture[tIdx].startsMonth<0)allocFuture[tIdx].startsMonth=ev.month;
-        allocFuture[tIdx].futureAmount=allocAmounts[tIdx];
-        allocFuture[tIdx].reason=ev.label;
-        allocFuture[tIdx].boosts.push({month:ev.month,amount:add,from:ev.label});
-        destinations.push({type:CPLAN.allocations[tIdx].type,name:CPLAN.allocations[tIdx].customName||CP_NM[CPLAN.allocations[tIdx].type],amount:add});
-        freed-=add;
+        var add=Math.min(freed,maxAdd);
+        if(add>0){
+          allocAmounts[tIdx]+=add;
+          if(allocFuture[tIdx].startsMonth<0)allocFuture[tIdx].startsMonth=ev.month;
+          allocFuture[tIdx].futureAmount=allocAmounts[tIdx];
+          allocFuture[tIdx].reason=ev.label;
+          allocFuture[tIdx].boosts.push({month:ev.month,amount:add,from:ev.label});
+          destinations.push({type:CPLAN.allocations[tIdx].type,name:CPLAN.allocations[tIdx].customName||CP_NM[CPLAN.allocations[tIdx].type],amount:add});
+          freed-=add;
+        }
       }
     }
     // Remaining: first boost existing growth allocations, then fund unfunded items
@@ -20671,8 +20727,10 @@ function _cpRunSimulation(){
     fullFundingMonth=lastStart;
   }
   var debtFreeMonth=debtSim?debtSim.months:0;
-  var projRetValue=netWorthData[years]||0;
-  var projRetIncome=Math.round(projRetValue*0.04/12);// 4% rule
+  // Retirement projection — use retirement-only data at retirement age (not full NW)
+  var _retAge=65;var _yrsToRet=Math.max(1,Math.min(years,_retAge-(CPLAN.age||35)));
+  var projRetValue=retirementData[_yrsToRet]||retirementData[years]||0;
+  var projRetIncome=Math.round(projRetValue*0.04/12);// 4% safe withdrawal rule
 
   // Store result
   CPLAN._sim={
@@ -21292,7 +21350,20 @@ function _cpConfetti(label){
   document.body.appendChild(overlay);
   setTimeout(function(){overlay.remove();},3000);
 }
-function _cpEnforce(){var total=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);if(total>CPLAN.surplus){var scale=CPLAN.surplus/total;CPLAN.allocations.forEach(function(a){a.amount=Math.round(a.amount*scale);});}}
+function _cpEnforce(){
+  // First: cap individual allocations at their IRS maximums
+  CPLAN.allocations.forEach(function(a){
+    if(a.amount<=0)return;
+    var irsTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'];
+    if(irsTypes.indexOf(a.type)>=0){
+      var max=_cpIRSMax(a.type);
+      if(a.amount>max)a.amount=max;
+    }
+  });
+  // Then: scale down if total exceeds surplus
+  var total=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
+  if(total>CPLAN.surplus){var scale=CPLAN.surplus/total;CPLAN.allocations.forEach(function(a){a.amount=Math.round(a.amount*scale);});}
+}
 function _cpMarkModified(){if(CPLAN.hasAdvisor&&CPLAN.advisorPlan){CPLAN.modified=true;CPLAN.exploring=true;var p=document.getElementById('cplanPropose');if(p)p.style.display='';}}
 function cplanUnlockExplore(){CPLAN.exploring=true;_cpRender();}
 
