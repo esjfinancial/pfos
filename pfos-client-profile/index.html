@@ -771,7 +771,7 @@ html[data-theme="light"] .tip-pop{background:#FFFFFF!important;color:#334155!imp
       <button class="theme-toggle" onclick="pfosToggleLang()" id="langToggle" title="English / Spanish">EN</button>
       <button class="theme-toggle" onclick="showErrorLog()" title="Error log" style="position:relative">🐛<span id="errorBadge" style="display:none;position:absolute;top:-4px;right:-4px;background:var(--rd);color:#fff;font-size:8px;border-radius:8px;padding:1px 4px;font-family:var(--fh);font-weight:700">0</span></button>
     </div>
-    <a class="sb-item" href="https://pfos.esjfinancial.com/pfos-dashboard" style="text-decoration:none;display:flex;align-items:center;gap:8px"><span class="icon">←</span> Back to Dashboard</a>
+    <div class="sb-item" onclick="goBackToClientList()" style="cursor:pointer"><span class="icon">←</span> Back to Dashboard</div>
     <div class="sb-item" onclick="doLogout()" style="color:rgba(239,68,68,.6)"><span class="icon">↩</span> Sign Out</div>
   </div>
 </nav>
@@ -1081,7 +1081,22 @@ function openAdminPanel(){
 }
 
 // Override goBackToClientList to navigate back to dashboard
-function goBackToClientList(){
+async function goBackToClientList(){
+  // Flush PFOS data before navigating away
+  try{
+    var frame=getPFOSFrame();
+    if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
+    await new Promise(function(r){setTimeout(r,200);});
+    if(APP.currentClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+      var calcs=_lastPfosState.calcs||{};
+      var saveToId=APP.currentClientId;
+      var couple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+      if(couple&&couple.household_type==='joint')saveToId=couple.client_a_id;
+      var pp={client_id:saveToId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+      var ex=await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+    }
+  }catch(e){}
   sessionStorage.removeItem('pfos_profile_client_id');
   window.location.href='https://pfos.esjfinancial.com/pfos-dashboard';
 }
@@ -1596,7 +1611,26 @@ async function logAuditEvent(action, entityType, entityId, details){
     });
   }catch(e){ console.warn('auditLog:',e); }
 }
-async function doLogout(){ await db.auth.signOut(); }
+async function doLogout(){
+  // Flush PFOS data before auth session is destroyed
+  try{
+    var frame=getPFOSFrame();
+    if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
+    // Give PFOS_FLUSH 200ms to fire _doSync and send PFOS_DATA_CHANGE back
+    await new Promise(function(r){setTimeout(r,200);});
+    // Save last known state directly (in case PFOS_DATA_CHANGE didn't arrive in time)
+    if(APP.currentClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+      var calcs=_lastPfosState.calcs||{};
+      var saveToId=APP.currentClientId;
+      var couple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+      if(couple&&couple.household_type==='joint')saveToId=couple.client_a_id;
+      var pp={client_id:saveToId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+      var ex=await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+    }
+  }catch(e){console.warn('Pre-logout save failed:',e);}
+  await db.auth.signOut();
+}
 // ── PROGRESS PANELS (shared with client-portal) ───────────────────────────────
 async function loadProgressPanels(clientId, isClientPortal){
   if(!clientId) return;
@@ -4666,14 +4700,16 @@ window.addEventListener('message', async function(e){
 // ── Save-on-exit: flush unsaved changes when navigating away ──
 window.addEventListener('beforeunload',function(){
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
-  if(APP.currentClientId&&_lastPfosState&&_lastPfosState.state){
+  if(APP.currentClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
     try{
       var calcs=_lastPfosState.calcs||{};
       var saveToId=APP.currentClientId;
       var couple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
       if(couple&&couple.household_type==='joint') saveToId=couple.client_a_id;
       var payload={client_id:saveToId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-      db.from('client_profiles').upsert(payload,{onConflict:'client_id'}).then(function(){}).catch(function(){});
+      // Use fetch directly with keepalive for reliable delivery during page unload
+      var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+saveToId+'&order=updated_at.desc&limit=1';
+      fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify({financial_data:payload.financial_data,scores:payload.scores,updated_at:payload.updated_at}),keepalive:true}).catch(function(){});
     }catch(e){}
   }
 });
