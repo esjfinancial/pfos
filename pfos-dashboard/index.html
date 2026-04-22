@@ -1587,7 +1587,7 @@ const SUPABASE_URL      = 'https://wbndgvicmgeodararpmr.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndibmRndmljbWdlb2RhcmFycG1yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ2NTIwNzYsImV4cCI6MjA5MDIyODA3Nn0.OwzfA4naIbJZFPmCZo87NkKRanXdJXlYOvWsx1GGwPE';
 var PFOS_ORIGIN='https://pfos.esjfinancial.com';
 var APP_COUPLES=[],APP_RECS=[],APP_ADVISORY_FILTER='all',APP_PRODUCT_FILTER='all';
-var pfosClientContext=null,_lastPfosState={state:{},calcs:{}};
+var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=false;
 var _sessionStart=null,_sessionClientId=null;
 var _sessionTimer=null,_sessionWarnTimer=null;
 var SESSION_WARN_MS=25*60*1000,SESSION_IDLE_MS=30*60*1000,_lastReset=0;
@@ -1964,8 +1964,13 @@ async function initAuth(){
         localStorage.removeItem('pfos_state');
         localStorage.removeItem('pfos_biometric_token');
         localStorage.removeItem('pfos_biometric_refresh');
+        localStorage.removeItem('pfos_tracking');
+        localStorage.removeItem('pfos_plan_calendar');
+        localStorage.removeItem('pfos_plan_backup');
+        localStorage.removeItem('pfos_ui_mode');
       }catch(ex){}
       _lastPfosState={state:{},calcs:{}};
+      _pfosDataLoaded=false;
       showScreen('loginScreen');
     }
   });
@@ -2353,7 +2358,7 @@ function pfosPost(msg){
   if(frame && frame.contentWindow) frame.contentWindow.postMessage(msg, PFOS_ORIGIN);
 }
 function getPFOSFrame(){
-  return document.getElementById('pfosFrame') || document.getElementById('clientPfosFrame');
+  return document.getElementById('pfosFrame') || document.getElementById('clientPfosFrame') || document.getElementById('pfosAgentFrame');
 }
 // ── Listen for PFOS data changes and save to Supabase ──
 window.addEventListener('message',async function(e){
@@ -2361,6 +2366,7 @@ window.addEventListener('message',async function(e){
   var msg=e.data; if(!msg||!msg.type) return;
   if(msg.type==='PFOS_DATA_CHANGE'){
     console.log('[Dashboard] Received PFOS_DATA_CHANGE','isAgent:',!!(pfosClientContext&&pfosClientContext.isAgentProfile),'clientId:',APP.currentClientId);
+    if(!_pfosDataLoaded){console.log('[Dashboard] Skipping save — data not loaded yet');return;}
     try{
       var state=msg.state,calcs=state.calcs||{};
       _lastPfosState={state:state,calcs:calcs};
@@ -2375,10 +2381,12 @@ window.addEventListener('message',async function(e){
       }
       // Client finances — save to client_profiles
       if(!APP.currentClientId){ console.warn('[Dashboard] No currentClientId — skipping save'); return; }
-      _lastSaveClientId=APP.currentClientId;
+      var _cpSave=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+      var _saveToId=(_cpSave&&_cpSave.household_type==='joint')?_cpSave.client_a_id:APP.currentClientId;
+      _lastSaveClientId=_saveToId;
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
-      var pp={client_id:APP.currentClientId,financial_data:{S:state,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
-      var ex=await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).maybeSingle();
+      var pp={client_id:_saveToId,financial_data:{S:state,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
+      var ex=await db.from('client_profiles').select('id').eq('client_id',_saveToId).maybeSingle();
       if(ex&&ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[Dashboard] Client profile UPDATED'); }
       else { await db.from('client_profiles').insert(pp); console.log('[Dashboard] Client profile INSERTED'); }
     }catch(err){ console.warn('Dashboard auto-save ERROR:',err); }
@@ -2489,6 +2497,7 @@ async function loadClientDataIntoPFOS(clientId){
     clientType: APP.currentClient ? (APP.currentClient.client_type||'product') : 'product',
     assignedAdvisorId: (APP.currentClient && APP.currentClient.client_type !== 'product') ? (APP.currentClient.user_id || null) : null,
     coupleData: coupleData });
+  _pfosDataLoaded=true;
   // Load calculator tier access for this client and send to iframe
   if(mode==='client'&&APP.currentClientId) loadCalcTiers(APP.currentClientId);
 }
@@ -4551,6 +4560,7 @@ async function loadAgentProfileIntoPFOS(){
       state:stateData,
       coupleData:null
     },'*');
+    _pfosDataLoaded=true;
   }catch(e){ console.warn('loadAgentProfileIntoPFOS:',e); }
 }
 async function saveAgentProfile(){
