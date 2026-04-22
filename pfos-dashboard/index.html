@@ -1299,7 +1299,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
         <div id="advClientInfo" style="font-size:11px;color:#64748B;min-width:120px">Manual mode</div>
       </div>
  
-      <div style="margin-bottom:20px"><input class="inp" type="text" id="advToolSearch" placeholder="Search 93 calculators..." oninput="advFilterTools()" style="min-height:40px;font-size:13px"></div>
+      <div style="margin-bottom:20px"><input class="inp" type="text" id="advToolSearch" placeholder="Search 62 calculators..." oninput="advFilterTools()" style="min-height:40px;font-size:13px"></div>
       <div id="advGrid" onclick="var b=event.target.closest('[data-calc]');if(b)advOpenCalc(b.getAttribute('data-calc'))"></div>
     </div>
     <!-- ── AGENTS PAGE (admin only) ── -->
@@ -2384,11 +2384,22 @@ window.addEventListener('message',async function(e){
 var _lastSaveClientId=null;
 window.addEventListener('beforeunload',function(){
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
-  if(_lastSaveClientId&&_lastPfosState&&_lastPfosState.state){
+  var saveId=_lastSaveClientId||(pfosClientContext&&pfosClientContext.isAgentProfile?null:APP.currentClientId);
+  if(saveId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
     try{
       var calcs=_lastPfosState.calcs||{};
-      var payload={client_id:_lastSaveClientId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-      db.from('client_profiles').upsert(payload,{onConflict:'client_id'}).then(function(){}).catch(function(){});
+      var payload={financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+      var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+saveId+'&order=updated_at.desc&limit=1';
+      fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
+    }catch(e){}
+  }
+  // Agent finances
+  if(pfosClientContext&&pfosClientContext.isAgentProfile&&APP.user&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+    try{
+      var agCalcs=_lastPfosState.calcs||{};
+      var agPayload={financial_data:{S:_lastPfosState.state,calcs:agCalcs},scores:{cfScore:agCalcs.cfScore,protScore:agCalcs.protScore,growScore:agCalcs.growScore,effScore:agCalcs.effScore},updated_at:new Date().toISOString()};
+      var agUrl=SUPABASE_URL+'/rest/v1/agent_profiles?user_id=eq.'+APP.user.id;
+      fetch(agUrl,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify(agPayload),keepalive:true}).catch(function(){});
     }catch(e){}
   }
 });
@@ -2863,7 +2874,27 @@ async function logAuditEvent(action, entityType, entityId, details){
     });
   }catch(e){ console.warn('auditLog:',e); }
 }
-async function doLogout(){ await db.auth.signOut(); }
+async function doLogout(){
+  try{
+    var frame=getPFOSFrame();
+    if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
+    await new Promise(function(r){setTimeout(r,200);});
+    if(_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+      if(pfosClientContext&&pfosClientContext.isAgentProfile&&APP.user){
+        var agCalcs=_lastPfosState.calcs||{};
+        var agPP={user_id:APP.user.id,financial_data:{S:_lastPfosState.state,calcs:agCalcs},scores:{cfScore:agCalcs.cfScore,protScore:agCalcs.protScore,growScore:agCalcs.growScore,effScore:agCalcs.effScore},updated_at:new Date().toISOString()};
+        var agEx=await db.from('agent_profiles').select('id').eq('user_id',APP.user.id).maybeSingle();
+        if(agEx&&agEx.data)await db.from('agent_profiles').update(agPP).eq('id',agEx.data.id);
+      } else if(APP.currentClientId){
+        var calcs=_lastPfosState.calcs||{};
+        var pp={client_id:APP.currentClientId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+        var ex=await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+        if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+      }
+    }
+  }catch(e){console.warn('Pre-logout save failed:',e);}
+  await db.auth.signOut();
+}
 
 // ── FIX 8: ADVISOR RECOMMENDATION ACTION STUBS ───────────────────────────────
 // Full rendering lives in client-profile.html. These stubs handle the DB
