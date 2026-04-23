@@ -1185,6 +1185,8 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="sb-item" id="cnav-notifications" onclick="showClientPage('notifications');loadNotificationCenter()"><span class="icon">🔔</span> Notifications <span id="notifBadge" style="display:none;background:var(--or);color:#fff;font-size:9px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
       <div class="sb-item" id="cnav-engage" onclick="showClientPage('engage');initEngagementPage()"><span class="icon">🏆</span> Achievements</div>
       <div class="sb-item" id="cnav-couple" onclick="showClientPage('couple');renderCoupleView()" style="display:none"><span class="icon">💑</span> Couple View</div>
+      <div class="sb-item" id="cnav-getadvisor" onclick="openFreeReviewRequest()" style="display:none"><span class="icon">🤝</span> Get an Advisor</div>
+      <div class="sb-item" id="cnav-myadvisor" style="display:none;cursor:default;opacity:.7"><span class="icon">👤</span> <span id="myAdvisorLabel">My Advisor</span></div>
       <div class="sb-section" id="secAdvisorResources" style="margin-top:8px">Advisor Resources</div>
       <div class="sb-item" id="cnav-reports" onclick="showClientPage('reports')"><span class="icon">📄</span> My Reports</div>
       <div class="sb-item" id="cnav-messages" onclick="showClientPage('messages');loadClientMessages()"><span class="icon">💬</span> Messages <span id="msgBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:9px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
@@ -1306,16 +1308,6 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
           <div style="font-size:64px;margin-bottom:8px" id="celebIcon">🎉</div>
           <div style="font-family:var(--fd);font-size:32px;color:var(--gr)" id="celebTitle">Great Progress!</div>
           <div style="font-size:14px;color:rgba(226,232,240,.7)" id="celebSub">You completed a recommendation</div>
-        </div>
-      </div>
-      <!-- Request-an-Agent (shown for product-only clients) -->
-      <div id="requestAgentSection" style="display:none">
-        <div class="info-card" style="border-color:rgba(34,197,94,.2);background:rgba(34,197,94,.04)">
-          <div class="info-card-title" style="color:var(--gr)">🤝 Work with an Advisor</div>
-          <div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7;margin-bottom:14px">Get personalized guidance from a financial advisor. Schedule a free consultation to review your financial profile and build a plan together.</div>
-          <textarea class="inp" id="agentRequestMsg" rows="3" placeholder="Optional: Tell us about your goals or questions..."></textarea>
-          <button class="btn btn-or" style="margin-top:10px;width:auto;padding:10px 20px" onclick="submitAgentRequest()" id="agentRequestBtn">Request a Free Consultation</button>
-          <div id="agentRequestConfirm" style="display:none;margin-top:10px;padding:10px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:2px;font-size:13px;color:var(--gr)">✓ Request sent! An advisor will contact you shortly.</div>
         </div>
       </div>
 
@@ -2390,6 +2382,7 @@ function updateMobileTools(){
   // Net Worth Ticker
   renderClientTracking();
   loadSupabaseSnapshots();
+  if(typeof _trackLoadFromSupabase==='function')_trackLoadFromSupabase();
   var nwEl=document.getElementById('nwTickerVal');
   var nwTrend=document.getElementById('nwTickerTrend');
   if(nwEl){
@@ -17645,6 +17638,13 @@ function _cpUpdateAdvisoryNav(){
   });
   // Also hide message badge container
   var msgBadge=document.getElementById('msgBadge');if(msgBadge&&!isAdvisory)msgBadge.style.display='none';
+  // Get an Advisor (product only) / My Advisor (advisory only)
+  var getAdv=document.getElementById('cnav-getadvisor');
+  var myAdv=document.getElementById('cnav-myadvisor');
+  if(getAdv)getAdv.style.display=isAdvisory?'none':'';
+  if(myAdv){myAdv.style.display=isAdvisory?'':'none';
+    var lbl=document.getElementById('myAdvisorLabel');if(lbl&&APP.currentClient){var an=APP.currentClient.advisor_name||APP.currentClient.agent_name||'My Advisor';lbl.textContent=an;}
+  }
 }
 
 // ── PLAN AUTO-LOAD ───────────────────────────────────
@@ -17668,8 +17668,49 @@ var _cpTracking={};
 var _cpPlanCalendar={};// {allocIdx: {day: 15, name: 'Roth IRA', amount: 500, type: 'roth'}}
 try{var _pcBk=localStorage.getItem('pfos_plan_calendar');if(_pcBk)_cpPlanCalendar=JSON.parse(_pcBk);}catch(e){}
 try{var _trkBk=localStorage.getItem('pfos_tracking');if(_trkBk)_cpTracking=JSON.parse(_trkBk);}catch(e){}
+function _trackLoadFromSupabase(){
+  if(!db||!APP.currentClientId)return;
+  var _svId=APP.currentClientId;
+  var _cpSvL=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+  if(_cpSvL&&_cpSvL.household_type==='joint')_svId=_cpSvL.client_a_id;
+  db.from('client_profiles').select('allocation_plan').eq('client_id',_svId).order('updated_at',{ascending:false}).limit(1).maybeSingle().then(function(res){
+    if(!res||!res.data||!res.data.allocation_plan)return;
+    var plan=res.data.allocation_plan;
+    // Merge Supabase tracking into local — Supabase wins for entries not in localStorage
+    if(plan.tracking){
+      Object.keys(plan.tracking).forEach(function(mk){
+        if(!_cpTracking[mk])_cpTracking[mk]={};
+        Object.keys(plan.tracking[mk]).forEach(function(idx){
+          // Only overwrite if local doesn't have this entry or Supabase is newer
+          if(!_cpTracking[mk][idx]||(_cpTracking[mk][idx].ts||0)<(plan.tracking[mk][idx].ts||0)){
+            _cpTracking[mk][idx]=plan.tracking[mk][idx];
+          }
+        });
+      });
+      try{localStorage.setItem('pfos_tracking',JSON.stringify(_cpTracking));}catch(e){}
+      if(typeof renderClientTracking==='function')renderClientTracking();
+    }
+    if(plan.planCalendar){
+      Object.keys(plan.planCalendar).forEach(function(k){if(!_cpPlanCalendar[k])_cpPlanCalendar[k]=plan.planCalendar[k];});
+      try{localStorage.setItem('pfos_plan_calendar',JSON.stringify(_cpPlanCalendar));}catch(e){}
+    }
+  }).catch(function(e){console.warn('_trackLoadFromSupabase:',e);});
+}
 function _trackKey(){return new Date().toISOString().slice(0,7);}
-function _trackSave(){try{localStorage.setItem('pfos_tracking',JSON.stringify(_cpTracking));localStorage.setItem('pfos_plan_calendar',JSON.stringify(_cpPlanCalendar));}catch(e){}}
+function _trackSave(){try{localStorage.setItem('pfos_tracking',JSON.stringify(_cpTracking));localStorage.setItem('pfos_plan_calendar',JSON.stringify(_cpPlanCalendar));}catch(e){}clearTimeout(_trackSave._timer);_trackSave._timer=setTimeout(_trackSyncToSupabase,1500);}
+function _trackSyncToSupabase(){
+  if(!db||!APP.currentClientId)return;
+  var _svId=APP.currentClientId;
+  var _cpSvT=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+  if(_cpSvT&&_cpSvT.household_type==='joint')_svId=_cpSvT.client_a_id;
+  db.from('client_profiles').select('id,allocation_plan').eq('client_id',_svId).order('updated_at',{ascending:false}).limit(1).maybeSingle().then(function(res){
+    if(!res||!res.data)return;
+    var plan=res.data.allocation_plan||{};
+    plan.tracking=_cpTracking;
+    plan.planCalendar=_cpPlanCalendar;
+    db.from('client_profiles').update({allocation_plan:plan,updated_at:new Date().toISOString()}).eq('id',res.data.id).then(function(){}).catch(function(e){console.warn('tracking sync error:',e);});
+  }).catch(function(e){console.warn('tracking sync load error:',e);});
+}
 function ordSuffix2(d){var s=['th','st','nd','rd'];var v=d%100;return s[(v-20)%10]||s[v]||s[0];}
 function _trackFindAccount(a){
   var S=(APP._portalFd&&APP._portalFd.S)||{};
@@ -17727,7 +17768,7 @@ function _mtConfirm(){
   var actual=parseFloat(document.getElementById('mtActual').value)||0;
   var note=document.getElementById('mtNote').value.trim();
   var mk=_trackKey();if(!_cpTracking[mk])_cpTracking[mk]={};
-  _cpTracking[mk][idx]={done:true,actual:actual,ts:Date.now(),note:note};
+  _cpTracking[mk][idx]={done:true,actual:actual,ts:Date.now(),note:note,source:'client'};
   // Calendar
   var calOn=document.getElementById('mtCalToggle').checked;
   if(calOn){
@@ -17760,7 +17801,7 @@ function _trackGetYTD(idx){
   }
   return{planned:planned,actual:actual};
 }
-function _trackMiss(idx){var mk=_trackKey();if(!_cpTracking[mk])_cpTracking[mk]={};_cpTracking[mk][idx]={done:false,actual:0,ts:Date.now()};CPLAN._missedMonths=CPLAN._missedMonths||{};if(!CPLAN._missedMonths[mk])CPLAN._missedMonths[mk]=[];if(CPLAN._missedMonths[mk].indexOf(idx)<0)CPLAN._missedMonths[mk].push(idx);_trackSave();renderClientTracking();_syncPlanToMain();}
+function _trackMiss(idx){var mk=_trackKey();if(!_cpTracking[mk])_cpTracking[mk]={};_cpTracking[mk][idx]={done:false,actual:0,ts:Date.now(),source:'client'};CPLAN._missedMonths=CPLAN._missedMonths||{};if(!CPLAN._missedMonths[mk])CPLAN._missedMonths[mk]=[];if(CPLAN._missedMonths[mk].indexOf(idx)<0)CPLAN._missedMonths[mk].push(idx);_trackSave();renderClientTracking();_syncPlanToMain();}
 function renderClientTracking(){
   var el=document.getElementById('clientTrackingContent');if(!el)return;
   _cpEnsurePlanLoaded();
