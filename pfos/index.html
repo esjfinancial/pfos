@@ -535,6 +535,26 @@ tbody td{padding:11px 14px;font-size:13px;color:rgba(226,232,240,.8)}
       <div class="login-footer"><a href="javascript:void(0)" onclick="showClientLogin()">&#8592; Back to login</a></div>
     </div>
 
+    <!-- Invite Signup Form (shown when ?invite=TOKEN is in URL) -->
+    <div id="inviteSignupForm" style="display:none">
+      <div style="text-align:center;margin-bottom:16px">
+        <div style="font-size:36px;margin-bottom:8px">📧</div>
+        <div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);letter-spacing:.06em;text-transform:uppercase">Welcome to Your Portal</div>
+        <div style="font-size:12px;color:var(--mu);margin-top:6px;line-height:1.6" id="inviteWelcomeMsg">Your advisor has set up your financial plan. Create a password to access your portal.</div>
+      </div>
+      <div id="inviteRegErr" class="reg-err"></div>
+      <div class="fi"><label class="lb">Email</label><input class="inp" type="email" id="inviteEmail" disabled style="opacity:.7"></div>
+      <div class="fi"><label class="lb">Your Name</label><input class="inp" type="text" id="inviteName" placeholder="Full name" autocomplete="name"></div>
+      <div class="fi"><label class="lb">Create Password <span style="color:var(--mu);font-size:11px">(min 8 chars)</span></label><input class="inp" type="password" id="invitePass" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;" autocomplete="new-password"></div>
+      <div class="fi"><label class="lb">Confirm Password</label><input class="inp" type="password" id="inviteConf" placeholder="&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;&#8226;" autocomplete="new-password" onkeydown="if(event.key==='Enter')doInviteSignup()"></div>
+      <div style="display:flex;align-items:flex-start;gap:8px;margin-bottom:14px">
+        <input type="checkbox" id="inviteTosCheck" style="margin-top:2px;flex-shrink:0">
+        <label for="inviteTosCheck" style="font-size:11px;color:rgba(226,232,240,.7);line-height:1.5;cursor:pointer">I agree to the <a href="javascript:void(0)" onclick="openModal('tosModal')" style="color:#5B9BFF;cursor:pointer">Terms of Service</a> and <a href="javascript:void(0)" onclick="openModal('tosModal')" style="color:#5B9BFF;cursor:pointer">Privacy Policy</a>.</label>
+      </div>
+      <button class="btn btn-bl" onclick="doInviteSignup()" id="inviteSignupBtn" style="width:100%">Create My Portal Account</button>
+      <div class="login-footer" style="margin-top:12px"><a href="javascript:void(0)" onclick="showClientLogin()">Already have an account? Sign in</a></div>
+    </div>
+
   </div>
 </div>
 
@@ -732,6 +752,45 @@ async function initAuth(){
     }
     else if(event === 'SIGNED_OUT'){ APP.user = null; APP.role = 'agent'; showScreen('loginScreen'); }
   });
+
+  // ── Invite token detection ──
+  _checkInviteToken();
+}
+
+async function _checkInviteToken(){
+  try{
+    var params=new URLSearchParams(window.location.search);
+    var token=params.get('invite');
+    var tabParam=params.get('tab');
+    // Handle legacy ?tab=client&email= format (no invite token)
+    if(!token&&tabParam==='client'){setLoginTab('client');var em=params.get('email');if(em){var el=document.getElementById('clientEmail');if(el)el.value=em;}return;}
+    if(!token||!db)return;
+    // Look up invite token
+    var {data:inv,error}=await db.from('portal_invites').select('*').eq('invite_token',token).eq('status','pending').maybeSingle();
+    if(error||!inv){
+      setLoginTab('client');
+      showLoginErr('This invite link is invalid or has expired. Please contact your advisor for a new one.');
+      return;
+    }
+    if(inv.expires_at&&new Date(inv.expires_at)<new Date()){
+      setLoginTab('client');
+      showLoginErr('This invite link has expired. Please contact your advisor for a new one.');
+      return;
+    }
+    // Show invite signup form
+    APP._inviteData=inv;
+    var allForms=['advisorLoginForm','forgotForm','clientLoginForm','agentRegisterForm','clientRegisterForm'];
+    allForms.forEach(function(id){var el2=document.getElementById(id);if(el2)el2.style.display='none';});
+    document.getElementById('tabClient').classList.add('active');
+    document.getElementById('tabAdvisor').classList.remove('active');
+    var emailEl=document.getElementById('inviteEmail');if(emailEl)emailEl.value=inv.email;
+    if(inv.advisor_id){
+      try{var {data:adv}=await db.from('users').select('name').eq('id',inv.advisor_id).maybeSingle();
+        if(adv&&adv.name){var msgEl=document.getElementById('inviteWelcomeMsg');if(msgEl)msgEl.textContent=adv.name+' has set up your financial plan. Create a password to access your portal.';}
+      }catch(e2){}
+    }
+    document.getElementById('inviteSignupForm').style.display='block';
+  }catch(e){console.warn('_checkInviteToken:',e);}
 }
 
 async function determineRoleAndRoute(){
@@ -1206,7 +1265,7 @@ function setLoginTab(tab){
   APP.loginTab = tab;
   document.getElementById('tabAdvisor').classList.toggle('active', tab==='advisor');
   document.getElementById('tabClient').classList.toggle('active', tab==='client');
-  var allForms = ['advisorLoginForm','forgotForm','clientLoginForm','agentRegisterForm','clientRegisterForm'];
+  var allForms = ['advisorLoginForm','forgotForm','clientLoginForm','agentRegisterForm','clientRegisterForm','inviteSignupForm'];
   allForms.forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   clearLoginMessages();
   if(tab==='advisor') document.getElementById('advisorLoginForm').style.display='block';
@@ -1214,31 +1273,31 @@ function setLoginTab(tab){
 }
 
 function showForgot(){
-  ['advisorLoginForm','agentRegisterForm','clientRegisterForm','clientLoginForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
+  ['advisorLoginForm','agentRegisterForm','clientRegisterForm','clientLoginForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   document.getElementById('forgotForm').style.display='block';
   clearLoginMessages();
 }
 
 function showLogin(){
-  ['forgotForm','agentRegisterForm','clientRegisterForm','clientLoginForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
+  ['forgotForm','agentRegisterForm','clientRegisterForm','clientLoginForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   document.getElementById('advisorLoginForm').style.display='block';
   clearLoginMessages();
 }
 
 function showAgentRegister(){
-  ['advisorLoginForm','forgotForm','clientRegisterForm','clientLoginForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
+  ['advisorLoginForm','forgotForm','clientRegisterForm','clientLoginForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   document.getElementById('agentRegisterForm').style.display='block';
   clearLoginMessages();
 }
 
 function showClientRegister(){
-  ['clientLoginForm','agentRegisterForm','advisorLoginForm','forgotForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
+  ['clientLoginForm','agentRegisterForm','advisorLoginForm','forgotForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   document.getElementById('clientRegisterForm').style.display='block';
   clearLoginMessages();
 }
 
 function showClientLogin(){
-  ['clientRegisterForm','agentRegisterForm','advisorLoginForm','forgotForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
+  ['clientRegisterForm','agentRegisterForm','advisorLoginForm','forgotForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   document.getElementById('clientLoginForm').style.display='block';
   clearLoginMessages();
 }
@@ -1473,6 +1532,50 @@ async function doClientRegister(){
     window._registrationInProgress = false;
     showRegErr(errId, e.message);
     setBtnLoading('clientRegBtn', false, isCouple?'Create Both Accounts':'Create My Account');
+  }
+}
+
+// ── INVITE SIGNUP — handles ?invite=TOKEN flow ────────────────────────────────
+async function doInviteSignup(){
+  var inv=APP._inviteData;
+  if(!inv){showRegErr('inviteRegErr','Invalid invite. Please use the link from your email.');return;}
+  var name=v('inviteName'),pass=v('invitePass'),conf=v('inviteConf');
+  if(!name||!pass||!conf){showRegErr('inviteRegErr','Please fill in all fields.');return;}
+  if(pass!==conf){showRegErr('inviteRegErr','Passwords do not match.');return;}
+  if(pass.length<8){showRegErr('inviteRegErr','Password must be at least 8 characters.');return;}
+  if(!(document.getElementById('inviteTosCheck')||{}).checked){showRegErr('inviteRegErr','You must agree to the Terms of Service.');return;}
+  setBtnLoading('inviteSignupBtn',true,'Creating account...');
+  try{
+    window._registrationInProgress=true;
+    // 1. Create auth account
+    var res=await db.auth.signUp({email:inv.email,password:pass});
+    if(res.error){window._registrationInProgress=false;showRegErr('inviteRegErr',res.error.message);setBtnLoading('inviteSignupBtn',false,'Create My Portal Account');return;}
+    var userId=res.data&&res.data.user?res.data.user.id:null;
+    if(!userId){window._registrationInProgress=false;showRegErr('inviteRegErr','Account creation failed — please try again.');setBtnLoading('inviteSignupBtn',false,'Create My Portal Account');return;}
+    // 2. Update existing clients row — set name, tier, status
+    await db.from('clients').update({
+      name:name,
+      pfos_tier:'core',
+      status:'active',
+      updated_at:new Date().toISOString()
+    }).eq('id',inv.client_id);
+    // 3. Mark invite as accepted
+    await db.from('portal_invites').update({status:'accepted'}).eq('id',inv.id);
+    // 4. Done — show success and switch to login
+    window._registrationInProgress=false;
+    setBtnLoading('inviteSignupBtn',false,'Create My Portal Account');
+    document.getElementById('inviteSignupForm').style.display='none';
+    document.getElementById('clientLoginForm').style.display='block';
+    showLoginMsg('Your portal is ready! Sign in with your new credentials.');
+    var emailInput=document.getElementById('clientEmail');if(emailInput)emailInput.value=inv.email;
+    // Clean URL
+    try{window.history.replaceState({},'',window.location.pathname);}catch(e2){}
+    // Notify advisor
+    try{db.functions.invoke('send-notification',{body:{type:'portal_activated',clientId:inv.client_id,clientName:name,clientEmail:inv.email,advisorId:inv.advisor_id}}).catch(function(){});}catch(e3){}
+  }catch(e){
+    window._registrationInProgress=false;
+    showRegErr('inviteRegErr','Error: '+e.message);
+    setBtnLoading('inviteSignupBtn',false,'Create My Portal Account');
   }
 }
 
