@@ -1060,7 +1060,7 @@ const SUPABASE_URL      = 'https://wbndgvicmgeodararpmr.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndibmRndmljbWdlb2RhcmFycG1yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ2NTIwNzYsImV4cCI6MjA5MDIyODA3Nn0.OwzfA4naIbJZFPmCZo87NkKRanXdJXlYOvWsx1GGwPE';
 var PFOS_ORIGIN='https://pfos.esjfinancial.com';
 var APP_COUPLES=[],APP_RECS=[],APP_ADVISORY_FILTER='all',APP_PRODUCT_FILTER='all';
-var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=false;
+var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=false,_firstSaveGuardPassed=false;
 var _sessionStart=null,_sessionClientId=null;
 var _sessionTimer=null,_sessionWarnTimer=null;
 var SESSION_WARN_MS=25*60*1000,SESSION_IDLE_MS=30*60*1000,_lastReset=0;
@@ -4805,6 +4805,7 @@ window.addEventListener('message', async function(e){
   }
   if(msg.type === 'PFOS_READY'){
     _pfosDataLoaded=false;
+    _firstSaveGuardPassed=false;
     pfosPost({ type:'PFOS_AUTH' });
     if(APP.currentClientId) loadClientDataIntoPFOS(APP.currentClientId);
     return;
@@ -4835,18 +4836,44 @@ window.addEventListener('message', async function(e){
     if(!clientId) return;
     try{
       var couple = getCoupleForClient(clientId);
-      // For joint: always save to primary's profile
       var saveToId = (couple && couple.household_type==='joint') ? couple.client_a_id : clientId;
       var state  = msg.state;
       var calcs  = state.calcs || {};
+      // ══ FIRST-SAVE DATA PROTECTION ══
+      if(!_firstSaveGuardPassed){
+        _firstSaveGuardPassed=true;
+        var _inc=(calcs.inc||0);
+        var _src=(state.incomeSources||[]).filter(function(s){return(parseFloat(s.amount)||0)>0;}).length;
+        if(_inc===0&&_src===0&&(state.debts||[]).every(function(d){return(parseFloat(d.balance)||0)===0;})&&(state.retAccounts||[]).every(function(r){return(parseFloat(r.balance)||0)===0;})){
+          var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+          if(_gEx&&_gEx.data&&_gEx.data.financial_data&&((_gEx.data.financial_data.calcs||{}).inc||0)>0){
+            console.warn('[PFOS-CP] ⛔ First save blocked — empty data would overwrite real data.');
+            _firstSaveGuardPassed=false;
+            var _banner=document.createElement('div');
+            _banner.id='dataProtectionBanner';
+            _banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;background:linear-gradient(90deg,#EF4444,#DC2626);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3)';
+            _banner.innerHTML='⛔ Data protection activated — client data was not loaded correctly. <button onclick="window.location.reload()" style="padding:6px 16px;background:#fff;color:#EF4444;border:none;border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">🔄 Refresh Page</button> <button onclick="_restorePreviousData()" style="padding:6px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">⏪ Restore Last Good Save</button> <button onclick="this.parentElement.remove()" style="padding:6px 12px;background:transparent;color:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.3);border-radius:3px;font-family:var(--fh);font-size:11px;cursor:pointer">Dismiss</button>';
+            if(!document.getElementById('dataProtectionBanner'))document.body.appendChild(_banner);
+            var ind=document.getElementById('saveIndicator');if(ind){ind.className='save-indicator';ind.textContent='⛔ Protected';ind.style.color='#EF4444';}
+            return;
+          }
+        }
+      }
+      // ══ END FIRST-SAVE GUARD ══
       // Cache latest state so saveClientData/clientSaveOwnData can use it
       _lastPfosState = { state: state, calcs: calcs };
       // Also cache in sessionStorage so data survives page navigation
       try{sessionStorage.setItem('pfos_cached_'+saveToId,JSON.stringify({calcs:calcs,S:state,scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},ts:Date.now()}));}catch(e){}
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
       var pp     = {client_id:saveToId, financial_data:{S:state, calcs}, scores, updated_at:new Date().toISOString()};
-      var ex = await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-      if(ex.data){ var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[PFOS-CP] Supabase SAVE:',_r.error?'FAILED: '+_r.error.message:'OK — calcs.inc='+calcs.inc+' for '+saveToId); }
+      var ex = await db.from('client_profiles').select('id,financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(ex&&ex.data){
+        // ══ BACKUP: save current data before overwriting ══
+        if(ex.data.financial_data&&ex.data.financial_data.calcs&&(ex.data.financial_data.calcs.inc||0)>0){
+          pp.previous_financial_data=ex.data.financial_data;
+        }
+        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[PFOS-CP] Supabase SAVE:',_r.error?'FAILED: '+_r.error.message:'OK — calcs.inc='+calcs.inc+' for '+saveToId);
+      }
       else { var _r2=await db.from('client_profiles').insert(pp); console.log('[PFOS-CP] Supabase INSERT:',_r2.error?'FAILED: '+_r2.error.message:'OK'); }
       var ind = document.getElementById('saveIndicator') || document.getElementById('clientSaveIndicator');
       if(ind){ ind.className='save-indicator saved'; ind.textContent='✓ Auto-saved'; setTimeout(function(){ind.className='save-indicator';},2000); }
@@ -6431,6 +6458,26 @@ async function renderAdvisorInsurance(){
     el.innerHTML='<div style="color:var(--rd);font-size:12px;padding:20px;text-align:center">Failed to load policies: '+e.message+'</div>';
   }
 }
+// ══ RESTORE PREVIOUS DATA ══
+async function _restorePreviousData(){
+  if(!APP.currentClientId){alert('No client loaded.');return;}
+  try{
+    var _cpR=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+    var _rId=(_cpR&&_cpR.household_type==='joint')?_cpR.client_a_id:APP.currentClientId;
+    var {data:row}=await db.from('client_profiles').select('id,previous_financial_data').eq('client_id',_rId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!row||!row.previous_financial_data||!row.previous_financial_data.calcs){
+      alert('No backup found. The previous_financial_data column is empty for this client.');
+      return;
+    }
+    if(!confirm('Restore the last known good save? This will overwrite the current data with the previous version.'))return;
+    var prev=row.previous_financial_data;
+    var scores={cfScore:(prev.calcs||{}).cfScore,protScore:(prev.calcs||{}).protScore,growScore:(prev.calcs||{}).growScore,effScore:(prev.calcs||{}).effScore};
+    await db.from('client_profiles').update({financial_data:prev,scores:scores,updated_at:new Date().toISOString()}).eq('id',row.id);
+    alert('Data restored! Refreshing page...');
+    window.location.reload();
+  }catch(e){alert('Restore failed: '+e.message);}
+}
+
 function _advEmailReviewReminder(){
   if(!APP.currentClient||!APP.currentClient.email){alert('No client email found.');return;}
   // Use scheduling link if available
