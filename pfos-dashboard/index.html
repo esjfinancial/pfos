@@ -1751,7 +1751,7 @@ function openSchedulingLink(clientId){
   var client=(APP.myClients||[]).find(function(c){return c.id===clientId;})||(APP.allClients||[]).find(function(c){return c.id===clientId;});
   var url=getSchedulingLink(client);
   if(!url){alert('No scheduling link configured. Click your name in the sidebar to add one.');return;}
-  window.open(url,'_blank');
+  window.open(url,'_blank','noreferrer');
 }
 function sendSchedulingEmail(clientId){
   var client=(APP.myClients||[]).find(function(c){return c.id===clientId;})||(APP.allClients||[]).find(function(c){return c.id===clientId;});
@@ -3061,6 +3061,9 @@ async function logAuditEvent(action, entityType, entityId, details){
   }catch(e){ console.warn('auditLog:',e); }
 }
 async function doLogout(){
+  // ══ CLEAR ALL CLIENT DATA FROM BROWSER ══
+  try{localStorage.removeItem('pfos_fd_backup');}catch(e){}
+  try{sessionStorage.clear();}catch(e){}
   try{
     var frame=getPFOSFrame();
     if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
@@ -4068,6 +4071,8 @@ async function exportClientsCSV(){
     const {data:profs} = await db.from('client_profiles').select('client_id,scores,financial_data').in('client_id',ids);
     var profMap = {};
     (profs||[]).forEach(function(p){ profMap[p.client_id]=p; });
+    // ══ CSV injection protection: sanitize cell values ══
+    function csvSafe(v){var s=String(v==null?'':v).replace(/"/g,'""');if(/^[=+\-@\t\r]/.test(s))s="'"+s;return'"'+s+'"';}
     var rows = [['Name','Email','Status','Tier','CF Score','Protection Score','Growth Score','Efficiency Score','Net Worth','Monthly Income','Total Debt','Savings Rate']];
     clients.forEach(function(c){
       var p = profMap[c.id]||{};
@@ -4079,13 +4084,15 @@ async function exportClientsCSV(){
         ca.netWorth||'', ca.inc||'', ca.totalDebt||'', ca.savingsRate||''
       ]);
     });
-    var csv = rows.map(function(r){return r.map(function(v){return '"'+(String(v).replace(/"/g,'""'))+'"';}).join(',');}).join('\n');
+    var csv = rows.map(function(r){return r.map(csvSafe).join(',');}).join('\n');
     var blob = new Blob([csv],{type:'text/csv'});
     var a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
     a.download = 'clients-export-'+new Date().toISOString().split('T')[0]+'.csv';
     a.click();
     URL.revokeObjectURL(a.href);
+    // ══ Audit log: track exports ══
+    try{await db.from('audit_log').insert({action:'csv_export',entity_type:'clients',details:{count:clients.length,exported_by:APP.user?APP.user.id:null},created_at:new Date().toISOString()});}catch(e2){}
   }catch(e){ alert('Export failed: '+e.message); }
 }
 async function renderAdvisorPerformancePage(){
