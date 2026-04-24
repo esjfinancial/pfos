@@ -5124,6 +5124,30 @@ async function updateClientBadges(){
   }catch(e){}
 }
 async function viewClientReport(reportId){ const { data:r }=await db.from('reports').select('*').eq('id',reportId).single(); if(!r) return; var content=(r.profile_snapshot&&r.profile_snapshot.reportHtml)?r.profile_snapshot.reportHtml:'<div style="padding:24px;color:var(--mu)">'+esc(r.summary||'No summary')+'</div>'; set('reportModalContent',content); openModal('reportModal'); }
+// ══ RESTORE PREVIOUS DATA ══
+async function _restorePreviousData(){
+  if(!APP.currentClientId){alert('No client loaded.');return;}
+  try{
+    var _cpR=getCoupleForClient(APP.currentClientId);
+    var _rId=(_cpR&&_cpR.household_type==='joint')?_cpR.client_a_id:APP.currentClientId;
+    var {data:row}=await db.from('client_profiles').select('id,previous_financial_data').eq('client_id',_rId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!row||!row.previous_financial_data||!row.previous_financial_data.calcs){
+      alert('No backup found in Supabase. The previous_financial_data column is empty for this client.');
+      return;
+    }
+    if(!confirm('Restore the last known good save? This will overwrite the current (empty) data with the previous version.'))return;
+    var prev=row.previous_financial_data;
+    var scores={cfScore:(prev.calcs||{}).cfScore,protScore:(prev.calcs||{}).protScore,growScore:(prev.calcs||{}).growScore,effScore:(prev.calcs||{}).effScore};
+    await db.from('client_profiles').update({
+      financial_data:prev,
+      scores:scores,
+      updated_at:new Date().toISOString()
+    }).eq('id',row.id);
+    alert('Data restored! Refreshing page...');
+    window.location.reload();
+  }catch(e){alert('Restore failed: '+e.message);}
+}
+
 async function clientSaveOwnData(){
   if(!APP.currentClientId) return;
   var siEl=document.getElementById('clientSaveIndicator'); if(siEl){siEl.className='save-indicator saving';siEl.textContent='⟳ Saving...';siEl.style.display='inline-flex';}
@@ -5203,11 +5227,13 @@ async function submitDeletionRequest(){
 }
 
 var _pfosDataLoaded=false;
+var _firstSaveGuardPassed=false;
 window.addEventListener('message',async function(e){
   if(e.origin!==PFOS_ORIGIN) return;
   var msg=e.data; if(!msg||!msg.type) return;
   if(msg.type==='PFOS_READY'){
-    _pfosDataLoaded=false;// Reset — iframe just loaded fresh
+    _pfosDataLoaded=false;
+    _firstSaveGuardPassed=false;
     pfosPost({type:'PFOS_AUTH'});
     if(APP.currentClientId) loadClientDataIntoPFOS(APP.currentClientId);
     return;
@@ -5314,10 +5340,39 @@ window.addEventListener('message',async function(e){
   }
   if(msg.type==='PFOS_DATA_CHANGE'){
     if(!APP.currentClientId) return;
-    // Block saves until PFOS_LOAD has been sent — prevents initial empty state from overwriting real data
     if(!_pfosDataLoaded){console.log('[PFOS] Skipping save — data not loaded yet');return;}
     try{
       var state=msg.state,calcs=state.calcs||{};
+      // ══ FIRST-SAVE DATA PROTECTION ══
+      // Only runs once per page load. If the very first save has empty data
+      // but Supabase has real data, block saving and show a refresh prompt.
+      if(!_firstSaveGuardPassed){
+        _firstSaveGuardPassed=true;
+        var _inc=(calcs.inc||0);
+        var _src=(state.incomeSources||[]).filter(function(s){return(parseFloat(s.amount)||0)>0;}).length;
+        var _dbt=(state.debts||[]).filter(function(d){return(parseFloat(d.balance)||0)>0;}).length;
+        var _ret=(state.retAccounts||[]).filter(function(r){return(parseFloat(r.balance)||0)>0;}).length;
+        if(_inc===0&&_src===0&&_dbt===0&&_ret===0){
+          var _cpG=getCoupleForClient(APP.currentClientId);
+          var _gId=(_cpG&&_cpG.household_type==='joint')?_cpG.client_a_id:APP.currentClientId;
+          var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',_gId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+          if(_gEx&&_gEx.data&&_gEx.data.financial_data){
+            var _gc=(_gEx.data.financial_data.calcs)||{};
+            if((_gc.inc||0)>0){
+              console.warn('[PFOS] ⛔ First save blocked — empty data would overwrite real data in Supabase.');
+              _firstSaveGuardPassed=false;
+              // Show user-facing banner
+              var _banner=document.createElement('div');
+              _banner.id='dataProtectionBanner';
+              _banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;background:linear-gradient(90deg,#EF4444,#DC2626);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3)';
+              _banner.innerHTML='⛔ Data protection activated — your financial data was not loaded correctly. <button onclick="window.location.reload()" style="padding:6px 16px;background:#fff;color:#EF4444;border:none;border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">🔄 Refresh Page</button> <button onclick="_restorePreviousData()" style="padding:6px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">⏪ Restore Last Good Save</button> <button onclick="this.parentElement.remove()" style="padding:6px 12px;background:transparent;color:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.3);border-radius:3px;font-family:var(--fh);font-size:11px;cursor:pointer">Dismiss</button>';
+              if(!document.getElementById('dataProtectionBanner'))document.body.appendChild(_banner);
+              return;
+            }
+          }
+        }
+      }
+      // ══ END FIRST-SAVE GUARD ══
       _lastPfosState={state:state,calcs:calcs};
       // For joint couples, save to primary (client_a)
       var _cpSave=getCoupleForClient(APP.currentClientId);
@@ -5325,9 +5380,15 @@ window.addEventListener('message',async function(e){
       _lastSaveClientId=_saveToId;
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
       var pp={client_id:_saveToId,financial_data:{S:state,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
-      var ex=await db.from('client_profiles').select('id').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var ex=await db.from('client_profiles').select('id,financial_data').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       if(ex&&ex.error){console.error('[PFOS] client_profiles SELECT failed:',ex.error.message);}
-      if(ex&&ex.data){ var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); if(_r.error)console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message); else console.log('[PFOS] Auto-saved to Supabase OK — id:',ex.data.id,'calcs.inc:',calcs.inc); }
+      if(ex&&ex.data){
+        // ══ BACKUP: save current data before overwriting ══
+        if(ex.data.financial_data&&ex.data.financial_data.calcs&&(ex.data.financial_data.calcs.inc||0)>0){
+          pp.previous_financial_data=ex.data.financial_data;
+        }
+        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); if(_r.error)console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message); else console.log('[PFOS] Auto-saved to Supabase OK — id:',ex.data.id,'calcs.inc:',calcs.inc);
+      }
       else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error)console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); else console.log('[PFOS] Inserted new client_profiles row — calcs.inc:',calcs.inc); }
       _lastSaveDirty=false;
       // Backup to localStorage for fast reload
