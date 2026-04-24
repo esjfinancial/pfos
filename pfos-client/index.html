@@ -3334,6 +3334,9 @@ function getTrialDaysLeft(client){
 }
 // ─────────────────────────────────────────────────────────────────────────────
 async function doLogout(){
+  // ══ CLEAR ALL CLIENT DATA FROM BROWSER ══
+  try{localStorage.removeItem('pfos_fd_backup');localStorage.removeItem('pfos_theme');}catch(e){}
+  try{sessionStorage.clear();}catch(e){}
   try{
     var frame=getPFOSFrame();
     if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
@@ -3964,7 +3967,7 @@ async function loadClientDataIntoPFOS(clientId){
   _lastPfosState = { state: stateData || {}, calcs: seedCalcs };
 
   var _ci=APP.currentClient?{name:APP.currentClient.name||'',email:APP.currentClient.email||'',phone:APP.currentClient.phone||'',marital:APP.currentClient.marital_status||'',spouse:APP.currentClient.spouse_name||''}:null;
-  pfosPost({ type:'PFOS_LOAD', state: stateData, clientInfo: _ci, mode: mode, tier: pfosTier,
+  pfosPost({ type:'PFOS_LOAD', state: stateData, clientInfo: _ci, clientId: APP.currentClientId, mode: mode, tier: pfosTier,
     trialStart: APP.currentClient ? (APP.currentClient.trial_start_date||null) : null,
     clientType: APP.currentClient ? (APP.currentClient.client_type||'product') : 'product',
     assignedAdvisorId: (APP.currentClient && APP.currentClient.client_type !== 'product') ? (APP.currentClient.user_id || null) : null,
@@ -4056,7 +4059,7 @@ async function loadClientPortalData(){
     var fdBackup2=localStorage.getItem('pfos_fd_backup');
     if(fdBackup2){
       var pb=JSON.parse(fdBackup2);
-      if(pb&&pb.S&&pb.ts){
+      if(pb&&pb.S&&pb.ts&&(!pb.cid||pb.cid===_profileQueryId||pb.cid===APP.currentClientId)){
         var supaTs2=profile&&profile.updated_at?new Date(profile.updated_at).getTime():0;
         if(pb.ts>supaTs2){
           // localStorage is newer — merge it into the profile
@@ -5340,6 +5343,11 @@ window.addEventListener('message',async function(e){
   }
   if(msg.type==='PFOS_DATA_CHANGE'){
     if(!APP.currentClientId) return;
+    // ══ A3: Client switch race condition guard ══
+    // If message includes a clientId, verify it matches current client
+    if(msg.clientId&&msg.clientId!==APP.currentClientId){
+      console.warn('[PFOS] ⛔ Client switch race: msg.clientId='+msg.clientId+' but current='+APP.currentClientId+' — dropping save');return;
+    }
     if(!_pfosDataLoaded){console.log('[PFOS] Skipping save — data not loaded yet');return;}
     try{
       var state=msg.state,calcs=state.calcs||{};
@@ -5373,6 +5381,10 @@ window.addEventListener('message',async function(e){
         }
       }
       // ══ END FIRST-SAVE GUARD ══
+      // ══ NaN GUARD: reject state with NaN values ══
+      if(isNaN(calcs.inc)||isNaN(calcs.netCF)||isNaN(calcs.netWorth)){
+        console.warn('[PFOS] ⛔ NaN detected in calcs — skipping save');return;
+      }
       _lastPfosState={state:state,calcs:calcs};
       // For joint couples, save to primary (client_a)
       var _cpSave=getCoupleForClient(APP.currentClientId);
@@ -5387,12 +5399,12 @@ window.addEventListener('message',async function(e){
         if(ex.data.financial_data&&ex.data.financial_data.calcs&&(ex.data.financial_data.calcs.inc||0)>0){
           pp.previous_financial_data=ex.data.financial_data;
         }
-        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); if(_r.error)console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message); else console.log('[PFOS] Auto-saved to Supabase OK — id:',ex.data.id,'calcs.inc:',calcs.inc);
+        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); if(_r.error)console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message); else console.log('[PFOS] Auto-saved OK');
       }
-      else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error)console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); else console.log('[PFOS] Inserted new client_profiles row — calcs.inc:',calcs.inc); }
+      else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error)console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); else console.log('[PFOS] Inserted new profile'); }
       _lastSaveDirty=false;
       // Backup to localStorage for fast reload
-      try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:state,calcs:calcs,ts:Date.now()}));}catch(e3){}
+      try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:state,calcs:calcs,ts:Date.now(),cid:_saveToId||APP.currentClientId}));}catch(e3){}
       // Update dashboard snapshot with fresh data — preserve allocation_plan
       var _prevPlan=APP._portalFd&&APP._portalFd.allocation_plan;
       APP._portalFd={S:state,calcs:calcs};APP._portalCalcs=calcs;
@@ -5429,14 +5441,28 @@ window.addEventListener('message',async function(e){
     }catch(err){ console.warn('Client auto-save:',err); }
   }
 });
+// ── visibilitychange: save when tab goes to background ──
+document.addEventListener('visibilitychange',function(){
+  if(document.visibilityState==='hidden'&&_lastPfosState&&_lastPfosState.calcs){
+    var _vc=_lastPfosState.calcs;
+    if((_vc.inc||0)>0&&!isNaN(_vc.inc)){
+      try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:_lastPfosState.state,calcs:_vc,ts:Date.now(),cid:APP.currentClientId}));}catch(e){}
+    }
+  }
+});
 // ── Save-on-exit: flush unsaved changes when navigating away ──
 var _lastSaveClientId=null;
 var _lastSaveDirty=false;
 window.addEventListener('beforeunload',function(){
   // Send PFOS_FLUSH to iframe to trigger immediate sync
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
+  // ══ GUARD: Only save if data has meaningful content ══
+  var _exitCalcs=_lastPfosState&&_lastPfosState.calcs||{};
+  var _exitHasData=(_exitCalcs.inc||0)>0||(_exitCalcs.totalDebt||0)>0||(_exitCalcs.netWorth||0)!==0;
+  if(!_exitHasData){console.log('[PFOS] beforeunload: skipping save — no meaningful data');return;}
+  if(isNaN(_exitCalcs.inc)||isNaN(_exitCalcs.netCF)){console.log('[PFOS] beforeunload: skipping save — NaN detected');return;}
   // Save latest state to localStorage as a fast backup for next page load
-  if(_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.state).length>0){try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:_lastPfosState.state,calcs:_lastPfosState.calcs||{},ts:Date.now()}));}catch(e){}}
+  if(_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.state).length>0){try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:_lastPfosState.state,calcs:_lastPfosState.calcs||{},ts:Date.now(),cid:APP.currentClientId}));}catch(e){}}
   // Also save _lastPfosState directly as backup (fetch+keepalive survives page unload)
   if(_lastSaveClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.state).length>0){
     try{
@@ -17743,7 +17769,7 @@ function _clientOpenScheduling(){
   var c=APP.currentClient||{};
   if(c.name)url+=sep+'name='+encodeURIComponent(c.name);
   if(c.email){sep=url.indexOf('?')>=0?'&':'?';url+=sep+'email='+encodeURIComponent(c.email);}
-  window.open(url,'_blank');
+  window.open(url,'_blank','noreferrer');
 }
 
 // ── Partner Status Card (couples) ──
