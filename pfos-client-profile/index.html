@@ -6466,12 +6466,174 @@ async function renderAdvisorInsurance(){
       } else {
         h+='<div style="font-size:10px;color:var(--mu);font-style:italic;margin-top:4px">No annual reviews yet. Upload the client\'s annual statement to start tracking.</div>';
       }
+      // ── Annual Review Button (calendar year limit check) ──
+      var currentYear=new Date().getFullYear();
+      var hasReviewThisYear=pReviews.some(function(r){return r.review_date&&r.review_date.substring(0,4)===String(currentYear);});
+      if(hasReviewThisYear){
+        h+='<div style="margin-top:10px;padding:10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.12);border-radius:3px;text-align:center"><div style="font-size:10px;color:var(--mu);line-height:1.5">📋 Annual review completed for <strong style="color:var(--wh)">'+currentYear+'</strong>. One review per policy per calendar year.<br>Next review available <strong style="color:#A855F7">January 1, '+(currentYear+1)+'</strong>.</div></div>';
+      } else {
+        h+='<div style="margin-top:10px"><button onclick="_advRunAnnualReview(\''+p.id+'\')" style="width:100%;padding:8px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);color:#A855F7;cursor:pointer;border-radius:2px;min-height:32px">📋 Run Annual Review</button></div>';
+      }
+      h+='<div id="advAR_'+p.id+'" style="margin-top:10px"></div>';
       h+='</div>';
     });
     el.innerHTML=h;
   }catch(e){
     console.error('Insurance tab error:',e);
     el.innerHTML='<div style="color:var(--rd);font-size:12px;padding:20px;text-align:center">Failed to load policies: '+e.message+'</div>';
+  }
+}
+// ── ADVISOR ANNUAL REVIEW FLOW ──────────────────────────────
+function _advRunAnnualReview(policyId){
+  var el=document.getElementById('advAR_'+policyId);if(!el)return;
+  // Build upload UI inline
+  var h='<div style="padding:16px;background:rgba(168,85,247,.03);border:1px solid rgba(168,85,247,.15);border-radius:4px">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#A855F7;margin-bottom:10px">Annual Review</div>';
+  // Upload area
+  h+='<div id="advARUpload_'+policyId+'" style="border:1px dashed rgba(168,85,247,.3);border-radius:4px;padding:20px;text-align:center;cursor:pointer;margin-bottom:12px" onclick="document.getElementById(\'advARFile_'+policyId+'\').click()" ondragover="event.preventDefault();this.style.borderColor=\'#A855F7\'" ondragleave="this.style.borderColor=\'rgba(168,85,247,.3)\'" ondrop="event.preventDefault();this.style.borderColor=\'rgba(168,85,247,.3)\';_advARHandleFile(event.dataTransfer.files[0],\''+policyId+'\')">';
+  h+='<input type="file" id="advARFile_'+policyId+'" accept=".pdf" style="display:none" onchange="_advARHandleFile(this.files[0],\''+policyId+'\')">';
+  h+='<div style="font-size:24px;margin-bottom:6px">📄</div>';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#A855F7;margin-bottom:3px">Upload Annual Statement (PDF)</div>';
+  h+='<div style="font-size:9px;color:var(--mu)">Drop file here or tap to browse. Analyzed instantly, never stored.</div>';
+  h+='</div>';
+  // Life changes
+  h+='<div style="margin-bottom:12px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--wh);margin-bottom:6px">Client life changes this year?</div>';
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:4px">';
+  [{id:'child',l:'Had a child'},{id:'married',l:'Got married'},{id:'divorced',l:'Got divorced'},{id:'house',l:'Bought/refinanced home'},{id:'income',l:'Income change'},{id:'debt',l:'Paid off major debt'},{id:'health',l:'Health improvement'},{id:'none',l:'Nothing changed'}].forEach(function(c){
+    h+='<label style="display:flex;align-items:center;gap:5px;padding:5px 6px;background:var(--bg-card);border:1px solid var(--bd);border-radius:3px;cursor:pointer;font-size:10px;color:var(--mu)"><input type="checkbox" id="advARC_'+policyId+'_'+c.id+'"> '+c.l+'</label>';
+  });
+  h+='</div>';
+  h+='<div id="advARHealth_'+policyId+'" style="display:none;margin-top:6px"><input class="inp" type="text" id="advARHealthDesc_'+policyId+'" placeholder="Describe health improvement..." style="font-size:10px"></div>';
+  h+='</div>';
+  // Beneficiary check
+  h+='<div style="margin-bottom:12px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--wh);margin-bottom:4px">Beneficiaries still correct?</div>';
+  h+='<div style="display:flex;gap:4px">';
+  ['Yes','No','Not sure'].forEach(function(opt){
+    h+='<label style="display:flex;align-items:center;gap:3px;padding:4px 8px;background:var(--bg-card);border:1px solid var(--bd);border-radius:3px;cursor:pointer;font-size:10px;color:var(--mu)"><input type="radio" name="advARBen_'+policyId+'" value="'+opt.toLowerCase().replace(/ /g,'_')+'"> '+opt+'</label>';
+  });
+  h+='</div></div>';
+  h+='<div id="advARResults_'+policyId+'"></div>';
+  h+='</div>';
+  el.innerHTML=h;
+  // Toggle health detail
+  var hc=document.getElementById('advARC_'+policyId+'_health');
+  if(hc)hc.addEventListener('change',function(){document.getElementById('advARHealth_'+policyId).style.display=this.checked?'':'none';});
+}
+
+async function _advARHandleFile(file,policyId){
+  if(!file||!file.name.toLowerCase().endsWith('.pdf')){alert('Please upload a PDF.');return;}
+  var uploadEl=document.getElementById('advARUpload_'+policyId);
+  if(uploadEl)uploadEl.innerHTML='<div style="padding:16px;text-align:center"><div class="skel" style="height:12px;width:180px;margin:0 auto 8px;border-radius:2px;background:linear-gradient(90deg,rgba(168,85,247,.06) 25%,rgba(168,85,247,.12) 50%,rgba(168,85,247,.06) 75%);background-size:400px 100%;animation:shimmer 1.5s infinite"></div><div style="font-family:var(--fh);font-size:10px;color:#A855F7;font-weight:700;margin-bottom:3px">Running annual review...</div><div style="font-size:9px;color:var(--mu)">Comparing to projections and prior years. This may take 60-90 seconds.</div></div>';
+  var resEl=document.getElementById('advARResults_'+policyId);
+  try{
+    var base64=await new Promise(function(resolve,reject){
+      var reader=new FileReader();reader.onload=function(){resolve(reader.result.split(',')[1]);};reader.onerror=function(){reject(new Error('Read failed'));};reader.readAsDataURL(file);
+    });
+    // Gather life changes
+    var lifeChanges=[];
+    ['child','married','divorced','house','income','debt','health','none'].forEach(function(c){
+      var cb=document.getElementById('advARC_'+policyId+'_'+c);if(cb&&cb.checked)lifeChanges.push(c);
+    });
+    var healthDesc='';if(lifeChanges.indexOf('health')>=0){healthDesc=(document.getElementById('advARHealthDesc_'+policyId)||{}).value||'';}
+    var beneficiary='yes';document.querySelectorAll('[name=advARBen_'+policyId+']').forEach(function(r){if(r.checked)beneficiary=r.value;});
+    // Get auth
+    var token='';try{var sess=await db.auth.getSession();token=(sess.data.session&&sess.data.session.access_token)||'';}catch(e){}
+    // Load policy tracking data
+    var {data:tpData}=await db.from('policy_tracking').select('*').eq('id',policyId).single();
+    if(!tpData)throw new Error('Policy not found');
+    var {data:projections}=await db.from('policy_projections').select('*').eq('policy_tracking_id',policyId).order('year',{ascending:true});
+    var {data:priorActuals}=await db.from('policy_annual_actuals').select('*').eq('policy_tracking_id',policyId).order('review_year',{ascending:true});
+    // Build client profile
+    var clientProfile={age:0,income:0,riskProfile:'moderate',netWorth:0};
+    try{
+      var {data:cp}=await db.from('client_profiles').select('*').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(cp&&cp.financial_data){var fd=cp.financial_data;var c2=fd.calcs||{};clientProfile={age:c2.currentAge||0,income:c2.inc||0,riskProfile:(fd.riskProfile&&fd.riskProfile.label)||'moderate',netWorth:c2.netWorth||0};}
+    }catch(e2){}
+    // Route to correct function
+    var isAnnuity=tpData.policy_type&&(tpData.policy_type.indexOf('annuity')>=0||tpData.policy_type==='fia'||tpData.policy_type==='spia'||tpData.policy_type==='fixed_annuity'||tpData.policy_type==='variable_annuity');
+    var functionName=isAnnuity?'annual-review-annuity':'annual-review-policy';
+    var res=await fetch(SUPABASE_URL+'/functions/v1/'+functionName,{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify({
+        mode:'annual_review',
+        currentStatementFile:base64,
+        currentStatementFileType:'pdf',
+        policyType:tpData.policy_type,
+        purpose:tpData.purpose||'protection',
+        policyTrackingData:tpData,
+        projections:projections||[],
+        priorActuals:priorActuals||[],
+        reviewYear:(priorActuals&&priorActuals.length)?priorActuals.length+1:1,
+        calendarYear:new Date().getFullYear(),
+        lifeChanges:lifeChanges,
+        healthChanges:healthDesc,
+        beneficiaryStatus:beneficiary,
+        clientProfile:clientProfile
+      })
+    });
+    var data=await res.json();
+    if(data.error)throw new Error(data.error);
+    // Save to policy_annual_actuals
+    var reviewYear=(priorActuals&&priorActuals.length)?priorActuals.length+1:1;
+    var actualData={
+      policy_tracking_id:policyId,
+      client_id:APP.currentClientId,
+      review_year:reviewYear,
+      review_date:new Date().toISOString().split('T')[0],
+      health_grade:data.overallHealth||data.healthGrade||data.grade||'',
+      summary:data.overallSummary||data.summary||data.gradeSummary||'',
+      life_changes:lifeChanges,
+      health_changes:healthDesc,
+      beneficiary_status:beneficiary,
+      full_review_json:data,
+      created_at:new Date().toISOString()
+    };
+    if(data.extractedData){
+      var ed=data.extractedData;
+      actualData.actual_cash_value=ed.cashValue||0;
+      actualData.actual_death_benefit=ed.deathBenefit||0;
+      actualData.actual_premium_paid=ed.premiumPaid||0;
+      actualData.credited_rate=ed.creditedRate||0;
+      actualData.coi_charges=ed.coiCharges||0;
+      actualData.loan_balance=ed.loanBalance||0;
+      actualData.current_cap_rate=ed.currentCapRate||ed.capRate||0;
+      actualData.current_dividend_rate=ed.currentDividendRate||ed.dividendRate||0;
+      actualData.contract_value=ed.contractValue||ed.accumulationValue||0;
+      actualData.income_base=ed.incomeBase||0;
+      actualData.surrender_value=ed.cashSurrenderValue||ed.surrenderValue||0;
+    }
+    await db.from('policy_annual_actuals').insert(actualData);
+    // Update policy_tracking
+    var updateData={updated_at:new Date().toISOString()};
+    if(data.extractedData){
+      var ed3=data.extractedData;
+      if(ed3.currentCapRate||ed3.capRate)updateData.current_cap_rate=ed3.currentCapRate||ed3.capRate;
+      if(ed3.currentDividendRate||ed3.dividendRate)updateData.current_dividend_rate=ed3.currentDividendRate||ed3.dividendRate;
+      if(ed3.currentDeclaredRate||ed3.declaredRate)updateData.current_declared_rate=ed3.currentDeclaredRate||ed3.declaredRate;
+    }
+    await db.from('policy_tracking').update(updateData).eq('id',policyId);
+    // Render results
+    if(resEl){
+      var rh='<div style="margin-top:12px;padding:14px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:4px">';
+      var gradeColor=data.overallHealth==='healthy'?'var(--gr)':data.overallHealth==='attention'?'var(--yl)':data.overallHealth==='warning'?'var(--or)':'var(--rd)';
+      rh+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px"><div style="font-family:var(--fd);font-size:24px;font-weight:800;color:'+gradeColor+'">'+(data.overallHealth||'?').toUpperCase()+'</div>';
+      rh+='<div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">Year '+reviewYear+' Review Complete</div>';
+      rh+='<div style="font-size:10px;color:var(--mu)">'+(data.overallSummary||'')+'</div></div></div>';
+      if(data.actionItems&&data.actionItems.length){
+        rh+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin:10px 0 6px">Action Items</div>';
+        data.actionItems.forEach(function(ai){
+          var priCol=ai.priority==='urgent'||ai.priority==='high'?'var(--rd)':ai.priority==='medium'?'var(--yl)':'var(--mu)';
+          rh+='<div style="padding:6px 0;border-bottom:1px solid var(--bd);font-size:10px"><span style="color:'+priCol+';font-weight:700;text-transform:uppercase;font-size:8px">'+ai.priority+'</span> <span style="color:var(--wh);font-weight:600">'+ai.title+'</span><div style="color:var(--mu);margin-top:2px">'+ai.description+'</div></div>';
+        });
+      }
+      rh+='</div>';
+      resEl.innerHTML=rh;
+    }
+    // Refresh the insurance tab
+    renderAdvisorInsurance();
+  }catch(err){
+    if(uploadEl)uploadEl.innerHTML='<div style="padding:12px;text-align:center"><div style="font-size:18px;margin-bottom:4px">⚠️</div><div style="font-size:10px;color:var(--rd);margin-bottom:6px">'+(err.message||'Review failed')+'</div><button onclick="_advRunAnnualReview(\''+policyId+'\')" style="padding:5px 12px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.2);color:#A855F7;cursor:pointer;border-radius:2px">Try Again</button></div>';
   }
 }
 // ══ RESTORE PREVIOUS DATA ══
