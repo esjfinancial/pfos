@@ -1623,7 +1623,7 @@ const SUPABASE_URL      = 'https://wbndgvicmgeodararpmr.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndibmRndmljbWdlb2RhcmFycG1yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzQ2NTIwNzYsImV4cCI6MjA5MDIyODA3Nn0.OwzfA4naIbJZFPmCZo87NkKRanXdJXlYOvWsx1GGwPE';
 var PFOS_ORIGIN='https://pfos.esjfinancial.com';
 var APP_COUPLES=[],APP_RECS=[],APP_ADVISORY_FILTER='all',APP_PRODUCT_FILTER='all';
-var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=false;
+var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=false,_dashFirstSaveGuardPassed=false;
 var _sessionStart=null,_sessionClientId=null;
 var _sessionTimer=null,_sessionWarnTimer=null;
 var SESSION_WARN_MS=25*60*1000,SESSION_IDLE_MS=30*60*1000,_lastReset=0;
@@ -2144,6 +2144,7 @@ async function initAuth(){
       }catch(ex){}
       _lastPfosState={state:{},calcs:{}};
       _pfosDataLoaded=false;
+      _dashFirstSaveGuardPassed=false;
       showScreen('loginScreen');
     }
   });
@@ -2558,8 +2559,64 @@ window.addEventListener('message',async function(e){
       var _saveToId=(_cpSave&&_cpSave.household_type==='joint')?_cpSave.client_a_id:APP.currentClientId;
       _lastSaveClientId=_saveToId;
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
-      var pp={client_id:_saveToId,financial_data:{S:state,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
-      var ex=await db.from('client_profiles').select('id').eq('client_id',_saveToId).maybeSingle();
+
+      // ══ FIRST-SAVE GUARD ══
+      if(!_dashFirstSaveGuardPassed){
+        _dashFirstSaveGuardPassed=true;
+        function _dashWeight(s,c){
+          var w=0;
+          w+=(s.incomeSources||[]).filter(function(x){return(parseFloat(x.amount)||0)>0;}).length*10;
+          w+=Object.keys(s.expData||{}).length;
+          w+=(s.debts||[]).filter(function(x){return(parseFloat(x.balance)||0)>0;}).length*10;
+          w+=(s.retAccounts||[]).length*10;
+          w+=(s.children||[]).length*5;
+          w+=(s.goals||[]).length*5;
+          w+=(s.insurancePolicies||[]).length*10;
+          if(s.profile){var p=s.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
+          if(s.assets){if(parseFloat(s.assets.checking)>0)w+=5;if(parseFloat(s.assets.savings)>0)w+=5;if(parseFloat(s.assets.invest)>0)w+=5;}
+          if(s.buckets&&s.buckets.length)w+=s.buckets.length*3;
+          if((c.inc||0)>0)w+=10;
+          return w;
+        }
+        var _inW=_dashWeight(state,calcs);
+        if(_inW<20){
+          try{
+            var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            if(_gEx&&_gEx.data&&_gEx.data.financial_data){
+              var _exW=_dashWeight(_gEx.data.financial_data.S||{},_gEx.data.financial_data.calcs||{});
+              if(_exW>10&&_inW<_exW*0.5){
+                console.warn('[Dashboard] ⛔ First save blocked — incoming weight '+_inW+' vs existing '+_exW);
+                _dashFirstSaveGuardPassed=false;return;
+              }
+            }
+          }catch(_ge){
+            if(_inW===0){console.warn('[Dashboard] ⛔ DB check failed AND empty — blocking save');_dashFirstSaveGuardPassed=false;return;}
+          }
+        }
+      }
+      // ══ NaN GUARD ══
+      if(isNaN(calcs.inc)||isNaN(calcs.netCF)||isNaN(calcs.netWorth)){
+        console.warn('[Dashboard] ⛔ NaN detected — skipping save');return;
+      }
+      // ══ SECTION-LEVEL MERGE ══
+      var ex=await db.from('client_profiles').select('id,financial_data').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var mergedState=JSON.parse(JSON.stringify(state));
+      var touched=state._touched||{};
+      if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
+        var exS=ex.data.financial_data.S;
+        ['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile'].forEach(function(sec){
+          if(!touched[sec]){
+            var exVal=exS[sec];
+            if(exVal===undefined||exVal===null)return;
+            var exHasData=Array.isArray(exVal)?exVal.length>0:(typeof exVal==='object'?Object.keys(exVal).length>0:!!exVal);
+            if(exHasData){mergedState[sec]=exVal;console.log('[Dashboard] ✓ Preserved:',sec);}
+          }
+        });
+      }
+      delete mergedState._touched;
+      var pp={client_id:_saveToId,financial_data:{S:mergedState,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
+      // ══ BACKUP: ALWAYS ══
+      if(ex&&ex.data&&ex.data.financial_data){pp.previous_financial_data=ex.data.financial_data;}
       if(ex&&ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[Dashboard] Client profile UPDATED'); }
       else { await db.from('client_profiles').insert(pp); console.log('[Dashboard] Client profile INSERTED'); }
     }catch(err){ console.warn('Dashboard auto-save ERROR:',err); }
@@ -2571,12 +2628,18 @@ window.addEventListener('beforeunload',function(){
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
   var saveId=_lastSaveClientId||(pfosClientContext&&pfosClientContext.isAgentProfile?null:APP.currentClientId);
   if(saveId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+    // Only fire beforeunload save if user actually touched data this session
+    var _blTouched=_lastPfosState.state._touched||{};
+    if(Object.keys(_blTouched).length===0){console.log('[Dashboard] beforeunload: no sections touched — skipping save');}
+    else{
     try{
       var calcs=_lastPfosState.calcs||{};
-      var payload={financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+      var _blState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _blState._touched;
+      var payload={financial_data:{S:_blState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
       var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+saveId+'&order=updated_at.desc&limit=1';
       fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
     }catch(e){}
+    }
   }
   // Agent finances
   if(pfosClientContext&&pfosClientContext.isAgentProfile&&APP.user&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
@@ -16628,7 +16691,7 @@ async function runAIPolicyAudit(){
   var btn=document.getElementById('pa_runAI');
   var resEl=document.getElementById('pa_ai_results');
   var manualEl=document.getElementById('pa_results');
-  btn.textContent='⏳ ANALYZING... (this may take 30-60 seconds)';
+  btn.textContent='⏳ ANALYZING... (this can take up to 2 minutes)';
   btn.disabled=true;
   btn.style.opacity='0.6';
   resEl.style.display='';
@@ -17089,7 +17152,7 @@ async function runAIPolicyCompare(){
   var filesData=_pc_files.filter(function(f){return f!==null;});
   if(filesData.length<2){alert('Please upload at least 2 policy illustrations.');return;}
 
-  btn.textContent='⏳ ANALYZING '+filesData.length+' POLICIES... (this may take 60-90 seconds)';
+  btn.textContent='⏳ ANALYZING '+filesData.length+' POLICIES... (this can take up to 2 minutes)';
   btn.disabled=true;btn.style.opacity='0.6';
   resEl.style.display='';
   resEl.innerHTML='<div style="text-align:center;padding:30px;color:var(--mu)"><div style="font-size:28px;margin-bottom:8px">🤖</div><div>Claude is reading all '+filesData.length+' illustrations page by page...</div><div style="font-size:10px;color:var(--mu);margin-top:4px">Running full audit on each policy, then comparing: structure, fees, cash value, income sustainability, loan provisions, carrier strength, and AG49-A compliance.</div></div>';
