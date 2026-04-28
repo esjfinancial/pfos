@@ -4962,20 +4962,46 @@ window.addEventListener('message', async function(e){
       // ══ FIRST-SAVE DATA PROTECTION ══
       if(!_firstSaveGuardPassed){
         _firstSaveGuardPassed=true;
-        var _inc=(calcs.inc||0);
-        var _src=(state.incomeSources||[]).filter(function(s){return(parseFloat(s.amount)||0)>0;}).length;
-        if(_inc===0&&_src===0&&(state.debts||[]).every(function(d){return(parseFloat(d.balance)||0)===0;})&&(state.retAccounts||[]).every(function(r){return(parseFloat(r.balance)||0)===0;})){
-          var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-          if(_gEx&&_gEx.data&&_gEx.data.financial_data&&((_gEx.data.financial_data.calcs||{}).inc||0)>0){
-            console.warn('[PFOS-CP] ⛔ First save blocked — empty data would overwrite real data.');
-            _firstSaveGuardPassed=false;
-            var _banner=document.createElement('div');
-            _banner.id='dataProtectionBanner';
-            _banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;background:linear-gradient(90deg,#EF4444,#DC2626);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3)';
-            _banner.innerHTML='⛔ Data protection activated — client data was not loaded correctly. <button onclick="window.location.reload()" style="padding:6px 16px;background:#fff;color:#EF4444;border:none;border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">🔄 Refresh Page</button> <button onclick="_restorePreviousData()" style="padding:6px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">⏪ Restore Last Good Save</button> <button onclick="this.parentElement.remove()" style="padding:6px 12px;background:transparent;color:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.3);border-radius:3px;font-family:var(--fh);font-size:11px;cursor:pointer">Dismiss</button>';
-            if(!document.getElementById('dataProtectionBanner'))document.body.appendChild(_banner);
-            var ind=document.getElementById('saveIndicator');if(ind){ind.className='save-indicator';ind.textContent='⛔ Protected';ind.style.color='#EF4444';}
-            return;
+        // Calculate incoming data weight (mirrors _stateWeight in pfos-main)
+        function _cpWeight(s,c){
+          var w=0;
+          w+=(s.incomeSources||[]).filter(function(x){return(parseFloat(x.amount)||0)>0;}).length*10;
+          w+=Object.keys(s.expData||{}).length;
+          w+=(s.debts||[]).filter(function(x){return(parseFloat(x.balance)||0)>0;}).length*10;
+          w+=(s.retAccounts||[]).length*10;
+          w+=(s.children||[]).length*5;
+          w+=(s.goals||[]).length*5;
+          w+=(s.insurancePolicies||[]).length*10;
+          if(s.profile){var p=s.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
+          if(s.assets){if(parseFloat(s.assets.checking)>0)w+=5;if(parseFloat(s.assets.savings)>0)w+=5;if(parseFloat(s.assets.invest)>0)w+=5;}
+          if(s.buckets&&s.buckets.length)w+=s.buckets.length*3;
+          if((c.inc||0)>0)w+=10;
+          return w;
+        }
+        var _inW=_cpWeight(state,calcs);
+        // If incoming weight is low, compare against existing data
+        if(_inW<20){
+          try{
+            var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            if(_gEx&&_gEx.data&&_gEx.data.financial_data){
+              var _exS=_gEx.data.financial_data.S||{};
+              var _exC=_gEx.data.financial_data.calcs||{};
+              var _exW=_cpWeight(_exS,_exC);
+              if(_exW>10&&_inW<_exW*0.5){
+                console.warn('[PFOS-CP] ⛔ First save blocked — incoming weight '+_inW+' vs existing '+_exW+'. Data loss prevented.');
+                _firstSaveGuardPassed=false;
+                var _banner=document.createElement('div');
+                _banner.id='dataProtectionBanner';
+                _banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;background:linear-gradient(90deg,#EF4444,#DC2626);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3)';
+                _banner.innerHTML='⛔ Data protection activated — client data was not loaded correctly. <button onclick="window.location.reload()" style="padding:6px 16px;background:#fff;color:#EF4444;border:none;border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">🔄 Refresh Page</button> <button onclick="_restorePreviousData()" style="padding:6px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">⏪ Restore Last Good Save</button> <button onclick="this.parentElement.remove()" style="padding:6px 12px;background:transparent;color:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.3);border-radius:3px;font-family:var(--fh);font-size:11px;cursor:pointer">Dismiss</button>';
+                if(!document.getElementById('dataProtectionBanner'))document.body.appendChild(_banner);
+                var ind=document.getElementById('saveIndicator');if(ind){ind.className='save-indicator';ind.textContent='⛔ Protected';ind.style.color='#EF4444';}
+                return;
+              }
+            }
+          }catch(_guardErr){
+            if(_inW===0){console.warn('[PFOS-CP] ⛔ DB check failed AND incoming data is empty — blocking save as precaution:',_guardErr);_firstSaveGuardPassed=false;return;}
+            else{console.warn('[PFOS-CP] DB check failed but incoming has data (weight='+_inW+'), allowing save:',_guardErr);}
           }
         }
       }
@@ -4989,13 +5015,44 @@ window.addEventListener('message', async function(e){
       // Also cache in sessionStorage so data survives page navigation
       try{sessionStorage.setItem('pfos_cached_'+saveToId,JSON.stringify({calcs:calcs,S:state,scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},ts:Date.now()}));}catch(e){}
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
-      var pp     = {client_id:saveToId, financial_data:{S:state, calcs}, scores, updated_at:new Date().toISOString()};
+
+      // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
       var ex = await db.from('client_profiles').select('id,financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var mergedState = JSON.parse(JSON.stringify(state));
+      var touched = state._touched || {};
+      if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
+        var exS = ex.data.financial_data.S;
+        // Protected sections: only use incoming if user intentionally modified them
+        var _protectedSections = ['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile'];
+        _protectedSections.forEach(function(sec){
+          if(!touched[sec]){
+            // Section was NOT touched by user — check if existing has data worth keeping
+            var exVal = exS[sec];
+            var inVal = mergedState[sec];
+            if(exVal === undefined || exVal === null) return; // existing has nothing, keep incoming
+            var exHasData = false;
+            if(Array.isArray(exVal)) exHasData = exVal.length > 0;
+            else if(typeof exVal === 'object') exHasData = Object.keys(exVal).length > 0;
+            else exHasData = !!exVal;
+            if(exHasData){
+              // Existing has data and section wasn't touched — preserve existing
+              mergedState[sec] = exVal;
+              console.log('[PFOS-CP] ✓ Preserved untouched section from existing:', sec);
+            }
+          }
+        });
+      }
+      // Clear _touched from saved state — it's session-only
+      delete mergedState._touched;
+      var mergedCalcs = calcs; // calcs always from incoming (freshly calculated)
+      var pp = {client_id:saveToId, financial_data:{S:mergedState, calcs:mergedCalcs}, scores, updated_at:new Date().toISOString()};
+
+      // ══ BACKUP: ALWAYS save current data before overwriting ══
+      if(ex&&ex.data&&ex.data.financial_data){
+        pp.previous_financial_data=ex.data.financial_data;
+      }
+
       if(ex&&ex.data){
-        // ══ BACKUP: save current data before overwriting ══
-        if(ex.data.financial_data&&ex.data.financial_data.calcs&&(ex.data.financial_data.calcs.inc||0)>0){
-          pp.previous_financial_data=ex.data.financial_data;
-        }
         var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[PFOS-CP] Supabase SAVE:',_r.error?'FAILED: '+_r.error.message:'OK');
       }
       else { var _r2=await db.from('client_profiles').insert(pp); console.log('[PFOS-CP] Supabase INSERT:',_r2.error?'FAILED: '+_r2.error.message:'OK'); }
@@ -5104,16 +5161,21 @@ window.addEventListener('message', async function(e){
 window.addEventListener('beforeunload',function(){
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
   if(APP.currentClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+    var _blTouched=_lastPfosState.state._touched||{};
+    if(Object.keys(_blTouched).length===0){console.log('[PFOS-CP] beforeunload: no sections touched — skipping save');}
+    else{
     try{
       var calcs=_lastPfosState.calcs||{};
       var saveToId=APP.currentClientId;
       var couple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
       if(couple&&couple.household_type==='joint') saveToId=couple.client_a_id;
-      var payload={client_id:saveToId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+      var _blState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _blState._touched;
+      var payload={client_id:saveToId,financial_data:{S:_blState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
       // Use fetch directly with keepalive for reliable delivery during page unload
       var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+saveToId+'&order=updated_at.desc&limit=1';
       fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify({financial_data:payload.financial_data,scores:payload.scores,updated_at:payload.updated_at}),keepalive:true}).catch(function(){});
     }catch(e){}
+    }
   }
 });
 
@@ -6531,7 +6593,7 @@ async function renderAdvisorInsurance(){
     var reviews=[];
     try{
       var _rvResult=await Promise.race([
-        db.from('policy_annual_actuals').select('*').in('policy_tracking_id',policyIds).order('review_year',{ascending:false}),
+        db.from('policy_annual_actuals').select('*').in('policy_tracking_id',policyIds).order('statement_year',{ascending:false}),
         new Promise(function(_,rej){setTimeout(function(){rej(new Error('timeout'));},8000);})
       ]);
       reviews=_rvResult.data||[];
@@ -6595,7 +6657,7 @@ async function renderAdvisorInsurance(){
           var rCol=r.health_grade&&'A+A A-B+B'.indexOf(r.health_grade)>=0?'var(--gr)':'B-C+C'.indexOf(r.health_grade)>=0?'var(--yl)':'var(--rd)';
           h+='<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--bd)">';
           h+='<span style="font-family:var(--fd);font-size:14px;font-weight:700;color:'+rCol+';width:24px;text-align:center">'+r.health_grade+'</span>';
-          h+='<div style="flex:1"><span style="font-size:11px;color:var(--wh);font-weight:600">Year '+(r.review_year||'?')+'</span>';
+          h+='<div style="flex:1"><span style="font-size:11px;color:var(--wh);font-weight:600">Year '+(r.statement_year||'?')+'</span>';
           if(r.summary)h+=' <span style="font-size:10px;color:var(--mu)">— '+r.summary.substring(0,60)+(r.summary.length>60?'...':'')+'</span>';
           h+='</div>';
           h+='<span style="font-size:9px;color:var(--mu)">'+new Date(r.created_at).toLocaleDateString('en-US',{month:'short',year:'numeric'})+'</span>';
@@ -6680,7 +6742,7 @@ async function _advARHandleFile(file,policyId){
     var {data:tpData}=await db.from('policy_tracking').select('*').eq('id',policyId).single();
     if(!tpData)throw new Error('Policy not found');
     var {data:projections}=await db.from('policy_projections').select('*').eq('policy_tracking_id',policyId).order('year',{ascending:true});
-    var {data:priorActuals}=await db.from('policy_annual_actuals').select('*').eq('policy_tracking_id',policyId).order('review_year',{ascending:true});
+    var {data:priorActuals}=await db.from('policy_annual_actuals').select('*').eq('policy_tracking_id',policyId).order('statement_year',{ascending:true});
     // Build client profile
     var clientProfile={age:0,income:0,riskProfile:'moderate',netWorth:0};
     try{
@@ -6717,7 +6779,7 @@ async function _advARHandleFile(file,policyId){
     var actualData={
       policy_tracking_id:policyId,
       client_id:APP.currentClientId,
-      review_year:reviewYear,
+      statement_year:reviewYear,
       review_date:new Date().toISOString().split('T')[0],
       health_grade:data.overallHealth||data.healthGrade||data.grade||'',
       summary:data.overallSummary||data.summary||data.gradeSummary||'',
