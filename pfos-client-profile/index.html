@@ -6504,14 +6504,38 @@ async function renderAdvisorInsurance(){
     var insClientId=APP.currentClientId;
     var insCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
     if(insCouple&&insCouple.household_type==='joint')insClientId=insCouple.client_a_id;
-    var {data:policies}=await db.from('policy_tracking').select('*').eq('client_id',insClientId).eq('status','active').order('created_at',{ascending:false});
+    // Query with timeout — fallback to raw fetch if Supabase client hangs
+    var policies=null;
+    try{
+      var _ptResult=await Promise.race([
+        db.from('policy_tracking').select('*').eq('client_id',insClientId).eq('status','active').order('created_at',{ascending:false}),
+        new Promise(function(_,rej){setTimeout(function(){rej(new Error('timeout'));},8000);})
+      ]);
+      policies=_ptResult.data;
+    }catch(ptTimeoutErr){
+      console.warn('[PFOS-CP] policy_tracking query timed out, using raw fetch fallback');
+      try{
+        var sess=null;try{sess=JSON.parse(localStorage.getItem('sb-'+SUPABASE_URL.split('//')[1].split('.')[0]+'-auth-token'));}catch(e){}
+        var tkn=(sess&&sess.access_token)?sess.access_token:SUPABASE_ANON_KEY;
+        var ptUrl=SUPABASE_URL+'/rest/v1/policy_tracking?select=*&client_id=eq.'+insClientId+'&status=eq.active&order=created_at.desc';
+        var ptResp=await fetch(ptUrl,{headers:{'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+tkn}});
+        policies=await ptResp.json();
+      }catch(fetchErr){console.error('[PFOS-CP] Raw fetch fallback also failed:',fetchErr);policies=[];}
+    }
     if(!policies||!policies.length){
       el.innerHTML='<div style="text-align:center;padding:40px"><div style="font-size:36px;margin-bottom:12px">🛡️</div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">No Tracked Policies</div><div style="font-size:12px;color:var(--mu);margin:6px 0 16px">This client has no policies being tracked. Upload an illustration or annual statement to start.</div><div style="display:flex;gap:8px;justify-content:center"><button class="btn btn-bl" style="width:auto;padding:10px 20px" onclick="openPFOSForClient()">⚡ Open PFOS to Upload</button></div></div>';
       return;
     }
     // Load review history for each policy
     var policyIds=policies.map(function(p){return p.id;});
-    var {data:reviews}=await db.from('policy_annual_actuals').select('*').in('policy_tracking_id',policyIds).order('review_year',{ascending:false});
+    var reviews=[];
+    try{
+      var _rvResult=await Promise.race([
+        db.from('policy_annual_actuals').select('*').in('policy_tracking_id',policyIds).order('review_year',{ascending:false}),
+        new Promise(function(_,rej){setTimeout(function(){rej(new Error('timeout'));},8000);})
+      ]);
+      reviews=_rvResult.data||[];
+    }catch(rvErr){console.warn('[PFOS-CP] policy_annual_actuals query timed out or failed:',rvErr);}
     var reviewsByPolicy={};
     (reviews||[]).forEach(function(r){if(!reviewsByPolicy[r.policy_tracking_id])reviewsByPolicy[r.policy_tracking_id]=[];reviewsByPolicy[r.policy_tracking_id].push(r);});
     var h='';
