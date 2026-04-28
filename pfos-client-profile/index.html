@@ -4828,9 +4828,6 @@ window.addEventListener('message', async function(e){
   }
   if(msg.type === 'PFOS_POLICY_AUDITED' && APP.currentClientId){
     try{
-      var ptClientId=APP.currentClientId;
-      var ptCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
-      if(ptCouple&&ptCouple.household_type==='joint')ptClientId=ptCouple.client_a_id;
       var ar=msg.auditResult||{};
       var ed=ar.extractedData||(msg.extractedData||{});
       var ir=ed.incomeRider||{};
@@ -4844,7 +4841,7 @@ window.addEventListener('message', async function(e){
       // Life insurance type mapping
       if(!msg.isAnnuity){var liMap={whole_life:'whole_life','Whole Life':'whole_life',iul:'iul','IUL (Indexed Universal Life)':'iul',universal_life:'universal_life','Universal Life':'universal_life',term:'term','Term Life':'term','Variable Life':'universal_life','Group Life (Employer)':'term','Accidental Death':'term'};policyType=liMap[policyType]||policyType;}
       var record={
-        client_id:ptClientId,
+        client_id:APP.currentClientId,
         policy_type:policyType,
         carrier:carrier,
         product_name:productName||null,
@@ -4922,7 +4919,7 @@ window.addEventListener('message', async function(e){
         record.purpose=pd.purpose||null;
       }
       // Duplicate check: same client + carrier + product
-      var dupQuery=db.from('policy_tracking').select('id').eq('client_id',ptClientId).eq('carrier',carrier);
+      var dupQuery=db.from('policy_tracking').select('id').eq('client_id',APP.currentClientId).eq('carrier',carrier);
       if(productName)dupQuery=dupQuery.eq('product_name',productName);
       var {data:existing}=await dupQuery.maybeSingle();
       if(existing&&existing.id){
@@ -6503,12 +6500,15 @@ async function renderAdvisorInsurance(){
   try{
     var insClientId=APP.currentClientId;
     var insCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
-    if(insCouple&&insCouple.household_type==='joint')insClientId=insCouple.client_a_id;
+    var insClientIds=[insClientId];
+    if(insCouple&&insCouple.household_type==='joint'){
+      insClientIds=[insCouple.client_a_id,insCouple.client_b_id];
+    }
     // Query with timeout — fallback to raw fetch if Supabase client hangs
     var policies=null;
     try{
       var _ptResult=await Promise.race([
-        db.from('policy_tracking').select('*').eq('client_id',insClientId).eq('status','active').order('created_at',{ascending:false}),
+        db.from('policy_tracking').select('*').in('client_id',insClientIds).eq('status','active').order('created_at',{ascending:false}),
         new Promise(function(_,rej){setTimeout(function(){rej(new Error('timeout'));},8000);})
       ]);
       policies=_ptResult.data;
@@ -6517,7 +6517,7 @@ async function renderAdvisorInsurance(){
       try{
         var sess=null;try{sess=JSON.parse(localStorage.getItem('sb-'+SUPABASE_URL.split('//')[1].split('.')[0]+'-auth-token'));}catch(e){}
         var tkn=(sess&&sess.access_token)?sess.access_token:SUPABASE_ANON_KEY;
-        var ptUrl=SUPABASE_URL+'/rest/v1/policy_tracking?select=*&client_id=eq.'+insClientId+'&status=eq.active&order=created_at.desc';
+        var ptUrl=SUPABASE_URL+'/rest/v1/policy_tracking?select=*&client_id=in.('+insClientIds.join(',')+')&status=eq.active&order=created_at.desc';
         var ptResp=await fetch(ptUrl,{headers:{'apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+tkn}});
         policies=await ptResp.json();
       }catch(fetchErr){console.error('[PFOS-CP] Raw fetch fallback also failed:',fetchErr);policies=[];}
