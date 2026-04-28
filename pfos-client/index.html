@@ -5354,31 +5354,47 @@ window.addEventListener('message',async function(e){
     try{
       var state=msg.state,calcs=state.calcs||{};
       // ══ FIRST-SAVE DATA PROTECTION ══
-      // Only runs once per page load. If the very first save has empty data
-      // but Supabase has real data, block saving and show a refresh prompt.
       if(!_firstSaveGuardPassed){
         _firstSaveGuardPassed=true;
-        var _inc=(calcs.inc||0);
-        var _src=(state.incomeSources||[]).filter(function(s){return(parseFloat(s.amount)||0)>0;}).length;
-        var _dbt=(state.debts||[]).filter(function(d){return(parseFloat(d.balance)||0)>0;}).length;
-        var _ret=(state.retAccounts||[]).filter(function(r){return(parseFloat(r.balance)||0)>0;}).length;
-        if(_inc===0&&_src===0&&_dbt===0&&_ret===0){
-          var _cpG=getCoupleForClient(APP.currentClientId);
-          var _gId=(_cpG&&_cpG.household_type==='joint')?_cpG.client_a_id:APP.currentClientId;
-          var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',_gId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-          if(_gEx&&_gEx.data&&_gEx.data.financial_data){
-            var _gc=(_gEx.data.financial_data.calcs)||{};
-            if((_gc.inc||0)>0){
-              console.warn('[PFOS] ⛔ First save blocked — empty data would overwrite real data in Supabase.');
-              _firstSaveGuardPassed=false;
-              // Show user-facing banner
-              var _banner=document.createElement('div');
-              _banner.id='dataProtectionBanner';
-              _banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;background:linear-gradient(90deg,#EF4444,#DC2626);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3)';
-              _banner.innerHTML='⛔ Data protection activated — your financial data was not loaded correctly. <button onclick="window.location.reload()" style="padding:6px 16px;background:#fff;color:#EF4444;border:none;border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">🔄 Refresh Page</button> <button onclick="_restorePreviousData()" style="padding:6px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">⏪ Restore Last Good Save</button> <button onclick="this.parentElement.remove()" style="padding:6px 12px;background:transparent;color:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.3);border-radius:3px;font-family:var(--fh);font-size:11px;cursor:pointer">Dismiss</button>';
-              if(!document.getElementById('dataProtectionBanner'))document.body.appendChild(_banner);
-              return;
+        function _cpWeight(s,c){
+          var w=0;
+          w+=(s.incomeSources||[]).filter(function(x){return(parseFloat(x.amount)||0)>0;}).length*10;
+          w+=Object.keys(s.expData||{}).length;
+          w+=(s.debts||[]).filter(function(x){return(parseFloat(x.balance)||0)>0;}).length*10;
+          w+=(s.retAccounts||[]).length*10;
+          w+=(s.children||[]).length*5;
+          w+=(s.goals||[]).length*5;
+          w+=(s.insurancePolicies||[]).length*10;
+          if(s.profile){var p=s.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
+          if(s.assets){if(parseFloat(s.assets.checking)>0)w+=5;if(parseFloat(s.assets.savings)>0)w+=5;if(parseFloat(s.assets.invest)>0)w+=5;}
+          if(s.buckets&&s.buckets.length)w+=s.buckets.length*3;
+          if((c.inc||0)>0)w+=10;
+          return w;
+        }
+        var _inW=_cpWeight(state,calcs);
+        if(_inW<20){
+          try{
+            var _cpG=getCoupleForClient(APP.currentClientId);
+            var _gId=(_cpG&&_cpG.household_type==='joint')?_cpG.client_a_id:APP.currentClientId;
+            var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',_gId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            if(_gEx&&_gEx.data&&_gEx.data.financial_data){
+              var _exS=_gEx.data.financial_data.S||{};
+              var _exC=_gEx.data.financial_data.calcs||{};
+              var _exW=_cpWeight(_exS,_exC);
+              if(_exW>10&&_inW<_exW*0.5){
+                console.warn('[PFOS] ⛔ First save blocked — incoming weight '+_inW+' vs existing '+_exW+'. Data loss prevented.');
+                _firstSaveGuardPassed=false;
+                var _banner=document.createElement('div');
+                _banner.id='dataProtectionBanner';
+                _banner.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;background:linear-gradient(90deg,#EF4444,#DC2626);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3)';
+                _banner.innerHTML='⛔ Data protection activated — your financial data was not loaded correctly. <button onclick="window.location.reload()" style="padding:6px 16px;background:#fff;color:#EF4444;border:none;border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">🔄 Refresh Page</button> <button onclick="_restorePreviousData()" style="padding:6px 16px;background:rgba(255,255,255,.15);color:#fff;border:1px solid rgba(255,255,255,.4);border-radius:3px;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer">⏪ Restore Last Good Save</button> <button onclick="this.parentElement.remove()" style="padding:6px 12px;background:transparent;color:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.3);border-radius:3px;font-family:var(--fh);font-size:11px;cursor:pointer">Dismiss</button>';
+                if(!document.getElementById('dataProtectionBanner'))document.body.appendChild(_banner);
+                return;
+              }
             }
+          }catch(_guardErr){
+            if(_inW===0){console.warn('[PFOS] ⛔ DB check failed AND incoming data is empty — blocking save as precaution:',_guardErr);_firstSaveGuardPassed=false;return;}
+            else{console.warn('[PFOS] DB check failed but incoming has data (weight='+_inW+'), allowing save:',_guardErr);}
           }
         }
       }
@@ -5393,14 +5409,39 @@ window.addEventListener('message',async function(e){
       var _saveToId=(_cpSave&&_cpSave.household_type==='joint')?_cpSave.client_a_id:APP.currentClientId;
       _lastSaveClientId=_saveToId;
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
-      var pp={client_id:_saveToId,financial_data:{S:state,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
+
+      // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
       var ex=await db.from('client_profiles').select('id,financial_data').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       if(ex&&ex.error){console.error('[PFOS] client_profiles SELECT failed:',ex.error.message);}
+      var mergedState=JSON.parse(JSON.stringify(state));
+      var touched=state._touched||{};
+      if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
+        var exS=ex.data.financial_data.S;
+        var _protectedSections=['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile'];
+        _protectedSections.forEach(function(sec){
+          if(!touched[sec]){
+            var exVal=exS[sec];
+            if(exVal===undefined||exVal===null)return;
+            var exHasData=false;
+            if(Array.isArray(exVal))exHasData=exVal.length>0;
+            else if(typeof exVal==='object')exHasData=Object.keys(exVal).length>0;
+            else exHasData=!!exVal;
+            if(exHasData){
+              mergedState[sec]=exVal;
+              console.log('[PFOS] ✓ Preserved untouched section from existing:',sec);
+            }
+          }
+        });
+      }
+      delete mergedState._touched;
+      var pp={client_id:_saveToId,financial_data:{S:mergedState,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
+
+      // ══ BACKUP: ALWAYS save current data before overwriting ══
+      if(ex&&ex.data&&ex.data.financial_data){
+        pp.previous_financial_data=ex.data.financial_data;
+      }
+
       if(ex&&ex.data){
-        // ══ BACKUP: save current data before overwriting ══
-        if(ex.data.financial_data&&ex.data.financial_data.calcs&&(ex.data.financial_data.calcs.inc||0)>0){
-          pp.previous_financial_data=ex.data.financial_data;
-        }
         var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); if(_r.error)console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message); else console.log('[PFOS] Auto-saved OK');
       }
       else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error)console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); else console.log('[PFOS] Inserted new profile'); }
@@ -5467,12 +5508,17 @@ window.addEventListener('beforeunload',function(){
   if(_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.state).length>0){try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:_lastPfosState.state,calcs:_lastPfosState.calcs||{},ts:Date.now(),cid:APP.currentClientId}));}catch(e){}}
   // Also save _lastPfosState directly as backup (fetch+keepalive survives page unload)
   if(_lastSaveClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.state).length>0){
+    var _blTouched=_lastPfosState.state._touched||{};
+    if(Object.keys(_blTouched).length===0){console.log('[PFOS] beforeunload: no sections touched — skipping Supabase save');}
+    else{
     try{
       var calcs=_lastPfosState.calcs||{};
-      var payload={financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+      var _blState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _blState._touched;
+      var payload={financial_data:{S:_blState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
       var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+_lastSaveClientId+'&order=updated_at.desc&limit=1';
       fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
     }catch(e){}
+    }
   }
 });
 
@@ -6947,7 +6993,7 @@ async function runAIPolicyAudit(){
   var btn=document.getElementById('pa_runAI');
   var resEl=document.getElementById('pa_ai_results');
   var manualEl=document.getElementById('pa_results');
-  btn.textContent='⏳ ANALYZING... (this may take 30-60 seconds)';
+  btn.textContent='⏳ ANALYZING... (this can take up to 2 minutes)';
   btn.disabled=true;
   btn.style.opacity='0.6';
   resEl.style.display='';
@@ -7408,7 +7454,7 @@ async function runAIPolicyCompare(){
   var filesData=_pc_files.filter(function(f){return f!==null;});
   if(filesData.length<2){alert('Please upload at least 2 policy illustrations.');return;}
 
-  btn.textContent='⏳ ANALYZING '+filesData.length+' POLICIES... (this may take 60-90 seconds)';
+  btn.textContent='⏳ ANALYZING '+filesData.length+' POLICIES... (this can take up to 2 minutes)';
   btn.disabled=true;btn.style.opacity='0.6';
   resEl.style.display='';
   resEl.innerHTML='<div style="text-align:center;padding:30px;color:var(--mu)"><div style="font-size:28px;margin-bottom:8px">🤖</div><div>Claude is reading all '+filesData.length+' illustrations page by page...</div><div style="font-size:10px;color:var(--mu);margin-top:4px">Running full audit on each policy, then comparing: structure, fees, cash value, income sustainability, loan provisions, carrier strength, and AG49-A compliance.</div></div>';
@@ -18101,14 +18147,17 @@ async function _loadTrackedPolicies(){
   if(!APP.currentClientId||APP._trackedPoliciesLoaded)return;
   APP._trackedPoliciesLoaded=true;
   try{
-    var {data}=await db.from('policy_tracking').select('*').eq('client_id',APP.currentClientId).eq('status','active');
+    var _tpIds=[APP.currentClientId];
+    var _tpCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+    if(_tpCouple&&_tpCouple.household_type==='joint')_tpIds=[_tpCouple.client_a_id,_tpCouple.client_b_id];
+    var {data}=await db.from('policy_tracking').select('*').in('client_id',_tpIds).eq('status','active');
     APP._trackedPolicies=data||[];
     if(APP._trackedPolicies.length>0){
       // Load latest annual review data for health grades
       for(var i=0;i<APP._trackedPolicies.length;i++){
         var tp=APP._trackedPolicies[i];
         try{
-          var {data:reviews}=await db.from('policy_annual_actuals').select('review_year,health_grade,created_at').eq('policy_tracking_id',tp.id).order('review_year',{ascending:false}).limit(1);
+          var {data:reviews}=await db.from('policy_annual_actuals').select('statement_year,health_grade,created_at').eq('policy_tracking_id',tp.id).order('statement_year',{ascending:false}).limit(1);
           if(reviews&&reviews.length){tp._healthGrade=reviews[0].health_grade;tp._lastReviewDate=reviews[0].created_at;}
         }catch(e2){}
       }
@@ -18180,7 +18229,7 @@ function _arBuildUI(tp,typeLabel){
 async function _arHandleFile(file){
   if(!file||!file.name.toLowerCase().endsWith('.pdf')){alert('Please upload a PDF.');return;}
   var uploadEl=document.getElementById('arUploadArea');
-  if(uploadEl)uploadEl.innerHTML='<div style="padding:20px;text-align:center"><div class="skel" style="height:14px;width:200px;margin:0 auto 10px;border-radius:2px;background:linear-gradient(90deg,rgba(168,85,247,.06) 25%,rgba(168,85,247,.12) 50%,rgba(168,85,247,.06) 75%);background-size:400px 100%;animation:shimmer 1.5s infinite"></div><div style="font-family:var(--fh);font-size:11px;color:#A855F7;font-weight:700;margin-bottom:4px">Running annual review...</div><div style="font-size:9px;color:var(--mu)">Comparing to projections and prior years. This may take 60-90 seconds.</div></div>';
+  if(uploadEl)uploadEl.innerHTML='<div style="padding:20px;text-align:center"><div class="skel" style="height:14px;width:200px;margin:0 auto 10px;border-radius:2px;background:linear-gradient(90deg,rgba(168,85,247,.06) 25%,rgba(168,85,247,.12) 50%,rgba(168,85,247,.06) 75%);background-size:400px 100%;animation:shimmer 1.5s infinite"></div><div style="font-family:var(--fh);font-size:11px;color:#A855F7;font-weight:700;margin-bottom:4px">Running annual review...</div><div style="font-size:9px;color:var(--mu)">Comparing to projections and prior years. This can take up to 2 minutes.</div></div>';
   var resEl=document.getElementById('arResults');
   try{
     var base64=await new Promise(function(resolve,reject){
@@ -18199,7 +18248,7 @@ async function _arHandleFile(file){
     var tp=(APP._trackedPolicies||[]).find(function(p){return p.id===_arPolicyId;});
     if(!tp)throw new Error('Policy not found');
     var {data:projections}=await db.from('policy_projections').select('*').eq('policy_tracking_id',_arPolicyId).order('year',{ascending:true});
-    var {data:priorActuals}=await db.from('policy_annual_actuals').select('*').eq('policy_tracking_id',_arPolicyId).order('review_year',{ascending:true});
+    var {data:priorActuals}=await db.from('policy_annual_actuals').select('*').eq('policy_tracking_id',_arPolicyId).order('statement_year',{ascending:true});
     var c=(_lastPfosState&&_lastPfosState.calcs)||{};
     var clientProfile={age:c.currentAge||0,income:c.inc||0,riskProfile:'moderate',netWorth:c.netWorth||0};
     var _arIsAnnuity=tp.policy_type&&(tp.policy_type.indexOf('annuity')>=0||tp.policy_type==='fia'||tp.policy_type==='spia'||tp.policy_type==='fixed_annuity'||tp.policy_type==='variable_annuity');
@@ -18233,7 +18282,7 @@ async function _arHandleFile(file){
     var actualData={
       policy_tracking_id:_arPolicyId,
       client_id:APP.currentClientId,
-      review_year:reviewYear,
+      statement_year:reviewYear,
       review_date:new Date().toISOString().split('T')[0],
       health_grade:data.healthGrade||data.grade||'',
       summary:data.summary||data.gradeSummary||'',
@@ -18323,7 +18372,7 @@ async function _viewReviewHistory(policyId){
   el.innerHTML='<div style="text-align:center;padding:20px;color:var(--mu);font-size:12px">Loading review history...</div>';
   openModal('annualReviewModal');
   try{
-    var {data:reviews}=await db.from('policy_annual_actuals').select('*').eq('policy_tracking_id',policyId).order('review_year',{ascending:false});
+    var {data:reviews}=await db.from('policy_annual_actuals').select('*').eq('policy_tracking_id',policyId).order('statement_year',{ascending:false});
     if(!reviews||!reviews.length){el.innerHTML='<div style="text-align:center;padding:30px"><div style="font-size:28px;margin-bottom:8px">📋</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">No Reviews Yet</div><div style="font-size:11px;color:var(--mu);margin-top:4px">Upload your first annual statement to start tracking.</div></div>';return;}
     var typeLabel={whole_life:'Whole Life',iul:'IUL',universal_life:'Universal Life',fixed_annuity:'Fixed Annuity',variable_annuity:'Variable Annuity',fia:'Fixed Indexed Annuity',spia:'Income Annuity'}[tp.policy_type]||tp.policy_type;
     var h='<div style="margin-bottom:14px"><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh)">Review History</div>';
@@ -18360,7 +18409,7 @@ async function _viewReviewHistory(policyId){
       var rCol=r.health_grade&&'A+A A-B+B'.indexOf(r.health_grade)>=0?'var(--gr)':'B-C+C'.indexOf(r.health_grade)>=0?'var(--yl)':'var(--rd)';
       h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+rCol+';border-radius:0 3px 3px 0;margin-bottom:8px">';
       h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
-      h+='<div><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">Year '+r.review_year+'</span> <span style="font-size:10px;color:var(--mu)">'+new Date(r.created_at).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})+'</span></div>';
+      h+='<div><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">Year '+r.statement_year+'</span> <span style="font-size:10px;color:var(--mu)">'+new Date(r.created_at).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'})+'</span></div>';
       h+='<span style="font-family:var(--fd);font-size:20px;font-weight:800;color:'+rCol+'">'+r.health_grade+'</span>';
       h+='</div>';
       if(r.summary)h+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin-bottom:6px">'+esc(r.summary)+'</div>';
