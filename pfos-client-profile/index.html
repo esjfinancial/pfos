@@ -4826,6 +4826,117 @@ window.addEventListener('message', async function(e){
     _syncPlanToMain();
     return;
   }
+  if(msg.type === 'PFOS_POLICY_AUDITED' && APP.currentClientId){
+    try{
+      var ptClientId=APP.currentClientId;
+      var ptCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+      if(ptCouple&&ptCouple.household_type==='joint')ptClientId=ptCouple.client_a_id;
+      var ar=msg.auditResult||{};
+      var ed=ar.extractedData||(msg.extractedData||{});
+      var ir=ed.incomeRider||{};
+      var gm=ed.gmdb||{};
+      var carrier=ar.carrier||ed.carrier||(msg.policyData&&msg.policyData.company)||'';
+      var productName=ar.product||ed.product||'';
+      if(!carrier){console.warn('[PFOS-CP] No carrier in audit — skipping policy_tracking insert');return;}
+      // Map annuityType to policy_type column
+      var ptMap={fixed:'fixed_annuity',fia:'fia',variable:'variable_annuity',spia:'spia',myga:'fixed_annuity',deferred_income:'spia'};
+      var policyType=msg.isAnnuity?(ptMap[ar.annuityType]||'fia'):(msg.policyData&&msg.policyData.type)||'unknown';
+      // Life insurance type mapping
+      if(!msg.isAnnuity){var liMap={whole_life:'whole_life','Whole Life':'whole_life',iul:'iul','IUL (Indexed Universal Life)':'iul',universal_life:'universal_life','Universal Life':'universal_life',term:'term','Term Life':'term','Variable Life':'universal_life','Group Life (Employer)':'term','Accidental Death':'term'};policyType=liMap[policyType]||policyType;}
+      var record={
+        client_id:ptClientId,
+        policy_type:policyType,
+        carrier:carrier,
+        product_name:productName||null,
+        status:'active',
+        updated_at:new Date().toISOString()
+      };
+      // Annuity-specific fields
+      if(msg.isAnnuity){
+        record.annuity_type=ar.annuityType||null;
+        record.contract_value=ed.contractValue||ed.accumulationValue||0;
+        record.annuity_contract_value=ed.contractValue||ed.accumulationValue||0;
+        record.death_benefit=ed.deathBenefit||0;
+        record.tax_qualified=ed.taxQualified||false;
+        record.annuity_qualified=ed.taxQualified||false;
+        record.surrender_period_years=ed.surrenderPeriodYears||null;
+        record.annuity_surrender_period=ed.surrenderPeriodYears||null;
+        record.surrender_charge_current=ed.currentSurrenderChargePct||0;
+        record.premium_type=ed.premiumType||null;
+        record.premium_annual=ed.premium||0;
+        record.original_cap_rate=ed.capRate||null;
+        record.current_cap_rate=ed.capRate||0;
+        record.annuity_original_cap_rate=ed.capRate||null;
+        record.participation_rate=ed.participationRate||0;
+        record.original_participation_rate=ed.participationRate||null;
+        record.annuity_original_par_rate=ed.participationRate||null;
+        record.spread=ed.spread||0;
+        record.annuity_original_spread=ed.spread||0;
+        record.floor_rate=ed.floorRate||0;
+        record.original_floor=ed.floorRate||null;
+        record.guaranteed_rate=ed.guaranteedMinRate||null;
+        record.annuity_guaranteed_rate=ed.guaranteedMinRate||null;
+        record.free_withdrawal_pct=ed.freeWithdrawalPct||10;
+        record.annuity_free_withdrawal_pct=ed.freeWithdrawalPct||10;
+        record.mva_applies=ed.mvaApplies||false;
+        record.bonus_rate=ed.bonusRate||null;
+        record.annuity_bonus_pct=ed.bonusRate||null;
+        record.annuity_bonus_amount=ed.bonusAmount||0;
+        record.bonus_recapture=(ed.bonusRecapturedIfSurrenderedNow||0)>0;
+        if(ed.bonusVestingSchedule&&ed.bonusVestingSchedule.length)record.annuity_bonus_vesting_years=ed.bonusVestingSchedule.length;
+        record.indexes=ed.indexes||[];
+        record.carrier_rating=ed.carrierRating||null;
+        record.carrier_type=ed.carrierType||null;
+        record.carrier_years_in_business=ed.carrierYearsInBusiness||null;
+        record.annuity_income_rider=ir.hasRider||false;
+        record.income_rider_fee=ir.riderFeeRate||0;
+        record.annuity_rider_fee=ir.riderFeeRate||null;
+        record.income_base=ir.incomeBase||0;
+        record.annuity_income_base=ir.incomeBase||0;
+        record.rollup_rate=ir.rollupRate||0;
+        record.annuity_rollup_rate=ir.rollupRate||null;
+        record.guaranteed_monthly_income=ir.projectedMonthlyIncome||0;
+        record.annuity_guaranteed_income=ir.projectedMonthlyIncome||0;
+        record.annuity_death_benefit_rider=gm.hasGMDB||false;
+        record.annuity_gmdb_amount=gm.guaranteedAmount||0;
+        record.annuity_death_benefit_rider_fee=gm.riderFee||null;
+        record.annuity_me_fee=ed.meeFee||null;
+        record.sub_accounts=ed.subAccounts||[];
+        record.annuity_sub_accounts=ed.subAccounts||[];
+        record.purpose='retirement_income';
+      } else {
+        // Life insurance fields
+        var pd=msg.policyData||{};
+        record.death_benefit=parseFloat(pd.coverage)||ed.deathBenefit||0;
+        record.premium_monthly=parseFloat(pd.premium)||0;
+        record.policy_number=pd.policyNumber||null;
+        record.guaranteed_rate=ed.guaranteedRate||ed.guaranteedMinRate||null;
+        record.original_cap_rate=ed.capRate||null;
+        record.current_cap_rate=ed.capRate||0;
+        record.original_participation_rate=ed.participationRate||null;
+        record.original_floor=ed.floorRate||null;
+        record.carrier_rating=ed.carrierRating||null;
+        record.carrier_type=ed.carrierType||null;
+        record.carrier_years_in_business=ed.carrierYearsInBusiness||null;
+        record.indexes=ed.indexes||[];
+        record.purpose=pd.purpose||null;
+      }
+      // Duplicate check: same client + carrier + product
+      var dupQuery=db.from('policy_tracking').select('id').eq('client_id',ptClientId).eq('carrier',carrier);
+      if(productName)dupQuery=dupQuery.eq('product_name',productName);
+      var {data:existing}=await dupQuery.maybeSingle();
+      if(existing&&existing.id){
+        await db.from('policy_tracking').update(record).eq('id',existing.id);
+        console.log('[PFOS-CP] Updated existing policy_tracking record:',existing.id);
+      } else {
+        await db.from('policy_tracking').insert(record);
+        console.log('[PFOS-CP] Inserted new policy_tracking record for',carrier,productName);
+      }
+      // Refresh Insurance tab if visible
+      if(document.getElementById('advisorInsuranceContent'))renderAdvisorInsurance();
+    }catch(ptErr){console.error('[PFOS-CP] policy_tracking save failed:',ptErr);}
+    return;
+  }
   if(msg.type === 'PFOS_DATA_CHANGE'){
     console.log('[PFOS-CP] PFOS_DATA_CHANGE received. calcs.inc:', msg.state&&msg.state.calcs?msg.state.calcs.inc:'NO CALCS');
     if(!_pfosDataLoaded){console.log('[PFOS-CP] Skipping save — data not loaded yet');return;}
@@ -5504,7 +5615,7 @@ async function _cpRunIllustAudit(idx){
   var a=CPLAN.allocations[idx];if(!a)return;
   var fileInfo=_cpIllustFiles[idx];if(!fileInfo)return;
   var statusEl=document.getElementById('cpIllustStatus_'+idx);
-  if(statusEl)statusEl.innerHTML='<span style="color:#A855F7">🤖 Analyzing illustration... (30-60 seconds)</span>';
+  if(statusEl)statusEl.innerHTML='<span style="color:#A855F7">🤖 Analyzing illustration... (up to 2 minutes)</span>';
   var typeMap={wl:'whole_life',iul:'iul'};
   var payload={
     mode:'audit',
@@ -5608,7 +5719,7 @@ async function _cpRunCompare(){
   var resEl=document.getElementById('cpCmpResults');
   var filesData=_cpCompareFiles.filter(function(f){return f!==null;});
   if(filesData.length<2){alert('Upload at least 2 illustrations.');return;}
-  btn.textContent='⏳ ANALYZING '+filesData.length+' POLICIES... (60-90 seconds)';btn.disabled=true;btn.style.opacity='0.6';
+  btn.textContent='⏳ ANALYZING '+filesData.length+' POLICIES... (up to 2 minutes)';btn.disabled=true;btn.style.opacity='0.6';
   resEl.innerHTML='<div style="text-align:center;padding:24px;color:var(--mu)"><div style="font-size:28px;margin-bottom:8px">🤖</div><div>Claude is reading all '+filesData.length+' illustrations page by page...</div><div style="font-size:10px;margin-top:4px">Full audit on each, then comparing: structure, fees, cash value, income sustainability, loan provisions, carrier strength.</div></div>';
   // Add labels from inputs
   filesData.forEach(function(f,i){var lbl=document.getElementById('cpCmpLabel_'+(i+1));if(lbl&&lbl.value)f.label=lbl.value;});
@@ -6390,7 +6501,10 @@ async function renderAdvisorInsurance(){
   if(!APP.currentClientId){el.innerHTML='<div style="color:var(--mu);font-size:13px;text-align:center;padding:30px">No client selected.</div>';return;}
   el.innerHTML='<div style="text-align:center;padding:30px;color:var(--mu);font-size:12px">Loading policies...</div>';
   try{
-    var {data:policies}=await db.from('policy_tracking').select('*').eq('client_id',APP.currentClientId).eq('status','active').order('created_at',{ascending:false});
+    var insClientId=APP.currentClientId;
+    var insCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+    if(insCouple&&insCouple.household_type==='joint')insClientId=insCouple.client_a_id;
+    var {data:policies}=await db.from('policy_tracking').select('*').eq('client_id',insClientId).eq('status','active').order('created_at',{ascending:false});
     if(!policies||!policies.length){
       el.innerHTML='<div style="text-align:center;padding:40px"><div style="font-size:36px;margin-bottom:12px">🛡️</div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">No Tracked Policies</div><div style="font-size:12px;color:var(--mu);margin:6px 0 16px">This client has no policies being tracked. Upload an illustration or annual statement to start.</div><div style="display:flex;gap:8px;justify-content:center"><button class="btn btn-bl" style="width:auto;padding:10px 20px" onclick="openPFOSForClient()">⚡ Open PFOS to Upload</button></div></div>';
       return;
@@ -6523,7 +6637,7 @@ function _advRunAnnualReview(policyId){
 async function _advARHandleFile(file,policyId){
   if(!file||!file.name.toLowerCase().endsWith('.pdf')){alert('Please upload a PDF.');return;}
   var uploadEl=document.getElementById('advARUpload_'+policyId);
-  if(uploadEl)uploadEl.innerHTML='<div style="padding:16px;text-align:center"><div class="skel" style="height:12px;width:180px;margin:0 auto 8px;border-radius:2px;background:linear-gradient(90deg,rgba(168,85,247,.06) 25%,rgba(168,85,247,.12) 50%,rgba(168,85,247,.06) 75%);background-size:400px 100%;animation:shimmer 1.5s infinite"></div><div style="font-family:var(--fh);font-size:10px;color:#A855F7;font-weight:700;margin-bottom:3px">Running annual review...</div><div style="font-size:9px;color:var(--mu)">Comparing to projections and prior years. This may take 60-90 seconds.</div></div>';
+  if(uploadEl)uploadEl.innerHTML='<div style="padding:16px;text-align:center"><div class="skel" style="height:12px;width:180px;margin:0 auto 8px;border-radius:2px;background:linear-gradient(90deg,rgba(168,85,247,.06) 25%,rgba(168,85,247,.12) 50%,rgba(168,85,247,.06) 75%);background-size:400px 100%;animation:shimmer 1.5s infinite"></div><div style="font-family:var(--fh);font-size:10px;color:#A855F7;font-weight:700;margin-bottom:3px">Running annual review...</div><div style="font-size:9px;color:var(--mu)">Comparing to projections and prior years. This can take up to 2 minutes.</div></div>';
   var resEl=document.getElementById('advARResults_'+policyId);
   try{
     var base64=await new Promise(function(resolve,reject){
