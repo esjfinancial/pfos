@@ -1697,20 +1697,23 @@ async function doLogout(){
     if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
     // Give PFOS_FLUSH 200ms to fire _doSync and send PFOS_DATA_CHANGE back
     await new Promise(function(r){setTimeout(r,200);});
-    // Save last known state directly (in case PFOS_DATA_CHANGE didn't arrive in time)
-    if(APP.currentClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+    // Only save if user actually touched data this session — prevents empty-state overwrites
+    var _logoutTouched=(_lastPfosState&&_lastPfosState.state&&_lastPfosState.state._touched)?Object.keys(_lastPfosState.state._touched):{};
+    if(_logoutTouched.length>0&&APP.currentClientId&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
       var calcs=_lastPfosState.calcs||{};
       var saveToId=APP.currentClientId;
       var couple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
       if(couple&&couple.household_type==='joint')saveToId=couple.client_a_id;
-      // ══ GUARD: skip save if data is empty or NaN ══
-      if((calcs.inc||0)===0&&(calcs.totalDebt||0)===0&&(calcs.netWorth||0)===0){console.log('[PFOS-CP] goBack: skipping save — empty data');
-      } else if(isNaN(calcs.inc)||isNaN(calcs.netCF)){console.log('[PFOS-CP] goBack: skipping save — NaN');
+      if(isNaN(calcs.inc)||isNaN(calcs.netCF)){console.log('[PFOS-CP] logout: skipping save — NaN detected');
       } else {
-      var pp={client_id:saveToId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+      var _logoutState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _logoutState._touched;
+      var pp={client_id:saveToId,financial_data:{S:_logoutState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
       var ex=await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+      console.log('[PFOS-CP] logout: saved ('+_logoutTouched.length+' sections touched)');
       }
+    } else {
+      console.log('[PFOS-CP] logout: no sections touched — skipping save to protect existing data');
     }
   }catch(e){console.warn('Pre-logout save failed:',e);}
   await db.auth.signOut();
