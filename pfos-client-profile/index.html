@@ -4620,6 +4620,7 @@ async function openClientProfile(clientId){
 
   console.log('[PFOS-CP] profile loaded:', profile?'YES':'NULL', 'financial_data:', profile&&profile.financial_data?'YES':'NULL', 'scores:', profile&&profile.scores?'YES':'NULL');
   APP._clientProfile=profile;// Stash for standalone pages (tracking/projections/analysis)
+  APP._lastDataVersion=(profile&&profile.data_version)||0;// Track version for multi-tab conflict detection
   // Use cached PFOS state if available (more current than Supabase)
   var renderFD=null,renderScores={};
   if(_lastPfosState&&_lastPfosState.state&&_lastPfosState.calcs&&Object.keys(_lastPfosState.calcs).length>0){
@@ -4643,6 +4644,8 @@ async function openClientProfile(clientId){
   }
   if(renderFD){ renderProfileSnapshot(renderFD, renderScores); renderProfileRedFlags(renderFD); renderProfileSavingsGoals(renderFD); _cpInitPlan(renderFD, profile?profile.allocation_plan:null); }
   else { set('profileSnapshotData','<div style="color:var(--mu);font-size:12px">No data yet. <a href="#" onclick="openPFOSForClient();return false" style="color:#5B9BFF">Open PFOS</a> to enter data.</div>'); _cpInitPlan(null,null); }
+  // Replay any saves queued during previous offline session
+  try{_replayPendingSaves();}catch(e){}
 
   set('profileReviewDates',
     '<div class="kv"><span class="kk">Last Review</span><span class="kv-val">'+fmtDate(client.last_review_date)+'</span></div>'
@@ -5042,9 +5045,14 @@ window.addEventListener('message', async function(e){
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
 
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
-      var ex = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var ex = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2,data_version').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       var mergedState = JSON.parse(JSON.stringify(state));
       var touched = state._touched || {};
+      // ══ MULTI-TAB CONFLICT DETECTION ══
+      if(ex&&ex.data&&ex.data.data_version>0&&APP._lastDataVersion>0&&ex.data.data_version>APP._lastDataVersion){
+        console.warn('[PFOS-CP] ⚠️ Another tab wrote since we loaded (DB v'+ex.data.data_version+' > local v'+APP._lastDataVersion+'). Merging carefully — only touched sections override.');
+      }
+      if(ex&&ex.data)APP._lastDataVersion=ex.data.data_version||0;
       if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
         var exS = ex.data.financial_data.S;
         // Protected sections: only use incoming if user intentionally modified them
@@ -5089,7 +5097,7 @@ window.addEventListener('message', async function(e){
         if(_r.error){
           if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS-CP] ⛔ Database blocked destructive overwrite — existing data preserved');
           } else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS-CP] ⛔ Rate limit — too many saves, skipping');
-          } else {console.error('[PFOS-CP] Supabase SAVE FAILED:',_r.error.message);}
+          } else {console.error('[PFOS-CP] Supabase SAVE FAILED:',_r.error.message);_queueFailedSave(saveToId,{financial_data:pp.financial_data,scores:pp.scores,updated_at:pp.updated_at});}
         } else {console.log('[PFOS-CP] Supabase SAVE: OK');_updateLastSaved();}
       }
       else { var _r2=await db.from('client_profiles').insert(pp); console.log('[PFOS-CP] Supabase INSERT:',_r2.error?'FAILED: '+_r2.error.message:'OK'); }
@@ -7309,6 +7317,47 @@ async function _restorePreviousData(){
     alert('Data restored! Refreshing page...');
     window.location.reload();
   }catch(e){alert('Restore failed: '+e.message);}
+}
+
+// ── OFFLINE SAVE QUEUE ──
+function _queueFailedSave(clientId,payload){
+  try{
+    var queue=JSON.parse(localStorage.getItem('pfos_save_queue')||'[]');
+    queue.push({clientId:clientId,payload:payload,ts:Date.now()});
+    // Keep max 5 queued saves
+    if(queue.length>5)queue=queue.slice(-5);
+    localStorage.setItem('pfos_save_queue',JSON.stringify(queue));
+    console.log('[PFOS-CP] Save queued offline ('+queue.length+' pending)');
+    // Show indicator
+    var el=document.getElementById('lastSavedIndicator');
+    if(!el){el=document.createElement('div');el.id='lastSavedIndicator';el.style.cssText='position:fixed;bottom:8px;right:8px;z-index:9000;padding:5px 12px;border-radius:4px;font-family:var(--fh);font-size:10px;font-weight:600;transition:opacity .5s;pointer-events:none';document.body.appendChild(el);}
+    el.style.background='rgba(234,179,8,.12)';el.style.border='1px solid rgba(234,179,8,.25)';el.style.color='var(--yl)';
+    el.textContent='⏳ Save queued — will retry when connection returns';el.style.opacity='1';
+  }catch(e){}
+}
+async function _replayPendingSaves(){
+  try{
+    var queue=JSON.parse(localStorage.getItem('pfos_save_queue')||'[]');
+    if(!queue.length)return;
+    console.log('[PFOS-CP] Replaying '+queue.length+' queued saves...');
+    var remaining=[];
+    for(var i=0;i<queue.length;i++){
+      var q=queue[i];
+      // Skip saves older than 24 hours
+      if(Date.now()-q.ts>86400000){console.log('[PFOS-CP] Skipping stale queued save from',new Date(q.ts).toLocaleString());continue;}
+      try{
+        var ex=await db.from('client_profiles').select('id').eq('client_id',q.clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+        if(ex&&ex.data){
+          q.payload.allow_data_downgrade=true;// Bypass protection since this is a replay
+          var {error}=await db.from('client_profiles').update(q.payload).eq('id',ex.data.id);
+          if(error){console.warn('[PFOS-CP] Queued save replay failed:',error.message);remaining.push(q);}
+          else{console.log('[PFOS-CP] ✓ Queued save replayed for',q.clientId);}
+        }
+      }catch(e){remaining.push(q);}
+    }
+    localStorage.setItem('pfos_save_queue',JSON.stringify(remaining));
+    if(!remaining.length)localStorage.removeItem('pfos_save_queue');
+  }catch(e){}
 }
 
 // ── LAST SAVED INDICATOR ──
