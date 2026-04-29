@@ -5141,22 +5141,32 @@ async function _restorePreviousData(){
   try{
     var _cpR=getCoupleForClient(APP.currentClientId);
     var _rId=(_cpR&&_cpR.household_type==='joint')?_cpR.client_a_id:APP.currentClientId;
-    var {data:row}=await db.from('client_profiles').select('id,previous_financial_data').eq('client_id',_rId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(!row||!row.previous_financial_data||!row.previous_financial_data.calcs){
-      alert('No backup found in Supabase. The previous_financial_data column is empty for this client.');
-      return;
+    var {data:row}=await db.from('client_profiles').select('id,previous_financial_data,previous_financial_data_2,previous_financial_data_3').eq('client_id',_rId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!row){alert('No profile found.');return;}
+    var backups=[];
+    if(row.previous_financial_data&&row.previous_financial_data.calcs)backups.push({label:'Last save (1 back)',data:row.previous_financial_data});
+    if(row.previous_financial_data_2&&row.previous_financial_data_2.calcs)backups.push({label:'2 versions back',data:row.previous_financial_data_2});
+    if(row.previous_financial_data_3&&row.previous_financial_data_3.calcs)backups.push({label:'3 versions back',data:row.previous_financial_data_3});
+    if(!backups.length){alert('No backups found.');return;}
+    var choice=0;
+    if(backups.length>1){
+      var msg='Which version?\n';
+      backups.forEach(function(b,i){msg+=(i+1)+'. '+b.label+' (income: $'+Math.round((b.data.calcs||{}).inc||0).toLocaleString()+'/mo)\n';});
+      var input=prompt(msg+'Enter number:');if(!input)return;choice=parseInt(input)-1;
+      if(isNaN(choice)||choice<0||choice>=backups.length){alert('Invalid.');return;}
     }
-    if(!confirm('Restore the last known good save? This will overwrite the current (empty) data with the previous version.'))return;
-    var prev=row.previous_financial_data;
+    if(!confirm('Restore "'+backups[choice].label+'"?'))return;
+    var prev=backups[choice].data;
     var scores={cfScore:(prev.calcs||{}).cfScore,protScore:(prev.calcs||{}).protScore,growScore:(prev.calcs||{}).growScore,effScore:(prev.calcs||{}).effScore};
-    await db.from('client_profiles').update({
-      financial_data:prev,
-      scores:scores,
-      updated_at:new Date().toISOString()
-    }).eq('id',row.id);
-    alert('Data restored! Refreshing page...');
-    window.location.reload();
+    await db.from('client_profiles').update({financial_data:prev,scores:scores,allow_data_downgrade:true,updated_at:new Date().toISOString()}).eq('id',row.id);
+    alert('Restored! Refreshing...');window.location.reload();
   }catch(e){alert('Restore failed: '+e.message);}
+}
+function _updateLastSaved(){
+  var el=document.getElementById('lastSavedIndicator');
+  if(!el){el=document.createElement('div');el.id='lastSavedIndicator';el.style.cssText='position:fixed;bottom:8px;right:8px;z-index:9000;padding:5px 12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:10px;color:var(--gr);font-weight:600;transition:opacity .5s;pointer-events:none';document.body.appendChild(el);}
+  el.textContent='✓ Saved '+new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+  el.style.opacity='1';clearTimeout(el._fadeTimer);el._fadeTimer=setTimeout(function(){el.style.opacity='0.4';},5000);
 }
 
 async function clientSaveOwnData(){
@@ -5351,6 +5361,25 @@ window.addEventListener('message',async function(e){
     }catch(e){console.warn('[PFOS] Policy tracking save failed:',e);}
     return;
   }
+  // ── POLICY DELETED FROM PROTECTION PANEL → deactivate policy_tracking ──
+  if(msg.type==='PFOS_POLICY_DELETED'&&APP.currentClientId){
+    try{
+      var delCarrier=(msg.carrier||'').trim().toLowerCase();
+      if(!delCarrier)return;
+      var _delIds=[APP.currentClientId];
+      var _delCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+      if(_delCouple&&_delCouple.household_type==='joint')_delIds=[_delCouple.client_a_id,_delCouple.client_b_id];
+      var {data:matches}=await db.from('policy_tracking').select('id,carrier,status').in('client_id',_delIds).eq('status','active');
+      if(matches&&matches.length){
+        var toDeactivate=matches.filter(function(m){return(m.carrier||'').trim().toLowerCase()===delCarrier;});
+        for(var td=0;td<toDeactivate.length;td++){
+          await db.from('policy_tracking').update({status:'inactive',updated_at:new Date().toISOString()}).eq('id',toDeactivate[td].id);
+          console.log('[PFOS] Deactivated policy_tracking:',toDeactivate[td].id);
+        }
+      }
+    }catch(e){console.warn('[PFOS] policy_tracking deactivation failed:',e);}
+    return;
+  }
   if(msg.type==='PFOS_DATA_CHANGE'){
     if(!APP.currentClientId) return;
     // ══ A3: Client switch race condition guard ══
@@ -5419,7 +5448,7 @@ window.addEventListener('message',async function(e){
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
 
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
-      var ex=await db.from('client_profiles').select('id,financial_data').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var ex=await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       if(ex&&ex.error){console.error('[PFOS] client_profiles SELECT failed:',ex.error.message);}
       var mergedState=JSON.parse(JSON.stringify(state));
       var touched=state._touched||{};
@@ -5444,13 +5473,20 @@ window.addEventListener('message',async function(e){
       delete mergedState._touched;
       var pp={client_id:_saveToId,financial_data:{S:mergedState,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
 
-      // ══ BACKUP: ALWAYS save current data before overwriting ══
+      // ══ BACKUP: ALWAYS rotate 3 versions before overwriting ══
       if(ex&&ex.data&&ex.data.financial_data){
         pp.previous_financial_data=ex.data.financial_data;
+        if(ex.data.previous_financial_data)pp.previous_financial_data_2=ex.data.previous_financial_data;
+        if(ex.data.previous_financial_data_2)pp.previous_financial_data_3=ex.data.previous_financial_data_2;
       }
 
       if(ex&&ex.data){
-        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); if(_r.error)console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message); else console.log('[PFOS] Auto-saved OK');
+        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+        if(_r.error){
+          if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS] ⛔ Database blocked destructive overwrite');}
+          else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS] ⛔ Rate limit hit');}
+          else{console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message);}
+        } else {console.log('[PFOS] Auto-saved OK');_updateLastSaved();}
       }
       else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error)console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); else console.log('[PFOS] Inserted new profile'); }
       _lastSaveDirty=false;
