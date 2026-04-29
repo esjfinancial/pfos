@@ -1718,6 +1718,41 @@ function goToAdmin(section){
   window.location.href='https://pfos.esjfinancial.com/pfos-admin';
 }
 
+// ── LAST SAVED INDICATOR ──
+function _updateLastSaved(){
+  var el=document.getElementById('lastSavedIndicator');
+  if(!el){el=document.createElement('div');el.id='lastSavedIndicator';el.style.cssText='position:fixed;bottom:8px;right:8px;z-index:9000;padding:5px 12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:10px;color:var(--gr);font-weight:600;transition:opacity .5s;pointer-events:none';document.body.appendChild(el);}
+  el.textContent='✓ Saved '+new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+  el.style.opacity='1';clearTimeout(el._fadeTimer);el._fadeTimer=setTimeout(function(){el.style.opacity='0.4';},5000);
+}
+
+// ── RESTORE PREVIOUS DATA ──
+async function _restorePreviousData(clientId){
+  var cid=clientId||APP.currentClientId;
+  if(!cid){alert('No client selected.');return;}
+  try{
+    var {data:row}=await db.from('client_profiles').select('id,previous_financial_data,previous_financial_data_2,previous_financial_data_3').eq('client_id',cid).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!row){alert('No profile found.');return;}
+    var backups=[];
+    if(row.previous_financial_data&&row.previous_financial_data.calcs)backups.push({label:'Last save (1 back)',data:row.previous_financial_data});
+    if(row.previous_financial_data_2&&row.previous_financial_data_2.calcs)backups.push({label:'2 versions back',data:row.previous_financial_data_2});
+    if(row.previous_financial_data_3&&row.previous_financial_data_3.calcs)backups.push({label:'3 versions back',data:row.previous_financial_data_3});
+    if(!backups.length){alert('No backups found.');return;}
+    var choice=0;
+    if(backups.length>1){
+      var msg='Which version?\n';
+      backups.forEach(function(b,i){msg+=(i+1)+'. '+b.label+' (income: $'+Math.round((b.data.calcs||{}).inc||0).toLocaleString()+'/mo)\n';});
+      var input=prompt(msg+'Enter number:');if(!input)return;choice=parseInt(input)-1;
+      if(isNaN(choice)||choice<0||choice>=backups.length){alert('Invalid.');return;}
+    }
+    if(!confirm('Restore "'+backups[choice].label+'" for this client?'))return;
+    var prev=backups[choice].data;
+    var scores={cfScore:(prev.calcs||{}).cfScore,protScore:(prev.calcs||{}).protScore,growScore:(prev.calcs||{}).growScore,effScore:(prev.calcs||{}).effScore};
+    await db.from('client_profiles').update({financial_data:prev,scores:scores,allow_data_downgrade:true,updated_at:new Date().toISOString()}).eq('id',row.id);
+    alert('Data restored! Refreshing...');window.location.reload();
+  }catch(e){alert('Restore failed: '+e.message);}
+}
+
 // ── ADVISOR SETTINGS & SCHEDULING ────────────────────────────────────────────
 function openAdvisorSettingsModal(){
   var ud=APP.userData||{};
@@ -2599,7 +2634,7 @@ window.addEventListener('message',async function(e){
         console.warn('[Dashboard] ⛔ NaN detected — skipping save');return;
       }
       // ══ SECTION-LEVEL MERGE ══
-      var ex=await db.from('client_profiles').select('id,financial_data').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var ex=await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       var mergedState=JSON.parse(JSON.stringify(state));
       var touched=state._touched||{};
       if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
@@ -2615,9 +2650,13 @@ window.addEventListener('message',async function(e){
       }
       delete mergedState._touched;
       var pp={client_id:_saveToId,financial_data:{S:mergedState,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
-      // ══ BACKUP: ALWAYS ══
-      if(ex&&ex.data&&ex.data.financial_data){pp.previous_financial_data=ex.data.financial_data;}
-      if(ex&&ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[Dashboard] Client profile UPDATED'); }
+      // ══ BACKUP: ALWAYS rotate 3 versions ══
+      if(ex&&ex.data&&ex.data.financial_data){
+        pp.previous_financial_data=ex.data.financial_data;
+        if(ex.data.previous_financial_data)pp.previous_financial_data_2=ex.data.previous_financial_data;
+        if(ex.data.previous_financial_data_2)pp.previous_financial_data_3=ex.data.previous_financial_data_2;
+      }
+      if(ex&&ex.data){ var _sR=await db.from('client_profiles').update(pp).eq('id',ex.data.id); if(!_sR.error){console.log('[Dashboard] Client profile UPDATED');_updateLastSaved();}else if(_sR.error.message&&_sR.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[Dashboard] ⛔ Database blocked destructive overwrite');}else if(_sR.error.message&&_sR.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[Dashboard] ⛔ Rate limit hit');}else{console.error('[Dashboard] UPDATE failed:',_sR.error.message);} }
       else { await db.from('client_profiles').insert(pp); console.log('[Dashboard] Client profile INSERTED'); }
     }catch(err){ console.warn('Dashboard auto-save ERROR:',err); }
   }
@@ -4007,6 +4046,7 @@ function renderAllClientsTable(clients){
       +"<td style='color:var(--mu);font-size:12px'>"+fmtDate(c.last_review_date)+"</td>"
       +"<td onclick='event.stopPropagation()'>"
         +"<button class='pfos-btn pfos-btn-bl' onclick=\"openClientProfile('"+c.id+"')\">View</button> "
+        +"<button class='pfos-btn' onclick=\"event.stopPropagation();_restorePreviousData('"+c.id+"')\" style='background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:#22C55E;font-size:10px' title='Restore previous data'>⏪</button> "
         +"<button class='pfos-btn' onclick=\"confirmDeleteClient('"+c.id+"')\" style='background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444'>Del</button>"
       +"</td></tr>";
   }).join('');
