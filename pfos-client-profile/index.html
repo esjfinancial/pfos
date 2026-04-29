@@ -4629,6 +4629,8 @@ async function openClientProfile(clientId){
   } else {
     // Check sessionStorage for cached data from a previous page load
     try{var _cached=JSON.parse(sessionStorage.getItem('pfos_cached_'+_profileQueryId)||'null');
+      // Reject stale cache — if older than 30 minutes, ignore (prevents data from crashed sessions)
+      if(_cached&&_cached.ts&&(Date.now()-_cached.ts)>1800000){console.log('[PFOS-CP] Ignoring stale sessionStorage cache ('+Math.round((Date.now()-_cached.ts)/60000)+' min old)');_cached=null;sessionStorage.removeItem('pfos_cached_'+_profileQueryId);}
       if(_cached&&_cached.calcs&&(_cached.calcs.inc>0||((_cached.S&&_cached.S.incomeSources&&_cached.S.incomeSources.some(function(s){return(parseFloat(s.amount)||0)>0;}))))){
         renderFD={S:_cached.S||{},calcs:_cached.calcs};renderScores=_cached.scores||{};
         console.log('[PFOS-CP] Using cached PFOS state (sessionStorage). calcs.inc:',_cached.calcs.inc);
@@ -4937,6 +4939,26 @@ window.addEventListener('message', async function(e){
     }catch(ptErr){console.error('[PFOS-CP] policy_tracking save failed:',ptErr);}
     return;
   }
+  // ── POLICY DELETED FROM PROTECTION PANEL → deactivate policy_tracking ──
+  if(msg.type === 'PFOS_POLICY_DELETED' && APP.currentClientId){
+    try{
+      var delCarrier=(msg.carrier||'').trim().toLowerCase();
+      if(!delCarrier){console.log('[PFOS-CP] PFOS_POLICY_DELETED: no carrier — skipping');return;}
+      var _delIds=[APP.currentClientId];
+      var _delCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+      if(_delCouple&&_delCouple.household_type==='joint')_delIds=[_delCouple.client_a_id,_delCouple.client_b_id];
+      var {data:matches}=await db.from('policy_tracking').select('id,carrier,status').in('client_id',_delIds).eq('status','active');
+      if(matches&&matches.length){
+        var toDeactivate=matches.filter(function(m){return(m.carrier||'').trim().toLowerCase()===delCarrier;});
+        for(var td=0;td<toDeactivate.length;td++){
+          await db.from('policy_tracking').update({status:'inactive',updated_at:new Date().toISOString()}).eq('id',toDeactivate[td].id);
+          console.log('[PFOS-CP] Deactivated policy_tracking:',toDeactivate[td].id,toDeactivate[td].carrier);
+        }
+        if(toDeactivate.length&&document.getElementById('advisorInsuranceContent'))renderAdvisorInsurance();
+      }
+    }catch(ptDelErr){console.error('[PFOS-CP] policy_tracking deactivation failed:',ptDelErr);}
+    return;
+  }
   if(msg.type === 'PFOS_DATA_CHANGE'){
     console.log('[PFOS-CP] PFOS_DATA_CHANGE received. calcs.inc:', msg.state&&msg.state.calcs?msg.state.calcs.inc:'NO CALCS');
     if(!_pfosDataLoaded){console.log('[PFOS-CP] Skipping save — data not loaded yet');return;}
@@ -5020,7 +5042,7 @@ window.addEventListener('message', async function(e){
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
 
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
-      var ex = await db.from('client_profiles').select('id,financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var ex = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       var mergedState = JSON.parse(JSON.stringify(state));
       var touched = state._touched || {};
       if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
@@ -5050,13 +5072,25 @@ window.addEventListener('message', async function(e){
       var mergedCalcs = calcs; // calcs always from incoming (freshly calculated)
       var pp = {client_id:saveToId, financial_data:{S:mergedState, calcs:mergedCalcs}, scores, updated_at:new Date().toISOString()};
 
-      // ══ BACKUP: ALWAYS save current data before overwriting ══
+      // ══ BACKUP: ALWAYS rotate 3 versions before overwriting ══
       if(ex&&ex.data&&ex.data.financial_data){
         pp.previous_financial_data=ex.data.financial_data;
+        // Rotate: previous → previous_2 → previous_3
+        if(ex.data.previous_financial_data){
+          pp.previous_financial_data_2=ex.data.previous_financial_data;
+        }
+        if(ex.data.previous_financial_data_2){
+          pp.previous_financial_data_3=ex.data.previous_financial_data_2;
+        }
       }
 
       if(ex&&ex.data){
-        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id); console.log('[PFOS-CP] Supabase SAVE:',_r.error?'FAILED: '+_r.error.message:'OK');
+        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+        if(_r.error){
+          if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS-CP] ⛔ Database blocked destructive overwrite — existing data preserved');
+          } else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS-CP] ⛔ Rate limit — too many saves, skipping');
+          } else {console.error('[PFOS-CP] Supabase SAVE FAILED:',_r.error.message);}
+        } else {console.log('[PFOS-CP] Supabase SAVE: OK');_updateLastSaved();}
       }
       else { var _r2=await db.from('client_profiles').insert(pp); console.log('[PFOS-CP] Supabase INSERT:',_r2.error?'FAILED: '+_r2.error.message:'OK'); }
       var ind = document.getElementById('saveIndicator') || document.getElementById('clientSaveIndicator');
@@ -6116,7 +6150,7 @@ function _advGetFD(){
   if(_lastPfosState&&_lastPfosState.calcs&&Object.keys(_lastPfosState.calcs).length>0){
     fd={S:_lastPfosState.state||{},calcs:_lastPfosState.calcs};scores={cfScore:fd.calcs.cfScore,protScore:fd.calcs.protScore,growScore:fd.calcs.growScore,effScore:fd.calcs.effScore};
   } else {
-    try{var _c2=JSON.parse(sessionStorage.getItem('pfos_cached_'+APP.currentClientId)||'null');if(_c2&&_c2.calcs)fd={S:_c2.S||{},calcs:_c2.calcs};}catch(e){}
+    try{var _c2=JSON.parse(sessionStorage.getItem('pfos_cached_'+APP.currentClientId)||'null');if(_c2&&_c2.ts&&(Date.now()-_c2.ts)>1800000){_c2=null;sessionStorage.removeItem('pfos_cached_'+APP.currentClientId);}if(_c2&&_c2.calcs)fd={S:_c2.S||{},calcs:_c2.calcs};}catch(e){}
   }
   return fd;
 }
@@ -7248,18 +7282,48 @@ async function _restorePreviousData(){
   try{
     var _cpR=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
     var _rId=(_cpR&&_cpR.household_type==='joint')?_cpR.client_a_id:APP.currentClientId;
-    var {data:row}=await db.from('client_profiles').select('id,previous_financial_data').eq('client_id',_rId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(!row||!row.previous_financial_data||!row.previous_financial_data.calcs){
-      alert('No backup found. The previous_financial_data column is empty for this client.');
-      return;
+    var {data:row}=await db.from('client_profiles').select('id,previous_financial_data,previous_financial_data_2,previous_financial_data_3').eq('client_id',_rId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!row){alert('No profile found for this client.');return;}
+    var backups=[];
+    if(row.previous_financial_data&&row.previous_financial_data.calcs)backups.push({label:'Last save (1 version back)',data:row.previous_financial_data});
+    if(row.previous_financial_data_2&&row.previous_financial_data_2.calcs)backups.push({label:'2 versions back',data:row.previous_financial_data_2});
+    if(row.previous_financial_data_3&&row.previous_financial_data_3.calcs)backups.push({label:'3 versions back',data:row.previous_financial_data_3});
+    if(!backups.length){alert('No backups found. All previous_financial_data columns are empty.');return;}
+    var choice=0;
+    if(backups.length>1){
+      var msg='Which version do you want to restore?\n';
+      backups.forEach(function(b,i){
+        var inc=(b.data.calcs||{}).inc||0;
+        msg+=(i+1)+'. '+b.label+' (income: $'+Math.round(inc).toLocaleString()+'/mo)\n';
+      });
+      msg+='Enter 1'+(backups.length>=2?', 2':'')+(backups.length>=3?', or 3':'')+':';
+      var input=prompt(msg);
+      if(!input)return;
+      choice=parseInt(input)-1;
+      if(isNaN(choice)||choice<0||choice>=backups.length){alert('Invalid choice.');return;}
     }
-    if(!confirm('Restore the last known good save? This will overwrite the current data with the previous version.'))return;
-    var prev=row.previous_financial_data;
+    var prev=backups[choice].data;
+    if(!confirm('Restore "'+backups[choice].label+'"? This will overwrite the current data.'))return;
     var scores={cfScore:(prev.calcs||{}).cfScore,protScore:(prev.calcs||{}).protScore,growScore:(prev.calcs||{}).growScore,effScore:(prev.calcs||{}).effScore};
-    await db.from('client_profiles').update({financial_data:prev,scores:scores,updated_at:new Date().toISOString()}).eq('id',row.id);
+    await db.from('client_profiles').update({financial_data:prev,scores:scores,allow_data_downgrade:true,updated_at:new Date().toISOString()}).eq('id',row.id);
     alert('Data restored! Refreshing page...');
     window.location.reload();
   }catch(e){alert('Restore failed: '+e.message);}
+}
+
+// ── LAST SAVED INDICATOR ──
+function _updateLastSaved(){
+  var el=document.getElementById('lastSavedIndicator');
+  if(!el){
+    el=document.createElement('div');el.id='lastSavedIndicator';
+    el.style.cssText='position:fixed;bottom:8px;right:8px;z-index:9000;padding:5px 12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:10px;color:var(--gr);font-weight:600;transition:opacity .5s;pointer-events:none';
+    document.body.appendChild(el);
+  }
+  var now=new Date();
+  el.textContent='✓ Saved '+now.toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
+  el.style.opacity='1';
+  clearTimeout(el._fadeTimer);
+  el._fadeTimer=setTimeout(function(){el.style.opacity='0.4';},5000);
 }
 
 function _advEmailReviewReminder(){
