@@ -918,6 +918,12 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
 [data-theme="light"] [style*="background:linear-gradient(135deg,rgba(14,14,56"]{background:#FFFFFF!important}
 [data-theme="light"] [style*="color:#F0F6FF"]{color:#0F172A!important}
 
+/* Biometric toggle switch */
+.bio-slider:before{position:absolute;content:"";height:18px;width:18px;left:3px;top:3px;background:#fff;border-radius:50%;transition:.2s}
+input:checked+.bio-slider{background:#0044BF}
+input:checked+.bio-slider:before{transform:translateX(22px)}
+input:focus+.bio-slider{box-shadow:0 0 0 2px rgba(91,155,255,.3)}
+
 </style>
 
 <!-- PFOS ERROR BOUNDARY -->
@@ -1367,6 +1373,18 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <input class="inp" type="url" id="asSchedulingUrl" placeholder="https://calendly.com/your-name">
     </div>
     <div style="font-size:10px;color:var(--mu);line-height:1.5;margin-bottom:16px">Paste your Calendly, TidyCal, or other scheduling URL. When clients need to book a review, they'll be sent directly to your booking page. The appointment will appear on whatever calendar you've linked in your scheduling tool.</div>
+    <div style="margin:20px 0 8px;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF">Security</div>
+    <div id="bioToggleRow" style="display:none;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:8px">
+      <div style="flex:1">
+        <div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:2px">🔐 Face ID / Fingerprint Sign-In</div>
+        <div id="bioStatusText" style="font-size:11px;color:var(--mu);line-height:1.5">Use biometric authentication to sign in faster on this device.</div>
+      </div>
+      <label class="bio-switch" style="position:relative;display:inline-block;width:46px;height:24px;flex-shrink:0">
+        <input type="checkbox" id="bioToggle" onchange="toggleBiometricEnrollment(this)" style="opacity:0;width:0;height:0">
+        <span class="bio-slider" style="position:absolute;cursor:pointer;inset:0;background:rgba(100,116,139,.3);transition:.2s;border-radius:24px"></span>
+      </label>
+    </div>
+    <div id="bioUnsupported" style="display:none;font-size:11px;color:var(--mu);line-height:1.5;margin-bottom:8px;padding:10px 12px;background:rgba(100,116,139,.05);border-radius:4px">Biometric sign-in isn't available on this device. Make sure Face ID, Touch ID, or fingerprint authentication is set up in your device's system settings.</div>
     <button class="btn btn-bl" style="width:100%" onclick="saveAdvisorSettings()">Save Settings</button>
   </div>
 </div>
@@ -1772,8 +1790,93 @@ function openAdvisorSettingsModal(){
   var n=document.getElementById('asName');if(n)n.value=ud.name||'';
   var p=document.getElementById('asPhone');if(p)p.value=ud.phone||'';
   var s=document.getElementById('asSchedulingUrl');if(s)s.value=ud.scheduling_url||'';
+  // Refresh biometric toggle state
+  refreshBioToggleUI();
   openModal('advisorSettingsModal');
 }
+
+// ── BIOMETRIC TOGGLE (settings modal) ────────────────────────────────────────
+function refreshBioToggleUI(){
+  var row=document.getElementById('bioToggleRow');
+  var unsupported=document.getElementById('bioUnsupported');
+  var toggle=document.getElementById('bioToggle');
+  var status=document.getElementById('bioStatusText');
+  if(!row||!unsupported||!toggle||!status)return;
+  if(!window.PublicKeyCredential){
+    row.style.display='none';
+    unsupported.style.display='block';
+    return;
+  }
+  PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(function(ok){
+    if(!ok){
+      row.style.display='none';
+      unsupported.style.display='block';
+      return;
+    }
+    row.style.display='flex';
+    unsupported.style.display='none';
+    var enrolled=false;
+    try{enrolled=localStorage.getItem('pfos_biometric_registered')==='true';}catch(e){}
+    toggle.checked=enrolled;
+    status.textContent=enrolled
+      ? '✓ Enabled on this device. You can sign in with biometrics next time.'
+      : 'Use biometric authentication to sign in faster on this device.';
+  }).catch(function(){
+    row.style.display='none';
+    unsupported.style.display='block';
+  });
+}
+
+function toggleBiometricEnrollment(checkbox){
+  var status=document.getElementById('bioStatusText');
+  if(checkbox.checked){
+    // Enroll
+    var c=new Uint8Array(32);window.crypto.getRandomValues(c);
+    var u=new Uint8Array(16);window.crypto.getRandomValues(u);
+    var userEmail=(APP.user&&APP.user.email)||'pfos-user';
+    navigator.credentials.create({publicKey:{
+      challenge:c,
+      rp:{name:'PFOS',id:window.location.hostname},
+      user:{id:u,name:userEmail,displayName:userEmail},
+      pubKeyCredParams:[{type:'public-key',alg:-7}],
+      authenticatorSelection:{authenticatorAttachment:'platform',userVerification:'required'},
+      timeout:60000
+    }}).then(function(cred){
+      try{
+        localStorage.setItem('pfos_biometric_registered','true');
+        localStorage.setItem('pfos_biometric_cred',JSON.stringify(Array.from(new Uint8Array(cred.rawId))));
+        localStorage.removeItem('pfos_bio_dismissed');
+      }catch(e){}
+      if(window.db&&window.db.auth){
+        db.auth.getSession().then(function(r){
+          if(r.data&&r.data.session){
+            try{
+              localStorage.setItem('pfos_biometric_token',r.data.session.access_token);
+              localStorage.setItem('pfos_biometric_refresh',r.data.session.refresh_token);
+            }catch(e){}
+          }
+        });
+      }
+      if(status)status.textContent='✓ Enabled on this device. You can sign in with biometrics next time.';
+    }).catch(function(e){
+      console.log('Enrollment cancelled or failed',e);
+      checkbox.checked=false;
+      if(status)status.textContent='Enrollment cancelled. Toggle on to try again.';
+    });
+  } else {
+    // Disable
+    if(!confirm('Disable Face ID / Fingerprint sign-in on this device? You\'ll need to sign in with your password next time.'))
+      { checkbox.checked=true; return; }
+    try{
+      localStorage.removeItem('pfos_biometric_registered');
+      localStorage.removeItem('pfos_biometric_cred');
+      localStorage.removeItem('pfos_biometric_token');
+      localStorage.removeItem('pfos_biometric_refresh');
+    }catch(e){}
+    if(status)status.textContent='Use biometric authentication to sign in faster on this device.';
+  }
+}
+
 async function saveAdvisorSettings(){
   try{
     var name=(document.getElementById('asName')||{}).value||'';
@@ -3214,6 +3317,8 @@ async function doLogout(){
       console.log('[Dashboard] logout: no sections touched — skipping save to protect existing data');
     }
   }catch(e){console.warn('Pre-logout save failed:',e);}
+  // Skip the Face ID auto-prompt on the next login page load — user explicitly signed out
+  try{sessionStorage.setItem('pfos_skip_bio_autoprompt','1');}catch(e){}
   await db.auth.signOut();
 }
 
