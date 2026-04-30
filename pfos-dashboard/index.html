@@ -1,6 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<!-- Cache-control headers (HTTP headers from vercel.json take precedence) -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="description" content="Architected Systems PFOS Dashboard — financial planning tools for advisors and agents.">
@@ -135,7 +139,7 @@ div[style*="padding"]:not(.modal-bg *) {
 /* ── PLATFORM SHELL ── */
 #platformScreen{flex-direction:row;width:100%}
 #clientScreen{flex-direction:row;width:100%}
-.plat-sidebar{width:220px;min-height:100vh;background:linear-gradient(180deg,#0A0A32,#07071E);border-right:1px solid var(--bd);display:flex;flex-direction:column;flex-shrink:0;position:sticky;top:0;height:100vh}
+.plat-sidebar{width:220px;min-height:100vh;min-height:100dvh;background:linear-gradient(180deg,#0A0A32,#07071E);border-right:1px solid var(--bd);display:flex;flex-direction:column;flex-shrink:0;position:sticky;top:0;height:100vh;height:100dvh}
 .plat-content{flex:1;min-height:100vh;overflow-y:auto;background:var(--bg)}
 
 /* ── SIDEBAR ── */
@@ -146,7 +150,7 @@ div[style*="padding"]:not(.modal-bg *) {
 .sb-user-role{font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--or);margin-top:1px}
 .sb-nav{flex:1;padding:12px 0;overflow-y:auto}
 .sb-section{font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.2em;text-transform:uppercase;color:var(--mu);padding:10px 16px 4px}
-.sb-item{display:flex;align-items:center;gap:9px;padding:9px 16px;font-family:var(--fh);font-size:13px;font-weight:700;color:rgba(226,232,240,.5);cursor:pointer;transition:all .16s;user-select:none;border-left:2px solid transparent}
+.sb-item{display:flex;align-items:center;gap:9px;padding:9px 16px;font-family:var(--fh);font-size:13px;font-weight:700;color:rgba(226,232,240,.5);cursor:pointer;transition:all .16s;user-select:none;border-left:2px solid transparent;touch-action:manipulation;-webkit-tap-highlight-color:rgba(91,155,255,.15)}
 .sb-item:hover{color:var(--wh);background:rgba(0,68,191,.08)}
 .sb-item.active{color:#fff;background:rgba(0,68,191,.14);border-left-color:#5B9BFF}
 .sb-item .icon{font-size:15px;width:18px;text-align:center;flex-shrink:0}
@@ -264,7 +268,7 @@ tbody td{padding:11px 14px;font-size:13px;color:rgba(226,232,240,.8)}
 
 /* ── RESPONSIVE ── */
 @media(max-width:900px){
-  .plat-sidebar{position:fixed;top:0;left:-260px;width:250px;height:100vh;z-index:600;transition:left .25s ease;box-shadow:none}
+  .plat-sidebar{position:fixed;top:0;left:-260px;width:250px;height:100vh;height:100dvh;z-index:600;transition:left .25s ease;box-shadow:none}
   .plat-sidebar.mobile-open{left:0;box-shadow:4px 0 24px rgba(0,0,0,.5)}
   .stat-grid{grid-template-columns:1fr 1fr}
   .profile-grid{grid-template-columns:1fr}
@@ -1845,6 +1849,8 @@ function toggleBiometricEnrollment(checkbox){
       try{
         localStorage.setItem('pfos_biometric_registered','true');
         localStorage.setItem('pfos_biometric_cred',JSON.stringify(Array.from(new Uint8Array(cred.rawId))));
+        // Tie biometric to this specific user (multi-user safety)
+        if(APP.user&&APP.user.id)localStorage.setItem('pfos_biometric_user_id',APP.user.id);
         localStorage.removeItem('pfos_bio_dismissed');
       }catch(e){}
       if(window.db&&window.db.auth){
@@ -3284,42 +3290,158 @@ async function logAuditEvent(action, entityType, entityId, details){
     });
   }catch(e){ console.warn('auditLog:',e); }
 }
+// ── COMPREHENSIVE STORAGE WIPE (used by doLogout) ──
+// Wipes EVERYTHING that could leak User A's data into User B's session.
+// Covers: all localStorage keys, all sessionStorage, all cookies, all
+// Cache Storage entries, and the iframe's storage.
+async function _pfosWipeAllUserData(){
+  // 1. localStorage — wipe every key starting with pfos_ or platform, plus
+  //    any Supabase auth tokens (sb-* and supabase.auth.*)
+  try{
+    var keysToRemove=[];
+    for(var i=0;i<localStorage.length;i++){
+      var k=localStorage.key(i);
+      if(!k)continue;
+      // Aggressive but safe — these are all user/app-specific
+      if(k.indexOf('pfos_')===0
+         ||k.indexOf('sb-')===0
+         ||k.indexOf('supabase.auth.')===0
+         ||k==='platformTheme'
+         ||k==='pwaDismissed'){
+        keysToRemove.push(k);
+      }
+    }
+    keysToRemove.forEach(function(k){try{localStorage.removeItem(k);}catch(e){}});
+  }catch(e){console.warn('localStorage wipe failed:',e);}
+  // 2. sessionStorage — full wipe
+  try{sessionStorage.clear();}catch(e){console.warn('sessionStorage wipe failed:',e);}
+  // 3. Cookies — clear every cookie visible to JS for this domain
+  //    (HttpOnly cookies can't be touched here; signOut() handles those server-side)
+  try{
+    var cookies=document.cookie?document.cookie.split(';'):[];
+    cookies.forEach(function(c){
+      var eq=c.indexOf('=');
+      var name=(eq>-1?c.substr(0,eq):c).trim();
+      if(!name)return;
+      // Expire on every reasonable path/domain combination
+      var paths=['/','/pfos','/pfos-dashboard','/pfos-client','/pfos-main'];
+      var domains=['',';domain='+window.location.hostname,';domain=.'+window.location.hostname];
+      paths.forEach(function(p){
+        domains.forEach(function(d){
+          document.cookie=name+'=;expires=Thu, 01 Jan 1970 00:00:00 GMT;path='+p+d;
+        });
+      });
+    });
+  }catch(e){console.warn('Cookie wipe failed:',e);}
+  // 4. Cache Storage — clear any service worker / fetch cache entries
+  try{
+    if(window.caches&&caches.keys){
+      var keys=await caches.keys();
+      await Promise.all(keys.map(function(k){return caches.delete(k);}));
+    }
+  }catch(e){console.warn('Cache Storage wipe failed:',e);}
+  // 5. In-memory app state (defensive — page will redirect, but if redirect
+  //    is delayed, the next user's session shouldn't see leftover variables)
+  try{
+    if(window.APP){APP.user=null;APP.userData=null;APP.currentClient=null;APP.currentClientId=null;APP.myClients=[];APP.allClients=[];APP.role=null;}
+    if(typeof _lastPfosState!=='undefined')_lastPfosState=null;
+    if(typeof pfosClientContext!=='undefined')pfosClientContext=null;
+    if(typeof APP_COUPLES!=='undefined')APP_COUPLES=[];
+    if(typeof APP_RECS!=='undefined')APP_RECS=[];
+  }catch(e){}
+}
+
 async function doLogout(){
-  // ══ CLEAR ALL CLIENT DATA FROM BROWSER ══
-  try{localStorage.removeItem('pfos_fd_backup');}catch(e){}
-  try{sessionStorage.clear();}catch(e){}
+  // ── INSTANT VISUAL FEEDBACK ──
+  if(window._pfosLogoutInFlight) return;
+  window._pfosLogoutInFlight=true;
+  _showLogoutOverlay();
+  // Hard timeout: if anything hangs, force-redirect to login after 4s
+  // (slightly longer than client to give wipe time to complete)
+  var redirectTimer=setTimeout(function(){_forceRedirectToLogin();}, 4000);
+  var didRedirect=false;
+  var doFinalRedirect=function(){
+    if(didRedirect)return;
+    didRedirect=true;
+    clearTimeout(redirectTimer);
+    _forceRedirectToLogin();
+  };
+  // ══ SIGNAL THE IFRAME TO FLUSH + CLEAR ITS OWN STORAGE ══
   try{
     var frame=getPFOSFrame();
-    if(frame&&frame.contentWindow)frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
-    await new Promise(function(r){setTimeout(r,200);});
-    // Only save if user actually touched data this session
-    var _logoutTouched=(_lastPfosState&&_lastPfosState.state&&_lastPfosState.state._touched)?Object.keys(_lastPfosState.state._touched):{};
-    if(_logoutTouched.length>0&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
-      if(pfosClientContext&&pfosClientContext.isAgentProfile&&APP.user){
-        var agCalcs=_lastPfosState.calcs||{};
-        if(!isNaN(agCalcs.inc)&&!isNaN(agCalcs.netCF)){
-          var _agState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _agState._touched;
-          var agPP={user_id:APP.user.id,financial_data:{S:_agState,calcs:agCalcs},scores:{cfScore:agCalcs.cfScore,protScore:agCalcs.protScore,growScore:agCalcs.growScore,effScore:agCalcs.effScore},updated_at:new Date().toISOString()};
-          var agEx=await db.from('agent_profiles').select('id').eq('user_id',APP.user.id).maybeSingle();
-          if(agEx&&agEx.data)await db.from('agent_profiles').update(agPP).eq('id',agEx.data.id);
-        }
-      } else if(APP.currentClientId){
-        var calcs=_lastPfosState.calcs||{};
-        if(!isNaN(calcs.inc)&&!isNaN(calcs.netCF)){
-          var _clState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _clState._touched;
-          var pp={client_id:APP.currentClientId,financial_data:{S:_clState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-          var ex=await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-          if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
-        }
-      }
-      console.log('[Dashboard] logout: saved ('+_logoutTouched.length+' sections touched)');
-    } else {
-      console.log('[Dashboard] logout: no sections touched — skipping save to protect existing data');
+    if(frame&&frame.contentWindow){
+      frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');
+      frame.contentWindow.postMessage({type:'PFOS_LOGOUT_WIPE'},'https://pfos.esjfinancial.com');
     }
-  }catch(e){console.warn('Pre-logout save failed:',e);}
-  // Skip the Face ID auto-prompt on the next login page load — user explicitly signed out
-  try{sessionStorage.setItem('pfos_skip_bio_autoprompt','1');}catch(e){}
-  await db.auth.signOut();
+  }catch(e){}
+  // ══ BACKGROUND SAVE (don't block logout on it) ══
+  (async function backgroundSave(){
+    try{
+      // Brief wait for iframe FLUSH response — capped to 150ms
+      await new Promise(function(r){setTimeout(r,150);});
+      var _logoutTouched=(_lastPfosState&&_lastPfosState.state&&_lastPfosState.state._touched)?Object.keys(_lastPfosState.state._touched):{};
+      if(_logoutTouched.length>0&&_lastPfosState&&_lastPfosState.state&&Object.keys(_lastPfosState.calcs||{}).length>0){
+        if(pfosClientContext&&pfosClientContext.isAgentProfile&&APP.user){
+          var agCalcs=_lastPfosState.calcs||{};
+          if(!isNaN(agCalcs.inc)&&!isNaN(agCalcs.netCF)){
+            var _agState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _agState._touched;
+            var agPP={user_id:APP.user.id,financial_data:{S:_agState,calcs:agCalcs},scores:{cfScore:agCalcs.cfScore,protScore:agCalcs.protScore,growScore:agCalcs.growScore,effScore:agCalcs.effScore},updated_at:new Date().toISOString()};
+            var agEx=await db.from('agent_profiles').select('id').eq('user_id',APP.user.id).maybeSingle();
+            if(agEx&&agEx.data)await db.from('agent_profiles').update(agPP).eq('id',agEx.data.id);
+          }
+        } else if(APP.currentClientId){
+          var calcs=_lastPfosState.calcs||{};
+          if(!isNaN(calcs.inc)&&!isNaN(calcs.netCF)){
+            var _clState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _clState._touched;
+            var pp={client_id:APP.currentClientId,financial_data:{S:_clState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
+            var ex=await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+          }
+        }
+        console.log('[Dashboard] logout: saved ('+_logoutTouched.length+' sections touched)');
+      } else {
+        console.log('[Dashboard] logout: no sections touched — skipping save to protect existing data');
+      }
+    }catch(e){console.warn('Pre-logout save failed:',e);}
+  })();
+  // ══ CALL SUPABASE signOut() WITH GLOBAL SCOPE ══
+  // Global scope invalidates the session on the SERVER, not just locally.
+  // This is critical: if local storage is cleared but the server still
+  // has a valid session, a stolen device or copied tokens could re-auth.
+  try{
+    var signOutP;
+    try{signOutP=db.auth.signOut({scope:'global'});}
+    catch(e){signOutP=db.auth.signOut();} // fallback for older SDK
+    if(signOutP&&signOutP.then){
+      signOutP.then(function(){return _pfosWipeAllUserData();})
+        .then(doFinalRedirect)
+        .catch(function(e){console.warn('signOut error:',e);_pfosWipeAllUserData().then(doFinalRedirect);});
+    } else {
+      _pfosWipeAllUserData().then(doFinalRedirect);
+    }
+  }catch(e){
+    console.warn('signOut threw:',e);
+    _pfosWipeAllUserData().then(doFinalRedirect);
+  }
+}
+
+// Shows a full-screen "Signing out..." overlay
+function _showLogoutOverlay(){
+  if(document.getElementById('_pfosLogoutOverlay'))return;
+  var o=document.createElement('div');
+  o.id='_pfosLogoutOverlay';
+  o.style.cssText='position:fixed;inset:0;background:rgba(9,9,46,.94);backdrop-filter:blur(8px);z-index:99999;display:flex;align-items:center;justify-content:center;font-family:Rajdhani,sans-serif;color:#F0F6FF';
+  o.innerHTML='<div style="text-align:center"><div style="font-size:44px;margin-bottom:12px">↩</div><div style="font-size:16px;font-weight:700;letter-spacing:.06em">Signing out...</div></div>';
+  document.body.appendChild(o);
+}
+
+// Forces a redirect to the login page with cache-busting query string
+function _forceRedirectToLogin(){
+  // Cache-bust the login page so the browser can't serve a stale cached
+  // copy that might have leaked auth state
+  var url='https://pfos.esjfinancial.com/pfos?_=' + Date.now();
+  try{window.location.replace(url);}
+  catch(e){window.location.href=url;}
 }
 
 // ── FIX 8: ADVISOR RECOMMENDATION ACTION STUBS ───────────────────────────────
@@ -17684,5 +17806,104 @@ var m=document.createElement('div');m.style.cssText='position:fixed;bottom:20px;
   </div>
 </div>
 
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// PFOS AUTH PERSISTENCE GUARD
+// ═══════════════════════════════════════════════════════════════════════════
+// Signs the user out and wipes storage when:
+//   - The user is idle for 15 min
+//   - The user closes the tab or PWA
+//   - The user comes back to the app after >5 min away
+// Skips itself when running inside an iframe (parent page handles it).
+// ═══════════════════════════════════════════════════════════════════════════
+(function(){
+  // ── SKIP IF RUNNING INSIDE AN IFRAME ──
+  try{
+    if(window.self !== window.top) return;
+  }catch(e){
+    return; // cross-origin iframe access throws — definitely an iframe
+  }
+
+  var IS_LOGIN_PAGE = !!document.getElementById('loginScreen');
+  var IDLE_TIMEOUT_MS = 15 * 60 * 1000;        // 15 min
+  var RESUME_TIMEOUT_MS = 5 * 60 * 1000;       // 5 min away → sign out
+
+  // ── SIGN OUT TRIGGER ──
+  function _triggerSignOut(reason){
+    console.log('[Auth] Sign-out — reason:', reason);
+    if(typeof window.doLogout === 'function'){
+      try{ window.doLogout(); return; }catch(e){}
+    }
+    try{
+      var keysToRemove = [];
+      for(var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if(!k) continue;
+        if(k.indexOf('pfos_')===0 || k.indexOf('sb-')===0 || k.indexOf('supabase.auth.')===0){
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(function(k){ try{localStorage.removeItem(k);}catch(e){} });
+    }catch(e){}
+    try{ sessionStorage.clear(); }catch(e){}
+    var u = 'https://pfos.esjfinancial.com/pfos?_=' + Date.now();
+    try{ window.location.replace(u); }catch(e){ window.location.href = u; }
+  }
+
+  // ── IDLE TIMEOUT ──
+  var _idleTimer = null;
+  function resetIdleTimer(){
+    if(IS_LOGIN_PAGE) return;
+    if(_idleTimer) clearTimeout(_idleTimer);
+    _idleTimer = setTimeout(function(){
+      _triggerSignOut('idle-timeout');
+    }, IDLE_TIMEOUT_MS);
+  }
+  if(!IS_LOGIN_PAGE){
+    var events = ['mousedown','keydown','touchstart','scroll'];
+    events.forEach(function(ev){
+      window.addEventListener(ev, resetIdleTimer, { passive: true });
+    });
+    resetIdleTimer();
+  }
+
+  // ── APP RESUME (PWA / tab return) ──
+  // If user was hidden > 5 min, sign out on resume. Otherwise reset idle.
+  var _hiddenAt = null;
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'hidden'){
+      _hiddenAt = Date.now();
+    } else if(document.visibilityState === 'visible'){
+      if(_hiddenAt && (Date.now() - _hiddenAt) > RESUME_TIMEOUT_MS){
+        _triggerSignOut('resume-after-long-absence');
+        return;
+      }
+      _hiddenAt = null;
+      resetIdleTimer();
+    }
+  });
+
+  // ── TAB / PWA CLOSE → WIPE STORAGE ──
+  // Only fires on real close, not iOS app-switching (event.persisted === true).
+  function _wipeOnExit(e){
+    if(IS_LOGIN_PAGE) return;
+    if(e && e.persisted === true) return; // soft hide, not a close
+    try{
+      var keysToRemove = [];
+      for(var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if(!k) continue;
+        if(k.indexOf('pfos_')===0 || k.indexOf('sb-')===0 || k.indexOf('supabase.auth.')===0){
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(function(k){ try{localStorage.removeItem(k);}catch(e2){} });
+      try{ sessionStorage.clear(); }catch(e3){}
+    }catch(e4){}
+  }
+  window.addEventListener('pagehide', _wipeOnExit);
+  window.addEventListener('beforeunload', function(){ _wipeOnExit({ persisted: false }); });
+})();
+</script>
 </body>
 </html>
