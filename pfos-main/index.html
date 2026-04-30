@@ -1,6 +1,10 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+<!-- Cache-control headers (HTTP headers from vercel.json take precedence) -->
+<meta http-equiv="Cache-Control" content="no-cache, no-store, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover">
   <link rel="manifest" href="data:application/manifest+json,%7B%22name%22%3A%22Architected%20Systems%20PFOS%22%2C%22short_name%22%3A%22PFOS%22%2C%22start_url%22%3A%22%2Fpfos-dashboard%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%23092E09%22%2C%22theme_color%22%3A%22%2309092E%22%2C%22icons%22%3A%5B%7B%22src%22%3A%22https%3A%2F%2Fesjfinancial.com%2Fpfos-icon-192.png%22%2C%22sizes%22%3A%22192x192%22%2C%22type%22%3A%22image%2Fpng%22%7D%2C%7B%22src%22%3A%22https%3A%2F%2Fesjfinancial.com%2Fpfos-icon-512.png%22%2C%22sizes%22%3A%22512x512%22%2C%22type%22%3A%22image%2Fpng%22%7D%5D%7D">
@@ -9396,6 +9400,27 @@ function submitAdvisorRequestFromModal(){
     if(msg.type==='GENERATE_REPORT'){generateReport();return;}
     if(msg.type==='PFOS_CALC_ACCESS'){_calcAccess=msg.calcAccess||{};if(_currentSection==='tools')renderToolsGrid();return;}
     if(msg.type==='PFOS_FLUSH'){_flushSync();return;}
+    if(msg.type==='PFOS_LOGOUT_WIPE'){
+      // Parent is logging out — wipe iframe's storage and in-memory state too
+      try{
+        var keysToRemove=[];
+        for(var i=0;i<localStorage.length;i++){
+          var k=localStorage.key(i);
+          if(!k)continue;
+          if(k.indexOf('pfos_')===0||k.indexOf('sb-')===0||k.indexOf('supabase.auth.')===0){
+            keysToRemove.push(k);
+          }
+        }
+        keysToRemove.forEach(function(k){try{localStorage.removeItem(k);}catch(e){}});
+      }catch(e){}
+      try{sessionStorage.clear();}catch(e){}
+      try{
+        // Reset in-memory state to defaults
+        if(window.S){for(var key in S){if(S.hasOwnProperty(key))delete S[key];}}
+        if(window._calcAccess)_calcAccess={};
+      }catch(e){}
+      return;
+    }
     if(msg.type==='PFOS_NAV'){if(msg.section)showSection(msg.section);if(msg.step!==undefined)setTimeout(function(){goStep(msg.step);},300);return;}
     if(msg.type==='PFOS_PLAN_DEPLOY'){S._planDeployed=msg.deployed||0;S._planAllocCount=msg.allocCount||0;S._planAllocations=msg.allocations||[];if(_currentSection==='home')renderHome();return;}
     if(msg.type==='PFOS_PLAN_SYNC'){
@@ -21704,6 +21729,105 @@ window.addEventListener('message',function(e){
   }
 });
 
+</script>
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+// PFOS AUTH PERSISTENCE GUARD
+// ═══════════════════════════════════════════════════════════════════════════
+// Signs the user out and wipes storage when:
+//   - The user is idle for 15 min
+//   - The user closes the tab or PWA
+//   - The user comes back to the app after >5 min away
+// Skips itself when running inside an iframe (parent page handles it).
+// ═══════════════════════════════════════════════════════════════════════════
+(function(){
+  // ── SKIP IF RUNNING INSIDE AN IFRAME ──
+  try{
+    if(window.self !== window.top) return;
+  }catch(e){
+    return; // cross-origin iframe access throws — definitely an iframe
+  }
+
+  var IS_LOGIN_PAGE = !!document.getElementById('loginScreen');
+  var IDLE_TIMEOUT_MS = 15 * 60 * 1000;        // 15 min
+  var RESUME_TIMEOUT_MS = 5 * 60 * 1000;       // 5 min away → sign out
+
+  // ── SIGN OUT TRIGGER ──
+  function _triggerSignOut(reason){
+    console.log('[Auth] Sign-out — reason:', reason);
+    if(typeof window.doLogout === 'function'){
+      try{ window.doLogout(); return; }catch(e){}
+    }
+    try{
+      var keysToRemove = [];
+      for(var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if(!k) continue;
+        if(k.indexOf('pfos_')===0 || k.indexOf('sb-')===0 || k.indexOf('supabase.auth.')===0){
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(function(k){ try{localStorage.removeItem(k);}catch(e){} });
+    }catch(e){}
+    try{ sessionStorage.clear(); }catch(e){}
+    var u = 'https://pfos.esjfinancial.com/pfos?_=' + Date.now();
+    try{ window.location.replace(u); }catch(e){ window.location.href = u; }
+  }
+
+  // ── IDLE TIMEOUT ──
+  var _idleTimer = null;
+  function resetIdleTimer(){
+    if(IS_LOGIN_PAGE) return;
+    if(_idleTimer) clearTimeout(_idleTimer);
+    _idleTimer = setTimeout(function(){
+      _triggerSignOut('idle-timeout');
+    }, IDLE_TIMEOUT_MS);
+  }
+  if(!IS_LOGIN_PAGE){
+    var events = ['mousedown','keydown','touchstart','scroll'];
+    events.forEach(function(ev){
+      window.addEventListener(ev, resetIdleTimer, { passive: true });
+    });
+    resetIdleTimer();
+  }
+
+  // ── APP RESUME (PWA / tab return) ──
+  // If user was hidden > 5 min, sign out on resume. Otherwise reset idle.
+  var _hiddenAt = null;
+  document.addEventListener('visibilitychange', function(){
+    if(document.visibilityState === 'hidden'){
+      _hiddenAt = Date.now();
+    } else if(document.visibilityState === 'visible'){
+      if(_hiddenAt && (Date.now() - _hiddenAt) > RESUME_TIMEOUT_MS){
+        _triggerSignOut('resume-after-long-absence');
+        return;
+      }
+      _hiddenAt = null;
+      resetIdleTimer();
+    }
+  });
+
+  // ── TAB / PWA CLOSE → WIPE STORAGE ──
+  // Only fires on real close, not iOS app-switching (event.persisted === true).
+  function _wipeOnExit(e){
+    if(IS_LOGIN_PAGE) return;
+    if(e && e.persisted === true) return; // soft hide, not a close
+    try{
+      var keysToRemove = [];
+      for(var i=0;i<localStorage.length;i++){
+        var k = localStorage.key(i);
+        if(!k) continue;
+        if(k.indexOf('pfos_')===0 || k.indexOf('sb-')===0 || k.indexOf('supabase.auth.')===0){
+          keysToRemove.push(k);
+        }
+      }
+      keysToRemove.forEach(function(k){ try{localStorage.removeItem(k);}catch(e2){} });
+      try{ sessionStorage.clear(); }catch(e3){}
+    }catch(e4){}
+  }
+  window.addEventListener('pagehide', _wipeOnExit);
+  window.addEventListener('beforeunload', function(){ _wipeOnExit({ persisted: false }); });
+})();
 </script>
 </body>
 </html>
