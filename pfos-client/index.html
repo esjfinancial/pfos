@@ -1851,8 +1851,8 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       </select>
     </div>
     <div style="display:flex;gap:10px;margin-top:16px">
-      <button class="btn btn-bl" style="flex:2" onclick="_cpSubmitAgentRequest()" id="craSubmitBtn">Submit Request</button>
-      <button class="btn btn-gh" onclick="closeModal('connectAgentModal')">Cancel</button>
+      <button class="btn btn-bl" style="flex:2;width:auto" onclick="_cpSubmitAgentRequest()" id="craSubmitBtn">Submit Request</button>
+      <button class="btn btn-gh" style="flex:1;width:auto" onclick="closeModal('connectAgentModal')">Cancel</button>
     </div>
   </div>
 </div>
@@ -19482,8 +19482,10 @@ async function _cpSubmitAgentRequest(){
   if(!name||!email){alert('Please enter your name and email.');return;}
   var btn=document.getElementById('craSubmitBtn');
   if(btn){btn.disabled=true;btn.textContent='Submitting...';}
+  var savedToDb=false;
+  var emailSent=false;
   try{
-    // Save as a message so it shows up in the admin/advisor dashboard
+    // 1) Save as a message so it shows up in the admin/advisor dashboard
     var content='📋 AGENT CONNECTION REQUEST\n\nName: '+name+'\nEmail: '+email+(phone?'\nPhone: '+phone:'')+'\nTopic: '+topic.replace(/_/g,' ')+'\nBest time: '+bestTime+(notes?'\n\nNotes: '+notes:'');
     await db.from('messages').insert({
       client_id:APP.currentClientId,
@@ -19492,10 +19494,42 @@ async function _cpSubmitAgentRequest(){
       is_read:false,
       created_at:new Date().toISOString()
     });
+    savedToDb=true;
+    // 2) Send email notification to admin/advisor via edge function
+    // We await this so the user sees a real success/failure state
+    try{
+      var emailResp=await db.functions.invoke('send-notification',{
+        body:{
+          type:'free_review_request',
+          name:name,
+          email:email,
+          phone:phone,
+          topic:(topic||'').replace(/_/g,' '),
+          notes:notes,
+          bestTime:bestTime,
+          source:'connect_agent_modal',
+          clientId:APP.currentClientId||null
+        }
+      });
+      // Edge function returns {data, error} — check both
+      if(emailResp && !emailResp.error){
+        emailSent=true;
+      } else {
+        console.warn('Email notification failed:', emailResp && emailResp.error);
+      }
+    }catch(emailErr){
+      console.warn('Email invoke threw:', emailErr);
+    }
     closeModal('connectAgentModal');
-    alert('Request submitted! A financial professional will reach out to you soon.');
+    if(emailSent){
+      alert('Request submitted! A financial professional will reach out to you soon.');
+    } else if(savedToDb){
+      // Saved but email failed — let user know it's been received but we may
+      // be slower to respond
+      alert('Request received. We\'ll be in touch soon. (If you don\'t hear back within 2 business days, please email support@esjfinancial.com.)');
+    }
   }catch(e){
-    alert('Failed to submit: '+e.message);
+    alert('Failed to submit: '+(e&&e.message?e.message:'Unknown error')+'\n\nPlease try again, or email support@esjfinancial.com directly.');
   }
   if(btn){btn.disabled=false;btn.textContent='Submit Request';}
 }
