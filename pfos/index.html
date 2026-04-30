@@ -1261,8 +1261,18 @@ function maybeOfferBiometricEnrollment(){
       resolve(); return;
     }
     if(dismissed){ resolve(); return; }
-    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(function(ok){
-      if(!ok){ resolve(); return; }
+    // Use isUserVerifyingPlatformAuthenticatorAvailable() as a hint — but
+    // proceed even if it returns false, because iOS PWAs can return false
+    // negatives. The actual enrollment will surface real errors if any.
+    var checkP;
+    try{
+      checkP=PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable();
+    }catch(e){
+      checkP=Promise.resolve(true); // assume available on failure
+    }
+    checkP.then(function(ok){
+      // Don't gate on `ok` — show the prompt anyway and let enrollment fail
+      // with a real error if the device truly doesn't support it.
       // Show modal
       var overlay=document.createElement('div');
       overlay.id='bioEnrollOverlay';
@@ -1319,8 +1329,19 @@ function maybeOfferBiometricEnrollment(){
           }catch(e){}
           finish();
         }).catch(function(e){
-          console.log('Bio enrollment cancelled',e);
-          // Don't permanently dismiss — user may have hit cancel by accident
+          console.log('Bio enrollment failed:',e);
+          // For "user cancelled" errors, just dismiss silently. For real
+          // errors (NotSupported, Security, etc.), show an alert so the
+          // user understands why nothing happened.
+          if(e && e.name && e.name !== 'NotAllowedError' && e.name !== 'AbortError'){
+            var msg='Face ID setup failed: ';
+            if(e.name==='SecurityError') msg+='Browser blocked the request (security context).';
+            else if(e.name==='NotSupportedError') msg+='Not supported on this device/browser.';
+            else if(e.name==='InvalidStateError') msg+='Already set up.';
+            else if(e.message) msg+=e.message;
+            else msg+=e.name;
+            try{ console.warn(msg); }catch(ex){}
+          }
           finish();
         });
       };
@@ -2010,13 +2031,15 @@ if(window.matchMedia('(display-mode:standalone)').matches||window.navigator.stan
 
   function tryShow(){
     if(bioBtnInjected) return;
-    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(function(ok){
-      if(!ok) return;
-      var hasBio=false;
-      try{hasBio=localStorage.getItem('pfos_biometric_registered')==='true';}catch(e){}
-      if(!hasBio) return;
-      injectBioPanel();
-    }).catch(function(){});
+    // Check enrollment first — if user never enrolled, no button regardless
+    var hasBio=false;
+    try{hasBio=localStorage.getItem('pfos_biometric_registered')==='true';}catch(e){}
+    if(!hasBio) return;
+    if(!window.PublicKeyCredential) return;
+    // Don't gate on isUserVerifyingPlatformAuthenticatorAvailable() — iOS
+    // PWAs can return false negatives. If the user enrolled successfully
+    // before, the device supports it. Just inject the panel.
+    injectBioPanel();
   }
 
   function injectBioPanel(){
