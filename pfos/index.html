@@ -1197,13 +1197,114 @@ function logSetupSQL(){
 async function routeToStaffDashboard(){
   try{ sessionStorage.setItem('pfos_user_id',    APP.user ? APP.user.id : ''); }catch(ex){}
   try{ sessionStorage.setItem('pfos_user_email', APP.user ? APP.user.email : ''); }catch(ex){}
+  await maybeOfferBiometricEnrollment();
   window.location.href = 'https://pfos.esjfinancial.com/pfos-dashboard';
 }
 
 async function routeToClientPortal(){
   try{ sessionStorage.setItem('pfos_user_id',    APP.user ? APP.user.id : ''); }catch(ex){}
   try{ sessionStorage.setItem('pfos_user_email', APP.user ? APP.user.email : ''); }catch(ex){}
+  await maybeOfferBiometricEnrollment();
   window.location.href = 'https://pfos.esjfinancial.com/pfos-client';
+}
+
+// ── BIOMETRIC ENROLLMENT PROMPT (fires post-login, pre-redirect) ──────────────
+// Shown once per device after successful login if:
+//   - the device supports a platform authenticator (Face ID, Touch ID, fingerprint, Windows Hello)
+//   - the user hasn't already enrolled
+//   - the user hasn't permanently dismissed the prompt
+// Resolves either way so the redirect proceeds.
+function maybeOfferBiometricEnrollment(){
+  return new Promise(function(resolve){
+    if(!window.PublicKeyCredential){ resolve(); return; }
+    var alreadyEnrolled=false, dismissed=false;
+    try{
+      alreadyEnrolled=localStorage.getItem('pfos_biometric_registered')==='true';
+      dismissed=localStorage.getItem('pfos_bio_dismissed')==='1';
+    }catch(e){}
+    if(alreadyEnrolled){
+      // Refresh stored session token in case it expired
+      try{
+        if(window.db&&window.db.auth){
+          db.auth.getSession().then(function(r){
+            if(r.data&&r.data.session){
+              try{
+                localStorage.setItem('pfos_biometric_token',r.data.session.access_token);
+                localStorage.setItem('pfos_biometric_refresh',r.data.session.refresh_token);
+              }catch(e){}
+            }
+            resolve();
+          }).catch(function(){resolve();});
+          return;
+        }
+      }catch(e){}
+      resolve(); return;
+    }
+    if(dismissed){ resolve(); return; }
+    PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(function(ok){
+      if(!ok){ resolve(); return; }
+      // Show modal
+      var overlay=document.createElement('div');
+      overlay.id='bioEnrollOverlay';
+      overlay.style.cssText='position:fixed;inset:0;background:rgba(9,9,46,.85);backdrop-filter:blur(6px);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px;font-family:Outfit,sans-serif';
+      overlay.innerHTML=''
+        +'<div style="background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(91,155,255,.25);border-radius:8px;padding:28px 24px;max-width:380px;width:100%;box-shadow:0 12px 48px rgba(0,0,0,.6);text-align:center">'
+          +'<div style="font-size:48px;margin-bottom:12px">🔐</div>'
+          +'<div style="font-family:Rajdhani,sans-serif;font-size:20px;font-weight:700;color:#F0F6FF;margin-bottom:8px">Enable Face ID / Fingerprint?</div>'
+          +'<div style="font-size:13px;color:#94A3B8;line-height:1.6;margin-bottom:22px">Skip typing your password next time. Sign in instantly with Face ID, Touch ID, or your fingerprint.</div>'
+          +'<button id="bioEnrollYes" style="width:100%;padding:14px 20px;background:linear-gradient(135deg,#0044BF,#1155D9);border:none;border-radius:4px;color:#fff;font-family:Rajdhani,sans-serif;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;margin-bottom:8px">Enable</button>'
+          +'<button id="bioEnrollLater" style="width:100%;padding:12px 20px;background:none;border:1px solid rgba(91,155,255,.2);border-radius:4px;color:#94A3B8;font-family:Rajdhani,sans-serif;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;margin-bottom:6px">Maybe Later</button>'
+          +'<button id="bioEnrollNever" style="background:none;border:none;color:#475569;font-size:11px;cursor:pointer;padding:6px;text-decoration:underline">Don\'t ask again on this device</button>'
+        +'</div>';
+      document.body.appendChild(overlay);
+      var done=false;
+      var finish=function(){if(done)return;done=true;var o=document.getElementById('bioEnrollOverlay');if(o)o.remove();resolve();};
+      document.getElementById('bioEnrollLater').onclick=finish;
+      document.getElementById('bioEnrollNever').onclick=function(){
+        try{localStorage.setItem('pfos_bio_dismissed','1');}catch(e){}
+        finish();
+      };
+      document.getElementById('bioEnrollYes').onclick=function(){
+        var btn=document.getElementById('bioEnrollYes');
+        if(btn){btn.disabled=true;btn.textContent='Setting up...';}
+        var c=new Uint8Array(32);window.crypto.getRandomValues(c);
+        var u=new Uint8Array(16);window.crypto.getRandomValues(u);
+        navigator.credentials.create({publicKey:{
+          challenge:c,
+          rp:{name:'PFOS',id:window.location.hostname},
+          user:{id:u,name:(APP.user&&APP.user.email)||'pfos-user',displayName:(APP.user&&APP.user.email)||'PFOS User'},
+          pubKeyCredParams:[{type:'public-key',alg:-7}],
+          authenticatorSelection:{authenticatorAttachment:'platform',userVerification:'required'},
+          timeout:60000
+        }}).then(function(cred){
+          try{
+            localStorage.setItem('pfos_biometric_registered','true');
+            localStorage.setItem('pfos_biometric_cred',JSON.stringify(Array.from(new Uint8Array(cred.rawId))));
+            // Capture session tokens so the login page can use them next time
+            if(window.db&&window.db.auth){
+              db.auth.getSession().then(function(r){
+                if(r.data&&r.data.session){
+                  try{
+                    localStorage.setItem('pfos_biometric_token',r.data.session.access_token);
+                    localStorage.setItem('pfos_biometric_refresh',r.data.session.refresh_token);
+                  }catch(e){}
+                }
+                finish();
+              }).catch(finish);
+              return;
+            }
+          }catch(e){}
+          finish();
+        }).catch(function(e){
+          console.log('Bio enrollment cancelled',e);
+          // Don't permanently dismiss — user may have hit cancel by accident
+          finish();
+        });
+      };
+      // Safety net: if the browser blocks the dialog or hangs, proceed after 60s
+      setTimeout(finish, 60000);
+    }).catch(function(){resolve();});
+  });
 }
 
 // ── LOGIN PAGE FUNCTIONS ──────────────────────────────────────────────────────
@@ -1874,35 +1975,151 @@ function pwaDismiss(){var el=document.getElementById('pwaInstall');if(el)el.styl
 if(window.matchMedia('(display-mode:standalone)').matches||window.navigator.standalone||localStorage.getItem('pfos_pwa_no')){var _p=document.getElementById('pwaInstall');if(_p)_p.style.display='none';}
 </script>
 <script>
-// ── BIOMETRIC / FACE ID LOGIN ──
+// ── BIOMETRIC / FACE ID LOGIN (banking-app style) ─────────────────────────────
+// If a user has previously enrolled biometrics on this device, show a big
+// prominent Face ID button at the TOP of the active login form, plus a
+// "Use password instead" fallback below. Auto-prompts after 600ms so the
+// user often doesn't even have to tap.
 (function(){
   if(!window.PublicKeyCredential) return;
-  setTimeout(function(){
+  var bioBtnInjected=false;
+  var autoPromptFired=false;
+
+  function tryShow(){
+    if(bioBtnInjected) return;
     PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(function(ok){
       if(!ok) return;
-      var hasBio=false;try{hasBio=localStorage.getItem('pfos_biometric_registered')==='true';}catch(e){}
+      var hasBio=false;
+      try{hasBio=localStorage.getItem('pfos_biometric_registered')==='true';}catch(e){}
       if(!hasBio) return;
-      var form=document.querySelector('.login-card,form,[id*="login"]');if(!form) form=document.querySelector('button[onclick*="login"]');
-      if(!form) return;
-      var container=form.parentElement||form;
-      var btn=document.createElement('button');
-      btn.type='button';
-      btn.style.cssText='width:100%;padding:14px 20px;margin-top:12px;background:linear-gradient(135deg,rgba(0,68,191,.1),rgba(91,155,255,.08));border:1px solid rgba(91,155,255,.25);border-radius:4px;color:#5B9BFF;font-family:Rajdhani,sans-serif;font-size:13px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:8px';
-      btn.innerHTML='🔐 Sign in with Face ID / Fingerprint';
-      btn.onclick=function(){
-        var challenge=new Uint8Array(32);window.crypto.getRandomValues(challenge);
-        var credId=null;try{credId=JSON.parse(localStorage.getItem('pfos_biometric_cred'));}catch(e){}
-        if(!credId){alert('Biometric not set up. Log in with email/password first.');return;}
-        navigator.credentials.get({publicKey:{challenge:challenge,timeout:60000,rpId:window.location.hostname,allowCredentials:[{type:'public-key',id:new Uint8Array(credId)}],userVerification:'required'}}).then(function(){
-          try{var token=localStorage.getItem('pfos_biometric_token');var refresh=localStorage.getItem('pfos_biometric_refresh');
-          if(token&&window.db&&window.db.auth){db.auth.setSession({access_token:token,refresh_token:refresh}).then(function(){window.location.reload();}).catch(function(){alert('Session expired. Use email/password.');});}
-          }catch(e){alert('Biometric failed. Use email/password.');}
-        }).catch(function(e){console.log('Bio cancelled',e);});
-      };
-      container.appendChild(btn);
-    });
-  },2000);
+      injectBioPanel();
+    }).catch(function(){});
+  }
+
+  function injectBioPanel(){
+    if(bioBtnInjected) return;
+    // Pick the currently visible form (advisor or client)
+    var advForm=document.getElementById('advisorLoginForm');
+    var clientForm=document.getElementById('clientLoginForm');
+    var visibleForm=(clientForm&&clientForm.style.display!=='none')?clientForm
+                  :(advForm&&advForm.style.display!=='none')?advForm:advForm;
+    if(!visibleForm) return;
+    var panel=document.createElement('div');
+    panel.id='bioLoginPanel';
+    panel.style.cssText='margin:0 0 18px 0;padding:0;text-align:center';
+    panel.innerHTML=''
+      +'<div style="display:flex;align-items:center;justify-content:center;width:84px;height:84px;margin:8px auto 14px auto;background:linear-gradient(145deg,rgba(0,68,191,.18),rgba(91,155,255,.10));border:2px solid rgba(91,155,255,.35);border-radius:50%;cursor:pointer;transition:transform .12s,border-color .12s,box-shadow .12s" id="bioFaceIcon" onclick="pfosBioSignIn()" role="button" tabindex="0" aria-label="Sign in with Face ID or Fingerprint">'
+        +'<svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#5B9BFF" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+          +'<path d="M4 8V6a2 2 0 0 1 2-2h2"></path>'
+          +'<path d="M16 4h2a2 2 0 0 1 2 2v2"></path>'
+          +'<path d="M20 16v2a2 2 0 0 1-2 2h-2"></path>'
+          +'<path d="M8 20H6a2 2 0 0 1-2-2v-2"></path>'
+          +'<line x1="9" y1="10" x2="9" y2="11"></line>'
+          +'<line x1="15" y1="10" x2="15" y2="11"></line>'
+          +'<path d="M12 9v3.5a1 1 0 0 1-1 1h-.5"></path>'
+          +'<path d="M9 16c1.5 1 4.5 1 6 0"></path>'
+        +'</svg>'
+      +'</div>'
+      +'<div style="font-family:Rajdhani,sans-serif;font-size:13px;font-weight:700;color:#5B9BFF;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Sign in with Face ID</div>'
+      +'<div style="font-size:11px;color:#64748B;margin-bottom:10px">Tap the icon, or use your password below</div>'
+      +'<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="flex:1;height:1px;background:rgba(91,155,255,.15)"></div><div style="font-family:Rajdhani,sans-serif;font-size:10px;font-weight:700;letter-spacing:.18em;color:#475569">OR</div><div style="flex:1;height:1px;background:rgba(91,155,255,.15)"></div></div>';
+    visibleForm.insertBefore(panel,visibleForm.firstChild);
+    // Hover effect
+    var icon=document.getElementById('bioFaceIcon');
+    if(icon){
+      icon.addEventListener('mouseenter',function(){this.style.transform='scale(1.05)';this.style.borderColor='rgba(91,155,255,.6)';this.style.boxShadow='0 0 24px rgba(91,155,255,.35)';});
+      icon.addEventListener('mouseleave',function(){this.style.transform='scale(1)';this.style.borderColor='rgba(91,155,255,.35)';this.style.boxShadow='none';});
+      icon.addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();pfosBioSignIn();}});
+    }
+    bioBtnInjected=true;
+    // Auto-prompt once on first show (banking-app behavior)
+    if(!autoPromptFired){
+      autoPromptFired=true;
+      try{
+        // Skip auto-prompt if URL has a special flag (e.g. ?nopromp=1 for testing)
+        // or if user just clicked Sign Out (sessionStorage flag)
+        var skipAuto=sessionStorage.getItem('pfos_skip_bio_autoprompt')==='1';
+        if(skipAuto){
+          sessionStorage.removeItem('pfos_skip_bio_autoprompt');
+          return;
+        }
+      }catch(e){}
+      setTimeout(function(){
+        // Only fire if the panel is still visible (user hasn't started typing into a field)
+        var stillVisible=document.getElementById('bioLoginPanel');
+        var activeEl=document.activeElement;
+        var isTyping=activeEl&&(activeEl.tagName==='INPUT'||activeEl.tagName==='TEXTAREA');
+        if(stillVisible && !isTyping){
+          pfosBioSignIn();
+        }
+      }, 600);
+    }
+  }
+
+  // Re-inject when user switches between advisor/client tabs
+  document.addEventListener('click',function(e){
+    var t=e.target;
+    if(t&&(t.id==='tabAdvisor'||t.id==='tabClient')){
+      // Tab switched; remove existing panel and re-inject for the newly visible form
+      var existing=document.getElementById('bioLoginPanel');
+      if(existing)existing.remove();
+      bioBtnInjected=false;
+      // Don't auto-prompt on tab switch — only on initial load
+      autoPromptFired=true;
+      setTimeout(tryShow, 80);
+    }
+  }, true);
+
+  // Initial show after page settles
+  if(document.readyState==='loading'){
+    document.addEventListener('DOMContentLoaded',function(){setTimeout(tryShow,500);});
+  } else {
+    setTimeout(tryShow,500);
+  }
 })();
+
+// Triggered by clicking the Face ID button (or by auto-prompt)
+window.pfosBioSignIn=function(){
+  var icon=document.getElementById('bioFaceIcon');
+  if(icon){icon.style.opacity='0.6';icon.style.pointerEvents='none';}
+  var challenge=new Uint8Array(32);window.crypto.getRandomValues(challenge);
+  var credId=null;try{credId=JSON.parse(localStorage.getItem('pfos_biometric_cred'));}catch(e){}
+  if(!credId){
+    if(icon){icon.style.opacity='1';icon.style.pointerEvents='auto';}
+    showLoginErr('Biometric not set up. Sign in with email/password first.');
+    return;
+  }
+  navigator.credentials.get({publicKey:{
+    challenge:challenge,
+    timeout:60000,
+    rpId:window.location.hostname,
+    allowCredentials:[{type:'public-key',id:new Uint8Array(credId)}],
+    userVerification:'required'
+  }}).then(function(){
+    try{
+      var token=localStorage.getItem('pfos_biometric_token');
+      var refresh=localStorage.getItem('pfos_biometric_refresh');
+      if(token&&window.db&&window.db.auth){
+        db.auth.setSession({access_token:token,refresh_token:refresh}).then(function(){
+          window.location.reload();
+        }).catch(function(){
+          if(icon){icon.style.opacity='1';icon.style.pointerEvents='auto';}
+          showLoginErr('Session expired. Please sign in with your password.');
+        });
+      } else {
+        if(icon){icon.style.opacity='1';icon.style.pointerEvents='auto';}
+        showLoginErr('Biometric session not available. Sign in with your password.');
+      }
+    }catch(e){
+      if(icon){icon.style.opacity='1';icon.style.pointerEvents='auto';}
+      showLoginErr('Biometric failed. Sign in with your password.');
+    }
+  }).catch(function(e){
+    console.log('Bio cancelled or failed',e);
+    if(icon){icon.style.opacity='1';icon.style.pointerEvents='auto';}
+    // Don't show an error if user cancelled — they'll just type their password
+  });
+};
 </script>
 </body>
 </html>
