@@ -5429,6 +5429,8 @@ function _cpInitPlan(fd,allocPlan,planMeta){
   CPLAN._planStatus=(planMeta&&planMeta.plan_status)||'draft';
   CPLAN._planPublishedAt=(planMeta&&planMeta.plan_published_at)||null;
   CPLAN._proposedChanges=(planMeta&&planMeta.proposed_plan_changes)||null;
+  // Phase 1: scale loaded plans if they exceed available budget (sets _scaledOnLoad notice flag)
+  _cpEnforce();
   _cpRenderPlan();
 }
 function _cpExtractFlags(){
@@ -5473,6 +5475,158 @@ function _cpCalcHealthScore(){
   return Math.min(100,Math.max(0,s));
 }
 function _cpIRSMax(type){var age=CPLAN.age||35;var o50=age>=50;var limits={roth:o50?8000:7000,'401k':o50?30500:23500,roth401k:o50?30500:23500,trad_ira:o50?8000:7000,hsa:4300,solo401k:o50?76500:69000,sep_ira:69000};return limits[type]?Math.round(limits[type]/12):99999;}
+// ── PHASE 1: SHARED BUDGET POOL (slider caps respect surplus + breathing room) ──
+function _cpAvailableBudget(excludeIdx){
+  var surplus=CPLAN.surplus||0;
+  var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+  var brReserve=Math.round(surplus*brPct);
+  var deployed=0;
+  CPLAN.allocations.forEach(function(a,i){
+    if(i===excludeIdx)return;
+    deployed+=(parseFloat(a.amount)||0);
+  });
+  var available=surplus-brReserve-deployed;
+  return Math.max(0,Math.round(available));
+}
+function _cpSliderMax(type,idx){
+  var irsMax=_cpIRSMax(type);
+  if(idx==null){
+    var surplusCap=Math.max(Math.min(CPLAN.surplus||1,15000),100);
+    return Math.min(irsMax,surplusCap);
+  }
+  var available=_cpAvailableBudget(idx);
+  var cap=Math.min(irsMax,available);
+  return Math.max(0,Math.round(cap));
+}
+function _cpEffectiveCapNote(type,idx){
+  var irsMax=_cpIRSMax(type);
+  var available=_cpAvailableBudget(idx);
+  var effective=Math.min(irsMax,available);
+  var govBy,color;
+  if(irsMax<99999&&irsMax<=available){govBy='IRS limit';color='rgba(234,179,8,.85)';}
+  else{govBy='available budget';color='rgba(34,197,94,.85)';}
+  var surplus=CPLAN.surplus||0;
+  return '<span style="color:'+color+';font-weight:700">Cap: '+fmt(effective)+'/mo</span>'
+    +' <span style="color:var(--mu)">&mdash; governed by '+govBy+'</span>'
+    +' <span style="color:var(--mu);font-size:8px">(surplus '+fmt(surplus)+' &minus; others = '+fmt(available)+' available)</span>';
+}
+function _cpEnforce(){
+  CPLAN.allocations.forEach(function(a){
+    if(a.amount<=0)return;
+    var irsTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'];
+    if(irsTypes.indexOf(a.type)>=0){
+      var max=_cpIRSMax(a.type);
+      if(a.amount>max)a.amount=max;
+    }
+  });
+  var surplus=CPLAN.surplus||0;
+  var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+  var budgetCap=surplus*(1-brPct);
+  var total=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+  if(total>budgetCap&&total>0&&budgetCap>0){
+    var scale=budgetCap/total;
+    CPLAN.allocations.forEach(function(a){a.amount=Math.round(a.amount*scale);});
+    CPLAN._scaledOnLoad={from:Math.round(total),to:Math.round(budgetCap),at:Date.now()};
+  }
+}
+function _cpUpdateOverBudgetBanner(){
+  var surplus=CPLAN.surplus||0;
+  var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+  var brReserve=Math.round(surplus*brPct);
+  var deployed=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+  var over=deployed-(surplus-brReserve);
+  var banner=document.getElementById('cpOverBudgetBanner');
+  if(!banner)return;
+  if(over>0){
+    banner.style.display='flex';
+    banner.innerHTML='<span style="font-size:14px">&#9888;&#65039;</span>'
+      +'<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--rd)">Plan exceeds available budget by '+fmt(over)+'/mo</div>'
+      +'<div style="font-size:10px;color:var(--mu)">Reduce one or more allocations. Save and Publish are disabled until resolved.</div></div>';
+    var saveBtn=document.querySelector('[onclick="_cpSavePlan()"]');
+    if(saveBtn){saveBtn.disabled=true;saveBtn.style.opacity='0.5';saveBtn.style.cursor='not-allowed';}
+    var pubBtn=document.querySelector('[onclick="_cpPublishPlan()"]');
+    if(pubBtn){pubBtn.disabled=true;pubBtn.style.opacity='0.5';pubBtn.style.cursor='not-allowed';}
+  } else {
+    banner.style.display='none';
+    var saveBtn2=document.querySelector('[onclick="_cpSavePlan()"]');
+    if(saveBtn2){saveBtn2.disabled=false;saveBtn2.style.opacity='';saveBtn2.style.cursor='';}
+    var pubBtn2=document.querySelector('[onclick="_cpPublishPlan()"]');
+    if(pubBtn2){pubBtn2.disabled=false;pubBtn2.style.opacity='';pubBtn2.style.cursor='';}
+  }
+}
+
+// ── PHASE A: HELP PANEL ─────────────────────────────────
+// Persistent collapsible "How to build a plan" panel. State persists in localStorage.
+function _cpHelpPanelCollapsed(){
+  try{return localStorage.getItem('pfos_diy_help_collapsed')==='1';}catch(e){return false;}
+}
+function _cpToggleHelpPanel(){
+  var newVal=_cpHelpPanelCollapsed()?'0':'1';
+  try{localStorage.setItem('pfos_diy_help_collapsed',newVal);}catch(e){}
+  if(typeof _cpRenderPlanFull==='function'&&document.getElementById('profileMainContent'))_cpRenderPlanFull();
+}
+function _cpHelpPanelHtml(audience){
+  var collapsed=_cpHelpPanelCollapsed();
+  var titleText=audience==='agent'?'How to build a plan with your client':'How to build your plan';
+  var introText=audience==='agent'
+    ? 'A quick walkthrough of how the plan engine works so you can move fast in front of your client.'
+    : 'Read this once. The plan engine has a few moving parts that work together.';
+  var h='';
+  h+='<div id="cpHelpPanel" style="margin-bottom:14px;border:1px solid rgba(91,155,255,.25);border-left:3px solid #5B9BFF;border-radius:6px;background:linear-gradient(135deg,rgba(91,155,255,.06),rgba(91,155,255,.02));overflow:hidden">';
+  h+='<div onclick="_cpToggleHelpPanel()" style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;cursor:pointer;user-select:none;min-height:44px">';
+  h+='<div style="display:flex;align-items:center;gap:10px"><span style="font-size:18px">&#128214;</span>';
+  h+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);letter-spacing:.02em">'+titleText+'</div>';
+  if(collapsed)h+='<div style="font-size:10px;color:var(--mu);margin-top:1px">Click to expand</div>';
+  h+='</div></div>';
+  h+='<span style="color:#5B9BFF;font-size:14px;transition:transform .15s;display:inline-block'+(collapsed?'':';transform:rotate(180deg)')+'">&#9662;</span>';
+  h+='</div>';
+  if(!collapsed){
+    h+='<div style="padding:0 18px 18px;border-top:1px solid rgba(91,155,255,.12)">';
+    h+='<div style="padding:14px 0 16px;font-size:13px;color:rgba(226,232,240,.85);line-height:1.7">'+introText+'</div>';
+    h+='<div style="margin-bottom:18px">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">What this page is</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.8);line-height:1.7">';
+    if(audience==='agent'){
+      h+='This is where you turn your client\'s monthly surplus into a concrete, phased financial plan. Items come from their financial data automatically (red flags become recommended allocations). You assign each one to a phase, set a monthly amount, and the cascade engine projects how the plan unfolds over time.';
+    } else {
+      h+='This is where you turn your monthly surplus into a real plan. Items appear automatically based on your financial data. You decide which ones go first, how much money each gets per month, and the engine projects how it all plays out over time.';
+    }
+    h+='</div></div>';
+    h+='<div style="margin-bottom:18px">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">The 4 steps</div>';
+    h+='<div style="display:flex;gap:12px;margin-bottom:14px"><div style="flex-shrink:0;width:26px;height:26px;border-radius:13px;background:rgba(91,155,255,.18);display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-weight:700;color:#5B9BFF;font-size:12px">1</div>';
+    h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh);margin-bottom:3px">Assign each item to a phase</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.75);line-height:1.65">Phase 1 is "now" &mdash; the things you start funding immediately. Phase 2 starts later, automatically, when something in Phase 1 frees up cash (debt paid off, EF filled). Phase 3 is even later. <span style="color:rgba(91,155,255,.85);font-style:italic">Example: EF + debt payoff in Phase 1. When debt is paid, the freed money cascades into Phase 2 retirement contributions.</span></div></div></div>';
+    h+='<div style="display:flex;gap:12px;margin-bottom:14px"><div style="flex-shrink:0;width:26px;height:26px;border-radius:13px;background:rgba(91,155,255,.18);display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-weight:700;color:#5B9BFF;font-size:12px">2</div>';
+    h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh);margin-bottom:3px">Set how much per month</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.75);line-height:1.65">Each item has a slider. Its max is the lower of the IRS contribution limit (where one applies) and the surplus left after other allocations and breathing room. Move money around freely &mdash; nothing locks until you save.</div></div></div>';
+    h+='<div style="display:flex;gap:12px;margin-bottom:14px"><div style="flex-shrink:0;width:26px;height:26px;border-radius:13px;background:rgba(91,155,255,.18);display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-weight:700;color:#5B9BFF;font-size:12px">3</div>';
+    h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh);margin-bottom:3px">Set breathing room</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.75);line-height:1.65">Breathing room is the percentage of '+(audience==='agent'?'the client\'s':'your')+' surplus to keep liquid every month &mdash; not deployed to any plan item. Default is 15%. Higher means more cushion but slower plan execution.</div></div></div>';
+    h+='<div style="display:flex;gap:12px"><div style="flex-shrink:0;width:26px;height:26px;border-radius:13px;background:rgba(91,155,255,.18);display:flex;align-items:center;justify-content:center;font-family:var(--fh);font-weight:700;color:#5B9BFF;font-size:12px">4</div>';
+    h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh);margin-bottom:3px">'+(audience==='agent'?'Save or publish':'Save or propose')+'</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.75);line-height:1.65">';
+    if(audience==='agent'){
+      h+='<strong style="color:var(--wh)">Save</strong> keeps your work as a draft on the client\'s record. <strong style="color:var(--wh)">Publish</strong> makes the plan visible to the client in their portal.';
+    } else {
+      h+='<strong style="color:var(--wh)">Save</strong> keeps your plan as a working draft. <strong style="color:var(--wh)">Propose</strong> sends your changes to your advisor for review (only appears if you have an advisor).';
+    }
+    h+='</div></div></div>';
+    h+='</div>';
+    h+='<div style="margin-bottom:18px">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Things to know</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.78);line-height:1.75">';
+    h+='<div style="margin-bottom:8px">&bull; <strong style="color:var(--wh)">"$0/mo now &rarr; $X/mo later"</strong> means that item starts unfunded but gets money automatically once a Phase 1 item completes (cascade).</div>';
+    h+='<div style="margin-bottom:8px">&bull; <strong style="color:var(--wh)">The colored deployment bar</strong> at top shows where every dollar of '+(audience==='agent'?'their':'your')+' surplus is going right now.</div>';
+    h+='<div style="margin-bottom:8px">&bull; <strong style="color:var(--wh)">The cap note under each slider</strong> tells you exactly why a slider stops where it does &mdash; IRS limit, available budget, or both.</div>';
+    h+='<div>&bull; <strong style="color:var(--wh)">Items marked "Action required"</strong> (like Protection) don\'t have a slider &mdash; they\'re things to review or set up.</div>';
+    h+='</div></div>';
+    h+='</div>';
+  }
+  h+='</div>';
+  return h;
+}
+
 function _cpRenderPlan(){
   var root=document.getElementById('profileMainContent');if(!root)return;
   if(CPLAN.allocations.length>0){_cpRenderPlanFull();return;}
@@ -5502,6 +5656,8 @@ function _cpRenderPlanFull(){
   h+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden"><button onclick="CPLAN.mode=\'guided\';_cpRenderPlanFull()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;border:none;cursor:pointer;min-height:32px;background:'+(CPLAN.mode==='guided'?'rgba(91,155,255,.15)':'transparent')+';color:'+(CPLAN.mode==='guided'?'#5B9BFF':'var(--mu)')+'">Guided</button><button onclick="CPLAN.mode=\'detailed\';_cpRenderPlanFull()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;border:none;cursor:pointer;min-height:32px;background:'+(CPLAN.mode==='detailed'?'rgba(91,155,255,.15)':'transparent')+';color:'+(CPLAN.mode==='detailed'?'#5B9BFF':'var(--mu)')+'">Detailed</button></div>';
   h+='</div><div style="font-size:11px;color:var(--mu)">Deploying <strong style="color:var(--gr)">'+fmt(allocated)+'</strong>/mo ('+allocPct+'% of surplus)'+(unalloc>0?' · <span style="color:var(--gr)">'+fmt(unalloc)+' breathing room</span>':'')+'</div></div>';
   h+='<div style="display:flex;gap:6px"><button onclick="CPLAN.allocations=[];_cpRenderPlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);color:var(--rd);cursor:pointer;border-radius:2px;min-height:32px">↩ Reset</button><button onclick="_cpSavePlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:32px">💾 Save Plan</button><button onclick="_cpPublishPlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">'+(CPLAN._planPublishedAt?'📤 Publish Changes':'📤 Publish to Client')+'</button>'+(CPLAN._planStatus==='published'?'<span style="display:inline-flex;align-items:center;padding:0 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:var(--gr);letter-spacing:.06em">● PUBLISHED</span>':'<span style="display:inline-flex;align-items:center;padding:0 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:var(--mu);letter-spacing:.06em">● DRAFT</span>')+'</div></div>';
+  // ── Phase A: Help Panel ──
+  h+=_cpHelpPanelHtml('agent');
   // ── Change Request Banner (when client has proposed changes) ──
   if(CPLAN._proposedChanges&&CPLAN._proposedChanges.status==='pending'){
     var _pcDate=CPLAN._proposedChanges.created?new Date(CPLAN._proposedChanges.created).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'';
@@ -5547,7 +5703,9 @@ function _cpRenderPlanFull(){
   if(!activeItems.length)h+='<div style="text-align:center;padding:30px;color:var(--mu);font-size:13px">No items in this phase. <span style="color:#5B9BFF;cursor:pointer;text-decoration:underline" onclick="_cpShowAddMenu('+CPLAN._activePhaseTab+')">Add one →</span></div>';
   activeItems.forEach(function(a){
     var idx=CPLAN.allocations.indexOf(a);var c2=CP_COL[a.type]||'#94A3B8';var ic=CP_IC[a.type]||'⭐';var nm=a.customName||CP_NM[a.type]||a.type;
-    var irsMax=_cpIRSMax(a.type);var atMax=a.amount>=irsMax&&irsMax<99999;
+    var irsMax=_cpIRSMax(a.type);
+    var slMax=_cpSliderMax(a.type,idx);
+    var atMax=a.amount>=irsMax&&irsMax<99999;
     var proj='';
     if(a._illustrationData&&a._illustrationData.cashValueYear10>0){
       var ilD=a._illustrationData;proj='→ CV Year 10: '+fmtK(ilD.cashValueYear10)+(ilD.cashValueYear20?' · Year 20: '+fmtK(ilD.cashValueYear20):'')+(ilD.carrier?' ('+esc(ilD.carrier)+')':'');
@@ -5559,10 +5717,11 @@ function _cpRenderPlanFull(){
     h+='<div style="flex:1"><div style="display:flex;align-items:center;gap:6px;margin-bottom:4px"><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+esc(nm)+'</span>';
     if(atMax)h+='<span style="font-size:8px;padding:2px 6px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.2);border-radius:8px;color:var(--gr);font-family:var(--fh);font-weight:700">MAX</span>';
     h+='</div>';
-    h+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="display:flex;align-items:center;gap:4px"><span style="color:var(--mu);font-size:12px">$</span><input type="number" value="'+a.amount+'" onchange="_cpSetAmount('+idx+',this.value)" style="width:80px;background:rgba(0,68,191,.07);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd);font-size:18px;padding:4px 8px;border-radius:2px;outline:none;text-align:right" min="0"></div><span style="font-size:10px;color:var(--mu)">/mo</span>';
-    h+='<input type="range" min="0" max="'+(irsMax<99999?irsMax:Math.round(CPLAN.surplus))+'" value="'+a.amount+'" oninput="_cpSetAmount('+idx+',this.value)" style="flex:1;accent-color:'+c2+';height:4px">';
-    if(irsMax<99999)h+='<span style="font-size:8px;color:var(--mu);white-space:nowrap">max '+fmt(irsMax)+'</span>';
+    h+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px"><div style="display:flex;align-items:center;gap:4px"><span style="color:var(--mu);font-size:12px">$</span><input type="number" value="'+a.amount+'" max="'+slMax+'" onchange="_cpSetAmount('+idx+',this.value)" style="width:80px;background:rgba(0,68,191,.07);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd);font-size:18px;padding:4px 8px;border-radius:2px;outline:none;text-align:right" min="0"></div><span style="font-size:10px;color:var(--mu)">/mo</span>';
+    h+='<input type="range" min="0" max="'+slMax+'" value="'+Math.min(a.amount,slMax)+'" oninput="_cpSetAmount('+idx+',this.value)" style="flex:1;accent-color:'+c2+';height:4px">';
+    if(irsMax<99999)h+='<span style="font-size:8px;color:var(--mu);white-space:nowrap">IRS '+fmt(irsMax)+'</span>';
     h+='</div>';
+    h+='<div style="font-size:9px;margin-bottom:4px">'+_cpEffectiveCapNote(a.type,idx)+'</div>';
     if(proj)h+='<div style="font-size:10px;color:var(--gr)">'+proj+'</div>';
     if(a.flagTitle)h+='<div style="font-size:9px;color:var(--mu);margin-top:2px">Resolves: '+esc(a.flagTitle)+'</div>';
     // ── Illustration upload for WL/IUL ──
@@ -5600,8 +5759,16 @@ function _cpRenderPlanFull(){
   });
   // Add item
   h+='<div style="text-align:center;margin-top:8px;margin-bottom:16px"><button onclick="_cpShowAddMenu('+CPLAN._activePhaseTab+')" style="padding:6px 16px;font-family:var(--fh);font-size:10px;font-weight:700;background:transparent;border:1px dashed var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:32px">+ Add Allocation</button></div>';
-  // Overallocation warning
-  if(allocated>CPLAN.surplus&&CPLAN.surplus>0)h+='<div style="padding:10px 14px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);border-radius:4px;margin-bottom:14px;font-size:11px;color:var(--rd);display:flex;align-items:center;gap:8px"><span style="font-size:14px">⚠️</span>Over-allocated by <strong>'+fmt(allocated-CPLAN.surplus)+'/mo</strong>. Reduce allocations or increase income.</div>';
+  // ── Phase 1: Over-Budget Banner (dynamic — populated by _cpUpdateOverBudgetBanner) ──
+  h+='<div id="cpOverBudgetBanner" style="display:none;align-items:center;gap:10px;padding:12px 16px;margin-bottom:12px;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);border-left:4px solid var(--rd);border-radius:4px"></div>';
+  // ── Phase 1: Scaled-on-Load Notice (when client's saved plan was scaled to fit budget) ──
+  if(CPLAN._scaledOnLoad){
+    var _sol=CPLAN._scaledOnLoad;
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;margin-bottom:12px;background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.3);border-left:4px solid var(--yl);border-radius:4px;flex-wrap:wrap;gap:10px">';
+    h+='<div style="display:flex;align-items:center;gap:10px"><span style="font-size:18px">&#128208;</span><div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--yl)">Plan adjusted to fit available surplus</div><div style="font-size:11px;color:var(--mu)">Loaded plan totaled '+fmt(_sol.from)+'/mo, exceeding available surplus. All allocations scaled proportionally to '+fmt(_sol.to)+'/mo.</div></div></div>';
+    h+='<button onclick="CPLAN._scaledOnLoad=null;_cpRenderPlanFull()" style="padding:6px 12px;font-family:var(--fh);font-size:10px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:30px">Dismiss</button>';
+    h+='</div>';
+  }
   // ── Analysis Sections (2-column grid) ──
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">';
   // EF Runway
@@ -5646,8 +5813,15 @@ function _cpRenderPlanFull(){
       h+='<div style="padding:12px;background:rgba(0,68,191,.03);border:1px solid rgba(0,68,191,.08);border-radius:2px"><div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:14px">'+s.icon+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">'+s.label+'</span></div><div style="font-family:var(--fd);font-size:20px;color:'+s.color+'">'+fmtK(s.val)+'</div><div style="font-size:10px;color:var(--mu)">'+s.desc+'</div><div style="font-size:10px;color:'+(diff<0?'var(--rd)':'var(--gr)')+';margin-top:3px">'+fmtK(diff)+' ('+pctD+'%) vs base</div></div>';});
     h+='</div><div style="font-size:10px;color:var(--mu);margin-top:8px;text-align:center">Base plan projection (20yr): <strong style="color:#5B9BFF">'+fmtK(base)+'</strong></div></div>';}
   root.innerHTML=h;
+  // Phase 1: refresh over-budget banner state every render
+  _cpUpdateOverBudgetBanner();
 }
-function _cpSetAmount(idx,val){CPLAN.allocations[idx].amount=Math.max(0,parseInt(val)||0);CPLAN.modified=true;_cpRenderPlanFull();}
+function _cpSetAmount(idx,val){
+  CPLAN.allocations[idx].amount=Math.max(0,parseInt(val)||0);
+  _cpEnforce();
+  CPLAN.modified=true;
+  _cpRenderPlanFull();
+}
 function _cpSetPhase(idx,phase){CPLAN.allocations[idx].phase=parseInt(phase)||1;_cpRenderPlanFull();}
 function _cpRemoveAlloc(idx){CPLAN.allocations.splice(idx,1);CPLAN.modified=true;_cpRenderPlanFull();}
 function _cpMarkComplete(idx){
