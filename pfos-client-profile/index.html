@@ -5405,7 +5405,7 @@ var CP_COL={ef:'#5B9BFF',iul:'#A855F7',wl:'#C084FC',debt:'#F97316',roth:'#22C55E
 var CP_NM={ef:'Emergency Fund',debt:'Eliminate Debt',protection:'Protection',roth:'Roth IRA','401k':'401(k) Match',roth401k:'Roth 401(k)',iul:'Indexed Universal Life',wl:'Whole Life',house:'House Fund',edu:'Education Savings',invest:'Taxable Investment',custom:'Custom',hsa:'HSA',ibc:'Infinite Banking',trad_ira:'Traditional IRA',solo401k:'Solo 401(k)',sep_ira:'SEP IRA',rollover:'Rollover IRA',rental:'Rental Property'};
 var CP_IC={ef:'🏦',debt:'⚡',protection:'🛡️',roth:'🎯','401k':'🏢',roth401k:'🏢',iul:'📋',wl:'📋',house:'🏠',edu:'🎓',invest:'📈',custom:'⭐',hsa:'🏥',ibc:'🏛️',trad_ira:'📊',solo401k:'💼',sep_ira:'💼',rollover:'🔄',rental:'🏘️'};
 
-function _cpInitPlan(fd,allocPlan,planMeta){
+async function _cpInitPlan(fd,allocPlan,planMeta){
   var root=document.getElementById('profileMainContent');if(!root)return;
   var c=(fd&&fd.calcs)||(fd&&fd.S&&fd.S.calcs)||{};
   var rawS=(fd&&fd.S)||{};
@@ -5429,6 +5429,57 @@ function _cpInitPlan(fd,allocPlan,planMeta){
   CPLAN._planStatus=(planMeta&&planMeta.plan_status)||'draft';
   CPLAN._planPublishedAt=(planMeta&&planMeta.plan_published_at)||null;
   CPLAN._proposedChanges=(planMeta&&planMeta.proposed_plan_changes)||null;
+  // ── Phase C: Couple link detection + partner data load ──
+  CPLAN._partner=null;CPLAN._coupleLink=null;CPLAN._householdType='individual';
+  CPLAN._jointSurplus=null;CPLAN._jointIncome=null;CPLAN._jointExpenses=null;
+  CPLAN._myClientId=APP.currentClientId||null;
+  try{
+    if(typeof getCoupleForClient==='function'&&APP.currentClientId){
+      var couple=getCoupleForClient(APP.currentClientId);
+      if(couple){
+        CPLAN._coupleLink=couple;
+        CPLAN._householdType=couple.household_type||'individual';
+        var partnerId=(typeof getPartnerClientId==='function')
+          ? getPartnerClientId(couple,APP.currentClientId)
+          : (couple.client_a_id===APP.currentClientId?couple.client_b_id:couple.client_a_id);
+        if(partnerId){
+          var partnerNameRes=await db.from('clients').select('name').eq('id',partnerId).maybeSingle();
+          var partnerName=(partnerNameRes&&partnerNameRes.data&&partnerNameRes.data.name)?partnerNameRes.data.name:'Partner';
+          var partnerProfileRes=await db.from('client_profiles').select('financial_data,allocation_plan')
+            .eq('client_id',partnerId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+          var pFd=(partnerProfileRes&&partnerProfileRes.data&&partnerProfileRes.data.financial_data)||{};
+          var pCalcs=pFd.calcs||(pFd.S&&pFd.S.calcs)||{};
+          var pRawS=pFd.S||{};
+          var pInc=pCalcs.inc||pCalcs.income||(pRawS.incomeSources?pRawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0):0);
+          var pExp=pCalcs.baseExp||pCalcs.expenses||0;
+          if(!pExp&&pRawS.expData)Object.keys(pRawS.expData).forEach(function(k){pExp+=(parseFloat((pRawS.expData[k]||{}).amount)||0);});
+          var pAge=parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35;
+          var pPlan=(partnerProfileRes&&partnerProfileRes.data&&partnerProfileRes.data.allocation_plan)||{};
+          var pAllocs=(pPlan.allocations||[]).slice();
+          CPLAN._partner={
+            clientId:partnerId,
+            name:partnerName,
+            firstName:(partnerName||'Partner').split(' ')[0],
+            income:pInc,
+            expenses:pExp,
+            surplus:Math.max(0,pInc-pExp),
+            age:pAge,
+            allocations:pAllocs,
+            debts:pRawS.debts||[],
+            efBal:pRawS.assets?(parseFloat(pRawS.assets.checking)||0)+(parseFloat(pRawS.assets.savings)||0):0,
+            employer:pRawS.employer||''
+          };
+          if(CPLAN._householdType==='joint'){
+            CPLAN._jointSurplus=CPLAN.surplus+CPLAN._partner.surplus;
+            CPLAN._jointIncome=CPLAN.income+CPLAN._partner.income;
+            CPLAN._jointExpenses=CPLAN.expenses+CPLAN._partner.expenses;
+          }
+          // Tag any existing allocations without owner — assume self
+          (CPLAN.allocations||[]).forEach(function(a){if(!a.owner)a.owner='self';});
+        }
+      }
+    }
+  }catch(e){console.warn('Couple link load failed:',e);}
   // Phase 1: scale loaded plans if they exceed available budget (sets _scaledOnLoad notice flag)
   _cpEnforce();
   _cpRenderPlan();
@@ -5474,10 +5525,28 @@ function _cpCalcHealthScore(){
   if(allocated>d.surplus*1.05)s=Math.max(0,s-15);
   return Math.min(100,Math.max(0,s));
 }
-function _cpIRSMax(type){var age=CPLAN.age||35;var o50=age>=50;var limits={roth:o50?8000:7000,'401k':o50?30500:23500,roth401k:o50?30500:23500,trad_ira:o50?8000:7000,hsa:4300,solo401k:o50?76500:69000,sep_ira:69000};return limits[type]?Math.round(limits[type]/12):99999;}
-// ── PHASE 1: SHARED BUDGET POOL (slider caps respect surplus + breathing room) ──
+// Phase C: owner-aware IRS limits. Pass an allocation OR a literal owner ('self'/'spouse'/'joint')
+// to use the right partner's age for 50+ catch-up. Joint allocations use the older partner's age.
+function _cpIRSMax(type,allocOrOwner){
+  var owner=null;
+  if(typeof allocOrOwner==='string')owner=allocOrOwner;
+  else if(allocOrOwner&&typeof allocOrOwner==='object')owner=allocOrOwner.owner||'self';
+  var age=CPLAN.age||35;
+  if(owner==='spouse'&&CPLAN._partner&&CPLAN._partner.age)age=CPLAN._partner.age;
+  else if(owner==='joint'&&CPLAN._partner&&CPLAN._partner.age)age=Math.max(CPLAN.age||35,CPLAN._partner.age);
+  var o50=age>=50;
+  var limits={roth:o50?8000:7000,'401k':o50?30500:23500,roth401k:o50?30500:23500,trad_ira:o50?8000:7000,hsa:4300,solo401k:o50?76500:69000,sep_ira:69000};
+  return limits[type]?Math.round(limits[type]/12):99999;
+}
+// Phase C: Household-aware surplus. For joint households, returns combined surplus
+// from both partners. Otherwise returns this client's surplus.
+function _cpHouseholdSurplus(){
+  if(CPLAN._householdType==='joint'&&CPLAN._jointSurplus!=null)return CPLAN._jointSurplus;
+  return CPLAN.surplus||0;
+}
+// ── PHASE 1: SHARED BUDGET POOL (slider caps respect surplus + breathing room; Phase C: household-aware) ──
 function _cpAvailableBudget(excludeIdx){
-  var surplus=CPLAN.surplus||0;
+  var surplus=_cpHouseholdSurplus();
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
   var brReserve=Math.round(surplus*brPct);
   var deployed=0;
@@ -5489,9 +5558,12 @@ function _cpAvailableBudget(excludeIdx){
   return Math.max(0,Math.round(available));
 }
 function _cpSliderMax(type,idx){
-  var irsMax=_cpIRSMax(type);
+  // Phase C: pass allocation through so IRS cap respects each partner's age
+  var alloc=(idx!=null&&CPLAN.allocations[idx])?CPLAN.allocations[idx]:null;
+  var irsMax=_cpIRSMax(type,alloc);
   if(idx==null){
-    var surplusCap=Math.max(Math.min(CPLAN.surplus||1,15000),100);
+    var _hs=_cpHouseholdSurplus();
+    var surplusCap=Math.max(Math.min(_hs||1,15000),100);
     return Math.min(irsMax,surplusCap);
   }
   var available=_cpAvailableBudget(idx);
@@ -5499,27 +5571,39 @@ function _cpSliderMax(type,idx){
   return Math.max(0,Math.round(cap));
 }
 function _cpEffectiveCapNote(type,idx){
-  var irsMax=_cpIRSMax(type);
+  // Phase C: pass allocation through so cap note reflects per-partner IRS catch-up
+  var alloc=(idx!=null&&CPLAN.allocations[idx])?CPLAN.allocations[idx]:null;
+  var irsMax=_cpIRSMax(type,alloc);
   var available=_cpAvailableBudget(idx);
   var effective=Math.min(irsMax,available);
   var govBy,color;
   if(irsMax<99999&&irsMax<=available){govBy='IRS limit';color='rgba(234,179,8,.85)';}
   else{govBy='available budget';color='rgba(34,197,94,.85)';}
-  var surplus=CPLAN.surplus||0;
+  var surplus=_cpHouseholdSurplus();
+  var surplusLabel=(CPLAN._householdType==='joint')?'household surplus':'surplus';
+  // Phase C: when joint/hybrid/separate, also note which partner this allocation belongs to
+  var ownerNote='';
+  if(alloc&&CPLAN._partner&&CPLAN._householdType!=='individual'){
+    var oOwner=alloc.owner||'self';
+    if(oOwner==='self')ownerNote=' &middot; 50+ catch-up uses age '+(CPLAN.age||35);
+    else if(oOwner==='spouse')ownerNote=' &middot; 50+ catch-up uses age '+(CPLAN._partner.age||35);
+    else if(oOwner==='joint')ownerNote=' &middot; joint &mdash; older partner\'s age applies';
+  }
   return '<span style="color:'+color+';font-weight:700">Cap: '+fmt(effective)+'/mo</span>'
-    +' <span style="color:var(--mu)">&mdash; governed by '+govBy+'</span>'
-    +' <span style="color:var(--mu);font-size:8px">(surplus '+fmt(surplus)+' &minus; others = '+fmt(available)+' available)</span>';
+    +' <span style="color:var(--mu)">&mdash; governed by '+govBy+ownerNote+'</span>'
+    +' <span style="color:var(--mu);font-size:8px">('+surplusLabel+' '+fmt(surplus)+' &minus; others = '+fmt(available)+' available)</span>';
 }
 function _cpEnforce(){
   CPLAN.allocations.forEach(function(a){
     if(a.amount<=0)return;
     var irsTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'];
     if(irsTypes.indexOf(a.type)>=0){
-      var max=_cpIRSMax(a.type);
+      // Phase C: per-partner IRS caps
+      var max=_cpIRSMax(a.type,a);
       if(a.amount>max)a.amount=max;
     }
   });
-  var surplus=CPLAN.surplus||0;
+  var surplus=_cpHouseholdSurplus();
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
   var budgetCap=surplus*(1-brPct);
   var total=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
@@ -5530,7 +5614,7 @@ function _cpEnforce(){
   }
 }
 function _cpUpdateOverBudgetBanner(){
-  var surplus=CPLAN.surplus||0;
+  var surplus=_cpHouseholdSurplus();
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
   var brReserve=Math.round(surplus*brPct);
   var deployed=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
@@ -5762,6 +5846,53 @@ function _cpRenderIncomeReplacement(){
   var el=document.getElementById('cplanIncomeReplace');if(!el)return;
   if(CPLAN.income<=0){el.innerHTML='';return;}
   var _retVehicles=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
+  // ── Phase C: For joint households with a partner, render a two-card view ──
+  // (each partner gets their own retirement projection at their own age 65; joint allocations
+  //  are split 50/50 between them). For individual/separate/hybrid, fall through to legacy logic.
+  if(CPLAN._partner&&CPLAN._householdType==='joint'&&CPLAN._sim&&CPLAN._sim.retirementByOwner){
+    var _myFirst=(APP._currentClientName||'You').split(' ')[0];
+    var _spFirst=CPLAN._partner.firstName||'Partner';
+    var _myAge=CPLAN.age||35;
+    var _spAge=CPLAN._partner.age||35;
+    var _myYr=Math.max(1,Math.min(30,65-_myAge));
+    var _spYr=Math.max(1,Math.min(30,65-_spAge));
+    var _selfArr=CPLAN._sim.retirementByOwner.self||[];
+    var _spArr=CPLAN._sim.retirementByOwner.spouse||[];
+    var _jtArr=CPLAN._sim.retirementByOwner.joint||[];
+    function _atYr(arr,yr){return arr[yr]!=null?arr[yr]:(arr[arr.length-1]||0);}
+    var _myBal=_atYr(_selfArr,_myYr)+_atYr(_jtArr,_myYr)*0.5;
+    var _spBal=_atYr(_spArr,_spYr)+_atYr(_jtArr,_spYr)*0.5;
+    var _myInc=Math.round(_myBal*0.04/12);
+    var _spInc=Math.round(_spBal*0.04/12);
+    var _myCurInc=CPLAN.income||1;var _spCurInc=CPLAN._partner.income||1;
+    var _myPct=Math.round(_myInc/_myCurInc*100);
+    var _spPct=Math.round(_spInc/_spCurInc*100);
+    function _col(p){return p>=80?'var(--gr)':p>=50?'var(--yl)':p>=25?'var(--or)':'var(--rd)';}
+    function _card(name,age,yr,inc,curInc,pct){
+      var col=_col(pct);
+      var disp=Math.min(100,pct);
+      var lbl=pct>=100?'Full':pct>=80?'Strong':pct>=50?'Moderate':pct>=25?'Partial':'Minimal';
+      var hh='<div style="padding:10px 12px;border:1px solid var(--bd);border-radius:4px;background:rgba(0,68,191,.02)">';
+      hh+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">';
+      hh+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu)">'+esc(name)+' &middot; age 65 in '+yr+'y</div>';
+      hh+='<div style="font-family:var(--fd);font-size:16px;color:'+col+'">'+disp+'%</div></div>';
+      hh+='<div style="height:6px;background:rgba(0,68,191,.06);border-radius:3px;overflow:hidden;margin-bottom:4px"><div style="height:100%;width:'+disp+'%;background:'+col+';border-radius:3px;transition:width .3s"></div></div>';
+      hh+='<div style="font-size:9px;color:var(--mu)">'+lbl+' &middot; '+fmt(inc)+'/mo of '+fmt(Math.round(curInc))+'/mo</div>';
+      hh+='</div>';
+      return hh;
+    }
+    var h='<div style="padding:12px 16px">';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Retirement Income Replacement &middot; per partner</div>';
+    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
+    h+=_card(_myFirst,_myAge,_myYr,_myInc,_myCurInc,_myPct);
+    h+=_card(_spFirst,_spAge,_spYr,_spInc,_spCurInc,_spPct);
+    h+='</div>';
+    h+='<div style="font-size:9px;color:var(--mu);margin-top:6px;line-height:1.4">Joint allocations split 50/50 between partners. Each partner projected to their own age 65 using their separate IRS limits.</div>';
+    h+='</div>';
+    el.innerHTML=h;
+    return;
+  }
+  // ── Legacy single-client logic (individual / hybrid / separate) ──
   // Use simulation's retirement-only data if available
   var retIncome=0;
   if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length>0){
@@ -6070,7 +6201,7 @@ function _cpRunSimulation(){
     if(ev.cascade){
       var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0)tIdx=i2;});
       if(tIdx>=0){
-        var irsMax=_cpIRSMax(CPLAN.allocations[tIdx].type);
+        var irsMax=_cpIRSMax(CPLAN.allocations[tIdx].type,CPLAN.allocations[tIdx]);
         var maxAdd=Math.max(0,irsMax-allocAmounts[tIdx]);
         var add=Math.min(freed,maxAdd);
         if(add>0){
@@ -6097,7 +6228,7 @@ function _cpRunSimulation(){
           if(freed<=0)return;
           var proportion=_growthTotal>0?allocAmounts[g.i]/_growthTotal:(1/growth.length);
           var per=Math.round(freed*proportion);
-          var irsMax3=_cpIRSMax(g.a.type);
+          var irsMax3=_cpIRSMax(g.a.type,g.a);
           var add3=Math.min(per,Math.max(0,irsMax3-allocAmounts[g.i]));
           if(add3>0){
             allocAmounts[g.i]+=add3;
@@ -6121,7 +6252,7 @@ function _cpRunSimulation(){
         .sort(function(a4,b4){return(a4.a.phase||99)-(b4.a.phase||99);});
       unfunded.forEach(function(uf){
         if(freed<=0)return;
-        var irsMax2=_cpIRSMax(uf.a.type);
+        var irsMax2=_cpIRSMax(uf.a.type,uf.a);
         var add2=Math.min(freed,irsMax2);
         allocAmounts[uf.i]+=add2;
         allocFuture[uf.i].futureAmount=add2;
@@ -6150,6 +6281,8 @@ function _cpRunSimulation(){
   // Per-allocation balance tracking for chart bands
   var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt')allocSeries[a.type+'_'+i]=[];});
   var _retOnlyByYear={};
+  // Phase C: per-owner retirement tracking (joint households need separate projections per partner)
+  var _retByOwner={self:[],spouse:[],joint:[]};
   var retirementData=[];
   // Home equity tracking — get home value from profile if homeowner
   var _rawS2=(APP._portalFd&&APP._portalFd.S)||{};
@@ -6185,6 +6318,11 @@ function _cpRunSimulation(){
       if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'].indexOf(a.type)>=0){
         if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
         _retOnlyByYear[yr]+=bal;
+        // Phase C: per-owner accumulator (used by joint-household income replacement display)
+        var _own=a.owner||'self';
+        if(!_retByOwner[_own])_retByOwner[_own]=[];
+        if(_retByOwner[_own][yr]==null)_retByOwner[_own][yr]=0;
+        _retByOwner[_own][yr]+=bal;
       }
     });
     // Remaining high-rate debt (accelerated payments)
@@ -6235,7 +6373,9 @@ function _cpRunSimulation(){
     debtFreeMonth:debtFreeMonth,
     fullFundingMonth:fullFundingMonth,
     projRetValue:projRetValue,
-    projRetIncome:projRetIncome
+    projRetIncome:projRetIncome,
+    // Phase C: per-owner retirement projections (year-indexed arrays)
+    retirementByOwner:_retByOwner
   };
   return CPLAN._sim;
 }
@@ -6522,12 +6662,43 @@ function _cpRenderPlanFull(){
   CPLAN.mode='detailed';
   try{ if(typeof _cpRunSimulation==='function') _cpRunSimulation(); }catch(e){ console.warn('Sim run failed:',e); }
   var h='';var allocated=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
-  var unalloc=Math.max(0,CPLAN.surplus-allocated);var allocPct=CPLAN.surplus>0?Math.round(allocated/CPLAN.surplus*100):0;
+  // Phase C: use household-aware surplus when joint household
+  var _planSurplus=_cpHouseholdSurplus();
+  var unalloc=Math.max(0,_planSurplus-allocated);var allocPct=_planSurplus>0?Math.round(allocated/_planSurplus*100):0;
   // ── Header ──
   h+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px"><div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh)">Client Financial Plan</span>';
   h+='<span style="display:inline-flex;align-items:center;padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:#5B9BFF;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);border-radius:2px;letter-spacing:.08em">DETAILED VIEW</span>';
-  h+='</div><div style="font-size:11px;color:var(--mu)">Deploying <strong style="color:var(--gr)">'+fmt(allocated)+'</strong>/mo ('+allocPct+'% of surplus)'+(unalloc>0?' · <span style="color:var(--gr)">'+fmt(unalloc)+' breathing room</span>':'')+'</div></div>';
+  h+='</div><div style="font-size:11px;color:var(--mu)">Deploying <strong style="color:var(--gr)">'+fmt(allocated)+'</strong>/mo ('+allocPct+'% of '+(CPLAN._householdType==='joint'?'household ':'')+'surplus)'+(unalloc>0?' · <span style="color:var(--gr)">'+fmt(unalloc)+' breathing room</span>':'')+'</div></div>';
   h+='<div style="display:flex;gap:6px"><button onclick="CPLAN.allocations=[];_cpRenderPlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);color:var(--rd);cursor:pointer;border-radius:2px;min-height:32px">↩ Reset</button><button onclick="_cpSavePlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:32px">💾 Save Plan</button><button onclick="_cpPublishPlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">'+(CPLAN._planPublishedAt?'📤 Publish Changes':'📤 Publish to Client')+'</button>'+(CPLAN._planStatus==='published'?'<span style="display:inline-flex;align-items:center;padding:0 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:var(--gr);letter-spacing:.06em">● PUBLISHED</span>':'<span style="display:inline-flex;align-items:center;padding:0 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:var(--mu);letter-spacing:.06em">● DRAFT</span>')+'</div></div>';
+  // ── Phase C: Couple Banner (joint/separate/hybrid households) ──
+  if(CPLAN._partner&&CPLAN._coupleLink){
+    var _ht=CPLAN._householdType||'individual';
+    var _htBadge={joint:{label:'JOINT HOUSEHOLD',col:'#5B9BFF',bg:'rgba(91,155,255,.08)',bd:'rgba(91,155,255,.25)',desc:'One combined plan covers both partners. Surplus, expenses, and goals are pooled.'},
+                  separate:{label:'SEPARATE FINANCES',col:'#94A3B8',bg:'rgba(148,163,184,.08)',bd:'rgba(148,163,184,.25)',desc:'Each partner has their own plan. Only shared goals are visible to both.'},
+                  hybrid:{label:'HYBRID HOUSEHOLD',col:'#A855F7',bg:'rgba(168,85,247,.08)',bd:'rgba(168,85,247,.25)',desc:'Each partner has their own income/expenses but shares some goals and joint allocations.'}}[_ht];
+    if(_htBadge){
+      h+='<div style="display:flex;align-items:center;gap:14px;padding:12px 16px;margin-bottom:12px;background:'+_htBadge.bg+';border:1px solid '+_htBadge.bd+';border-left:3px solid '+_htBadge.col+';border-radius:4px;flex-wrap:wrap">';
+      h+='<span style="font-size:22px">&#128107;</span>';
+      h+='<div style="flex:1;min-width:200px">';
+      h+='<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:3px">';
+      h+='<span style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">Linked with '+esc(CPLAN._partner.name||'Partner')+'</span>';
+      h+='<span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;color:'+_htBadge.col+';background:'+_htBadge.bg+';padding:3px 8px;border:1px solid '+_htBadge.bd+';border-radius:2px">'+_htBadge.label+'</span>';
+      h+='</div>';
+      h+='<div style="font-size:11px;color:var(--mu);line-height:1.5">'+_htBadge.desc+'</div>';
+      if(_ht==='joint'&&CPLAN._jointSurplus!=null){
+        h+='<div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;font-size:10px">';
+        h+='<div><span style="color:var(--mu)">Combined income:</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN._jointIncome))+'/mo</strong></div>';
+        h+='<div><span style="color:var(--mu)">Combined surplus:</span> <strong style="color:var(--gr)">'+fmt(Math.round(CPLAN._jointSurplus))+'/mo</strong></div>';
+        h+='</div>';
+      } else {
+        h+='<div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;font-size:10px">';
+        h+='<div><span style="color:var(--mu)">Your client:</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN.surplus))+'/mo surplus</strong> (age '+CPLAN.age+')</div>';
+        h+='<div><span style="color:var(--mu)">'+esc(CPLAN._partner.firstName||'Partner')+':</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN._partner.surplus))+'/mo surplus</strong> (age '+CPLAN._partner.age+')</div>';
+        h+='</div>';
+      }
+      h+='</div></div>';
+    }
+  }
   // ── Phase A: Help Panel ──
   h+=_cpHelpPanelHtml('agent');
   // ── Change Request Banner (when client has proposed changes) ──
@@ -6546,21 +6717,24 @@ function _cpRenderPlanFull(){
   h+='<div style="display:flex;align-items:center;gap:16px;padding:16px 20px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:14px">';
   h+='<div style="position:relative;width:72px;height:72px;flex-shrink:0"><svg viewBox="0 0 72 72" style="transform:rotate(-90deg)"><circle cx="36" cy="36" r="30" fill="none" stroke="rgba(0,68,191,.08)" stroke-width="6"/><circle cx="36" cy="36" r="30" fill="none" stroke="'+scol+'" stroke-width="6" stroke-linecap="round" stroke-dasharray="'+Math.round(score*1.885)+' 188.5" style="transition:stroke-dasharray .5s"/></svg><div style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center"><span style="font-family:var(--fd);font-size:24px;color:'+scol+'">'+score+'</span></div></div>';
   h+='<div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">Plan Health</div><div style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+scol+';letter-spacing:.06em">'+slbl+'</div><div style="font-size:10px;color:var(--mu);margin-top:2px;line-height:1.5">Based on emergency coverage, debt trajectory, savings rate, protection, tax efficiency, retirement readiness, and diversification.</div></div></div>';
-  // ── Deployment bar ──
+  // ── Deployment bar (Phase C: household-aware surplus) ──
   h+='<div style="height:10px;display:flex;border-radius:5px;overflow:hidden;background:rgba(0,68,191,.05);margin-bottom:6px">';
-  CPLAN.allocations.forEach(function(a){if(a.amount>0){var w=CPLAN.surplus>0?Math.max(1,Math.round(a.amount/CPLAN.surplus*100)):0;h+='<div style="height:100%;width:'+w+'%;background:'+CP_COL[a.type]+';opacity:0.7;transition:width .3s"></div>';}});
-  if(unalloc>0)h+='<div style="height:100%;width:'+Math.round(unalloc/Math.max(CPLAN.surplus,1)*100)+'%;background:rgba(100,116,139,.1)"></div>';
+  CPLAN.allocations.forEach(function(a){if(a.amount>0){var w=_planSurplus>0?Math.max(1,Math.round(a.amount/_planSurplus*100)):0;h+='<div style="height:100%;width:'+w+'%;background:'+CP_COL[a.type]+';opacity:0.7;transition:width .3s"></div>';}});
+  if(unalloc>0)h+='<div style="height:100%;width:'+Math.round(unalloc/Math.max(_planSurplus,1)*100)+'%;background:rgba(100,116,139,.1)"></div>';
   h+='</div>';
   h+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:16px">';
   CPLAN.allocations.forEach(function(a){if(a.amount>0){h+='<div style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:'+CP_COL[a.type]+';opacity:0.7;flex-shrink:0"></div>'+(a.customName||CP_NM[a.type]||a.type)+' <span style="color:'+CP_COL[a.type]+';font-weight:700">'+fmt(a.amount)+'</span></div>';}});
   if(unalloc>0)h+='<div style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:rgba(100,116,139,.2);flex-shrink:0"></div>Breathing Room <span style="color:var(--gr);font-weight:700">'+fmt(unalloc)+'</span></div>';
   h+='</div>';
-  // ── Phase B: Breathing Room slider ──
+  // ── Phase B: Breathing Room slider (Phase C: household-aware) ──
   var _brPct=CPLAN._breathingPct!=null?CPLAN._breathingPct:15;
+  var _brSurplus=_cpHouseholdSurplus();
+  var _brLabel=(CPLAN._householdType==='joint')?'Household Breathing Room':'Breathing Room';
+  var _brSubtext=(CPLAN._householdType==='joint')?'Combined unallocated surplus kept liquid':'Unallocated surplus kept liquid';
   h+='<div style="padding:14px 16px;margin-bottom:14px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:6px">';
   h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">';
-  h+='<div style="display:flex;align-items:center;gap:8px"><div style="width:36px;height:36px;border-radius:8px;background:rgba(34,197,94,.12);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">&#128168;</div><div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">Breathing Room</div><div style="font-size:10px;color:var(--mu)">Unallocated surplus kept liquid</div></div></div>';
-  h+='<div style="text-align:right"><div style="font-family:var(--fd);font-size:22px;color:var(--gr)">'+fmt(Math.round((CPLAN.surplus||0)*_brPct/100))+'</div><div style="font-size:9px;color:var(--mu)">/mo ('+_brPct+'%)</div></div></div>';
+  h+='<div style="display:flex;align-items:center;gap:8px"><div style="width:36px;height:36px;border-radius:8px;background:rgba(34,197,94,.12);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">&#128168;</div><div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+_brLabel+'</div><div style="font-size:10px;color:var(--mu)">'+_brSubtext+'</div></div></div>';
+  h+='<div style="text-align:right"><div style="font-family:var(--fd);font-size:22px;color:var(--gr)">'+fmt(Math.round(_brSurplus*_brPct/100))+'</div><div style="font-size:9px;color:var(--mu)">/mo ('+_brPct+'%)</div></div></div>';
   h+='<input type="range" min="0" max="30" step="5" value="'+_brPct+'" oninput="_cpSetBreathingRoomAgent(this.value)" style="width:100%;accent-color:var(--gr);color:var(--gr);height:5px">';
   h+='<div style="display:flex;justify-content:space-between;font-size:8px;color:var(--mu);margin-top:4px"><span>0% (all deployed)</span><span>15% recommended</span><span>30% (conservative)</span></div>';
   h+='</div>';
@@ -6591,7 +6765,7 @@ function _cpRenderPlanFull(){
   if(!activeItems.length)h+='<div style="text-align:center;padding:30px;color:var(--mu);font-size:13px">No items in this phase. <span style="color:#5B9BFF;cursor:pointer;text-decoration:underline" onclick="_cpShowAddMenu('+CPLAN._activePhaseTab+')">Add one →</span></div>';
   activeItems.forEach(function(a){
     var idx=CPLAN.allocations.indexOf(a);var c2=CP_COL[a.type]||'#94A3B8';var ic=CP_IC[a.type]||'⭐';var nm=a.customName||CP_NM[a.type]||a.type;
-    var irsMax=_cpIRSMax(a.type);
+    var irsMax=_cpIRSMax(a.type,a);
     var slMax=_cpSliderMax(a.type,idx);
     var atMax=a.amount>=irsMax&&irsMax<99999;
     var proj='';
@@ -6758,7 +6932,7 @@ function _cpMarkComplete(idx){
       var totalGrowth=growthItems.reduce(function(t,g){return t+g.amount;},0);
       growthItems.forEach(function(g){
         var share=totalGrowth>0?Math.round(freed*g.amount/totalGrowth):Math.round(freed/growthItems.length);
-        var irsMax=_cpIRSMax(g.type);
+        var irsMax=_cpIRSMax(g.type,g);
         g.amount=Math.min(g.amount+share,irsMax<99999?irsMax:g.amount+share);
       });
     }
