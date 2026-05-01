@@ -5627,6 +5627,875 @@ function _cpHelpPanelHtml(audience){
   return h;
 }
 
+// ── PHASE B: PLAN ENGINE PORTED FROM CLIENT PORTAL ─────────
+// These functions provide the cascade simulation, timeline, projection chart,
+// and analysis widgets that the agent view previously lacked. Imported from
+// pfos-client.html. Agent-specific stubs follow.
+
+// Agent always has full feature access — tier stubs return true/empty.
+function _cpTierHas(feature){return true;}
+function _cpUpgradeHint(feature,tierNeeded){return '';}
+// Old single-render entry point used by debounced detailed-mode setters.
+function _cpRender(){_cpRenderPlanFull();}
+// Education vehicle labels (used inside cards for `edu` type)
+var CP_EDU_VEH_NM={'529':'529 Plan','coverdell':'Coverdell ESA','utma':'UTMA/UGMA','wl':'Whole Life Cash Value','iul':'IUL Cash Value'};
+
+function _cpDebtSimulate(debtArr,extraPmt){
+  var ds=debtArr.map(function(d,i){return{name:d.name||(d.type||('Debt '+(i+1))),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,min:Math.max(parseFloat(d.min)||parseFloat(d.payment)||0,10),oMin:Math.max(parseFloat(d.min)||parseFloat(d.payment)||0,10),paid:false,paidMonth:0};});
+  var months=0,totalInt=0,order=[],freed=0;
+  while(ds.some(function(d){return d.bal>0.01;})&&months<600){
+    months++;
+    ds.forEach(function(d){if(d.bal<=0)return;var interest=d.bal*d.rate;totalInt+=interest;d.bal+=interest;});
+    ds.forEach(function(d){if(d.bal<=0)return;var pmt=Math.min(d.min,d.bal);d.bal-=pmt;if(d.bal<0.01){d.bal=0;freed+=d.oMin;}});
+    var extraLeft=extraPmt+freed;
+    for(var i=0;i<ds.length;i++){if(ds[i].bal>0){var pay=Math.min(extraLeft,ds[i].bal);ds[i].bal-=pay;extraLeft-=pay;if(ds[i].bal<0.01){ds[i].bal=0;freed+=ds[i].oMin;}if(extraLeft<=0)break;}}
+    ds.forEach(function(d){if(d.bal<0.01&&!d.paid){d.paid=true;d.paidMonth=months;order.push({name:d.name,month:months});}});
+  }
+  return{months:months,interest:Math.round(totalInt),order:order,perDebt:ds};
+}
+
+function _cpDebtSort(debts,method){
+  var sorted=debts.slice();
+  if(method==='avalanche')sorted.sort(function(a,b){return(parseFloat(b.rate)||0)-(parseFloat(a.rate)||0);});
+  else if(method==='snowball')sorted.sort(function(a,b){return(parseFloat(a.balance)||0)-(parseFloat(b.balance)||0);});
+  else if(method==='hybrid')sorted.sort(function(a,b){var ab=parseFloat(a.balance)||0,bb=parseFloat(b.balance)||0,ar=parseFloat(a.rate)||0,br=parseFloat(b.rate)||0;return(br*bb)-(ar*ab);});
+  return sorted;
+}
+
+function _cpBuildTimeline(){
+  var milestones=[];
+  var sim=CPLAN._sim;
+  CPLAN.allocations.forEach(function(a){
+    if(a.amount<=0)return;
+    if(a.type==='ef'&&a.target>0){var mo=Math.ceil(Math.max(0,a.target-(CPLAN.efBal||0))/a.amount);if(mo>0)milestones.push({month:mo,label:'EF funded',color:'#22C55E',icon:'🛡️'});}
+    if(a.type==='custom'&&a.target>0){var mo3=Math.ceil((a.target-(a.goalCurrent||0))/a.amount);if(mo3>0)milestones.push({month:mo3,label:a.customName||'Goal',color:'#EAB308',icon:'🎯'});}
+    // Individual debt payoffs — HIGH-RATE ONLY (>10% APR)
+    if(a.type==='debt'&&CPLAN.debts.length>0){
+      var strat=CPLAN.debtStrategy||'avalanche';
+      var _tlDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0&&(parseFloat(d.rate)||0)>10;});
+      if(!_tlDebts.length)_tlDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0;});
+      var sorted=_cpDebtSort(_tlDebts,strat);
+      var simResult=_cpDebtSimulate(sorted,a.amount);
+      simResult.order.forEach(function(o){
+        milestones.push({month:o.month,label:o.name+' paid off',color:'#F97316',icon:'💳'});
+      });
+      if(simResult.months>0)milestones.push({month:simResult.months,label:'High-rate debt free',color:'#22C55E',icon:'🎉'});
+    }
+  });
+  // ── Cascade flow events from simulation ──
+  if(sim&&sim.cascadeLog){
+    sim.cascadeLog.forEach(function(cl){
+      if(cl.destinations&&cl.destinations.length>0){
+        var flowDesc=cl.destinations.map(function(d){return fmt(d.amount)+' → '+d.name;}).join(' · ');
+        milestones.push({month:cl.month,label:fmt(cl.freed)+' freed',color:'#5B9BFF',icon:'🔄',sublabel:flowDesc});
+      }
+    });
+  }
+  // ── Net worth milestones from simulation ──
+  if(sim&&sim.netWorth){
+    var nwThresholds=[{val:100000,label:'$100K net worth',icon:'💎',color:'#5B9BFF'},{val:500000,label:'$500K net worth',icon:'🏆',color:'#A855F7'},{val:1000000,label:'$1M net worth',icon:'🌟',color:'#22C55E'}];
+    nwThresholds.forEach(function(t){
+      for(var y=1;y<sim.netWorth.length;y++){
+        if(sim.netWorth[y-1]<t.val&&sim.netWorth[y]>=t.val){
+          milestones.push({month:y*12,label:t.label,color:t.color,icon:t.icon});
+          break;
+        }
+      }
+    });
+  }
+  milestones.sort(function(a,b){return a.month-b.month;});
+  if(!milestones.length)return'';
+  var maxMo=Math.max(milestones[milestones.length-1].month,12);
+  var h='<div style="margin-bottom:16px;padding:16px 20px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:14px">Projected Timeline</div>';
+  h+='<div style="position:relative;height:'+(Math.max(60,milestones.length*16+30))+'px;margin:0 16px">';
+  // Track line
+  h+='<div style="position:absolute;top:20px;left:0;right:0;height:4px;background:linear-gradient(90deg,rgba(91,155,255,.2),rgba(34,197,94,.2));border-radius:2px"></div>';
+  // Start marker
+  h+='<div style="position:absolute;left:0;top:16px"><div style="width:12px;height:12px;border-radius:6px;background:rgba(91,155,255,.3);border:2px solid #5B9BFF"></div><div style="font-size:9px;color:var(--mu);text-align:center;margin-top:6px;margin-left:-4px">Now</div></div>';
+  // Stagger labels vertically to avoid overlap
+  var usedPcts=[];
+  milestones.forEach(function(m,mi){
+    var pct=Math.min(92,Math.max(8,Math.round(m.month/maxMo*100)));
+    var dateEst=new Date(Date.now()+m.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'2-digit'});
+    var vOff=0;usedPcts.forEach(function(up){if(Math.abs(up-pct)<10)vOff+=18;});usedPcts.push(pct);
+    h+='<div style="position:absolute;left:'+pct+'%;top:'+vOff+'px;transform:translateX(-50%);text-align:center;max-width:140px">';
+    h+='<div style="width:14px;height:14px;border-radius:7px;background:'+m.color+';border:3px solid var(--bg-card);margin:13px auto 0;box-shadow:0 0 0 2px '+m.color+'40"></div>';
+    h+='<div style="font-size:10px;color:'+m.color+';font-family:var(--fh);font-weight:700;white-space:nowrap;margin-top:3px">'+m.label+'</div>';
+    if(m.sublabel)h+='<div style="font-size:8px;color:var(--mu);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px" title="'+m.sublabel+'">'+m.sublabel+'</div>';
+    h+='<div style="font-size:9px;color:var(--mu)">'+dateEst+'</div>';
+    h+='</div>';
+  });
+  h+='</div></div>';
+  return h;
+}
+
+function _cpRenderEFRunway(){
+  var el=document.getElementById('cplanEFRunway');if(!el)return;
+  if(CPLAN.income<=0){el.innerHTML='';return;}
+  var efBal=CPLAN.efBal;var target3=CPLAN.efTarget;var target6=CPLAN.expenses*6;
+  var months=CPLAN.expenses>0?efBal/CPLAN.expenses:0;
+  var pct3=Math.min(100,Math.round(efBal/Math.max(target3,1)*100));
+  var efAlloc=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
+  var monthsToTarget=efAlloc&&efAlloc.amount>0?Math.ceil(Math.max(0,target3-efBal)/efAlloc.amount):0;
+  var col=months>=6?'var(--gr)':months>=3?'#5B9BFF':months>=1?'var(--yl)':'var(--rd)';
+  var h='<div style="padding:12px 16px">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Emergency Fund Runway</div>';
+  h+='<div style="font-family:var(--fd);font-size:20px;color:'+col+'">'+months.toFixed(1)+'<span style="font-size:10px;color:var(--mu)"> months</span></div></div>';
+  // Bar with 3-mo and 6-mo markers
+  h+='<div style="position:relative;height:10px;background:rgba(0,68,191,.06);border-radius:5px;overflow:visible;margin-bottom:6px">';
+  h+='<div style="height:100%;width:'+Math.min(100,Math.round(efBal/Math.max(target6,1)*100))+'%;background:'+col+';border-radius:5px;transition:width .3s"></div>';
+  var mark3=Math.round(target3/Math.max(target6,1)*100);
+  h+='<div style="position:absolute;top:-2px;left:'+mark3+'%;width:1px;height:14px;background:rgba(91,155,255,.4)"></div>';
+  h+='<div style="position:absolute;top:14px;left:'+mark3+'%;transform:translateX(-50%);font-size:7px;color:#5B9BFF;font-family:var(--fh);white-space:nowrap">3 mo</div>';
+  h+='</div>';
+  h+='<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mu);margin-top:10px">';
+  h+='<span>Current: '+fmt(Math.round(efBal))+'</span>';
+  h+='<span>3-mo target: '+fmt(Math.round(target3))+'</span></div>';
+  if(efAlloc&&monthsToTarget>0)h+='<div style="font-size:10px;color:#5B9BFF;margin-top:4px">At '+fmt(efAlloc.amount)+'/mo → fully funded in '+monthsToTarget+' month'+(monthsToTarget!==1?'s':'')+'</div>';
+  h+='</div>';
+  el.innerHTML=h;
+}
+
+function _cpRenderIncomeReplacement(){
+  var el=document.getElementById('cplanIncomeReplace');if(!el)return;
+  if(CPLAN.income<=0){el.innerHTML='';return;}
+  var _retVehicles=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
+  // Use simulation's retirement-only data if available
+  var retIncome=0;
+  if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length>0){
+    var _retYrsToAge65=Math.max(1,Math.min(30,65-(CPLAN.age||35)));
+    var retAtRetire=CPLAN._sim.retirement[_retYrsToAge65]||CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
+    retIncome=Math.round(retAtRetire*0.04/12);
+  } else {
+    var yrs=Math.max(1,65-CPLAN.age);
+    CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;
+      if(_retVehicles.indexOf(a.type)<0)return;// Only retirement vehicles
+      var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var bal=0;
+      for(var y=1;y<=Math.min(yrs,40);y++){var c2=a.amount*12*cf;bal=(bal+c2)*(1+rate);}
+      retIncome+=Math.round(bal*0.04/12);
+    });
+  }
+  var replacePct=CPLAN.income>0?Math.round(retIncome/CPLAN.income*100):0;
+  var displayPct=Math.min(100,replacePct);
+  var col=replacePct>=80?'var(--gr)':replacePct>=50?'var(--yl)':replacePct>=25?'var(--or)':'var(--rd)';
+  var label=replacePct>=100?'Full replacement':replacePct>=80?'Strong':replacePct>=50?'Moderate':replacePct>=25?'Partial':'Minimal';
+  var h='<div style="padding:12px 16px">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Retirement Income Replacement</div>';
+  h+='<div style="font-family:var(--fd);font-size:20px;color:'+col+'">'+displayPct+'%</div></div>';
+  h+='<div style="height:8px;background:rgba(0,68,191,.06);border-radius:4px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+displayPct+'%;background:'+col+';border-radius:4px;transition:width .3s"></div></div>';
+  h+='<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mu)">';
+  h+='<span>'+label+' — '+fmt(retIncome)+'/mo projected</span>';
+  h+='<span>of '+fmt(CPLAN.income)+'/mo current</span></div>';
+  if(replacePct<80)h+='<div style="font-size:10px;color:var(--yl);margin-top:4px">Gap: '+fmt(Math.round(CPLAN.income*0.8-retIncome))+'/mo to reach 80% target</div>';
+  else if(replacePct>100)h+='<div style="font-size:10px;color:var(--gr);margin-top:4px">Surplus: '+fmt(retIncome-CPLAN.income)+'/mo above current income</div>';
+  h+='</div>';
+  el.innerHTML=h;
+}
+
+function _cpRenderStressTests(){
+  var el=document.getElementById('cplanStressTests');if(!el)return;
+  if(!_cpTierHas('stress_tests')){el.innerHTML=_cpUpgradeHint('Stress Tests','pro_plus');return;}
+  if(CPLAN.income<=0||!CPLAN.allocations.some(function(a){return a.amount>0;})){el.innerHTML='';return;}
+  var yrs=20;
+  // Base plan projection
+  function projectPlan(incMult,rateMult,efShock,durationLoss){
+    var total=0;
+    CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;
+      var rate=_cpGetNetRate(a)*rateMult;var cf=_cpGetCF(a);var bal=0;
+      var adjAmt=a.amount*incMult;
+      for(var y=1;y<=yrs;y++){
+        var contrib=(y<=durationLoss)?0:adjAmt*12*cf;
+        if((a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target)contrib=0;
+        bal=(bal+contrib)*(1+rate);
+      }
+      if(a.type!=='debt')total+=bal;
+    });
+    total-=CPLAN.totalDebt;total-=efShock;
+    return Math.round(total);
+  }
+  var basePlan=projectPlan(1,1,0,0);
+  var scenarios=[
+    {icon:'💼',label:'Job loss (6 months)',desc:'No contributions for 6 months',val:projectPlan(1,1,0,0.5),color:'var(--or)'},
+    {icon:'📉',label:'Market crash (−30%)',desc:'All growth rates cut 30% permanently',val:projectPlan(1,0.7,0,0),color:'var(--rd)'},
+    {icon:'🚨',label:'$10k emergency',desc:'Unexpected expense depletes savings',val:projectPlan(1,1,10000,0),color:'var(--yl)'},
+    {icon:'📊',label:'Reduced income (−20%)',desc:'Permanent 20% income reduction',val:projectPlan(0.8,1,0,0),color:'var(--or)'}
+  ];
+  var h='<div style="padding:14px 16px">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">What happens to this plan if...</div>';
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
+  scenarios.forEach(function(s){
+    var diff=s.val-basePlan;var pctDiff=basePlan>0?Math.round(diff/basePlan*100):0;
+    h+='<div style="padding:12px;background:rgba(0,68,191,.03);border:1px solid rgba(0,68,191,.08);border-radius:2px">';
+    h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:14px">'+s.icon+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">'+s.label+'</span></div>';
+    h+='<div style="font-family:var(--fd);font-size:20px;color:'+s.color+'">'+fmtK(s.val)+'</div>';
+    h+='<div style="font-size:10px;color:var(--mu)">'+s.desc+'</div>';
+    h+='<div style="font-size:10px;color:'+(diff<0?'var(--rd)':'var(--gr)')+';margin-top:3px">'+fmtK(diff)+' ('+pctDiff+'%) vs base plan</div>';
+    h+='</div>';
+  });
+  h+='</div>';
+  h+='<div style="font-size:10px;color:var(--mu);margin-top:8px;text-align:center">Base plan projection (20yr): <strong style="color:#5B9BFF">'+fmtK(basePlan)+'</strong></div>';
+  h+='</div>';
+  el.innerHTML=h;
+}
+
+function _cpRenderRebalanceTriggers(){
+  var el=document.getElementById('cplanRebalance');if(!el)return;
+  if(!_cpTierHas('rebalance')){el.innerHTML='';return;}
+  if(CPLAN.income<=0){el.innerHTML='';return;}
+  var triggers=[];
+  // EF complete — redirect to growth
+  var efAlloc=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
+  if(efAlloc&&CPLAN.efBal>=CPLAN.efTarget)triggers.push({icon:'✅',text:'Emergency fund is fully funded. Consider redirecting '+fmt(efAlloc.amount)+'/mo to growth.',action:'Move EF allocation to investing'});
+  // Debt paid off — redirect
+  if(CPLAN.totalDebt<=0){var dAlloc=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});if(dAlloc)triggers.push({icon:'🎉',text:'All debts paid off! Redirect '+fmt(dAlloc.amount)+'/mo from debt to retirement or investing.',action:'Move debt allocation'});}
+  // Below match threshold
+  if(CPLAN.employer){var k401=CPLAN.allocations.find(function(a){return a.type==='401k';});if(!k401||k401.amount===0)triggers.push({icon:'💰',text:'You\'re not capturing your employer match. This is the highest guaranteed return available.',action:'Start 401(k) contribution'});}
+  // Income change detection (if stored)
+  if(CPLAN._lastIncome&&Math.abs(CPLAN.income-CPLAN._lastIncome)/CPLAN._lastIncome>0.1)triggers.push({icon:'📊',text:'Your income changed by more than 10% since last plan. Consider reviewing allocations.',action:'Review allocations'});
+  // Annual review
+  try{var savedPlan=APP._portalFd&&APP._portalFd.allocation_plan;if(savedPlan&&savedPlan.created){var daysSince=Math.round((Date.now()-new Date(savedPlan.created).getTime())/86400000);if(daysSince>330)triggers.push({icon:'📅',text:'Your plan was created '+Math.round(daysSince/30)+' months ago. Annual review recommended.',action:'Review plan'});}}catch(e){}
+  if(!triggers.length){el.innerHTML='';return;}
+  var h='<div style="padding:12px 16px">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--yl);margin-bottom:8px">Rebalancing Triggers</div>';
+  triggers.forEach(function(t){
+    h+='<div style="display:flex;align-items:flex-start;gap:8px;padding:8px 0;border-bottom:1px solid rgba(234,179,8,.08);font-size:11px">';
+    h+='<span style="font-size:14px;flex-shrink:0">'+t.icon+'</span>';
+    h+='<div style="flex:1;color:var(--mu);line-height:1.5">'+t.text+'</div>';
+    h+='</div>';
+  });
+  h+='</div>';
+  el.innerHTML=h;
+}
+
+function _cpRenderOutcomes(){
+  var el=document.getElementById('cplanOutcomes');if(!el)return;
+  var active=CPLAN.allocations.filter(function(a){return a.amount>0;});
+  if(!active.length){el.innerHTML='';return;}
+  var allocated=active.reduce(function(t,a){return t+a.amount;},0);
+  var unalloc=Math.max(0,CPLAN.surplus-allocated);
+  var h='';
+
+  // ── 1. Cash Flow Waterfall ──
+  h+='<div class="info-card" style="padding:16px;margin-bottom:10px">';
+  h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Cash Flow Waterfall</div>';
+  var wfItems=[
+    {label:'Monthly Income',val:CPLAN.income,col:'var(--gr)',pct:100},
+    {label:'Expenses',val:-CPLAN.expenses,col:'var(--rd)',pct:CPLAN.income>0?Math.round(CPLAN.expenses/CPLAN.income*100):0},
+    {label:'Available Surplus',val:CPLAN.surplus,col:'#5B9BFF',pct:CPLAN.income>0?Math.round(CPLAN.surplus/CPLAN.income*100):0}
+  ];
+  wfItems.forEach(function(w){
+    h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">';
+    h+='<span style="font-size:11px;color:var(--mu);min-width:110px">'+w.label+'</span>';
+    h+='<div style="flex:1;height:16px;background:rgba(0,68,191,.04);border-radius:2px;overflow:hidden;position:relative"><div style="height:100%;width:'+Math.abs(w.pct)+'%;background:'+w.col+';opacity:0.25;border-radius:2px"></div></div>';
+    h+='<span style="font-family:var(--fd);font-size:13px;color:'+w.col+';min-width:70px;text-align:right">'+(w.val>=0?'+':'')+fmt(w.val)+'</span>';
+    h+='</div>';
+  });
+  // Allocation breakdown within surplus
+  h+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(0,68,191,.08)">';
+  h+='<div style="font-size:10px;color:var(--mu);margin-bottom:6px">Surplus deployment ('+fmt(allocated)+' of '+fmt(CPLAN.surplus)+' allocated — '+(CPLAN.surplus>0?Math.round(allocated/CPLAN.surplus*100):0)+'%)</div>';
+  h+='<div style="height:10px;display:flex;border-radius:2px;overflow:hidden;background:rgba(0,68,191,.04)">';
+  active.forEach(function(a){
+    var w2=CPLAN.surplus>0?Math.max(1,Math.round(a.amount/CPLAN.surplus*100)):0;
+    h+='<div style="height:100%;width:'+w2+'%;background:'+CP_COL[a.type]+';opacity:0.5" title="'+(a.customName||CP_NM[a.type])+': '+fmt(a.amount)+'"></div>';
+  });
+  if(unalloc>0){h+='<div style="height:100%;width:'+Math.round(unalloc/CPLAN.surplus*100)+'%;background:rgba(100,116,139,.15)" title="Unallocated: '+fmt(unalloc)+'"></div>';}
+  h+='</div>';
+  h+='<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px">';
+  active.forEach(function(a){h+='<span style="font-size:9px;color:var(--mu)"><span style="display:inline-block;width:8px;height:8px;border-radius:1px;background:'+CP_COL[a.type]+';opacity:0.5;margin-right:3px;vertical-align:middle"></span>'+(a.customName||CP_NM[a.type])+' '+fmt(a.amount)+'</span>';});
+  if(unalloc>0)h+='<span style="font-size:9px;color:var(--mu)"><span style="display:inline-block;width:8px;height:8px;border-radius:1px;background:rgba(100,116,139,.15);margin-right:3px;vertical-align:middle"></span>Unallocated '+fmt(unalloc)+'</span>';
+  h+='</div></div></div>';
+
+  // ── 2. Projected Outcomes ──
+  var nw5=-CPLAN.totalDebt,nw10=-CPLAN.totalDebt,nw20=-CPLAN.totalDebt,nw30=-CPLAN.totalDebt,retIncome=0;
+  active.forEach(function(a){var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var b5=0,b10=0,b20=0,b30=0;for(var y=1;y<=30;y++){var c2=a.amount*12*cf;if(y<=5)b5=(b5+c2)*(1+rate);if(y<=10)b10=(b10+c2)*(1+rate);if(y<=20)b20=(b20+c2)*(1+rate);b30=(b30+c2)*(1+rate);}nw5+=b5;nw10+=b10;nw20+=b20;nw30+=b30;if(a.type!=='ef'&&a.type!=='debt'&&a.type!=='house')retIncome+=Math.round(b30*0.04/12);});
+  h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">';
+  [{y:'YR 5',v:nw5},{y:'YR 10',v:nw10},{y:'YR 20',v:nw20},{y:'YR 30',v:nw30}].forEach(function(p){h+='<div class="info-card" style="text-align:center;padding:10px"><div style="font-size:8px;color:var(--mu);font-family:var(--fh);font-weight:700">'+p.y+'</div><div style="font-family:var(--fd);font-size:16px;color:var(--gr)">'+fmtK(Math.round(p.v))+'</div></div>';});
+  h+='</div>';
+  h+='<div class="info-card" style="text-align:center;padding:10px;margin-bottom:10px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700">EST. RETIREMENT INCOME (4% rule)</div><div style="font-family:var(--fd);font-size:20px;color:var(--wh)">'+fmt(retIncome)+'/mo</div></div>';
+
+  // ── 3. Per-Allocation Year-by-Year Table ──
+  h+='<div class="info-card" style="padding:14px;margin-bottom:10px">';
+  h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Per-Strategy Projections</div>';
+  h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:11px">';
+  h+='<tr style="border-bottom:1px solid rgba(0,68,191,.1)"><th style="text-align:left;padding:4px 6px;color:var(--mu);font-family:var(--fh);font-weight:700;font-size:9px">Strategy</th><th style="text-align:right;padding:4px 6px;color:var(--mu);font-size:9px">/mo</th><th style="text-align:right;padding:4px 6px;color:var(--mu);font-size:9px">Rate</th><th style="text-align:right;padding:4px 6px;color:var(--mu);font-size:9px">Yr 5</th><th style="text-align:right;padding:4px 6px;color:var(--mu);font-size:9px">Yr 10</th><th style="text-align:right;padding:4px 6px;color:var(--mu);font-size:9px">Yr 20</th><th style="text-align:right;padding:4px 6px;color:var(--mu);font-size:9px">Yr 30</th></tr>';
+  active.forEach(function(a){
+    var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var b5=0,b10=0,b20=0,b30=0;
+    for(var y=1;y<=30;y++){var c2=a.amount*12*cf;if(y<=5)b5=(b5+c2)*(1+rate);if(y<=10)b10=(b10+c2)*(1+rate);if(y<=20)b20=(b20+c2)*(1+rate);b30=(b30+c2)*(1+rate);}
+    var icon=CP_IC[a.type]||'📌';
+    h+='<tr style="border-bottom:1px solid rgba(0,68,191,.05)"><td style="padding:5px 6px;color:var(--wh);font-family:var(--fh);font-weight:700"><span style="margin-right:4px">'+icon+'</span>'+(a.customName||CP_NM[a.type])+'</td>';
+    h+='<td style="text-align:right;padding:5px 6px;color:var(--mu);font-family:var(--fd)">'+fmt(a.amount)+'</td>';
+    h+='<td style="text-align:right;padding:5px 6px;color:var(--mu);font-family:var(--fd)">'+(rate*100).toFixed(1)+'%</td>';
+    h+='<td style="text-align:right;padding:5px 6px;color:var(--gr);font-family:var(--fd)">'+fmtK(Math.round(b5))+'</td>';
+    h+='<td style="text-align:right;padding:5px 6px;color:var(--gr);font-family:var(--fd)">'+fmtK(Math.round(b10))+'</td>';
+    h+='<td style="text-align:right;padding:5px 6px;color:var(--gr);font-family:var(--fd)">'+fmtK(Math.round(b20))+'</td>';
+    h+='<td style="text-align:right;padding:5px 6px;color:var(--gr);font-family:var(--fd);font-weight:700">'+fmtK(Math.round(b30))+'</td></tr>';
+  });
+  // Total row
+  h+='<tr style="border-top:2px solid rgba(91,155,255,.2)"><td style="padding:5px 6px;color:#5B9BFF;font-family:var(--fh);font-weight:700">Total</td>';
+  h+='<td style="text-align:right;padding:5px 6px;color:#5B9BFF;font-family:var(--fd);font-weight:700">'+fmt(allocated)+'</td><td></td>';
+  h+='<td style="text-align:right;padding:5px 6px;color:#5B9BFF;font-family:var(--fd);font-weight:700">'+fmtK(Math.round(nw5+CPLAN.totalDebt))+'</td>';
+  h+='<td style="text-align:right;padding:5px 6px;color:#5B9BFF;font-family:var(--fd);font-weight:700">'+fmtK(Math.round(nw10+CPLAN.totalDebt))+'</td>';
+  h+='<td style="text-align:right;padding:5px 6px;color:#5B9BFF;font-family:var(--fd);font-weight:700">'+fmtK(Math.round(nw20+CPLAN.totalDebt))+'</td>';
+  h+='<td style="text-align:right;padding:5px 6px;color:#5B9BFF;font-family:var(--fd);font-weight:700">'+fmtK(Math.round(nw30+CPLAN.totalDebt))+'</td></tr>';
+  h+='</table></div></div>';
+
+  // ── 4. Tax Efficiency Summary ──
+  h+='<div class="info-card" style="padding:14px">';
+  h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Tax Efficiency</div>';
+  var taxFree=active.filter(function(a){return a.type==='roth'||a.type==='iul';}).reduce(function(t,a){return t+a.amount;},0);
+  var taxDef=active.filter(function(a){return a.type==='401k';}).reduce(function(t,a){return t+a.amount;},0);
+  var taxable=active.filter(function(a){return a.type==='invest'||a.type==='house';}).reduce(function(t,a){return t+a.amount;},0);
+  var taxEffItems=[
+    {label:'Tax-Free Growth (Roth, IUL)',val:taxFree,col:'var(--gr)'},
+    {label:'Tax-Deferred (401k)',val:taxDef,col:'var(--yl)'},
+    {label:'Tax-Advantaged (WL)',val:active.filter(function(a){return a.type==='wl';}).reduce(function(t,a){return t+a.amount;},0),col:'#C084FC'},
+    {label:'Taxable (Invest, House)',val:taxable,col:'var(--or)'}
+  ];
+  taxEffItems.forEach(function(te){
+    if(te.val<=0)return;
+    var pctTe=allocated>0?Math.round(te.val/allocated*100):0;
+    h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+    h+='<span style="font-size:10px;color:var(--mu);min-width:160px">'+te.label+'</span>';
+    h+='<div style="flex:1;height:8px;background:rgba(0,68,191,.04);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+pctTe+'%;background:'+te.col+';opacity:0.4;border-radius:2px"></div></div>';
+    h+='<span style="font-family:var(--fd);font-size:11px;color:'+te.col+';min-width:55px;text-align:right">'+fmt(te.val)+' ('+pctTe+'%)</span>';
+    h+='</div>';
+  });
+  h+='</div>';
+
+  el.innerHTML=h;
+}
+
+function _cpRunSimulation(){
+  var years=30;
+  var maxMonths=years*12;
+
+  // ── 1. Calculate cascade events ──
+  var events=[];
+  // EF completion
+  var efA=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
+  var efRemaining=Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0));
+  if(efA&&efRemaining>0){
+    var efMo=Math.ceil(efRemaining/efA.amount);
+    events.push({month:efMo,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF funded'});
+  } else if(efA&&efRemaining<=0){
+    // EF already funded — immediately free
+    events.push({month:0,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF already funded'});
+  }
+  // Debt completion — only accelerate high-rate debts (>10% APR)
+  var _RATE_THRESHOLD=10;
+  var debtA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
+  var allDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0;});
+  var hiRateDebts=allDebts.filter(function(d){return(parseFloat(d.rate)||0)>_RATE_THRESHOLD;});
+  var loRateDebts=allDebts.filter(function(d){return(parseFloat(d.rate)||0)<=_RATE_THRESHOLD;});
+  var hiRateMin=hiRateDebts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
+  var totalDebtMin=allDebts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
+  var debtSim=null;
+  if(debtA&&hiRateDebts.length>0){
+    var debtSorted=_cpDebtSort(hiRateDebts,CPLAN.debtStrategy||'avalanche');
+    debtSim=_cpDebtSimulate(debtSorted,debtA.amount);
+    // IBC debt strategy: IBC premium continues as growth vehicle after debt payoff
+    var _ibcPremiumPortion=0;
+    if(CPLAN.debtStrategy==='ibc'&&debtA.amount>0){
+      // IBC premium = ~35% of debt allocation (or user-set _ibcPremium)
+      _ibcPremiumPortion=debtA._ibcPremium||Math.round(debtA.amount*0.35);
+      // Only the actual credit card payment portion gets freed (extra + minimums), NOT the IBC premium
+      var _creditCardFreed=Math.max(0,debtA.amount-_ibcPremiumPortion)+hiRateMin;
+      // Calculate CV = AV recovery: freed minimums repay policy loans before redistributing
+      var _totalLoans=hiRateDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+      var _loanRate=0.05/12;// 5% policy loan rate
+      var _loanBal=_totalLoans;
+      var _cvAvMonths=0;
+      for(var _lm=0;_lm<360&&_loanBal>0;_lm++){
+        _loanBal=_loanBal*(1+_loanRate)-_creditCardFreed;
+        if(_loanBal<=0){_cvAvMonths=_lm+1;break;}
+      }
+      var _cvAvRecoveryMonth=debtSim.months+_cvAvMonths;
+      // Event 1: At debt-free — IBC premium continues, but freed mins go to loan repayment (freed=0 for redistribution)
+      events.push({month:debtSim.months,type:'debt',freed:0,cascade:'',label:'High-rate debt free — freed minimums repaying IBC policy loans',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion,_ibcLoanRepayment:_creditCardFreed});
+      // Event 2: At CV=AV recovery — NOW freed minimums redistribute to growth
+      if(_cvAvRecoveryMonth>debtSim.months){
+        events.push({month:_cvAvRecoveryMonth,type:'ibc_recovery',freed:_creditCardFreed,cascade:debtA.cascade,label:'IBC loans repaid (CV=AV) — freed minimums now redistributing',_ibcRecovery:true});
+      } else {
+        // Instant recovery (unlikely but handle gracefully)
+        events.push({month:debtSim.months,type:'debt',freed:_creditCardFreed,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion});
+      }
+    } else {
+      // Non-IBC: full debt allocation + minimums freed
+      events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order});
+    }
+    debtSim.order.forEach(function(o){events.push({month:o.month,type:'debt_milestone',freed:0,cascade:'',label:o.name+' paid off'});});
+  } else if(debtA&&hiRateDebts.length===0&&allDebts.length>0){
+    // No high-rate debt — all debt is low-rate, don't accelerate. Free the debt allocation immediately.
+    events.push({month:0,type:'debt',freed:debtA.amount,cascade:debtA.cascade,label:'No high-rate debt — extra redirected to growth'});
+  }
+  // Custom/house goal completions
+  CPLAN.allocations.forEach(function(a,i){
+    if((a.type==='custom'||a.type==='house')&&a.target>0&&a.amount>0){
+      var mo=Math.ceil(Math.max(0,(a.target-(a.goalCurrent||0)))/a.amount);
+      events.push({month:mo,type:a.type,freed:a.amount,cascade:a.cascade,label:(a.customName||CP_NM[a.type]||'Goal')+' complete',allocIdx:i});
+    }
+  });
+  events.sort(function(a,b){return a.month-b.month;});
+
+  // ── 2. Distribute freed cash to unfunded/underfunded allocations ──
+  var allocAmounts=CPLAN.allocations.map(function(a){return a.amount;});
+  var allocFuture=CPLAN.allocations.map(function(a,i){return{idx:i,type:a.type,currentAmount:a.amount,futureAmount:a.amount,startsMonth:a.amount>0?0:-1,reason:'',boosts:[]};});
+  // Track cascade distributions
+  var cascadeLog=[];
+  events.forEach(function(ev){
+    if(ev.freed<=0||ev.type==='debt_milestone')return;
+    var freed=ev.freed;var destinations=[];
+    // IBC debt strategy: reclassify IBC premium as growth allocation when debt completes
+    if(ev._ibcContinues&&ev._ibcContinues>0){
+      var ibcIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='ibc'&&ibcIdx<0)ibcIdx=i2;});
+      if(ibcIdx<0){
+        // No existing IBC allocation — find the debt allocation and note the continuation
+        var dIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='debt'&&dIdx<0)dIdx=i2;});
+        if(dIdx>=0){
+          allocFuture[dIdx].boosts.push({month:ev.month,amount:ev._ibcContinues,from:'IBC premium continues as growth vehicle'});
+          allocFuture[dIdx]._ibcContinuation=ev._ibcContinues;
+        }
+      } else {
+        // Add to existing IBC allocation
+        allocAmounts[ibcIdx]+=ev._ibcContinues;
+        allocFuture[ibcIdx].futureAmount=allocAmounts[ibcIdx];
+        allocFuture[ibcIdx].boosts.push({month:ev.month,amount:ev._ibcContinues,from:'IBC premium reclassified from debt payoff to pure growth'});
+        destinations.push({type:'ibc',name:'IBC (continued)',amount:ev._ibcContinues});
+      }
+    }
+    // Specific cascade target
+    if(ev.cascade){
+      var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0)tIdx=i2;});
+      if(tIdx>=0){
+        var irsMax=_cpIRSMax(CPLAN.allocations[tIdx].type);
+        var maxAdd=Math.max(0,irsMax-allocAmounts[tIdx]);
+        var add=Math.min(freed,maxAdd);
+        if(add>0){
+          allocAmounts[tIdx]+=add;
+          if(allocFuture[tIdx].startsMonth<0)allocFuture[tIdx].startsMonth=ev.month;
+          allocFuture[tIdx].futureAmount=allocAmounts[tIdx];
+          allocFuture[tIdx].reason=ev.label;
+          allocFuture[tIdx].boosts.push({month:ev.month,amount:add,from:ev.label});
+          destinations.push({type:CPLAN.allocations[tIdx].type,name:CPLAN.allocations[tIdx].customName||CP_NM[CPLAN.allocations[tIdx].type],amount:add});
+          freed-=add;
+        }
+      }
+    }
+    // Remaining: first boost existing growth allocations, then fund unfunded items
+    if(freed>0){
+      // Priority: INCREASE existing growth allocations (they're already compounding)
+      var growth=CPLAN.allocations.map(function(a5,i5){return{a:a5,i:i5};})
+        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;})
+        .sort(function(a6,b6){return(a6.a.phase||99)-(b6.a.phase||99);});
+      if(growth.length>0){
+        // Distribute proportionally to current allocation amounts (not equal split)
+        var _growthTotal=growth.reduce(function(t,g){return t+allocAmounts[g.i];},0);
+        growth.forEach(function(g){
+          if(freed<=0)return;
+          var proportion=_growthTotal>0?allocAmounts[g.i]/_growthTotal:(1/growth.length);
+          var per=Math.round(freed*proportion);
+          var irsMax3=_cpIRSMax(g.a.type);
+          var add3=Math.min(per,Math.max(0,irsMax3-allocAmounts[g.i]));
+          if(add3>0){
+            allocAmounts[g.i]+=add3;
+            allocFuture[g.i].futureAmount=allocAmounts[g.i];
+            allocFuture[g.i].boosts.push({month:ev.month,amount:add3,from:ev.label});
+            destinations.push({type:g.a.type,name:g.a.customName||CP_NM[g.a.type],amount:add3});
+            freed-=add3;
+          }
+        });
+      }
+    }
+    // Then: fund any remaining unfunded growth items (skip action-only items)
+    if(freed>0){
+      var unfunded=CPLAN.allocations.map(function(a3,i3){return{a:a3,i:i3};})
+        .filter(function(x){
+          if(allocAmounts[x.i]>0||x.a._completed)return false;
+          if(x.a.type==='protection')return false;
+          if(x.a.type==='custom'&&(!x.a.target||x.a.target<=0))return false;
+          return['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;
+        })
+        .sort(function(a4,b4){return(a4.a.phase||99)-(b4.a.phase||99);});
+      unfunded.forEach(function(uf){
+        if(freed<=0)return;
+        var irsMax2=_cpIRSMax(uf.a.type);
+        var add2=Math.min(freed,irsMax2);
+        allocAmounts[uf.i]+=add2;
+        allocFuture[uf.i].futureAmount=add2;
+        allocFuture[uf.i].startsMonth=ev.month;
+        allocFuture[uf.i].reason=ev.label;
+        allocFuture[uf.i].boosts.push({month:ev.month,amount:add2,from:ev.label});
+        destinations.push({type:uf.a.type,name:uf.a.customName||CP_NM[uf.a.type],amount:add2});
+        freed-=add2;
+      });
+    }
+    if(destinations.length>0){
+      cascadeLog.push({month:ev.month,source:ev.label,freed:ev.freed,destinations:destinations});
+    }
+  });
+
+  // ── 3. Build year-by-year net worth trajectory with cascade-adjusted amounts ──
+  var netWorthData=[];var baselineData=[];
+  // Debt amortization data — separate high-rate (accelerated) from low-rate (min only)
+  var hiRateTotal=hiRateDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+  var loRateTotal=loRateDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+  var loRateMin=loRateDebts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
+  var avgHiRate=hiRateTotal>0?hiRateDebts.reduce(function(t,d){return t+((parseFloat(d.rate)||0)/100/12)*(parseFloat(d.balance)||0);},0)/hiRateTotal:0;
+  var avgLoRate=loRateTotal>0?loRateDebts.reduce(function(t,d){return t+((parseFloat(d.rate)||0)/100/12)*(parseFloat(d.balance)||0);},0)/loRateTotal:0;
+  var avgAllRate=CPLAN.totalDebt>0?allDebts.reduce(function(t,d){return t+((parseFloat(d.rate)||0)/100/12)*(parseFloat(d.balance)||0);},0)/CPLAN.totalDebt:0;
+  var hiRatePmt=debtA?(debtA.amount+hiRateMin):hiRateMin;// Extra + high-rate minimums
+  // Per-allocation balance tracking for chart bands
+  var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt')allocSeries[a.type+'_'+i]=[];});
+  var _retOnlyByYear={};
+  var retirementData=[];
+  // Home equity tracking — get home value from profile if homeowner
+  var _rawS2=(APP._portalFd&&APP._portalFd.S)||{};
+  var _homeValue=parseFloat((_rawS2.assets&&_rawS2.assets.re)||0);
+  var _homeAppreciation=0.035;// 3.5% annual appreciation
+  var _mortgageBal=loRateDebts.filter(function(d){var nm=(d.name||d.type||'').toLowerCase();return nm.indexOf('house')>=0||nm.indexOf('mortgage')>=0||nm.indexOf('home')>=0;}).reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+
+  for(var yr=0;yr<=years;yr++){
+    // Baseline: idle cash at 0%, ALL debt with min payments only
+    var baseCash=CPLAN.surplus*12*yr;
+    var baseDebt=CPLAN.totalDebt;
+    for(var bdm=0;bdm<yr*12;bdm++){baseDebt=Math.max(0,baseDebt*(1+avgAllRate)-totalDebtMin);if(baseDebt<1)baseDebt=0;}
+    baselineData.push(Math.round(baseCash-baseDebt));
+
+    // Plan: each allocation grows with cascade-adjusted amounts
+    var totalAssets=0;
+    CPLAN.allocations.forEach(function(a,idx){
+      if(a.type==='debt')return;// Debt handled via -remDebt
+      var af=allocFuture[idx];
+      var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);
+      var bal=0;
+      for(var m=1;m<=yr*12;m++){
+        var monthlyAmt=af.currentAmount;
+        af.boosts.forEach(function(b){if(m>=b.month)monthlyAmt=af.futureAmount;});
+        if((a.type==='ef'||a.type==='house'||a.type==='custom')&&a.target>0&&bal>=a.target){monthlyAmt=0;}
+        var contrib=monthlyAmt*cf;
+        bal=(bal+contrib)*(1+(rate/12));
+      }
+      var key=a.type+'_'+idx;
+      if(allocSeries[key])allocSeries[key].push(Math.round(bal));
+      totalAssets+=bal;
+      // Track retirement-only assets separately
+      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'].indexOf(a.type)>=0){
+        if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
+        _retOnlyByYear[yr]+=bal;
+      }
+    });
+    // Remaining high-rate debt (accelerated payments)
+    var remHi=hiRateTotal;
+    for(var dm=0;dm<yr*12;dm++){remHi=Math.max(0,remHi*(1+avgHiRate)-hiRatePmt);if(remHi<1)remHi=0;}
+    // Remaining low-rate debt (minimum payments only — mortgage, auto, student)
+    var remLo=loRateTotal;
+    for(var dm2=0;dm2<yr*12;dm2++){remLo=Math.max(0,remLo*(1+avgLoRate)-loRateMin);if(remLo<1)remLo=0;}
+    var unBal=Math.max(0,CPLAN.surplus-CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0))*12*yr;
+    // Home equity for NW: home value appreciates, mortgage amortizes
+    var _homeEq=0;
+    if(_homeValue>0){
+      var _curHomeVal=Math.round(_homeValue*Math.pow(1+_homeAppreciation,yr));
+      var _remMortgage=_mortgageBal;
+      var _mortRate=avgLoRate>0?avgLoRate:0.052/12;
+      var _mortPmt=loRateMin>0?loRateMin:0;
+      for(var _hm=0;_hm<yr*12;_hm++){_remMortgage=Math.max(0,_remMortgage*(1+_mortRate)-_mortPmt);if(_remMortgage<1)_remMortgage=0;}
+      _homeEq=Math.max(0,_curHomeVal-_remMortgage);
+    }
+    netWorthData.push(Math.round(totalAssets+unBal-remHi-remLo+_homeEq));
+    // Retirement-only projection (excludes edu, invest bridge, EF, custom goals, home equity)
+    retirementData.push(Math.round(_retOnlyByYear[yr]||0));
+  }
+
+  // ── 4. Calculate trajectory metrics for health score ──
+  var fullFundingMonth=0;
+  var allItemsFunded=true;
+  allocFuture.forEach(function(af){if(af.startsMonth<0&&CPLAN.allocations[af.idx].type!=='debt'&&CPLAN.allocations[af.idx].type!=='ef'&&!CPLAN.allocations[af.idx]._completed){allItemsFunded=false;}});
+  if(!allItemsFunded){
+    var lastStart=0;allocFuture.forEach(function(af){if(af.startsMonth>lastStart)lastStart=af.startsMonth;});
+    fullFundingMonth=lastStart;
+  }
+  var debtFreeMonth=debtSim?debtSim.months:0;
+  // Retirement projection — use retirement-only data at retirement age (not full NW)
+  var _retAge=65;var _yrsToRet=Math.max(1,Math.min(years,_retAge-(CPLAN.age||35)));
+  var projRetValue=retirementData[_yrsToRet]||retirementData[years]||0;
+  var projRetIncome=Math.round(projRetValue*0.04/12);// 4% safe withdrawal rule
+
+  // Store result
+  CPLAN._sim={
+    netWorth:netWorthData,
+    retirement:retirementData,
+    baseline:baselineData,
+    allocFuture:allocFuture,
+    allocSeries:allocSeries,
+    cascadeLog:cascadeLog,
+    events:events,
+    debtFreeMonth:debtFreeMonth,
+    fullFundingMonth:fullFundingMonth,
+    projRetValue:projRetValue,
+    projRetIncome:projRetIncome
+  };
+  return CPLAN._sim;
+}
+
+function _cpRenderChart(targetId){
+  var el=document.getElementById(targetId||'cplanChart');if(!el)return;
+  if(!CPLAN._chartView)CPLAN._chartView='nw';
+  var _isRetView=CPLAN._chartView==='retirement';
+  var _retTypes=['roth','401k','roth401k','iul','wl','trad_ira','solo401k','sep_ira','hsa','ibc'];
+  var _chartGrowthTypes=_isRetView?_retTypes:['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','ef','house','rental'];
+  var active=CPLAN.allocations.filter(function(a){
+    if(a.type==='protection'||a.type==='debt')return false;
+    if(a.type==='custom'&&a.amount===0)return false;
+    if(_isRetView&&_retTypes.indexOf(a.type)<0)return false;// Retirement view: only retirement vehicles
+    if(_chartGrowthTypes.indexOf(a.type)<0&&a.type!=='custom')return false;
+    if(a.amount>0)return true;
+    if(CPLAN._sim&&CPLAN._sim.allocFuture){var idx=CPLAN.allocations.indexOf(a);return CPLAN._sim.allocFuture[idx]&&CPLAN._sim.allocFuture[idx].futureAmount>0;}
+    return false;
+  });
+  if(!active.length&&!CPLAN._sim){el.innerHTML='';return;}
+  // ── Chart toggle: Net Worth vs Retirement ──
+  var _toggleH='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+  _toggleH+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">'+(_isRetView?'RETIREMENT PROJECTION':'NET WORTH PROJECTION')+'</div>';
+  _toggleH+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
+  var _chartTarget=targetId?("'"+targetId+"'"):'';
+  _toggleH+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:9px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
+  _toggleH+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:9px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
+  _toggleH+='</div></div>';
+  var W=600,H=260,padL=50,padR=55,padT=24,padB=28;var years=30;
+
+  // ── Use simulation data if available, else fall back to static ──
+  var sim=CPLAN._sim;
+  var baselineData,totalData,rawSeries;
+  if(sim&&sim.netWorth&&sim.netWorth.length>0){
+    baselineData=sim.baseline;
+    totalData=_isRetView?(sim.retirement||sim.netWorth):sim.netWorth;
+    // Build rawSeries from sim.allocSeries for displacement bands
+    rawSeries={};
+    active.forEach(function(a,aIdx){
+      var key=a.type+'_'+CPLAN.allocations.indexOf(a);
+      rawSeries[a.type]=sim.allocSeries[key]||[];
+    });
+  } else {
+    // Fallback: static calculation (same as before but without debt double-count)
+    var allocatedTotal=active.reduce(function(t,a){return t+a.amount;},0);
+    var unallocated=Math.max(0,CPLAN.surplus-allocatedTotal);
+    var debtAlloc=active.find(function(a){return a.type==='debt';});
+    var debtMonthlyPmt=(debtAlloc?(debtAlloc.amount+CPLAN.debtMin):CPLAN.debtMin)||0;
+    var avgDebtRate=0;
+    if(CPLAN.totalDebt>0&&CPLAN.debts.length){avgDebtRate=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.rate)||0)*(parseFloat(d.balance)||0);},0)/CPLAN.totalDebt/100/12;}
+    baselineData=[];totalData=[];rawSeries={};
+    active.forEach(function(a){rawSeries[a.type]=[];});
+    for(var yr=0;yr<=years;yr++){
+      var baseCash=CPLAN.surplus*12*yr;
+      var baseDebt=CPLAN.totalDebt;
+      for(var bdm=0;bdm<yr*12;bdm++){baseDebt=Math.max(0,baseDebt*(1+avgDebtRate)-CPLAN.debtMin);if(baseDebt<1)baseDebt=0;}
+      baselineData.push(Math.round(baseCash-baseDebt));
+      var total=0;
+      active.forEach(function(a){
+        if(a.type==='debt'){rawSeries[a.type].push(0);return;}// Debt value handled by -remDebt
+        var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var bal=0;
+        for(var y2=1;y2<=yr;y2++){var c2=(a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target?0:a.amount*12*cf;bal=(bal+c2)*(1+rate);}
+        rawSeries[a.type].push(Math.round(bal));total+=bal;
+      });
+      var remDebt=CPLAN.totalDebt;
+      for(var dm=0;dm<yr*12;dm++){remDebt=Math.max(0,remDebt*(1+avgDebtRate)-debtMonthlyPmt);if(remDebt<1)remDebt=0;}
+      var unBal=unallocated*12*yr;
+      totalData.push(Math.round(total+unBal-remDebt));
+    }
+  }
+
+  // ── Scale — include both lines + simulated if present ──
+  var allVals=baselineData.concat(totalData);
+  var simData=CPLAN._sim&&CPLAN._sim._simulated&&!_isRetView?CPLAN._sim._simulated:(CPLAN._sim&&CPLAN._sim._simulatedRet&&_isRetView?CPLAN._sim._simulatedRet:null);
+  if(simData)allVals=allVals.concat(simData);
+  var minV=Math.min.apply(null,allVals);var maxV=Math.max.apply(null,allVals);if(maxV===minV)maxV=minV+1;
+  var cW=W-padL-padR,cH=H-padT-padB;
+  function x(yr4){return padL+yr4/years*cW;}
+  function yf(v){return padT+cH-(v-minV)/(maxV-minV)*cH;}
+
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;display:block;max-height:300px">';
+  for(var g=0;g<=4;g++){var gv=minV+(maxV-minV)*g/4;var gy=yf(gv);svg+='<line x1="'+padL+'" y1="'+gy+'" x2="'+(W-padR)+'" y2="'+gy+'" stroke="rgba(0,68,191,.06)" stroke-width="0.5"/>';svg+='<text x="'+(padL-4)+'" y="'+(gy+3)+'" fill="rgba(100,116,139,.5)" font-size="8" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(gv))+'</text>';}
+  if(minV<0&&maxV>0)svg+='<line x1="'+padL+'" y1="'+yf(0)+'" x2="'+(W-padR)+'" y2="'+yf(0)+'" stroke="rgba(100,116,139,.2)" stroke-width="0.5" stroke-dasharray="3,3"/>';
+  var _chartAge=CPLAN.age||35;
+  [0,5,10,15,20,25,30].forEach(function(yr5){svg+='<text x="'+x(yr5)+'" y="'+(H-padB+14)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="middle" font-family="var(--fh)">Age '+(_chartAge+yr5)+'</text>';});
+
+  // ── Displacement bands: proportioned between baseline and plan ──
+  if(_cpTierHas('displacement_bands')){
+    for(var aIdx2=active.length-1;aIdx2>=0;aIdx2--){
+      var a2=active[aIdx2];var topPts='';var bottomPts='';
+      for(var yr6=0;yr6<=years;yr6++){
+        var bv=baselineData[yr6];var pv=totalData[yr6];var gain=Math.max(0,pv-bv);
+        var totalRaw=0;active.forEach(function(ax){totalRaw+=(rawSeries[ax.type][yr6]||0);});
+        var thisRaw=rawSeries[a2.type][yr6]||0;
+        var share=totalRaw>0?thisRaw/totalRaw:0;
+        var belowShare=0;for(var bi=0;bi<aIdx2;bi++){belowShare+=totalRaw>0?(rawSeries[active[bi].type][yr6]||0)/totalRaw:0;}
+        topPts+=x(yr6)+','+yf(bv+gain*(belowShare+share))+' ';
+        bottomPts=x(yr6)+','+yf(bv+gain*belowShare)+' '+bottomPts;
+      }
+      svg+='<polygon points="'+topPts+bottomPts+'" fill="'+CP_COL[a2.type]+'" opacity="0.22"/>';
+    }
+  } else {
+    var sfT=totalData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
+    var sfB=baselineData.map(function(v,i){return x(years-i)+','+yf(baselineData[years-i]);}).join(' ');
+    svg+='<polygon points="'+sfT+' '+sfB+'" fill="rgba(91,155,255,.06)"/>';
+  }
+
+  // ── Baseline line (dashed) ──
+  var basePts=baselineData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
+  svg+='<polyline points="'+basePts+'" fill="none" stroke="rgba(100,116,139,.35)" stroke-width="1.5" stroke-dasharray="4,3" stroke-linejoin="round"/>';
+  svg+='<text x="'+(W-padR+4)+'" y="'+(yf(baselineData[years])+4)+'" fill="rgba(100,116,139,.6)" font-size="9" font-family="var(--fh)">'+fmtK(baselineData[years])+'</text>';
+
+  // ── Plan total line (solid blue) ──
+  var totalPts=totalData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
+  svg+='<polyline points="'+totalPts+'" fill="none" stroke="#5B9BFF" stroke-width="2.5" stroke-linejoin="round"/>';
+  svg+='<circle cx="'+x(years)+'" cy="'+yf(totalData[years])+'" r="4" fill="#5B9BFF"/>';
+  svg+='<text x="'+(W-padR+4)+'" y="'+(yf(totalData[years])+4)+'" fill="#5B9BFF" font-size="10" font-family="var(--fh)" font-weight="700">'+fmtK(totalData[years])+'</text>';
+
+  // ── Simulated scenario line (if life events active) ──
+  if(simData&&simData.length>0){
+    // Shaded area between plan and simulated
+    var simFill=simData[years]>=totalData[years]?'rgba(34,197,94,.08)':'rgba(239,68,68,.08)';
+    var sfPlanPts=totalData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
+    var sfSimPts=simData.slice().reverse().map(function(v,i){return x(years-i)+','+yf(v);}).join(' ');
+    svg+='<polygon points="'+sfPlanPts+' '+sfSimPts+'" fill="'+simFill+'"/>';
+    // Simulated line
+    var simCol=simData[years]>=totalData[years]?'#22C55E':'#EF4444';
+    var simPts=simData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
+    svg+='<polyline points="'+simPts+'" fill="none" stroke="'+simCol+'" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6,3"/>';
+    svg+='<circle cx="'+x(years)+'" cy="'+yf(simData[years])+'" r="4" fill="'+simCol+'"/>';
+    svg+='<text x="'+(W-padR+4)+'" y="'+(yf(simData[years])+4)+'" fill="'+simCol+'" font-size="9" font-family="var(--fh)" font-weight="700">'+fmtK(simData[years])+'</text>';
+    // Delta label between plan and simulated
+    var simDelta=simData[years]-totalData[years];
+    if(Math.abs(simDelta)>100){
+      var simMidY=(yf(totalData[years])+yf(simData[years]))/2;
+      svg+='<text x="'+(W-padR-20)+'" y="'+simMidY+'" fill="'+simCol+'" font-size="8" font-family="var(--fh)" font-weight="700" text-anchor="end">'+(simDelta>0?'+':'')+fmtK(simDelta)+'</text>';
+    }
+  }
+
+  // ── Gain/loss label between lines ──
+  var planGain=totalData[years]-baselineData[years];
+  if(Math.abs(planGain)>100){
+    var midY2=(yf(totalData[years])+yf(baselineData[years]))/2;
+    svg+='<text x="'+(W-padR+4)+'" y="'+midY2+'" fill="'+(planGain>0?'rgba(34,197,94,.8)':'rgba(239,68,68,.8)')+'" font-size="8" font-family="var(--fh)" font-weight="700">'+(planGain>0?'+':'')+fmtK(planGain)+'</text>';
+  }
+
+  // ── Milestones ──
+  var efA=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
+  if(efA){var efYr=Math.ceil(Math.ceil((efA.target||CPLAN.efTarget)/efA.amount)/12);if(efYr>0&&efYr<years){svg+='<line x1="'+x(efYr)+'" y1="'+padT+'" x2="'+x(efYr)+'" y2="'+(H-padB)+'" stroke="rgba(34,197,94,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(efYr)+'" y="'+(padT-3)+'" fill="rgba(34,197,94,.6)" font-size="7" text-anchor="middle" font-family="var(--fh)">EF done</text>';}}
+  var dA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
+  if(dA&&CPLAN.totalDebt>0){var dYr=Math.ceil(Math.ceil(CPLAN.totalDebt/(dA.amount+CPLAN.debtMin))/12);if(dYr>0&&dYr<years){svg+='<line x1="'+x(dYr)+'" y1="'+padT+'" x2="'+x(dYr)+'" y2="'+(H-padB)+'" stroke="rgba(249,115,22,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(dYr)+'" y="'+(padT-3)+'" fill="rgba(249,115,22,.6)" font-size="7" text-anchor="middle" font-family="var(--fh)">Debt free</text>';}}
+  if(_cpTierHas('milestones_extra')){
+  for(var m100=1;m100<=years;m100++){if(totalData[m100]>=100000&&(m100===1||totalData[m100-1]<100000)){svg+='<line x1="'+x(m100)+'" y1="'+padT+'" x2="'+x(m100)+'" y2="'+(H-padB)+'" stroke="rgba(91,155,255,.2)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(m100)+'" y="'+(H-padB+10)+'" fill="rgba(91,155,255,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">$100k</text>';break;}}
+  var fiTarget=CPLAN.expenses*12*25;
+  if(fiTarget>0){for(var mFI=1;mFI<=years;mFI++){if(totalData[mFI]>=fiTarget&&(mFI===1||totalData[mFI-1]<fiTarget)){svg+='<line x1="'+x(mFI)+'" y1="'+padT+'" x2="'+x(mFI)+'" y2="'+(H-padB)+'" stroke="rgba(168,85,247,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(mFI)+'" y="'+(H-padB+10)+'" fill="rgba(168,85,247,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">FI</text>';break;}}}
+  }
+  svg+='</svg>';
+  // Store chart data for hover interactivity
+  var chartId='cpChart_'+Date.now();
+  svg='<div id="'+chartId+'" style="position:relative;cursor:crosshair" data-years="'+years+'" data-padl="'+padL+'" data-padr="'+padR+'">'+svg;
+  svg+='<div id="'+chartId+'_tip" style="display:none;position:absolute;pointer-events:none;background:rgba(12,12,52,.95);border:1px solid rgba(91,155,255,.3);border-radius:4px;padding:8px 12px;font-size:10px;min-width:120px;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>';
+  svg+='<div id="'+chartId+'_line" style="display:none;position:absolute;top:'+padT+'px;width:1px;height:'+(H-padT-padB)+'px;background:rgba(91,155,255,.4);pointer-events:none;z-index:5"></div>';
+  svg+='</div>';
+  // Hover handler — attached after innerHTML
+  var _chartBase=baselineData.slice();var _chartPlan=totalData.slice();
+  var _chartSeries=JSON.parse(JSON.stringify(rawSeries));
+  var _chartActive=active.map(function(a){return{type:a.type,name:a.customName||CP_NM[a.type]||a.type,color:CP_COL[a.type]||'#94A3B8'};});
+  var _chartUserAge=CPLAN.age||35;
+  setTimeout(function(){
+    var wrap=document.getElementById(chartId);if(!wrap)return;
+    var svgEl=wrap.querySelector('svg');if(!svgEl)return;
+    var tip=document.getElementById(chartId+'_tip');
+    var vLine=document.getElementById(chartId+'_line');
+    function showTip(e2){
+      var rect=svgEl.getBoundingClientRect();
+      var px=(e2.touches?e2.touches[0].clientX:e2.clientX)-rect.left;
+      var svgW=rect.width;var scaleX=600/svgW;// viewBox width
+      var svgX=px*scaleX;
+      var yr7=Math.round((svgX-padL)/(600-padL-padR)*years);
+      yr7=Math.max(0,Math.min(years,yr7));
+      if(tip){
+        var bv2=_chartBase[yr7]||0;var pv2=_chartPlan[yr7]||0;var diff3=pv2-bv2;
+        var tipH='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:6px">Age '+(_chartUserAge+yr7)+'</div>';
+        // Per-allocation breakdown
+        _chartActive.forEach(function(ca){
+          var sv=(_chartSeries[ca.type]&&_chartSeries[ca.type][yr7])||0;
+          if(sv>0)tipH+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px"><span style="width:8px;height:8px;border-radius:2px;background:'+ca.color+';flex-shrink:0"></span><span style="color:var(--mu);font-size:9px;flex:1">'+ca.name+'</span><span style="color:'+ca.color+';font-weight:700;font-size:10px">'+fmtK(sv)+'</span></div>';
+        });
+        tipH+='<div style="border-top:1px solid rgba(100,116,139,.15);margin-top:4px;padding-top:4px">';
+        tipH+='<div style="color:var(--gr);font-size:10px">Plan: <strong>'+fmtK(pv2)+'</strong></div>';
+        tipH+='<div style="color:var(--mu);font-size:9px">Do nothing: '+fmtK(bv2)+'</div>';
+        tipH+='<div style="color:'+(diff3>=0?'var(--gr)':'var(--rd)')+';font-size:10px;font-weight:700">'+(diff3>=0?'+':'')+fmtK(diff3)+'</div></div>';
+        tip.innerHTML=tipH;
+        var tipX=Math.min(px,svgW-160);tip.style.left=tipX+'px';tip.style.top='4px';tip.style.display='block';
+      }
+      if(vLine){vLine.style.left=px+'px';vLine.style.display='block';}
+    }
+    svgEl.addEventListener('mousemove',showTip);
+    svgEl.addEventListener('touchmove',function(e3){e3.preventDefault();showTip(e3);},{passive:false});
+    wrap.addEventListener('mouseleave',function(){if(tip)tip.style.display='none';if(vLine)vLine.style.display='none';});
+  },100);
+  svg+='<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;font-size:10px;color:var(--mu);margin-top:6px">';
+  svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:rgba(100,116,139,.4);margin-right:4px;vertical-align:middle;border-top:1px dashed rgba(100,116,139,.5)"></span>Do nothing ('+fmtK(baselineData[years])+')</span>';
+  active.forEach(function(a){svg+='<span><span style="display:inline-block;width:12px;height:8px;border-radius:1px;background:'+CP_COL[a.type]+';opacity:0.4;margin-right:4px;vertical-align:middle"></span>'+(a.customName||CP_NM[a.type])+'</span>';});
+  svg+='<span><span style="display:inline-block;width:12px;height:3px;border-radius:1px;background:#5B9BFF;margin-right:4px;vertical-align:middle"></span>'+(_isRetView?'Retirement':'This plan')+' ('+fmtK(totalData[years])+')</span>';
+  if(simData&&simData.length>0){var simLegCol=simData[years]>=totalData[years]?'#22C55E':'#EF4444';svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:'+simLegCol+';margin-right:4px;vertical-align:middle;border-top:1px dashed '+simLegCol+'"></span>Simulated ('+fmtK(simData[years])+')</span>';}
+  svg+='</div>';
+  el.innerHTML=_toggleH+svg;
+}
+
+function _cpProj(a){
+  if(a.amount<=0)return'';
+  var mo=a.amount;var yrs=Math.max(1,65-CPLAN.age);
+  if(a.type==='ef'){var t=a.target||Math.round(CPLAN.efTarget-CPLAN.efBal);var m=mo>0?Math.ceil(Math.max(0,t)/mo):0;return'Fully funded in <strong>'+m+' month'+(m!==1?'s':'')+'</strong>';}
+  if(a.type==='debt'){
+    var sorted=CPLAN.debts.slice().filter(function(x){return(parseFloat(x.balance)||0)>0;});
+    if(CPLAN.debtStrategy==='avalanche')sorted.sort(function(a2,b){return(parseFloat(b.rate)||0)-(parseFloat(a2.rate)||0);});
+    else if(CPLAN.debtStrategy==='snowball')sorted.sort(function(a2,b){return(parseFloat(a2.balance)||0)-(parseFloat(b.balance)||0);});
+    var totalPmt=mo+CPLAN.debtMin;var bal=CPLAN.totalDebt;var mo2=0;
+    var avgR=sorted.length?sorted.reduce(function(t,x){return t+(parseFloat(x.rate)||0);},0)/sorted.length/100/12:0;
+    while(bal>0&&mo2<600){bal=bal*(1+avgR)-totalPmt;mo2++;}
+    var stName={avalanche:'highest rate first',snowball:'smallest balance first',hybrid:'balanced approach'}[CPLAN.debtStrategy];
+    return'Debt free in <strong>~'+mo2+' months</strong> using '+stName;
+  }
+  if(a.type==='iul'){var cv=0;var _iR=_cpGetNetRate(a);var _iCF=_cpGetCF(a);for(var y=1;y<=Math.min(yrs,30);y++)cv=(cv+mo*12*_iCF)*(1+_iR);var ri=Math.round(cv*0.045/12);return'Cash value: <strong>'+fmtK(Math.round(cv))+'</strong> · Tax-free income: <strong>~'+fmt(ri)+'/mo</strong> in retirement';}
+  if(a.type==='wl'){var cv2=0;var _wR=_cpGetNetRate(a);var _wCF=_cpGetCF(a);for(var y2=1;y2<=Math.min(yrs,30);y2++)cv2=(cv2+mo*12*_wCF)*(1+_wR);return'Guaranteed cash value: <strong>'+fmtK(Math.round(cv2))+'</strong> + dividends';}
+  if(a.type==='roth'||a.type==='401k'){var b=0;var _rR=_cpGetNetRate(a);var match=a.type==='401k'&&CPLAN.employer?0.04:0;for(var y3=0;y3<yrs;y3++)b=(b+mo*12*(1+match))*(1+_rR);var feeNote=_cpGetFeeRate(a)>0?' ('+(_cpGetGrossRate(a)*100).toFixed(1)+'% gross − '+((_cpGetFeeRate(a)*100).toFixed(2))+'% fees)':'';return'Could grow to <strong>'+fmtK(Math.round(b))+'</strong>'+(match>0?' (incl employer match)':'')+feeNote+' by retirement';}
+  if(a.type==='house'){var t2=a.target||80000;return'<strong>'+fmt(t2)+'</strong> down payment in <strong>'+Math.ceil(t2/Math.max(mo,1))+' months</strong>';}
+  if(a.type==='edu'){var yrs2=CPLAN.children.length?Math.max(1,18-(CPLAN.children[0].age||0)):18;var b2=0;var veh=a.eduVehicle||'529';var _eR=_cpGetNetRate(a);var _eCF=_cpGetCF(a);var vehName=CP_EDU_VEH_NM[veh]||'529 Plan';for(var y4=0;y4<yrs2;y4++)b2=(b2+mo*12*_eCF)*(1+_eR);var eduExtra=(veh==='wl'||veh==='iul')?' + death benefit protection':'';return vehName+': <strong>'+fmtK(Math.round(b2))+'</strong> in '+yrs2+' years'+eduExtra;}
+  if(a.type==='invest'){var _invR=_cpGetNetRate(a);var b3=0;for(var y5=0;y5<yrs;y5++)b3=(b3+mo*12)*(1+_invR);var invFeeNote=_cpGetFeeRate(a)>0?' ('+(_cpGetGrossRate(a)*100).toFixed(1)+'% gross − '+(_cpGetFeeRate(a)*100).toFixed(2)+'% fees)':'';return'Could grow to <strong>'+fmtK(Math.round(b3))+'</strong>'+invFeeNote;}
+  if(a.type==='custom'&&a.target>0)return'<strong>'+fmt(a.target)+'</strong> in <strong>'+Math.ceil(a.target/Math.max(mo,1))+' months</strong>';
+  return'';
+}
+
+function _cpGetGrossRate(a){
+  if(a._grossReturn!=null&&a._grossReturn>0)return a._grossReturn/100;
+  if(a.type==='iul')return 0.055;if(a.type==='wl')return 0.04;
+  if(a.type==='roth'||a.type==='401k'||a.type==='roth401k'||a.type==='trad_ira'||a.type==='solo401k'||a.type==='sep_ira')return 0.07;
+  if(a.type==='hsa')return 0.06;
+  if(a.type==='invest')return CPLAN.riskProfile==='aggressive'?0.09:CPLAN.riskProfile==='conservative'?0.06:0.075;
+  if(a.type==='edu'){var ev=a.eduVehicle||'529';return ev==='wl'?0.04:ev==='iul'?0.055:ev==='coverdell'?0.06:ev==='utma'?0.07:0.06;}
+  if(a.type==='ibc')return 0.04;
+  return 0;
+}
+
+function _cpGetFeeRate(a){if(a._feeRate!=null&&a._feeRate>0)return a._feeRate/100;if(a.type==='invest')return 0.01;if(a.type==='401k'||a.type==='roth401k')return 0.01;if(a.type==='roth'||a.type==='trad_ira'||a.type==='solo401k'||a.type==='sep_ira')return 0.005;if(a.type==='hsa')return 0.005;if(a.type==='edu'){var ev=a.eduVehicle||'529';return(ev==='wl'||ev==='iul')?0:0.005;}return 0;}
+
+function _cpGetNetRate(a){return _cpGetGrossRate(a)-_cpGetFeeRate(a);}
+
+function _cpGetCF(a){
+  if(a.type==='iul'||(a.type==='edu'&&a.eduVehicle==='iul'))return 0.82;
+  if(a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&a.eduVehicle==='wl'))return 0.75;
+  return 1;
+}
+
+function _cpHex2Rgba(hex,alpha){var r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);return'rgba('+r+','+g+','+b+','+alpha+')';}
+
+function _cpSetGrossReturn(i,v){CPLAN.allocations[i]._grossReturn=parseFloat(v)||0;clearTimeout(CPLAN._retFeeTimer);CPLAN._retFeeTimer=setTimeout(_cpRender,300);}
+
+function _cpSetFeeRate(i,v){CPLAN.allocations[i]._feeRate=parseFloat(v)||0;clearTimeout(CPLAN._retFeeTimer);CPLAN._retFeeTimer=setTimeout(_cpRender,300);}
 function _cpRenderPlan(){
   var root=document.getElementById('profileMainContent');if(!root)return;
   if(CPLAN.allocations.length>0){_cpRenderPlanFull();return;}
@@ -5649,11 +6518,14 @@ function _cpStartSelf(){
 }
 function _cpRenderPlanFull(){
   var root=document.getElementById('profileMainContent');if(!root)return;
+  // ── Phase B: agent view always uses detailed mode + cascade simulation ──
+  CPLAN.mode='detailed';
+  try{ if(typeof _cpRunSimulation==='function') _cpRunSimulation(); }catch(e){ console.warn('Sim run failed:',e); }
   var h='';var allocated=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
   var unalloc=Math.max(0,CPLAN.surplus-allocated);var allocPct=CPLAN.surplus>0?Math.round(allocated/CPLAN.surplus*100):0;
   // ── Header ──
   h+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px"><div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh)">Client Financial Plan</span>';
-  h+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden"><button onclick="CPLAN.mode=\'guided\';_cpRenderPlanFull()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;border:none;cursor:pointer;min-height:32px;background:'+(CPLAN.mode==='guided'?'rgba(91,155,255,.15)':'transparent')+';color:'+(CPLAN.mode==='guided'?'#5B9BFF':'var(--mu)')+'">Guided</button><button onclick="CPLAN.mode=\'detailed\';_cpRenderPlanFull()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;border:none;cursor:pointer;min-height:32px;background:'+(CPLAN.mode==='detailed'?'rgba(91,155,255,.15)':'transparent')+';color:'+(CPLAN.mode==='detailed'?'#5B9BFF':'var(--mu)')+'">Detailed</button></div>';
+  h+='<span style="display:inline-flex;align-items:center;padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:#5B9BFF;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);border-radius:2px;letter-spacing:.08em">DETAILED VIEW</span>';
   h+='</div><div style="font-size:11px;color:var(--mu)">Deploying <strong style="color:var(--gr)">'+fmt(allocated)+'</strong>/mo ('+allocPct+'% of surplus)'+(unalloc>0?' · <span style="color:var(--gr)">'+fmt(unalloc)+' breathing room</span>':'')+'</div></div>';
   h+='<div style="display:flex;gap:6px"><button onclick="CPLAN.allocations=[];_cpRenderPlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.15);color:var(--rd);cursor:pointer;border-radius:2px;min-height:32px">↩ Reset</button><button onclick="_cpSavePlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:32px">💾 Save Plan</button><button onclick="_cpPublishPlan()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">'+(CPLAN._planPublishedAt?'📤 Publish Changes':'📤 Publish to Client')+'</button>'+(CPLAN._planStatus==='published'?'<span style="display:inline-flex;align-items:center;padding:0 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:var(--gr);letter-spacing:.06em">● PUBLISHED</span>':'<span style="display:inline-flex;align-items:center;padding:0 10px;font-family:var(--fh);font-size:9px;font-weight:700;color:var(--mu);letter-spacing:.06em">● DRAFT</span>')+'</div></div>';
   // ── Phase A: Help Panel ──
@@ -5683,6 +6555,22 @@ function _cpRenderPlanFull(){
   CPLAN.allocations.forEach(function(a){if(a.amount>0){h+='<div style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:'+CP_COL[a.type]+';opacity:0.7;flex-shrink:0"></div>'+(a.customName||CP_NM[a.type]||a.type)+' <span style="color:'+CP_COL[a.type]+';font-weight:700">'+fmt(a.amount)+'</span></div>';}});
   if(unalloc>0)h+='<div style="display:flex;align-items:center;gap:5px;font-size:11px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:rgba(100,116,139,.2);flex-shrink:0"></div>Breathing Room <span style="color:var(--gr);font-weight:700">'+fmt(unalloc)+'</span></div>';
   h+='</div>';
+  // ── Phase B: Breathing Room slider ──
+  var _brPct=CPLAN._breathingPct!=null?CPLAN._breathingPct:15;
+  h+='<div style="padding:14px 16px;margin-bottom:14px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:6px">';
+  h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">';
+  h+='<div style="display:flex;align-items:center;gap:8px"><div style="width:36px;height:36px;border-radius:8px;background:rgba(34,197,94,.12);display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">&#128168;</div><div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">Breathing Room</div><div style="font-size:10px;color:var(--mu)">Unallocated surplus kept liquid</div></div></div>';
+  h+='<div style="text-align:right"><div style="font-family:var(--fd);font-size:22px;color:var(--gr)">'+fmt(Math.round((CPLAN.surplus||0)*_brPct/100))+'</div><div style="font-size:9px;color:var(--mu)">/mo ('+_brPct+'%)</div></div></div>';
+  h+='<input type="range" min="0" max="30" step="5" value="'+_brPct+'" oninput="_cpSetBreathingRoomAgent(this.value)" style="width:100%;accent-color:var(--gr);color:var(--gr);height:5px">';
+  h+='<div style="display:flex;justify-content:space-between;font-size:8px;color:var(--mu);margin-top:4px"><span>0% (all deployed)</span><span>15% recommended</span><span>30% (conservative)</span></div>';
+  h+='</div>';
+  // ── Phase B: Analysis Widgets Row (EF runway + retirement income replacement) ──
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">';
+  h+='<div id="cplanEFRunway" style="background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;min-height:90px"></div>';
+  h+='<div id="cplanIncomeReplace" style="background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;min-height:90px"></div>';
+  h+='</div>';
+  // ── Phase B: Projected Timeline (rendered inline as HTML) ──
+  try{ h+=_cpBuildTimeline(); }catch(e){ console.warn('Timeline build failed:',e); }
   // ── Phase tabs ──
   h+='<div style="display:flex;gap:0;margin-bottom:14px;border-bottom:2px solid var(--bd)">';
   var CP_PHASE={1:{icon:'🛡️',name:'Foundation',color:'var(--or)'},2:{icon:'📈',name:'Growth',color:'#5B9BFF'},3:{icon:'🚀',name:'Optimization',color:'var(--gr)'},4:{icon:'🏛️',name:'Legacy',color:'#A855F7'},5:{icon:'🎯',name:'Advanced',color:'#06B6D4'}};
@@ -5736,9 +6624,55 @@ function _cpRenderPlanFull(){
         h+='</div>';
       } else {
         h+='<div style="margin-top:8px;display:flex;gap:6px"><input type="file" id="cpIllust_'+idx+'" accept=".pdf,image/*" style="display:none" onchange="_cpHandleIllustFile('+idx+',this)">';
-        h+='<button onclick="document.getElementById(\'cpIllust_'+idx+'\').click()" style="padding:6px 14px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);color:#A855F7;cursor:pointer;border-radius:2px;display:flex;align-items:center;gap:6px;min-height:28px"><span>📄</span> Upload Illustration</button>';
-        h+='<button onclick="_cpShowCompareModal('+idx+')" style="padding:6px 14px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;display:flex;align-items:center;gap:6px;min-height:28px"><span>📊</span> Compare Policies</button>';
+        h+='<button onclick="document.getElementById(\'cpIllust_'+idx+'\').click()" style="padding:6px 14px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);color:#A855F7;cursor:pointer;border-radius:2px;display:flex;align-items:center;gap:6px;min-height:28px"><span>&#128196;</span> Upload Illustration</button>';
+        h+='<button onclick="_cpShowCompareModal('+idx+')" style="padding:6px 14px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;display:flex;align-items:center;gap:6px;min-height:28px"><span>&#128202;</span> Compare Policies</button>';
         h+='</div><div id="cpIllustStatus_'+idx+'" style="font-size:9px;color:var(--mu);margin-top:4px"></div></div>';
+      }
+    }
+    // ── Phase B: Education vehicle selector + projection chart ──
+    if(a.type==='edu'){
+      h+='<div style="display:flex;gap:4px;flex-wrap:wrap;margin:6px 0">';
+      ['529','coverdell','utma','wl','iul'].forEach(function(v){var sel2=a.eduVehicle===v;h+='<button onclick="CPLAN.allocations['+idx+'].eduVehicle=\''+v+'\';_cpRenderPlanFull()" style="padding:4px 8px;font-family:var(--fh);font-size:9px;font-weight:700;border-radius:2px;cursor:pointer;min-height:28px;border:1px solid '+(sel2?'rgba(6,182,212,.4)':'var(--bd)')+';background:'+(sel2?'rgba(6,182,212,.12)':'transparent')+';color:'+(sel2?'#06B6D4':'var(--mu)')+'">'+CP_EDU_VEH_NM[v]+'</button>';});
+      h+='</div>';
+      if(a.amount>0&&CPLAN.children&&CPLAN.children.length>0){
+        var _child=CPLAN.children[0];var _cAge=parseInt(_child.age)||5;
+        var _yrsToCollege=Math.max(1,18-_cAge);
+        var _eduInflation=0.05;var _baseCost=25000;
+        var _projCost=Math.round(_baseCost*4*Math.pow(1+_eduInflation,_yrsToCollege));
+        var _eduRate=_cpGetNetRate(a);var _eduCF=_cpGetCF(a);
+        var _eduPts=[];var _costPts=[];var _eBal=0;
+        for(var _ey=0;_ey<=_yrsToCollege;_ey++){
+          _eBal=(_eBal+a.amount*12*_eduCF)*(1+_eduRate);
+          _eduPts.push(Math.round(_eBal));
+          _costPts.push(Math.round(_baseCost*4*Math.pow(1+_eduInflation,_ey)));
+        }
+        var _eMax=Math.max(_projCost,_eduPts[_eduPts.length-1],1);
+        var _eW=340,_eH=100,_ePL=6,_ePR=6,_ePT=6,_ePB=18;
+        var _ecW=_eW-_ePL-_ePR,_ecH=_eH-_ePT-_ePB;
+        function _ex(i){return _ePL+i/_yrsToCollege*_ecW;}
+        function _ey2(v){return _ePT+_ecH-(v/_eMax*_ecH);}
+        var _savLine=_eduPts.map(function(v,i){return _ex(i)+','+_ey2(v);}).join(' ');
+        var _costLine=_costPts.map(function(v,i){return _ex(i)+','+_ey2(v);}).join(' ');
+        h+='<div style="margin:8px 0;padding:12px;background:rgba(6,182,212,.04);border:1px solid rgba(6,182,212,.12);border-radius:4px">';
+        h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+        h+='<div><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#06B6D4;margin-bottom:2px">EDUCATION PROJECTION</div>';
+        h+='<div style="font-size:9px;color:var(--mu)">Child age '+_cAge+' &middot; College in '+_yrsToCollege+' years</div></div>';
+        h+='<div style="text-align:right"><div style="font-family:var(--fd);font-size:16px;color:var(--or)">'+fmtK(_projCost)+'</div><div style="font-size:8px;color:var(--mu)">projected 4yr cost</div></div></div>';
+        h+='<svg viewBox="0 0 '+_eW+' '+_eH+'" style="width:100%;height:auto;display:block;max-height:130px">';
+        h+='<polyline points="'+_costLine+'" fill="none" stroke="rgba(249,115,22,.4)" stroke-width="1.5" stroke-dasharray="3,2"/>';
+        h+='<polyline points="'+_savLine+'" fill="none" stroke="#06B6D4" stroke-width="2"/>';
+        h+='<polygon points="'+_ePL+','+_ey2(0)+' '+_savLine+' '+_ex(_yrsToCollege)+','+_ey2(0)+'" fill="rgba(6,182,212,.1)"/>';
+        h+='<text x="'+_ex(_yrsToCollege)+'" y="'+(_ey2(_eduPts[_eduPts.length-1])-4)+'" fill="#06B6D4" font-size="9" text-anchor="end" font-family="var(--fh)" font-weight="700">'+fmtK(_eduPts[_eduPts.length-1])+'</text>';
+        h+='<text x="'+_ex(_yrsToCollege)+'" y="'+(_ey2(_projCost)-4)+'" fill="rgba(249,115,22,.7)" font-size="8" text-anchor="end" font-family="var(--fh)">'+fmtK(_projCost)+'</text>';
+        h+='<text x="'+_ePL+'" y="'+(_eH-4)+'" fill="var(--mu)" font-size="7" font-family="var(--fh)">Now</text>';
+        h+='<text x="'+_ex(_yrsToCollege)+'" y="'+(_eH-4)+'" fill="var(--mu)" font-size="7" text-anchor="end" font-family="var(--fh)">Age 18</text>';
+        h+='</svg>';
+        var _eduGap=_projCost-_eduPts[_eduPts.length-1];
+        h+='<div style="display:flex;justify-content:space-between;margin-top:6px;font-size:10px">';
+        h+='<span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:2px;background:#06B6D4;display:inline-block"></span><span style="color:var(--mu)">Savings</span></span>';
+        h+='<span style="display:flex;align-items:center;gap:4px"><span style="width:12px;height:2px;background:rgba(249,115,22,.5);display:inline-block;border-top:1px dashed rgba(249,115,22,.8)"></span><span style="color:var(--mu)">Projected cost</span></span>';
+        h+='<span style="font-weight:700;color:'+(_eduGap>0?'var(--or)':'var(--gr)')+'">'+(_eduGap>0?'Gap: '+fmtK(_eduGap):'Surplus: '+fmtK(Math.abs(_eduGap)))+'</span>';
+        h+='</div></div>';
       }
     }
     h+='</div>';
@@ -5769,30 +6703,9 @@ function _cpRenderPlanFull(){
     h+='<button onclick="CPLAN._scaledOnLoad=null;_cpRenderPlanFull()" style="padding:6px 12px;font-family:var(--fh);font-size:10px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:30px">Dismiss</button>';
     h+='</div>';
   }
-  // ── Analysis Sections (2-column grid) ──
-  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px">';
-  // EF Runway
-  var efMo=CPLAN.expenses>0?CPLAN.efBal/CPLAN.expenses:0;var efCol=efMo>=6?'var(--gr)':efMo>=3?'#5B9BFF':efMo>=1?'var(--yl)':'var(--rd)';
-  var target6=CPLAN.expenses*6;var efAlloc=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
-  var moToTarget=efAlloc&&efAlloc.amount>0?Math.ceil(Math.max(0,CPLAN.efTarget-CPLAN.efBal)/efAlloc.amount):0;
-  h+='<div style="padding:14px 16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px">';
-  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Emergency Fund Runway</div><div style="font-family:var(--fd);font-size:20px;color:'+efCol+'">'+efMo.toFixed(1)+'<span style="font-size:10px;color:var(--mu)"> months</span></div></div>';
-  h+='<div style="position:relative;height:10px;background:rgba(0,68,191,.06);border-radius:5px;overflow:visible;margin-bottom:6px"><div style="height:100%;width:'+Math.min(100,Math.round(CPLAN.efBal/Math.max(target6,1)*100))+'%;background:'+efCol+';border-radius:5px;transition:width .3s"></div>';
-  var mark3=Math.round(CPLAN.efTarget/Math.max(target6,1)*100);h+='<div style="position:absolute;top:-2px;left:'+mark3+'%;width:1px;height:14px;background:rgba(91,155,255,.4)"></div><div style="position:absolute;top:14px;left:'+mark3+'%;transform:translateX(-50%);font-size:7px;color:#5B9BFF;font-family:var(--fh);white-space:nowrap">3 mo</div></div>';
-  h+='<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mu);margin-top:10px"><span>Current: '+fmt(Math.round(CPLAN.efBal))+'</span><span>3-mo target: '+fmt(Math.round(CPLAN.efTarget))+'</span></div>';
-  if(efAlloc&&moToTarget>0)h+='<div style="font-size:10px;color:#5B9BFF;margin-top:4px">At '+fmt(efAlloc.amount)+'/mo → funded in '+moToTarget+' month'+(moToTarget!==1?'s':'')+'</div>';
-  h+='</div>';
-  // Income Replacement
-  var retIncome=0;var yrs=Math.max(1,65-CPLAN.age);
-  CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;if(['roth','401k','iul','wl','ibc','hsa','trad_ira','solo401k','sep_ira'].indexOf(a.type)<0)return;
-    if(a._illustrationData&&a._illustrationData.cashValueYear20>0){retIncome+=Math.round(a._illustrationData.cashValueYear20*0.04/12);return;}
-    var bal=0;for(var y=1;y<=Math.min(yrs,40);y++)bal=(bal+a.amount*12)*1.07;retIncome+=Math.round(bal*0.04/12);});
-  var repPct=CPLAN.income>0?Math.round(retIncome/CPLAN.income*100):0;var repCol=repPct>=80?'var(--gr)':repPct>=50?'var(--yl)':repPct>=25?'var(--or)':'var(--rd)';
-  h+='<div style="padding:14px 16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px">';
-  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Income Replacement at Retirement</div><div style="font-family:var(--fd);font-size:20px;color:'+repCol+'">'+Math.min(repPct,999)+'<span style="font-size:10px;color:var(--mu)">%</span></div></div>';
-  h+='<div style="height:10px;background:rgba(0,68,191,.06);border-radius:5px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+Math.min(100,repPct)+'%;background:'+repCol+';border-radius:5px;transition:width .3s"></div></div>';
-  h+='<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mu)"><span>Projected: '+fmt(retIncome)+'/mo</span><span>Current income: '+fmt(Math.round(CPLAN.income))+'/mo</span></div></div>';
-  h+='</div>';
+  // ── Phase B: Inline EF runway, Income Replacement, and Stress Test removed.
+  //  Replaced with cascade-aware ported widgets above (cplanEFRunway, cplanIncomeReplace)
+  //  and below (cplanStressTests, cplanChart, cplanOutcomes, cplanRebalance). ──
   // ── Red Flags ──
   var flags=_cpExtractFlags();
   if(flags.length){
@@ -5801,25 +6714,35 @@ function _cpRenderPlanFull(){
     flags.forEach(function(f){var fc=f.type==='crit'?'var(--rd)':f.type==='warn'?'var(--yl)':'var(--gr)';
       h+='<div style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;margin-bottom:6px;background:'+(f.type==='crit'?'rgba(239,68,68,.06)':f.type==='warn'?'rgba(234,179,8,.04)':'rgba(34,197,94,.04)')+';border:1px solid '+(f.type==='crit'?'rgba(239,68,68,.15)':f.type==='warn'?'rgba(234,179,8,.12)':'rgba(34,197,94,.1)')+';border-left:3px solid '+fc+';border-radius:4px"><span style="font-size:14px;flex-shrink:0">'+f.icon+'</span><div><div style="font-size:11px;color:'+fc+';font-weight:600">'+f.title+'</div><div style="font-size:10px;color:var(--mu);margin-top:2px;line-height:1.5">'+f.desc+'</div></div></div>';});
     h+='</div>';}
-  // ── Stress Test ──
-  if(CPLAN.income>0&&allocated>0){
-    function _stressProject(incMult,rateMult,shock,skipMo){var tot=0;CPLAN.allocations.forEach(function(a){if(a.amount<=0||a.type==='debt'||a.type==='ef')return;var ann=a.amount*12*incMult;var bal=0;for(var y=1;y<=20;y++){if(y<=skipMo/12){bal=bal*1.04;continue;}bal=(bal+ann)*(1+0.07*rateMult);}tot+=bal;});tot-=CPLAN.totalDebt;tot-=shock;return Math.round(tot);}
-    var base=_stressProject(1,1,0,0);
-    var scenarios=[{icon:'💼',label:'Job loss (6mo)',desc:'No contributions for 6 months',val:_stressProject(1,1,0,6),color:'var(--or)'},{icon:'📉',label:'Market crash (−30%)',desc:'Growth rates cut 30% permanently',val:_stressProject(1,0.7,0,0),color:'var(--rd)'},{icon:'🚨',label:'$10k emergency',desc:'Unexpected expense depletes savings',val:_stressProject(1,1,10000,0),color:'var(--yl)'},{icon:'📊',label:'Reduced income (−20%)',desc:'Permanent 20% income reduction',val:_stressProject(0.8,1,0,0),color:'var(--or)'}];
-    h+='<div style="padding:14px 16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:14px">';
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">What happens to this plan if...</div>';
-    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
-    scenarios.forEach(function(s){var diff=s.val-base;var pctD=base>0?Math.round(diff/base*100):0;
-      h+='<div style="padding:12px;background:rgba(0,68,191,.03);border:1px solid rgba(0,68,191,.08);border-radius:2px"><div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:14px">'+s.icon+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">'+s.label+'</span></div><div style="font-family:var(--fd);font-size:20px;color:'+s.color+'">'+fmtK(s.val)+'</div><div style="font-size:10px;color:var(--mu)">'+s.desc+'</div><div style="font-size:10px;color:'+(diff<0?'var(--rd)':'var(--gr)')+';margin-top:3px">'+fmtK(diff)+' ('+pctD+'%) vs base</div></div>';});
-    h+='</div><div style="font-size:10px;color:var(--mu);margin-top:8px;text-align:center">Base plan projection (20yr): <strong style="color:#5B9BFF">'+fmtK(base)+'</strong></div></div>';}
+  // ── Phase B: Cascade-engine widget containers ──
+  h+='<div id="cplanChart" style="margin-bottom:14px"></div>';
+  h+='<div id="cplanOutcomes" style="margin-bottom:14px"></div>';
+  h+='<div id="cplanStressTests" style="background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:14px;min-height:80px"></div>';
+  h+='<div id="cplanRebalance" style="margin-bottom:14px"></div>';
   root.innerHTML=h;
   // Phase 1: refresh over-budget banner state every render
   _cpUpdateOverBudgetBanner();
+  // ── Phase B: Render ported widgets after main DOM is in place ──
+  setTimeout(function(){
+    try{ if(typeof _cpRenderEFRunway==='function') _cpRenderEFRunway(); }catch(e){console.warn('EF runway:',e);}
+    try{ if(typeof _cpRenderIncomeReplacement==='function') _cpRenderIncomeReplacement(); }catch(e){console.warn('Income replace:',e);}
+    try{ if(typeof _cpRenderChart==='function') _cpRenderChart('cplanChart'); }catch(e){console.warn('Chart:',e);}
+    try{ if(typeof _cpRenderOutcomes==='function') _cpRenderOutcomes(); }catch(e){console.warn('Outcomes:',e);}
+    try{ if(typeof _cpRenderStressTests==='function') _cpRenderStressTests(); }catch(e){console.warn('Stress tests:',e);}
+    try{ if(typeof _cpRenderRebalanceTriggers==='function') _cpRenderRebalanceTriggers(); }catch(e){console.warn('Rebalance:',e);}
+  },0);
 }
 function _cpSetAmount(idx,val){
   CPLAN.allocations[idx].amount=Math.max(0,parseInt(val)||0);
   _cpEnforce();
   CPLAN.modified=true;
+  _cpRenderPlanFull();
+}
+// Phase B: agent breathing room handler (warn-and-let-fix; no silent rescaling)
+function _cpSetBreathingRoomAgent(v){
+  CPLAN._breathingPct=parseInt(v)||15;
+  CPLAN.modified=true;
+  _cpUpdateOverBudgetBanner();
   _cpRenderPlanFull();
 }
 function _cpSetPhase(idx,phase){CPLAN.allocations[idx].phase=parseInt(phase)||1;_cpRenderPlanFull();}
