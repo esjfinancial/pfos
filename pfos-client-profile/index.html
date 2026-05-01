@@ -2124,127 +2124,6 @@ function renderEngagementScore(client, recs){
   el.innerHTML=h;
 }
 
-// ── AI RECOMMENDATION GENERATION ────────────────────
-async function generateAIRecommendations(){
-  if(!APP.currentClientId){alert('No client selected.');return;}
-  var btn=document.getElementById('aiRecBtn');
-  if(btn){btn.disabled=true;btn.textContent='⏳ Generating...';}
-  try{
-    // Get client financial data from PFOS iframe or stored profile
-    var fd={};
-    var {data:prof}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',APP.currentClientId).maybeSingle();
-    if(prof&&prof.financial_data){fd=prof.financial_data;}
-    var calcs=(fd.calcs||{});
-    var riskProfile=(fd.riskProfile||fd.risk_profile||'moderate');
-
-    // Get existing flags from decision engine state
-    var existingFlags=[];
-    if(fd.deFlags&&Array.isArray(fd.deFlags)){existingFlags=fd.deFlags;}
-
-    // Get existing recommendations
-    var currentRecs=[];
-    var {data:recs}=await db.from('advisor_recommendations').select('*').eq('client_id',APP.currentClientId).not('status','eq','dismissed');
-    if(recs) currentRecs=recs;
-
-    var householdType=APP.currentClient.household_type||'individual';
-
-    var resp=await db.functions.invoke('generate-recommendations',{body:{
-      clientData:fd,
-      calcs:calcs,
-      riskProfile:riskProfile,
-      existingFlags:existingFlags,
-      householdType:householdType,
-      currentRecs:currentRecs.map(function(r){return{title:r.recommendation,status:r.status};})
-    }});
-
-    if(resp.error) throw new Error(resp.error.message||'Edge function error');
-    var result=resp.data;
-    if(!result||!result.success||!result.recommendations){
-      throw new Error(result.error||'No recommendations returned');
-    }
-
-    // Show summary
-    var summary=result.summary||'';
-    var aiRecs=result.recommendations||result.scenarios||[];
-
-    // Present as a modal for review before saving
-    var mH='<div style="margin-bottom:14px">';
-    if(summary){mH+='<div style="font-size:12px;color:var(--mu);margin-bottom:14px;line-height:1.6;padding:10px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.15);border-radius:2px">'+esc(summary)+'</div>';}
-    if(result.complianceNote){mH+='<div style="font-size:9px;color:var(--yl);margin-bottom:12px;padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.1);border-radius:2px;line-height:1.6">'+esc(result.complianceNote)+'</div>';}
-    mH+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:8px">'+aiRecs.length+' Personalized Recommendations</div>';
-    aiRecs.forEach(function(r,i){
-      var pCol=r.priority==='high'?'var(--rd)':r.priority==='medium'?'var(--or)':'var(--gr)';
-      mH+='<div style="padding:10px;margin-bottom:8px;background:rgba(0,68,191,.04);border:1px solid rgba(0,68,191,.1);border-radius:2px">';
-      mH+='<label style="display:flex;align-items:flex-start;gap:8px;cursor:pointer">';
-      mH+='<input type="checkbox" checked data-ai-rec-idx="'+i+'" style="margin-top:3px">';
-      mH+='<div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+esc(r.title||r.recommendation.substring(0,60))+'</div>';
-      mH+='<div style="font-size:11px;color:var(--mu);margin-top:2px">'+esc(r.recommendation)+'</div>';
-      mH+='<div style="display:flex;gap:8px;margin-top:4px">';
-      mH+='<span style="font-family:var(--fh);font-size:9px;font-weight:700;color:'+pCol+';text-transform:uppercase">'+esc(r.priority)+'</span>';
-      mH+='<span style="font-family:var(--fh);font-size:9px;font-weight:700;color:var(--mu);text-transform:uppercase">'+esc(r.section)+'</span>';
-      if(r.outcome){mH+='<span style="font-size:9px;color:var(--mu)">→ '+esc(r.outcome)+'</span>';}
-      mH+='</div></div></label></div>';
-    });
-    mH+='<button class="btn btn-or" style="width:100%;margin-top:12px" onclick="saveAIRecommendations()">💾 Save Selected Recommendations</button>';
-
-    mH+='<div style="margin-top:16px;padding:16px;background:linear-gradient(135deg,rgba(34,197,94,.06),rgba(91,155,255,.06));border:1px solid rgba(34,197,94,.2);border-radius:6px;text-align:center">';
-    mH+='<div style="font-size:24px;margin-bottom:6px">📋</div>';
-    mH+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:4px">Want Specific, Actionable Steps?</div>';
-    mH+='<div style="font-size:11px;color:var(--mu);line-height:1.6;margin-bottom:12px;max-width:400px;margin-left:auto;margin-right:auto">These recommendations are based on your profile — a licensed professional can turn them into a personalized action plan with exact products, accounts, and timelines tailored to your complete situation.</div>';
-    mH+='<button onclick="openFreeReviewRequest()" style="padding:10px 28px;background:linear-gradient(135deg,#22C55E,#16A34A);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;min-height:42px">🗓️ Get a Free Review</button>';
-    mH+='<div style="font-size:9px;color:var(--mu);margin-top:6px">No obligation · 15-minute call · Licensed advisor</div>';
-    mH+='</div>';
-    mH+='</div>';
-
-    // Store in temp for saving
-    window._aiRecsTemp=aiRecs;
-
-    // Show in a modal
-    var modal=document.getElementById('aiRecsModal');
-    if(!modal){
-      modal=document.createElement('div');modal.id='aiRecsModal';modal.className='modal-bg';
-      modal.onclick=function(e){if(e.target===modal)closeModal('aiRecsModal');};
-      modal.innerHTML='<div class="modal" style="max-width:620px"><button class="modal-close" onclick="closeModal(\'aiRecsModal\')" aria-label="Close">✕</button><div class="modal-hdr"><div class="modal-title">✨ Personalized Recommendations</div></div><div id="aiRecsContent"></div></div>';
-      document.body.appendChild(modal);
-    }
-    document.getElementById('aiRecsContent').innerHTML=mH;
-    modal.classList.add('active');
-
-  }catch(e){
-    console.error('AI rec generation error:',e);
-    alert('AI recommendation generation failed: '+e.message);
-  }finally{
-    if(btn){btn.disabled=false;btn.textContent='✨ AI Suggest';}
-  }
-}
-
-async function saveAIRecommendations(){
-  var aiRecs=window._aiRecsTemp||[];
-  var checks=document.querySelectorAll('[data-ai-rec-idx]');
-  var toSave=[];
-  checks.forEach(function(cb){if(cb.checked){var idx=parseInt(cb.getAttribute('data-ai-rec-idx'));if(aiRecs[idx])toSave.push(aiRecs[idx]);}});
-  if(!toSave.length){alert('No recommendations selected.');return;}
-  var saved=0;
-  for(var i=0;i<toSave.length;i++){
-    var r=toSave[i];
-    var {error}=await db.from('advisor_recommendations').insert({
-      client_id:APP.currentClientId,
-      section:r.section||'general',
-      recommendation:r.recommendation,
-      priority:r.priority||'medium',
-      status:'drafted',
-      is_locked:false,
-      created_by:APP.userId
-    });
-    if(!error) saved++;
-  }
-  closeModal('aiRecsModal');
-  window._aiRecsTemp=null;
-  alert(saved+' recommendation(s) saved as drafts.');
-  loadRecommendations(APP.currentClientId);
-  logAuditEvent('ai_recommendations_generated',{client_id:APP.currentClientId,count:saved});
-}
-
 // ── IBC HEALTH MONITOR ──────────────────────────────
 function renderIBCHealthMonitor(financialData){
   var card=document.getElementById('ibcHealthCard');
@@ -5456,6 +5335,10 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
           var pAge=parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35;
           var pPlan=(partnerProfileRes&&partnerProfileRes.data&&partnerProfileRes.data.allocation_plan)||{};
           var pAllocs=(pPlan.allocations||[]).slice();
+          // Phase D follow-up: enrich partner with retirement accounts, policies, employment, health
+          var pProfile=(pRawS.profile||{});
+          var pRetAccounts=pRawS.retAccounts||pFd.retAccounts||[];
+          var pPolicies=pRawS.policies||pRawS.insurancePolicies||[];
           CPLAN._partner={
             clientId:partnerId,
             name:partnerName,
@@ -5467,7 +5350,15 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             allocations:pAllocs,
             debts:pRawS.debts||[],
             efBal:pRawS.assets?(parseFloat(pRawS.assets.checking)||0)+(parseFloat(pRawS.assets.savings)||0):0,
-            employer:pRawS.employer||''
+            employer:pRawS.employer||pProfile.employer||'',
+            employmentType:pProfile.employmentType||'',
+            healthStatus:pProfile.healthStatus||'',
+            creditScore:pProfile.creditScore||null,
+            taxFilingStatus:pProfile.taxFilingStatus||'',
+            retAccounts:pRetAccounts,
+            policies:pPolicies,
+            currentAllocations:pAllocs,
+            previousPlan:pPlan
           };
           if(CPLAN._householdType==='joint'){
             CPLAN._jointSurplus=CPLAN.surplus+CPLAN._partner.surplus;
