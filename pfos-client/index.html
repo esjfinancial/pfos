@@ -19780,7 +19780,9 @@ function _cpConvertAIRecs(aiData){
     if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
     if(r.fee_impact&&r.fee_impact!=='None')reason+='\n💰 Fees: '+r.fee_impact;
     if(r.tax_impact&&r.tax_impact!=='None')reason+='\n🏛️ Tax: '+r.tax_impact;
-    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':'')});
+    // Phase D: preserve owner tag from AI; default to 'self' if missing or invalid
+    var _ownerTag=(r.owner&&['self','spouse','joint'].indexOf(r.owner)>=0)?r.owner:'self';
+    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag});
     usedPool+=amt;
   });
 
@@ -20103,12 +20105,72 @@ function _cpRetryApproach(key){
   var flags=_cpExtractRedFlags();
   var prevPlan=(fd&&fd.allocation_plan)||null;
   var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:rawS.householdType||'individual',previousPlan:prevPlan};
-  delete CPLAN._approaches[key];// Set back to loading
-  _cpShowApproachFork();
-  db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:key})})
-  .then(function(r){CPLAN._approaches[key]=r.data&&r.data.recommendations?r.data:null;})
-  .catch(function(){CPLAN._approaches[key]=null;})
-  .then(function(){_cpShowApproachFork();});
+  // Phase D: forward partner data so AI can produce owner-tagged recs
+  _cpLoadPartnerForAI().then(function(partnerInfo){
+    if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
+    delete CPLAN._approaches[key];// Set back to loading
+    _cpShowApproachFork();
+    db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:key})})
+    .then(function(r){CPLAN._approaches[key]=r.data&&r.data.recommendations?r.data:null;})
+    .catch(function(){CPLAN._approaches[key]=null;})
+    .then(function(){_cpShowApproachFork();});
+  });
+}
+
+// ── Phase D: lazy-load partner data once for AI calls. Returns a promise. ──
+async function _cpLoadPartnerForAI(){
+  if(CPLAN._partnerForAILoaded)return CPLAN._partnerForAICache||null;
+  CPLAN._partnerForAILoaded=true;
+  if(!APP.currentClientId||typeof getCoupleForClient!=='function')return null;
+  try{
+    var couple=getCoupleForClient(APP.currentClientId);
+    if(!couple)return null;
+    var householdType=couple.household_type||'individual';
+    if(householdType==='individual')return null;
+    var partnerId=typeof getPartnerClientId==='function'
+      ? getPartnerClientId(couple,APP.currentClientId)
+      : (couple.client_a_id===APP.currentClientId?couple.client_b_id:couple.client_a_id);
+    if(!partnerId)return null;
+    var pNameRes=await db.from('clients').select('name').eq('id',partnerId).maybeSingle();
+    var pName=(pNameRes&&pNameRes.data&&pNameRes.data.name)||'Partner';
+    var pProfRes=await db.from('client_profiles').select('financial_data,allocation_plan').eq('client_id',partnerId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    var pFd=(pProfRes&&pProfRes.data&&pProfRes.data.financial_data)||{};
+    var pCalcs=pFd.calcs||(pFd.S&&pFd.S.calcs)||{};
+    var pRawS=pFd.S||{};
+    var pProfile=pRawS.profile||{};
+    var pInc=pCalcs.inc||pCalcs.income||(pRawS.incomeSources?pRawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0):0);
+    var pExp=pCalcs.baseExp||pCalcs.expenses||0;
+    if(!pExp&&pRawS.expData)Object.keys(pRawS.expData).forEach(function(k){pExp+=(parseFloat((pRawS.expData[k]||{}).amount)||0);});
+    var pPlan=(pProfRes&&pProfRes.data&&pProfRes.data.allocation_plan)||{};
+    var partner={
+      clientId:partnerId,
+      name:pName,
+      firstName:(pName||'Partner').split(' ')[0],
+      age:parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35,
+      income:pInc,
+      expenses:pExp,
+      surplus:Math.max(0,pInc-pExp),
+      employer:pRawS.employer||pProfile.employer||'',
+      employmentType:pProfile.employmentType||'',
+      healthStatus:pProfile.healthStatus||'',
+      creditScore:pProfile.creditScore||null,
+      taxFilingStatus:pProfile.taxFilingStatus||'',
+      retAccounts:pRawS.retAccounts||pFd.retAccounts||[],
+      debts:pRawS.debts||[],
+      policies:pRawS.policies||pRawS.insurancePolicies||[],
+      currentAllocations:(pPlan.allocations||[]).slice()
+    };
+    // Cache the partner for use by both _cpRender and AI calls
+    CPLAN._partner=partner;
+    CPLAN._householdType=householdType;
+    CPLAN._coupleLink=couple;
+    var result={partner:partner,partnerPreviousPlan:pPlan,householdType:householdType};
+    CPLAN._partnerForAICache=result;
+    return result;
+  }catch(e){
+    console.warn('Partner load for AI failed:',e);
+    return null;
+  }
 }
 
 function _cpDoAIGenerate(){
@@ -20118,23 +20180,27 @@ function _cpDoAIGenerate(){
   var flags=_cpExtractRedFlags();
   var prevPlan=(fd&&fd.allocation_plan)||null;
   var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:rawS.householdType||'individual',previousPlan:prevPlan};
-  // Initialize approaches as undefined (=loading), show fork with loading states
-  CPLAN._approaches={};
-  _cpShowApproachFork();
-  // Fire 3 independent calls — each updates UI as it completes
-  var _apDone=0;
-  ['traditional','tax_free','hybrid'].forEach(function(ap){
-    db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:ap})})
-    .then(function(r){
-      CPLAN._approaches[ap]=r.data&&r.data.recommendations?r.data:null;
-    }).catch(function(){
-      CPLAN._approaches[ap]=null;
-    }).then(function(){
-      _apDone++;
-      _cpShowApproachFork();
-      if(_apDone===3&&!CPLAN._approaches.traditional&&!CPLAN._approaches.tax_free&&!CPLAN._approaches.hybrid){
-        _cpAutoSuggestV2();_cpRenderPlanV2();cplanSave();
-      }
+  // Phase D: forward partner data so AI can produce owner-tagged recs
+  _cpLoadPartnerForAI().then(function(partnerInfo){
+    if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
+    // Initialize approaches as undefined (=loading), show fork with loading states
+    CPLAN._approaches={};
+    _cpShowApproachFork();
+    // Fire 3 independent calls — each updates UI as it completes
+    var _apDone=0;
+    ['traditional','tax_free','hybrid'].forEach(function(ap){
+      db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:ap})})
+      .then(function(r){
+        CPLAN._approaches[ap]=r.data&&r.data.recommendations?r.data:null;
+      }).catch(function(){
+        CPLAN._approaches[ap]=null;
+      }).then(function(){
+        _apDone++;
+        _cpShowApproachFork();
+        if(_apDone===3&&!CPLAN._approaches.traditional&&!CPLAN._approaches.tax_free&&!CPLAN._approaches.hybrid){
+          _cpAutoSuggestV2();_cpRenderPlanV2();cplanSave();
+        }
+      });
     });
   });
 }
