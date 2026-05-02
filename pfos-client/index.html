@@ -997,6 +997,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
 ══════════════════════════════════════════════════════ */
 @keyframes planFadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
 @keyframes pulseGlow{0%,100%{box-shadow:0 0 0 0 rgba(91,155,255,0)}50%{box-shadow:0 0 12px 2px rgba(91,155,255,.15)}}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 1.5px #06B6D4,0 0 0 0 rgba(6,182,212,.6)}50%{box-shadow:0 0 0 1.5px #06B6D4,0 0 0 6px rgba(6,182,212,0)}}
 @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
 @keyframes cardEntrance{from{opacity:0;transform:translateX(-8px)}to{opacity:1;transform:translateX(0)}}
 @keyframes streakBounce{0%{transform:scale(1)}50%{transform:scale(1.15)}100%{transform:scale(1)}}
@@ -1228,6 +1229,10 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="pg-title">Dashboard</div>
       <div class="pg-sub">Your latest financial snapshot prepared by your advisor</div>
 
+      <!-- Phase I: Advisor Request Banner — rendered when advisor has requested
+           spending access. Hidden when no pending request, or when already granted. -->
+      <div id="advisorRequestBanner" style="display:none"></div>
+
       <!-- Onboarding Checklist (Phase 7) — shown for new clients with incomplete setup -->
       <div id="onboardingChecklist" style="display:none;margin-bottom:20px">
         <div class="info-card" style="border-color:rgba(91,155,255,.25);background:rgba(0,68,191,.04)">
@@ -1266,6 +1271,9 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
           <div id="cfPlanDeploy" style="display:none;margin-top:8px;padding:8px;background:rgba(0,68,191,.04);border-radius:2px;border:1px solid rgba(0,68,191,.06)"></div>
         </div>
       </div>
+      <!-- Phase G: Spending Pulse — live this-month status. Updates on data sync.
+           Click to jump to My Spending tab for the full dashboard. -->
+      <div id="spendPulseCard" style="margin-bottom:12px"></div>
       <!-- Quick Add Expense -->
       <div style="margin-bottom:12px">
         <button class="btn" onclick="clientQuickAddExpense()" style="width:100%;padding:14px;font-size:14px;font-family:var(--fh);font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;min-height:48px;border-radius:2px;cursor:pointer">+ Add Expense</button>
@@ -1450,6 +1458,8 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="pg-title">Privacy & Sharing</div>
       <div class="pg-sub">Control what your advisor can see — your data, your rules</div>
       <div style="margin-top:14px">
+        <!-- Phase I: Spending Sharing — tier-based permission for live spending data -->
+        <div id="spendingSharingPanel" style="margin-bottom:14px"></div>
         <div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px;margin-bottom:12px">
           <div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh);margin-bottom:10px">Data Visibility Settings</div>
           <div style="font-size:12px;color:var(--mu);margin-bottom:12px;line-height:1.7">Choose which sections your advisor can view. Hiding a section does not delete your data — it simply limits advisor visibility during reviews.</div>
@@ -2472,7 +2482,11 @@ function showClientPage(id){
   // Hide client portal walkthrough buttons when inside PFOS iframe (it has its own)
   var wtReplay=document.getElementById('wt-replay');if(wtReplay)wtReplay.style.display=id==='pfos'?'none':'';
   var wtCtx=document.getElementById('wt-context-help');if(wtCtx)wtCtx.style.display=id==='pfos'?'none':'';
-  if(id==='privacy') initSharingControls();
+  if(id==='privacy'){
+    initSharingControls();
+    // Phase I: render the Spending Sharing tier panel
+    if(typeof _pvRenderSpendingSharing==='function')_pvRenderSpendingSharing();
+  }
   if(id==='pfos'&&APP.currentClientId){
     var container=document.getElementById('clientPfosContainer');
     if(container&&!container.dataset.loaded){
@@ -2547,6 +2561,8 @@ function updateMobileTools(){
   }
   // Bill Calendar
   renderBillCalendar();
+  // Phase G: render the spending pulse card on the dashboard
+  try{if(typeof _clientRenderSpendPulse==='function')_clientRenderSpendPulse();}catch(e){}
 }
 
 // ── CLIENT TRACKING CHARTS ──
@@ -4267,6 +4283,31 @@ async function loadClientPortalData(){
     APP._portalFd._planStatus=profile.plan_status||'draft';
     APP._portalFd._planPublishedAt=profile.plan_published_at||null;
     APP._portalFd._proposedChanges=profile.proposed_plan_changes||null;
+    // Phase H: attach spending_visibility (controls whether/how much the advisor sees
+    // of this client's spending data). Falls back to default tier-0 (not shared) if
+    // the column doesn't exist yet (pre-migration) or has never been set.
+    try{
+      var _pvLoaded=_pvGetVisibility(profile.spending_visibility);
+      // Auto-expiry: if a grant has expired, zero it now and persist the change in the
+      // background. We don't block load on the save — if it fails we'll retry next time.
+      var _pvAfterExpiry=_pvApplyExpiryIfDue(_pvLoaded);
+      if(_pvAfterExpiry!==_pvLoaded){
+        // Apply applied — schedule persist
+        APP._portalFd._spendingVisibility=_pvAfterExpiry;
+        if(profile.id){
+          db.from('client_profiles').update({spending_visibility:_pvAfterExpiry,updated_at:new Date().toISOString()}).eq('id',profile.id).then(function(){}).catch(function(e){console.warn('PV expiry persist:',e&&e.message);});
+        }
+      } else {
+        APP._portalFd._spendingVisibility=_pvLoaded;
+      }
+    }catch(e){console.warn('Phase H init:',e&&e.message);APP._portalFd._spendingVisibility=_pvDefaultVisibility();}
+    // Phase I: surface auto-prompt for advisory clients (once per client) + render
+    // advisor-request banner if a request is pending. Both helpers are safe no-ops if
+    // their conditions aren't met (e.g., not advisory, already prompted, no request).
+    try{
+      if(typeof _pvMaybeShowAutoPrompt==='function')_pvMaybeShowAutoPrompt();
+      if(typeof _pvRenderAdvisorRequestBanner==='function')_pvRenderAdvisorRequestBanner();
+    }catch(e){console.warn('Phase I trigger:',e&&e.message);}
     // ── Populate global S for calculator tools ──
     var _fdS=fd.S||{};
     window.S={calcs:calcs,debts:_fdS.debts||fd.debts||[],retAccounts:_fdS.retAccounts||fd.retAccounts||[],currentAge:_fdS.currentAge||fd.currentAge||0,riskProfile:_fdS.riskProfile||fd.riskProfile||null,creditScore:scores.creditScore||_fdS.creditScore||fd.creditScore||0,children:_fdS.children||fd.children||[],insurancePolicies:_fdS.insurancePolicies||fd.insurancePolicies||[],dependents:_fdS.dependents||fd.dependents||0,protCalcs:_fdS.protCalcs||fd.protCalcs||{},snapshot:fd.snapshot||{},expData:_fdS.expData||fd.expData||{},goals:_fdS.goals||fd.goals||[],buckets:_fdS.buckets||fd.buckets||[]};
@@ -4859,6 +4900,565 @@ function showTip(key,event){
 async function renderJourneyTimeline(){/* removed — journey tab deprecated */}
 
 // ── MY SPENDING / SPENDING PATTERN ANALYSIS ─────────
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase F — PORTAL SPENDING DASHBOARD + ACCOUNTABILITY + ADD-EXPENSE OVERLAY
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Mirrors pfos-main's home dashboard onto the portal's My Spending tab so clients
+// can see live this-month progress without bouncing to pfos-main. Same accountability
+// pattern (popup-then-banner) tied to plan impact.
+//
+// Data architecture: Reads from _lastPfosState.state.spendingEntries (mirrored from
+// pfos-main via the existing data sync). Logging from the portal posts to pfos-main
+// via postMessage; pfos-main remains the canonical store.
+
+// ── Compute current spending status (portal version of _acctSpendStatus) ──
+// Mirrors the pfos-main implementation but reads portal-side state.
+function _portalSpendStatus(){
+  var fd=APP._portalFd||{};
+  var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=APP._portalCalcs||(fd.calcs)||(_lastPfosState&&_lastPfosState.calcs)||{};
+  var entries=S.spendingEntries||[];
+  var now=new Date();var curMonth=now.getMonth(),curYear=now.getFullYear();
+  var daysInMonth=new Date(curYear,curMonth+1,0).getDate();
+  var dayOfMonth=now.getDate();
+  var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
+  var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
+  var moneyIn=Math.round(calcs.inc||0);
+  if(moneyIn<=0){
+    return{severity:'ok',paceRatio:0,overspend:0,categories:[],reasons:[],projected:0,daysLeft:daysInMonth-dayOfMonth,
+      monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'}),
+      moneyIn:0,moneyOut:0,dayOfMonth:dayOfMonth,daysInMonth:daysInMonth,pctSpent:0,pctOfMonthGone:0};
+  }
+  var snap=S.snapshot||{};
+  var isSnapMonth=snap.month===curMonth&&snap.year===curYear;
+  if(isSnapMonth)moneyOut+=snap.alreadySpent||0;
+  var pctSpent=Math.round((moneyOut/moneyIn)*100);
+  var pctOfMonthGone=Math.round((dayOfMonth/daysInMonth)*100);
+  var paceRatio=pctOfMonthGone>0?(pctSpent/pctOfMonthGone):0;
+  var dailyPace=dayOfMonth>0?moneyOut/dayOfMonth:0;
+  var projected=Math.round(dailyPace*daysInMonth);
+  var overspend=Math.max(0,projected-moneyIn);
+  var severity='ok';
+  var reasons=[];
+  if(pctSpent>=100){
+    severity='over';
+    reasons.push('All monthly income is spent — '+(daysInMonth-dayOfMonth)+' days left.');
+  } else if(paceRatio>=1.4&&pctOfMonthGone>=20){
+    severity='warning';
+    reasons.push('Spending '+Math.round((paceRatio-1)*100)+'% over pace through day '+dayOfMonth+'.');
+  } else if(paceRatio>=1.2&&pctOfMonthGone>=15){
+    severity='caution';
+    reasons.push(Math.round((paceRatio-1)*100)+'% over pace through day '+dayOfMonth+'.');
+  } else if(projected>moneyIn&&pctOfMonthGone>=25){
+    severity='caution';
+    reasons.push('On pace to overspend by $'+overspend.toLocaleString()+' this month.');
+  }
+  // Per-category check
+  var bucketMap={food:'Food',housing:'Housing',transportation:'Transport',discretionary:'Entertainment',subscriptions:'Subscriptions',misc:'Other',utilities:'Utilities',insurance:'Insurance'};
+  var catSpend={};
+  monthEntries.forEach(function(e){
+    var bk=e.category_bucket||e.category||'misc';
+    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(e.amount)||0);
+  });
+  var categories=[];
+  var expData=S.expData||{};
+  Object.keys(bucketMap).forEach(function(bk){
+    var spent=catSpend[bk]||0;
+    if(spent<=0)return;
+    var budget=0;
+    var ed=expData[bk];
+    if(ed){
+      if(ed.total!=null)budget=parseFloat(ed.total)||0;
+      else if(ed.amount!=null){
+        budget=parseFloat(ed.amount)||0;
+        if(ed.period==='annual')budget=budget/12;
+      } else if(ed.subs){
+        Object.keys(ed.subs).forEach(function(sk){budget+=(parseFloat(ed.subs[sk])||0);});
+      }
+    }
+    if(budget<=0)return;
+    var pct=Math.round(spent/budget*100);
+    var catSev='ok';
+    if(spent>budget)catSev='over';
+    else if(pct>=80&&pctOfMonthGone<=70)catSev='warning';
+    else if(pct>=50&&pctOfMonthGone<=40)catSev='caution';
+    if(catSev!=='ok'){
+      categories.push({key:bk,name:bucketMap[bk],spent:Math.round(spent),budget:Math.round(budget),pct:pct,severity:catSev});
+      if(catSev==='over'&&severity!=='over')severity='over';
+      else if(catSev==='warning'&&(severity==='ok'||severity==='caution'))severity='warning';
+      else if(catSev==='caution'&&severity==='ok')severity='caution';
+      var reasonText=bucketMap[bk]+' is at '+pct+'% of budget by day '+dayOfMonth;
+      if(reasons.indexOf(reasonText)<0)reasons.push(reasonText);
+    }
+  });
+  return{
+    severity:severity,paceRatio:Math.round(paceRatio*100)/100,
+    pctSpent:pctSpent,pctOfMonthGone:pctOfMonthGone,
+    moneyIn:moneyIn,moneyOut:Math.round(moneyOut),
+    projected:projected,overspend:Math.round(overspend),
+    categories:categories,reasons:reasons,
+    dayOfMonth:dayOfMonth,daysInMonth:daysInMonth,daysLeft:daysInMonth-dayOfMonth,
+    monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'})
+  };
+}
+
+// ── Compute plan impact (portal — uses CPLAN directly since plan lives here) ──
+function _portalSpendPlanImpact(monthlyShortfall){
+  if(monthlyShortfall<=0)return null;
+  if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length)return null;
+  var growthTypes=['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','custom'];
+  var growthAllocs=CPLAN.allocations.filter(function(a){return a.amount>0&&growthTypes.indexOf(a.type)>=0;});
+  growthAllocs.sort(function(a,b){
+    var pa=(a.phase!=null)?a.phase:1;var pb=(b.phase!=null)?b.phase:1;
+    if(pa!==pb)return pb-pa;
+    return a.amount-b.amount;
+  });
+  var mostAffected=growthAllocs[0]||CPLAN.allocations.find(function(a){return a.amount>0;});
+  var mostAffectedName='your savings';
+  if(mostAffected){
+    if(typeof CP_NM!=='undefined'&&CP_NM[mostAffected.type]){mostAffectedName=CP_NM[mostAffected.type];}
+    else if(mostAffected.customName){mostAffectedName=mostAffected.customName;}
+    else mostAffectedName=mostAffected.type;
+  }
+  var age=CPLAN.age||30;
+  var retAge=65;
+  var yrs=Math.max(1,retAge-age);
+  var rate=0.065;
+  var monthsRem=yrs*12;
+  var monthRate=rate/12;
+  var compoundedShortfall=Math.round(monthlyShortfall*((Math.pow(1+monthRate,monthsRem)-1)/monthRate));
+  var origRetValue=null,newRetValue=null;
+  // Use portal sim if available
+  if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length){
+    origRetValue=CPLAN._sim.retirement[Math.min(yrs,CPLAN._sim.retirement.length-1)];
+    newRetValue=Math.max(0,origRetValue-compoundedShortfall);
+  }
+  return{monthlyShortfall:monthlyShortfall,yearsToRetirement:yrs,
+    compoundedShortfall:compoundedShortfall,origRetValue:origRetValue,
+    newRetValue:newRetValue,mostAffectedName:mostAffectedName};
+}
+
+// ── Trigger key for popup dedup ──
+function _portalSpendTriggerKey(status){
+  if(!status||status.severity==='ok')return null;
+  var bucket=Math.round(status.overspend/50)*50;
+  return status.monthLabel+'|'+status.severity+'|'+bucket;
+}
+
+// ── Render the live this-month dashboard for portal My Spending ──
+// Returns an HTML string with: tiles, spending bar, accountability banner, calendar
+// summary, category breakdown. Designed to mirror pfos-main home but tailored to the
+// portal aesthetic.
+function _portalRenderSpendDashboard(){
+  var fd=APP._portalFd||{};
+  var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=APP._portalCalcs||fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
+  var status=_portalSpendStatus();
+  var entries=S.spendingEntries||[];
+  var now=new Date();var curMonth=now.getMonth(),curYear=now.getFullYear();
+  var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
+  var monthNames=['January','February','March','April','May','June','July','August','September','October','November','December'];
+  var moneyIn=status.moneyIn,moneyOut=status.moneyOut;
+  var leftToSpend=Math.max(0,moneyIn-moneyOut);
+  var dailyBudget=status.daysLeft>0?Math.round(leftToSpend/status.daysLeft):0;
+  if(moneyIn<=0){
+    return'<div style="padding:20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px;margin-bottom:16px"><div style="font-size:32px;margin-bottom:8px">💰</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:4px">No income on file</div><div style="font-size:11px;color:var(--mu);line-height:1.6;max-width:380px;margin:0 auto">Enter your income in <strong style="color:#5B9BFF">My Financial Data</strong> to unlock the live spending dashboard.</div></div>';
+  }
+  var h='';
+  // Header + Add Expense button
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px"><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+monthNames[curMonth]+' '+curYear+'</div><div style="font-size:10px;color:var(--mu)">Day '+status.dayOfMonth+' of '+status.daysInMonth+'</div></div>';
+  h+='<button onclick="_portalOpenAddExpense()" style="padding:8px 14px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">+ Add Expense</button>';
+  h+='</div>';
+  // 3 stat tiles
+  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px">';
+  h+='<div style="background:linear-gradient(135deg,rgba(14,14,56,.9),rgba(9,9,46,.8));border:1px solid var(--bd);border-top:3px solid var(--gr);border-radius:4px;padding:12px;text-align:center"><div style="font-family:var(--fd);font-size:20px;color:var(--gr)">'+fmt(Math.round(moneyIn))+'</div><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase">Money In</div></div>';
+  h+='<div style="background:linear-gradient(135deg,rgba(14,14,56,.9),rgba(9,9,46,.8));border:1px solid var(--bd);border-top:3px solid var(--or);border-radius:4px;padding:12px;text-align:center"><div style="font-family:var(--fd);font-size:20px;color:var(--or)">'+fmt(Math.round(moneyOut))+'</div><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase">Spent</div></div>';
+  h+='<div style="background:linear-gradient(135deg,rgba(14,14,56,.9),rgba(9,9,46,.8));border:1px solid var(--bd);border-top:3px solid #5B9BFF;border-radius:4px;padding:12px;text-align:center"><div style="font-family:var(--fd);font-size:20px;color:#5B9BFF">'+fmt(Math.round(leftToSpend))+'</div><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase">Left</div><div style="font-size:9px;color:var(--mu);margin-top:2px">'+fmt(dailyBudget)+'/day</div></div>';
+  h+='</div>';
+  // Spending progress bar
+  var barPct=moneyIn>0?Math.min(100,Math.round(moneyOut/moneyIn*100)):0;
+  var barCol=barPct>90?'var(--rd)':barPct>70?'var(--or)':'var(--gr)';
+  h+='<div style="margin-bottom:12px"><div style="height:7px;background:rgba(0,68,191,.08);border-radius:4px;overflow:hidden"><div style="height:100%;width:'+barPct+'%;background:'+barCol+';border-radius:4px;transition:width .5s ease"></div></div>';
+  h+='<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:9px;color:var(--mu)"><span>'+barPct+'% spent</span><span>'+(100-barPct)+'% remaining</span></div></div>';
+  // Accountability banner (severity-aware)
+  h+=_portalSpendBanner(status);
+  // Where Your Money Went (category breakdown by bucket)
+  if(monthEntries.length>0){
+    var bucketMap={food:'🍽️ Food',housing:'🏠 Housing',transportation:'🚗 Transport',discretionary:'🎬 Entertainment',subscriptions:'📱 Subscriptions',utilities:'⚡ Utilities',insurance:'🛡️ Insurance',misc:'📦 Other'};
+    var catTotals={};
+    monthEntries.forEach(function(e){var bk=e.category_bucket||e.category||'misc';if(!catTotals[bk])catTotals[bk]=0;catTotals[bk]+=parseFloat(e.amount)||0;});
+    h+='<div style="margin-top:18px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px" id="portalSpendCatHdr">Where Your Money Went</div>';
+    var anyCats=false;
+    var expData=S.expData||{};
+    Object.keys(bucketMap).forEach(function(bk){
+      var spent=catTotals[bk]||0;if(spent<=0)return;
+      anyCats=true;
+      var budget=0;
+      var ed=expData[bk];
+      if(ed){
+        if(ed.total!=null)budget=parseFloat(ed.total)||0;
+        else if(ed.amount!=null){budget=parseFloat(ed.amount)||0;if(ed.period==='annual')budget=budget/12;}
+        else if(ed.subs){Object.keys(ed.subs).forEach(function(sk){budget+=(parseFloat(ed.subs[sk])||0);});}
+      }
+      var pct=budget>0?Math.min(100,Math.round(spent/budget*100)):0;
+      var catBarCol=pct>100?'var(--rd)':pct>80?'var(--or)':'var(--gr)';
+      h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px"><span style="color:var(--wh)">'+bucketMap[bk]+'</span><span style="color:'+catBarCol+';font-family:var(--fh);font-weight:700">'+fmt(Math.round(spent))+(budget>0?' / '+fmt(Math.round(budget)):'')+'</span></div>';
+      if(budget>0)h+='<div style="height:5px;background:rgba(0,68,191,.08);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+Math.min(100,pct)+'%;background:'+catBarCol+';border-radius:3px;transition:width .3s"></div></div>';
+      h+='</div>';
+    });
+    if(!anyCats)h+='<div style="font-size:11px;color:var(--mu);padding:6px 0">No categorized spending yet.</div>';
+    h+='</div>';
+  }
+  // Recent entries
+  if(monthEntries.length>0){
+    var recent=monthEntries.slice().sort(function(a,b){return new Date(b.date)-new Date(a.date);}).slice(0,8);
+    h+='<div style="margin-top:18px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Recent ('+monthEntries.length+' this month)</div>';
+    recent.forEach(function(e){
+      var bk=e.category_bucket||e.category||'misc';
+      var icMap={food:'🍽️',housing:'🏠',transportation:'🚗',discretionary:'🎬',subscriptions:'📱',utilities:'⚡',insurance:'🛡️',misc:'📦',activeSavings:'📈'};
+      var ic=icMap[bk]||'📦';
+      var dateStr='';
+      try{var d=new Date(e.date);dateStr=(d.getMonth()+1)+'/'+d.getDate();}catch(_){}
+      h+='<div style="display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:4px">';
+      h+='<span style="font-size:14px">'+ic+'</span>';
+      h+='<div style="flex:1;min-width:0"><div style="font-size:12px;color:var(--wh);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.description||(typeof bucketMap!=='undefined'&&bucketMap[bk])||bk)+'</div>';
+      h+='<div style="font-size:9px;color:var(--mu)">'+dateStr+'</div></div>';
+      h+='<div style="font-family:var(--fd);font-size:13px;color:var(--or);font-weight:700">'+fmt(parseFloat(e.amount)||0)+'</div>';
+      h+='</div>';
+    });
+    h+='</div>';
+  } else {
+    h+='<div style="margin-top:18px;padding:18px;text-align:center;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px"><div style="font-size:24px;margin-bottom:6px">📝</div><div style="font-size:11px;color:var(--mu)">No expenses logged this month yet. Tap <strong style="color:#5B9BFF">+ Add Expense</strong> to start.</div></div>';
+  }
+  return h;
+}
+
+// ── Inline accountability banner (portal version) ──
+function _portalSpendBanner(status){
+  if(!status)status=_portalSpendStatus();
+  var on=status.severity!=='ok';
+  var theme={
+    ok:{bg:'rgba(34,197,94,.06)',bd:'rgba(34,197,94,.18)',fg:'var(--gr)',icon:'✅'},
+    caution:{bg:'rgba(234,179,8,.06)',bd:'rgba(234,179,8,.22)',fg:'var(--yl)',icon:'👁️'},
+    warning:{bg:'rgba(249,115,22,.07)',bd:'rgba(249,115,22,.28)',fg:'var(--or)',icon:'⚠️'},
+    over:{bg:'rgba(239,68,68,.07)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️'}
+  };
+  var t=theme[status.severity]||theme.ok;
+  if(!on){
+    return'<div style="padding:10px 12px;background:'+t.bg+';border:1px solid '+t.bd+';border-radius:4px;font-size:12px;color:'+t.fg+';margin-bottom:14px">'+t.icon+' On track — spending under pace</div>';
+  }
+  var h='<div onclick="_portalSpendShowPopup()" role="button" tabindex="0" onkeypress="if(event.key===\'Enter\')_portalSpendShowPopup()" style="padding:11px 13px;background:'+t.bg+';border:1px solid '+t.bd+';border-left:3px solid '+t.fg+';border-radius:4px;margin-bottom:14px;cursor:pointer;transition:.15s">';
+  h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">';
+  h+='<div style="display:flex;align-items:flex-start;gap:9px;flex:1;min-width:200px">';
+  h+='<span style="font-size:16px;line-height:1">'+t.icon+'</span>';
+  h+='<div><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;color:'+t.fg+';text-transform:uppercase">';
+  h+=(status.severity==='over'?'OVER BUDGET':status.severity==='warning'?'SPENDING WARNING':'HEADS UP');
+  h+='</div>';
+  h+='<div style="font-size:11px;color:rgba(226,232,240,.85);margin-top:2px">'+esc(status.reasons[0]||'');
+  if(status.overspend>0)h+=' · projected overspend <strong>'+fmt(status.overspend)+'</strong>';
+  h+='</div></div></div>';
+  h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;color:'+t.fg+';white-space:nowrap">View impact →</div>';
+  h+='</div></div>';
+  return h;
+}
+
+// ── Show the accountability popup (portal version) ──
+function _portalSpendShowPopup(forceShow){
+  var status=_portalSpendStatus();
+  if(status.severity==='ok'&&!forceShow)return;
+  var el=document.getElementById('portalSpendModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='portalSpendModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('portalSpendModal');};
+    document.body.appendChild(el);
+  }
+  var theme={
+    caution:{fg:'var(--yl)',label:'Heads up',icon:'👁️'},
+    warning:{fg:'var(--or)',label:'Spending warning',icon:'⚠️'},
+    over:{fg:'var(--rd)',label:'Over budget',icon:'⚖️'}
+  };
+  var t=theme[status.severity]||theme.caution;
+  var h='<div class="modal" style="max-width:540px;max-height:90vh;overflow-y:auto">';
+  h+='<button class="modal-close" onclick="closeModal(\'portalSpendModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">'+t.icon+' '+t.label+'</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="font-size:10px;color:var(--mu);margin-bottom:14px">'+status.monthLabel+' · day '+status.dayOfMonth+' of '+status.daysInMonth+'</div>';
+  // 1. What's happening
+  h+='<div style="margin-bottom:14px;padding:11px 12px;background:rgba(249,115,22,.04);border-left:3px solid '+t.fg+';border-radius:0 4px 4px 0">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:'+t.fg+';margin-bottom:6px">What\'s happening</div>';
+  status.reasons.forEach(function(r){
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.85);margin-bottom:3px">• '+esc(r)+'</div>';
+  });
+  h+='<div style="display:flex;gap:14px;margin-top:8px;font-size:11px;flex-wrap:wrap">';
+  h+='<div><span style="color:var(--mu)">Spent:</span> <strong style="color:var(--wh)">'+fmt(status.moneyOut)+'</strong></div>';
+  h+='<div><span style="color:var(--mu)">Income:</span> <strong style="color:var(--wh)">'+fmt(status.moneyIn)+'</strong></div>';
+  if(status.projected>status.moneyIn)h+='<div><span style="color:var(--mu)">Projected:</span> <strong style="color:'+t.fg+'">'+fmt(status.projected)+'</strong></div>';
+  h+='</div></div>';
+  // 2. Plan impact
+  if(status.overspend>0){
+    var impact=_portalSpendPlanImpact(status.overspend);
+    if(impact){
+      h+='<div style="margin-bottom:14px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--wh);margin-bottom:8px">What this does to your plan</div>';
+      h+='<div style="display:flex;justify-content:space-between;padding:9px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:5px">';
+      h+='<span style="font-size:11px;color:var(--mu)">Less for '+esc(impact.mostAffectedName)+' this month</span>';
+      h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+t.fg+'">−'+fmt(impact.monthlyShortfall)+'</span>';
+      h+='</div>';
+      if(impact.compoundedShortfall>0){
+        h+='<div style="display:flex;justify-content:space-between;padding:9px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:5px">';
+        h+='<span style="font-size:11px;color:var(--mu)">Compounded over '+impact.yearsToRetirement+' years (~6.5%)</span>';
+        h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+t.fg+'">−'+fmt(impact.compoundedShortfall)+'</span>';
+        h+='</div>';
+      }
+      if(impact.origRetValue!=null&&impact.newRetValue!=null&&impact.origRetValue>0){
+        h+='<div style="display:flex;justify-content:space-between;padding:9px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">';
+        h+='<span style="font-size:11px;color:var(--mu)">Retirement projection</span>';
+        h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+t.fg+'">$'+Math.round(impact.origRetValue/1000)+'K → $'+Math.round(impact.newRetValue/1000)+'K</span>';
+        h+='</div>';
+      }
+      h+='</div>';
+    } else {
+      h+='<div style="margin-bottom:14px;padding:11px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:4px;font-size:11px;color:var(--mu);line-height:1.7">Build a financial plan to see how this overspend affects your long-term goals. <a href="javascript:closeModal(\'portalSpendModal\');showClientPage(\'plan\');initClientPlan()" style="color:#5B9BFF;text-decoration:underline">Build my plan →</a></div>';
+    }
+  }
+  // 3. Course-correct suggestion
+  if(status.overspend>0&&status.daysLeft>0){
+    var dailyCut=Math.ceil(status.overspend/Math.max(1,status.daysLeft));
+    h+='<div style="margin-bottom:12px;padding:11px 12px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:4px">';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--gr);margin-bottom:5px">Course correct</div>';
+    h+='<div style="font-size:11px;color:rgba(226,232,240,.85);line-height:1.7">Cut about <strong style="color:var(--gr)">'+fmt(dailyCut)+'/day</strong> for the rest of the month to land at budget.';
+    if(status.categories.length>0){
+      var topCat=status.categories[0];
+      h+=' Top spending pressure: <strong style="color:var(--wh)">'+esc(topCat.name)+'</strong> ('+topCat.pct+'% of budget).';
+    }
+    h+='</div></div>';
+  }
+  // Footer
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'portalSpendModal\')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">I\'ll handle it</button>';
+  h+='<button onclick="_portalSpendScrollToCats();closeModal(\'portalSpendModal\')" style="padding:9px 16px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Show me what to cut</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('portalSpendModal');
+  // Mark trigger as shown (per-session — no need to persist across reloads on portal side)
+  if(!APP._portalSpendShown)APP._portalSpendShown={};
+  var key=_portalSpendTriggerKey(status);
+  if(key)APP._portalSpendShown[key]=Date.now();
+}
+
+// ── Auto-show popup on My Spending tab open ──
+function _portalSpendMaybeShowPopup(){
+  var status=_portalSpendStatus();
+  if(status.severity==='ok')return;
+  var key=_portalSpendTriggerKey(status);
+  if(!key)return;
+  var shown=APP._portalSpendShown||{};
+  if(shown[key])return;
+  setTimeout(function(){_portalSpendShowPopup();},500);
+}
+
+// ── Scroll helper for "Show me what to cut" ──
+function _portalSpendScrollToCats(){
+  setTimeout(function(){
+    var el=document.getElementById('portalSpendCatHdr');
+    if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
+  },200);
+}
+
+// ── Add-expense overlay modal ──
+// Light-weight version of pfos-main's quick-add: amount, description, category, date.
+// Posts the entry to pfos-main via PFOS_QUICK_ADD message. Also writes optimistically
+// to the local _lastPfosState mirror so the My Spending dashboard refreshes immediately.
+function _portalOpenAddExpense(){
+  var el=document.getElementById('portalAddExpenseModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='portalAddExpenseModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('portalAddExpenseModal');};
+    document.body.appendChild(el);
+  }
+  var today=new Date().toISOString().split('T')[0];
+  var h='<div class="modal" style="max-width:440px">';
+  h+='<button class="modal-close" onclick="closeModal(\'portalAddExpenseModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">+ Log Expense</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">';
+  h+='<div><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Amount</div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="number" step="0.01" id="portalQaAmount" placeholder="0.00" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:18px;font-weight:700;border-radius:4px;box-sizing:border-box" oninput="this.style.borderColor=parseFloat(this.value)>0?\'rgba(91,155,255,.35)\':\'var(--bd)\'"></div>';
+  h+='</div>';
+  h+='<div><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Date</div>';
+  h+='<input type="date" id="portalQaDate" value="'+today+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box">';
+  h+='</div></div>';
+  h+='<div style="margin-bottom:10px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Description</div>';
+  h+='<input type="text" id="portalQaDesc" placeholder="e.g. Groceries, Gas, Coffee" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box" oninput="_portalQaAutoCat(this.value)">';
+  h+='</div>';
+  h+='<div style="margin-bottom:14px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Category</div>';
+  h+='<select id="portalQaCat" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box">';
+  h+='<option value="food">🍽️ Food</option>';
+  h+='<option value="housing">🏠 Housing</option>';
+  h+='<option value="transportation">🚗 Transport</option>';
+  h+='<option value="utilities">⚡ Utilities</option>';
+  h+='<option value="insurance">🛡️ Insurance</option>';
+  h+='<option value="discretionary">🛍️ Entertainment / Shopping</option>';
+  h+='<option value="subscriptions">📱 Subscriptions</option>';
+  h+='<option value="misc">📦 Other</option>';
+  h+='</select></div>';
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'portalAddExpenseModal\')" style="padding:10px 18px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Cancel</button>';
+  h+='<button onclick="_portalSubmitAddExpense()" style="padding:10px 22px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Save Expense</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('portalAddExpenseModal');
+  setTimeout(function(){var amt=document.getElementById('portalQaAmount');if(amt)amt.focus();},120);
+}
+
+// ── Auto-categorize description text ──
+var _portalQaCatKW={
+  'grocer':'food','restaurant':'food','starbucks':'food','coffee':'food','lunch':'food','dinner':'food','meal':'food','pizza':'food','burger':'food','food':'food','dining':'food','uber eats':'food','doordash':'food','grubhub':'food',
+  'gas':'transportation','fuel':'transportation','uber':'transportation','lyft':'transportation','taxi':'transportation','parking':'transportation','toll':'transportation','car wash':'transportation','auto':'transportation',
+  'rent':'housing','mortgage':'housing','hoa':'housing','property tax':'housing','home':'housing','plumber':'housing','electrician':'housing','repair':'housing',
+  'electric':'utilities','water':'utilities','internet':'utilities','phone':'utilities','wifi':'utilities','cable':'utilities','utility':'utilities',
+  'netflix':'subscriptions','spotify':'subscriptions','gym':'subscriptions','membership':'subscriptions','subscription':'subscriptions','hulu':'subscriptions','disney':'subscriptions','apple tv':'subscriptions','prime':'subscriptions',
+  'insurance':'insurance','premium':'insurance','geico':'insurance','progressive':'insurance','allstate':'insurance','state farm':'insurance',
+  'amazon':'discretionary','target':'discretionary','walmart':'discretionary','clothing':'discretionary','shopping':'discretionary','movie':'discretionary','concert':'discretionary'
+};
+function _portalQaAutoCat(desc){
+  var lower=(desc||'').toLowerCase();
+  var sel=document.getElementById('portalQaCat');if(!sel)return;
+  for(var k in _portalQaCatKW){if(lower.indexOf(k)!==-1){sel.value=_portalQaCatKW[k];return;}}
+}
+
+// ── Submit the expense ──
+// 1. Build the entry
+// 2. Optimistically write to _lastPfosState.state.spendingEntries so portal UI updates instantly
+// 3. Post to pfos-main for canonical save
+// 4. Refresh the spending dashboard
+function _portalSubmitAddExpense(){
+  var amtEl=document.getElementById('portalQaAmount');
+  var amt=parseFloat(amtEl&&amtEl.value);
+  if(isNaN(amt)||amt<=0){
+    if(amtEl){amtEl.style.borderColor='var(--rd)';amtEl.focus();}
+    return;
+  }
+  var desc=(document.getElementById('portalQaDesc')||{}).value||'';
+  var cat=(document.getElementById('portalQaCat')||{}).value||'misc';
+  var date=(document.getElementById('portalQaDate')||{}).value||new Date().toISOString().split('T')[0];
+  var entry={
+    id:Date.now(),
+    amount:amt,
+    description:desc,
+    category:cat,
+    category_bucket:cat,// portal version: simple — categories ARE buckets
+    expense_type:'regular',
+    payment_method:'debit',
+    payment_detail:{},
+    couple_owner:'self',
+    is_recurring:false,
+    date:date,
+    created_at:new Date().toISOString(),
+    _source:'portal'
+  };
+  // 1. Optimistic local write
+  if(_lastPfosState&&_lastPfosState.state){
+    if(!_lastPfosState.state.spendingEntries)_lastPfosState.state.spendingEntries=[];
+    _lastPfosState.state.spendingEntries.push(entry);
+  }
+  if(APP._portalFd&&APP._portalFd.S){
+    if(!APP._portalFd.S.spendingEntries)APP._portalFd.S.spendingEntries=[];
+    APP._portalFd.S.spendingEntries.push(entry);
+  }
+  // 2. Post to pfos-main for canonical save
+  try{
+    var frame=getPFOSFrame();
+    if(frame&&frame.contentWindow){
+      frame.contentWindow.postMessage({type:'PFOS_QUICK_ADD',entry:entry},'https://pfos.esjfinancial.com');
+    }
+  }catch(e){console.warn('Portal add-expense postMessage:',e);}
+  // 3. Close modal + refresh
+  closeModal('portalAddExpenseModal');
+  // Toast confirmation
+  var toast=document.createElement('div');
+  toast.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(34,197,94,.95);color:#fff;padding:10px 18px;border-radius:6px;font-family:var(--fh);font-size:12px;font-weight:700;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.3);transition:opacity .3s';
+  toast.textContent='✓ '+fmt(amt)+' logged';
+  document.body.appendChild(toast);
+  setTimeout(function(){toast.style.opacity='0';setTimeout(function(){toast.remove();},300);},2200);
+  // 4. Re-render the spending dashboard if it's visible
+  try{if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();}catch(e){}
+  // Phase G: refresh the dashboard pulse card too
+  try{if(typeof _clientRenderSpendPulse==='function')_clientRenderSpendPulse();}catch(e){}
+}
+
+
+// ── Phase G: Compact spending pulse card for the portal dashboard ──
+// Pulls from the same _portalSpendStatus() data used in My Spending. Severity-aware,
+// click to jump to the full My Spending dashboard. Keeps the dashboard's "at a glance"
+// promise — clients see the headline without navigating.
+function _clientRenderSpendPulse(){
+  var el=document.getElementById('spendPulseCard');
+  if(!el)return;
+  var status;
+  try{status=_portalSpendStatus();}catch(e){return;}
+  if(!status||!status.moneyIn||status.moneyIn<=0){
+    // No income on file yet — hide the card to avoid empty noise
+    el.innerHTML='';
+    return;
+  }
+  var moneyIn=status.moneyIn,moneyOut=status.moneyOut;
+  var leftToSpend=Math.max(0,moneyIn-moneyOut);
+  var dailyBudget=status.daysLeft>0?Math.round(leftToSpend/status.daysLeft):0;
+  var pctSpent=moneyIn>0?Math.min(100,Math.round(moneyOut/moneyIn*100)):0;
+  // Severity theme — same palette as the My Spending banner
+  var theme={
+    ok:{bg:'rgba(34,197,94,.04)',bd:'rgba(34,197,94,.18)',fg:'var(--gr)',icon:'✅',label:'On track'},
+    caution:{bg:'rgba(234,179,8,.05)',bd:'rgba(234,179,8,.22)',fg:'var(--yl)',icon:'👁️',label:'Heads up'},
+    warning:{bg:'rgba(249,115,22,.06)',bd:'rgba(249,115,22,.28)',fg:'var(--or)',icon:'⚠️',label:'Spending warning'},
+    over:{bg:'rgba(239,68,68,.06)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️',label:'Over budget'}
+  };
+  var t=theme[status.severity]||theme.ok;
+  var barCol=pctSpent>=100?'var(--rd)':pctSpent>90?'var(--rd)':pctSpent>70?'var(--or)':'var(--gr)';
+  // Top line — "Day X of Y" + spent / income
+  var monthShort=new Date().toLocaleDateString('en-US',{month:'short'});
+  // Card click navigates to My Spending tab
+  var h='<div onclick="showClientPage(\'spending\');renderSpendingAnalysis()" role="button" tabindex="0" onkeypress="if(event.key===\'Enter\'){showClientPage(\'spending\');renderSpendingAnalysis();}" class="info-card" style="padding:14px;cursor:pointer;background:'+t.bg+';border:1px solid '+t.bd+';border-left:3px solid '+t.fg+';transition:.15s" onmouseover="this.style.background=\''+t.bg.replace('.04','.08').replace('.05','.08').replace('.06','.10')+'\'" onmouseout="this.style.background=\''+t.bg+'\'">';
+  // Header
+  h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">';
+  h+='<div style="display:flex;align-items:center;gap:6px">';
+  h+='<span style="font-size:12px">'+t.icon+'</span>';
+  h+='<span style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+t.label+'</span>';
+  h+='</div>';
+  h+='<span style="font-family:var(--fh);font-size:10px;color:var(--mu)">'+monthShort+' · day '+status.dayOfMonth+' of '+status.daysInMonth+'</span>';
+  h+='</div>';
+  // Numbers row
+  h+='<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:8px;gap:10px">';
+  h+='<div><div style="font-family:var(--fd);font-size:22px;color:var(--wh);line-height:1">'+fmt(moneyOut)+' <span style="font-size:11px;color:var(--mu);font-family:var(--fh)">of '+fmt(moneyIn)+'</span></div>';
+  h+='<div style="font-size:10px;color:var(--mu);margin-top:3px">'+pctSpent+'% spent · '+fmt(leftToSpend)+' left ('+fmt(dailyBudget)+'/day)</div></div>';
+  // CTA on the right
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+t.fg+';white-space:nowrap">Open →</div>';
+  h+='</div>';
+  // Progress bar
+  h+='<div style="height:5px;background:rgba(0,68,191,.1);border-radius:3px;overflow:hidden">';
+  h+='<div style="height:100%;width:'+pctSpent+'%;background:'+barCol+';border-radius:3px;transition:width .5s ease"></div>';
+  h+='</div>';
+  // Status line — mirrors the banner reason if there's an issue
+  if(status.severity!=='ok'&&status.reasons&&status.reasons.length>0){
+    h+='<div style="font-size:11px;color:rgba(226,232,240,.8);margin-top:8px;line-height:1.5">';
+    h+=esc(status.reasons[0]);
+    if(status.overspend>0)h+=' · projected overspend <strong style="color:'+t.fg+'">'+fmt(status.overspend)+'</strong>';
+    h+='</div>';
+  }
+  h+='</div>';
+  el.innerHTML=h;
+}
+
 function renderSpendingAnalysis(){
   var el=document.getElementById('spendingAnalysis');
   if(!el) return;
@@ -4908,6 +5508,17 @@ function renderSpendingAnalysis(){
   var maxCat=catData.length?catData[0].amount:1;
 
   var h='';
+  // Phase F: Live this-month dashboard at the top — mirrors pfos-main home so clients
+  // can see live spending progress without bouncing between products. The static
+  // analytical view (tiles, plan deployment, category bars) stays below.
+  try{
+    var dashH=_portalRenderSpendDashboard();
+    if(dashH){
+      h+='<div style="margin-bottom:18px">'+dashH+'</div>';
+      // Section divider before the static analysis
+      h+='<div style="display:flex;align-items:center;gap:10px;margin:18px 0 14px"><div style="flex:1;height:1px;background:var(--bd)"></div><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.14em;color:var(--mu);text-transform:uppercase">Spending Profile</div><div style="flex:1;height:1px;background:var(--bd)"></div></div>';
+    }
+  }catch(e){console.warn('Spend dashboard:',e);}
   // Summary tiles
   h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:16px">';
   h+='<div style="background:linear-gradient(135deg,rgba(14,14,56,.9),rgba(9,9,46,.8));border:1px solid rgba(249,115,22,.15);border-radius:4px;padding:14px;text-align:center;backdrop-filter:blur(8px)"><div style="font-family:var(--fd);font-size:24px;color:var(--or)">'+fmt(Math.round(totalExp))+'</div><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase">Monthly Spending</div></div>';
@@ -4960,6 +5571,9 @@ function renderSpendingAnalysis(){
   }
 
   el.innerHTML=h;
+  // Phase F: auto-trigger the spending accountability popup if a new event has occurred.
+  // Idempotent — only pops once per (month + severity + ~$50 overspend bucket).
+  try{if(typeof _portalSpendMaybeShowPopup==='function')_portalSpendMaybeShowPopup();}catch(e){}
 }
 function renderOnboardingChecklist(){
   if(!APP.currentClientId) return;
@@ -5716,7 +6330,11 @@ window.addEventListener('message',async function(e){
         if(_currentClientPage==='analysis'&&typeof renderClientAnalysis==='function')renderClientAnalysis();
         if(_currentClientPage==='tracking'&&typeof renderClientTracking==='function')renderClientTracking();
         if(_currentClientPage==='projections'&&typeof renderClientProjections==='function')renderClientProjections();
-        if(_currentClientPage==='overview'){renderClientSavingsGoals();var _nwT=document.getElementById('nwTickerVal');if(_nwT)_nwT.textContent=fmtK(calcs.netWorth||0);}
+        if(_currentClientPage==='overview'){renderClientSavingsGoals();var _nwT=document.getElementById('nwTickerVal');if(_nwT)_nwT.textContent=fmtK(calcs.netWorth||0);
+          // Phase G: refresh spending pulse card when state arrives from pfos-main
+          try{if(typeof _clientRenderSpendPulse==='function')_clientRenderSpendPulse();}catch(e){}
+        }
+        if(_currentClientPage==='spending'&&typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
       }catch(e5){}
       // ── FORWARD DETECTION: check if pfos-main added new items matching plan recommendations ──
       try{
@@ -18042,8 +18660,16 @@ function calcFIRE(){
 }
 // ── QUICK ADD EXPENSE ──────────────────────────────────
 function clientQuickAddExpense(){
+  // Phase F: open the lightweight overlay modal directly. No more page swap or 800ms
+  // wait — clients can log expenses from anywhere in the portal. The overlay posts the
+  // entry to pfos-main via PFOS_QUICK_ADD message and writes optimistically to the
+  // local mirror so the spending dashboard updates instantly.
+  if(typeof _portalOpenAddExpense==='function'){
+    _portalOpenAddExpense();
+    return;
+  }
+  // Fallback for any older code path: switch to PFOS section
   showClientPage('pfos');
-  // Wait for iframe to load then navigate to expenses
   setTimeout(function(){
     var frame=getPFOSFrame();
     if(frame&&frame.contentWindow){
@@ -18264,6 +18890,19 @@ function _mtConfirm(){
   var note=document.getElementById('mtNote').value.trim();
   var mk=_trackKey();if(!_cpTracking[mk])_cpTracking[mk]={};
   _cpTracking[mk][idx]={done:true,actual:actual,ts:Date.now(),note:note,source:'client'};
+  // Phase D: mirror this entry into CPLAN._checkIns so plan projections + the
+  // accountability banner see it without requiring the user to also use the Phase B modal.
+  // Status follows the partial/full convention: actual >= planned → 'on', else 'partial'.
+  if(!CPLAN._checkIns)CPLAN._checkIns={};
+  if(!CPLAN._checkIns[mk])CPLAN._checkIns[mk]={};
+  var _statusD=actual>=a.amount?'on':(actual<=0?'off':'partial');
+  CPLAN._checkIns[mk][a.type]={
+    status:_statusD,
+    actual:actual,
+    plannedAt:a.amount,
+    recordedAt:new Date().toISOString(),
+    source:'tracking_page'
+  };
   // Calendar
   var calOn=document.getElementById('mtCalToggle').checked;
   if(calOn){
@@ -18271,6 +18910,13 @@ function _mtConfirm(){
     _cpPlanCalendar[idx]={day:day,name:a.customName||CP_NM[a.type]||a.type,amount:a.amount,type:a.type,icon:CP_IC[a.type]||'📋'};
   }
   _trackSave();
+  // Phase D: also persist via cplanSave so checkIns flow to Supabase + localStorage backup
+  try{if(typeof cplanSave==='function')cplanSave();}catch(e){}
+  // Phase D: re-run the simulation so chart/timeline/banner reflect the new actual immediately
+  try{
+    if(typeof _cpRunSimulation==='function')_cpRunSimulation();
+    if(typeof _cpRenderAccountabilityBanner==='function')_cpRenderAccountabilityBanner();
+  }catch(e){}
   closeModal('monthlyTrackModal');
   renderClientTracking();
   _syncPlanToMain();
@@ -18296,7 +18942,36 @@ function _trackGetYTD(idx){
   }
   return{planned:planned,actual:actual};
 }
-function _trackMiss(idx){var mk=_trackKey();if(!_cpTracking[mk])_cpTracking[mk]={};_cpTracking[mk][idx]={done:false,actual:0,ts:Date.now(),source:'client'};CPLAN._missedMonths=CPLAN._missedMonths||{};if(!CPLAN._missedMonths[mk])CPLAN._missedMonths[mk]=[];if(CPLAN._missedMonths[mk].indexOf(idx)<0)CPLAN._missedMonths[mk].push(idx);_trackSave();renderClientTracking();_syncPlanToMain();}
+function _trackMiss(idx){
+  var a=CPLAN.allocations[idx];
+  var mk=_trackKey();
+  if(!_cpTracking[mk])_cpTracking[mk]={};
+  _cpTracking[mk][idx]={done:false,actual:0,ts:Date.now(),source:'client'};
+  CPLAN._missedMonths=CPLAN._missedMonths||{};
+  if(!CPLAN._missedMonths[mk])CPLAN._missedMonths[mk]=[];
+  if(CPLAN._missedMonths[mk].indexOf(idx)<0)CPLAN._missedMonths[mk].push(idx);
+  // Phase D: mirror miss into CPLAN._checkIns so projections + accountability banner reflect it
+  if(a){
+    if(!CPLAN._checkIns)CPLAN._checkIns={};
+    if(!CPLAN._checkIns[mk])CPLAN._checkIns[mk]={};
+    CPLAN._checkIns[mk][a.type]={
+      status:'off',
+      actual:0,
+      plannedAt:a.amount,
+      recordedAt:new Date().toISOString(),
+      source:'tracking_page'
+    };
+  }
+  _trackSave();
+  // Phase D: persist via cplanSave + re-run sim + refresh banner
+  try{if(typeof cplanSave==='function')cplanSave();}catch(e){}
+  try{
+    if(typeof _cpRunSimulation==='function')_cpRunSimulation();
+    if(typeof _cpRenderAccountabilityBanner==='function')_cpRenderAccountabilityBanner();
+  }catch(e){}
+  renderClientTracking();
+  _syncPlanToMain();
+}
 function renderClientTracking(){
   var el=document.getElementById('clientTrackingContent');if(!el)return;
   _cpEnsurePlanLoaded();
@@ -18330,14 +19005,34 @@ function renderClientTracking(){
     h+='<div style="flex:1"><div style="display:flex;align-items:center;gap:6px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+nm+'</div>';
     if(streak>=2)h+='<span style="font-size:9px;padding:2px 6px;background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.2);border-radius:8px;color:var(--or);font-family:var(--fh);font-weight:700">🔥 '+streak+'</span>';
     h+='</div>';
-    h+='<div style="font-size:11px;color:var(--mu)">'+fmt(a.amount)+'/mo planned'+(isDone&&d2.actual!==a.amount?' · Actual: <strong style="color:var(--gr)">'+fmt(d2.actual)+'</strong>':'')+'</div>';
+    // Phase D: show actual amount with status-aware styling. Full = green, partial = yellow.
+    var _actualLine='';
+    if(isDone){
+      var _act=d2.actual||a.amount;
+      if(_act<a.amount){
+        _actualLine=' · Actual: <strong style="color:var(--yl)">'+fmt(_act)+' (partial)</strong>';
+      } else if(_act>a.amount){
+        _actualLine=' · Actual: <strong style="color:var(--gr)">'+fmt(_act)+' (over)</strong>';
+      } else if(d2.actual!==a.amount){
+        _actualLine=' · Actual: <strong style="color:var(--gr)">'+fmt(_act)+'</strong>';
+      }
+    }
+    h+='<div style="font-size:11px;color:var(--mu)">'+fmt(a.amount)+'/mo planned'+_actualLine+'</div>';
     if(lnk)h+='<div style="font-size:9px;color:#5B9BFF">🔗 '+lnk.label+'</div>';
     if(calEntry)h+='<div style="font-size:9px;color:var(--mu)">📅 Withdraws on the '+calEntry.day+ordSuffix2(calEntry.day)+'</div>';
     if(isDone&&d2.note)h+='<div style="font-size:9px;color:var(--mu);font-style:italic">📝 '+esc(d2.note)+'</div>';
     if(a.type==='debt'&&CPLAN.debts.length){var hd=CPLAN.debts.filter(function(x){return(parseFloat(x.rate)||0)>10;});if(hd.length&&typeof _cpDebtSimulate==='function'){var ds=typeof _cpDebtSort==='function'?_cpDebtSort(hd,CPLAN.debtStrategy||'avalanche'):hd;var dr=_cpDebtSimulate(ds,a.amount);h+='<div style="font-size:9px;color:var(--or)">→ ~'+dr.months+' months</div>';}}
     else if(['roth','401k','invest','iul','wl','edu','ibc'].indexOf(a.type)>=0){var rt=typeof _cpGetNetRate==='function'?_cpGetNetRate(a):.065;var yr2=Math.max(1,65-(CPLAN.age||35));var bl=0;for(var y=1;y<=yr2;y++)bl=(bl+a.amount*12)*(1+rt);h+='<div style="font-size:9px;color:var(--gr)">→ '+fmtK(Math.round(bl))+' at retirement</div>';}
     h+='</div><div style="text-align:right;flex-shrink:0;margin-right:8px"><div style="font-family:var(--fd);font-size:22px;color:'+c2+'">'+fmt(a.amount)+'</div><div style="font-size:8px;color:var(--mu)">/mo</div></div>';
-    if(isDone)h+='<div style="padding:8px 16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr)">✓ Done</div>';
+    if(isDone){
+      // Phase D: distinguish partial from full so the user can see what they reported
+      var _act2=d2.actual||a.amount;
+      if(_act2<a.amount && _act2>0){
+        h+='<div style="padding:8px 14px;background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--yl);text-align:center"><div>~ Partial</div><div style="font-size:9px;font-weight:600;opacity:.85">'+fmt(_act2)+' of '+fmt(a.amount)+'</div></div>';
+      } else {
+        h+='<div style="padding:8px 16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr)">✓ Done</div>';
+      }
+    }
     else if(isMiss)h+='<div style="padding:8px 16px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--rd)">✗ Missed</div>';
     else{h+='<div style="display:flex;flex-direction:column;gap:4px"><button onclick="_trackComplete('+idx+')" style="padding:8px 16px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr);cursor:pointer;min-height:34px;transition:.15s" onmouseover="this.style.background=\'rgba(34,197,94,.2)\'" onmouseout="this.style.background=\'rgba(34,197,94,.08)\'">✓ Done</button><button onclick="_trackMiss('+idx+')" style="padding:5px 16px;background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.12);border-radius:4px;font-family:var(--fh);font-size:9px;font-weight:700;color:var(--rd);cursor:pointer;opacity:.7;transition:.15s" onmouseover="this.style.opacity=\'1\'" onmouseout="this.style.opacity=\'.7\'">✗ Miss</button></div>';}
     h+='</div>';
@@ -21288,70 +21983,416 @@ function _cpDebtSort(debts,method){
 }
 
 function _cpBuildTimeline(){
-  var milestones=[];
   var sim=CPLAN._sim;
+  var monthsElapsed=(sim&&sim.monthsElapsed)||(typeof _cpMonthsElapsed==='function'?_cpMonthsElapsed():0);
+  var origProj=CPLAN._originalProjection||null;
+
+  // ── Collect all phase numbers in use, in order ──
+  var phases=[];
+  var phaseSet={};
   CPLAN.allocations.forEach(function(a){
-    if(a.amount<=0)return;
-    if(a.type==='ef'&&a.target>0){var mo=Math.ceil(Math.max(0,a.target-(CPLAN.efBal||0))/a.amount);if(mo>0)milestones.push({month:mo,label:'EF funded',color:'#22C55E',icon:'🛡️'});}
-    if(a.type==='custom'&&a.target>0){var mo3=Math.ceil((a.target-(a.goalCurrent||0))/a.amount);if(mo3>0)milestones.push({month:mo3,label:a.customName||'Goal',color:'#EAB308',icon:'🎯'});}
-    // Individual debt payoffs — HIGH-RATE ONLY (>10% APR)
-    if(a.type==='debt'&&CPLAN.debts.length>0){
-      var strat=CPLAN.debtStrategy||'avalanche';
-      var _tlDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0&&(parseFloat(d.rate)||0)>10;});
-      if(!_tlDebts.length)_tlDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0;});
-      var sorted=_cpDebtSort(_tlDebts,strat);
-      var simResult=_cpDebtSimulate(sorted,a.amount);
-      simResult.order.forEach(function(o){
-        milestones.push({month:o.month,label:o.name+' paid off',color:'#F97316',icon:'💳'});
-      });
-      if(simResult.months>0)milestones.push({month:simResult.months,label:'High-rate debt free',color:'#22C55E',icon:'🎉'});
-    }
+    var p=(a.phase!=null)?a.phase:1;
+    if(p===0)return;// unassigned items don't contribute to a phase track
+    if(!phaseSet[p]){phaseSet[p]=true;phases.push(p);}
   });
-  // ── Cascade flow events from simulation ──
-  if(sim&&sim.cascadeLog){
-    sim.cascadeLog.forEach(function(cl){
-      if(cl.destinations&&cl.destinations.length>0){
-        var flowDesc=cl.destinations.map(function(d){return fmt(d.amount)+' → '+d.name;}).join(' · ');
-        milestones.push({month:cl.month,label:fmt(cl.freed)+' freed',color:'#5B9BFF',icon:'🔄',sublabel:flowDesc});
+  phases.sort(function(a,b){return a-b;});
+  // Always show Phase 1 even if empty so the user has context
+  if(!phases.length||phases[0]>1)phases.unshift(1);
+
+  // ── Build per-phase milestone data ──
+  // For each allocation we want to know:
+  //   - When does it start being funded? (its phase trigger month)
+  //   - When does it complete? (target reached, debt paid off, etc.)
+  //
+  // Milestones come from a few sources:
+  //   1. Allocation-specific completions (EF target reached, custom goal hit, debt cleared)
+  //   2. Cascade events from the simulation (Phase 2 starts when EF funded, etc.)
+  //   3. Catch-up boost markers (one-time top-ups the user committed to)
+
+  // Simulation cascade events tell us when each phase actually triggers.
+  // The "trigger month" for a phase is the earliest month any allocation IN that phase
+  // starts being funded according to allocFuture.startsMonth. Phase 1 starts at month 0.
+  var phaseStartByPhase={1:0};
+  if(sim&&sim.allocFuture){
+    CPLAN.allocations.forEach(function(a,idx){
+      var p=(a.phase!=null)?a.phase:1;
+      if(p===0||p===1)return;
+      var af=sim.allocFuture[idx];
+      if(!af)return;
+      var startMo=af.startsMonth>=0?af.startsMonth:null;
+      if(startMo==null)return;
+      if(phaseStartByPhase[p]==null||startMo<phaseStartByPhase[p]){
+        phaseStartByPhase[p]=startMo;
       }
     });
   }
-  // ── Net worth milestones from simulation ──
-  if(sim&&sim.netWorth){
-    var nwThresholds=[{val:100000,label:'$100K net worth',icon:'💎',color:'#5B9BFF'},{val:500000,label:'$500K net worth',icon:'🏆',color:'#A855F7'},{val:1000000,label:'$1M net worth',icon:'🌟',color:'#22C55E'}];
+
+  // Phase end month = max completion month among items in the phase, OR the next phase's
+  // start month if known, OR (open-ended) the projection horizon.
+  // We use this to scale each phase's bar so the visible width represents real time.
+
+  // Per-phase milestones (events to plot ON that phase's bar):
+  var phaseMilestonesByPhase={};
+  phases.forEach(function(p){phaseMilestonesByPhase[p]=[];});
+
+  // 1. Allocation-specific completions — anchor each to the phase its allocation lives in
+  CPLAN.allocations.forEach(function(a,idx){
+    if(a.amount<=0&&!a._completed)return;
+    var p=(a.phase!=null)?a.phase:1;
+    if(p===0)return;
+    var af=sim&&sim.allocFuture?sim.allocFuture[idx]:null;
+    var startMo=(af&&af.startsMonth>=0)?af.startsMonth:0;
+    // Item start (only worth showing if this isn't Phase 1 month 0)
+    if(startMo>0&&p>1){
+      // Already represented by the phase trigger; skip per-item start
+    }
+    // EF completion
+    if(a.type==='ef'&&a.target>0){
+      var efMo=Math.ceil(Math.max(0,a.target-(CPLAN.efBal||0))/Math.max(1,a.amount));
+      if(efMo>0)phaseMilestonesByPhase[p].push({month:startMo+efMo,label:'EF funded',color:'#22C55E',icon:'🛡️'});
+    }
+    // Custom goal completion
+    if(a.type==='custom'&&a.target>0){
+      var cMo=Math.ceil(Math.max(0,a.target-(a.goalCurrent||0))/Math.max(1,a.amount));
+      if(cMo>0)phaseMilestonesByPhase[p].push({month:startMo+cMo,label:(a.customName||'Goal')+' funded',color:'#EAB308',icon:'🎯'});
+    }
+    // House goal completion
+    if(a.type==='house'&&a.target>0){
+      var hMo=Math.ceil(Math.max(0,a.target-(a.goalCurrent||0))/Math.max(1,a.amount));
+      if(hMo>0)phaseMilestonesByPhase[p].push({month:startMo+hMo,label:'Down payment ready',color:'#A855F7',icon:'🏠'});
+    }
+    // Item completed (manually marked done)
+    if(a._completed){
+      var nm=a.customName||CP_NM[a.type]||a.type;
+      // If we know completion date, use it; otherwise place at "now"
+      var compMo=monthsElapsed;
+      try{
+        if(a._completedDate){
+          var d=new Date(a._completedDate);
+          var start=typeof _cpGetPlanStartDate==='function'?_cpGetPlanStartDate():new Date();
+          compMo=Math.max(0,(d.getFullYear()-start.getFullYear())*12+(d.getMonth()-start.getMonth()));
+        }
+      }catch(e){}
+      phaseMilestonesByPhase[p].push({month:compMo,label:nm+' ✓',color:'#22C55E',icon:'✓',completed:true});
+    }
+  });
+
+  // 2. Debt payoffs (high-rate accelerated) → all live in Phase 1 typically
+  var debtA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
+  if(debtA&&CPLAN.debts&&CPLAN.debts.length>0){
+    var dPhase=(debtA.phase!=null)?debtA.phase:1;
+    if(dPhase!==0&&phaseMilestonesByPhase[dPhase]){
+      var _hiDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0&&(parseFloat(d.rate)||0)>10;});
+      if(!_hiDebts.length)_hiDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0;});
+      try{
+        var sortedD=_cpDebtSort(_hiDebts,CPLAN.debtStrategy||'avalanche');
+        var simD=_cpDebtSimulate(sortedD,debtA.amount);
+        simD.order.forEach(function(o){
+          phaseMilestonesByPhase[dPhase].push({month:o.month,label:o.name+' paid',color:'#F97316',icon:'💳'});
+        });
+        if(simD.months>0)phaseMilestonesByPhase[dPhase].push({month:simD.months,label:'Debt-free',color:'#22C55E',icon:'🎉'});
+      }catch(e){}
+    }
+  }
+
+  // 3. Catch-up boost markers
+  if(CPLAN._catchUpBoosts&&CPLAN._catchUpBoosts.length){
+    var seenBoostMonths={};
+    CPLAN._catchUpBoosts.forEach(function(b){
+      // De-dupe by month (multiple boosts in same month roll up to one marker)
+      if(seenBoostMonths[b.monthOffset])return;
+      seenBoostMonths[b.monthOffset]=true;
+      var totalForMonth=0;
+      CPLAN._catchUpBoosts.forEach(function(b2){if(b2.monthOffset===b.monthOffset)totalForMonth+=(parseFloat(b2.amount)||0);});
+      // Anchor catch-up to whatever phase contains the boost's allocation
+      var refAlloc=CPLAN.allocations[b.allocIdx];
+      var bp=refAlloc?((refAlloc.phase!=null)?refAlloc.phase:1):1;
+      if(bp===0||!phaseMilestonesByPhase[bp])bp=1;
+      phaseMilestonesByPhase[bp].push({month:b.monthOffset,label:'Catch-up +$'+Math.round(totalForMonth),color:'#06B6D4',icon:'⚡',catchUp:true});
+    });
+  }
+
+  // ── Determine each phase's display window: [startMo, endMo] ──
+  // endMo = next phase's start, or last milestone in this phase + buffer, or projection horizon
+  var phaseEndByPhase={};
+  var horizon=Math.max(60,monthsElapsed+24);// at least 5 years out, or 2 yr past "now"
+  // Find the latest milestone across all phases as a candidate horizon
+  phases.forEach(function(p){
+    (phaseMilestonesByPhase[p]||[]).forEach(function(mil){
+      if(mil.month>horizon)horizon=mil.month;
+    });
+  });
+  horizon=Math.max(horizon,monthsElapsed+12);
+  for(var pi=0;pi<phases.length;pi++){
+    var p=phases[pi];
+    var nextP=phases[pi+1];
+    if(nextP!=null&&phaseStartByPhase[nextP]!=null){
+      phaseEndByPhase[p]=phaseStartByPhase[nextP];
+    } else {
+      // Last phase or no next-phase trigger known — extend to horizon (or past last milestone)
+      var lastMil=0;
+      (phaseMilestonesByPhase[p]||[]).forEach(function(mil){if(mil.month>lastMil)lastMil=mil.month;});
+      phaseEndByPhase[p]=Math.max(lastMil+6,horizon);
+    }
+  }
+
+  // ── Date formatter for absolute month offsets ──
+  function _tlFmt(monthOffset){
+    if(typeof _cpMonthLabelForOffset==='function')return _cpMonthLabelForOffset(monthOffset);
+    var d=new Date(Date.now()+monthOffset*30*86400000);
+    var monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    return monthNames[d.getMonth()]+" '"+String(d.getFullYear()).slice(2);
+  }
+
+  // Stagger labels to avoid overlap (within a track)
+  function _placeLabels(items,trackLeftPct,trackRightPct,minMo,maxMo){
+    // items: [{month, label, color, icon, ...}]
+    // Returns enriched items with {pct, vOffset, dateLabel}
+    var spanMo=Math.max(1,maxMo-minMo);
+    var spanPct=Math.max(1,trackRightPct-trackLeftPct);
+    var withPct=items.map(function(it){
+      var pct=trackLeftPct+((it.month-minMo)/spanMo)*spanPct;
+      pct=Math.min(trackRightPct-2,Math.max(trackLeftPct+2,pct));
+      return Object.assign({},it,{pct:pct,dateLabel:_tlFmt(it.month)});
+    });
+    // Sort by pct
+    withPct.sort(function(a,b){return a.pct-b.pct;});
+    // Offset overlapping labels — alternate between two rows
+    var lastPctRow=[null,null];// last pct in row 0 / row 1
+    withPct.forEach(function(it){
+      var row=0;
+      if(lastPctRow[0]!=null && (it.pct-lastPctRow[0])<11)row=1;
+      if(row===1 && lastPctRow[1]!=null && (it.pct-lastPctRow[1])<11)row=0;// fall back
+      lastPctRow[row]=it.pct;
+      it.row=row;
+    });
+    return withPct;
+  }
+
+  // ── Determine a phase's status: completed / current / future ──
+  // completed = all funded items in phase are _completed AND we've passed phaseEnd
+  // current = phaseStart <= monthsElapsed < phaseEnd
+  // future = phaseStart > monthsElapsed
+  function _phaseStatus(p){
+    var start=phaseStartByPhase[p]||0;
+    var end=phaseEndByPhase[p]||horizon;
+    var phaseAllocs=CPLAN.allocations.filter(function(a){return((a.phase!=null)?a.phase:1)===p&&a.amount>0;});
+    var allDone=phaseAllocs.length>0&&phaseAllocs.every(function(a){return a._completed;});
+    if(allDone&&monthsElapsed>=start)return 'completed';
+    if(monthsElapsed<start)return 'future';
+    return 'current';
+  }
+
+  // ── Format month offset as relative ("3 months ago" / "in 4 months") ──
+  function _relMonths(mo){
+    var diff=mo-monthsElapsed;
+    if(diff===0)return 'this month';
+    if(diff>0)return 'in '+diff+' mo';
+    return Math.abs(diff)+' mo ago';
+  }
+
+  // Color by phase number (consistent with the existing phase color theme)
+  function _phaseColor(p){
+    if(p===1)return '#5B9BFF';
+    if(p===2)return '#A855F7';
+    if(p===3)return '#22C55E';
+    if(p===4)return '#F97316';
+    return '#EAB308';
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Render
+  // ═══════════════════════════════════════════════════════════════════════════
+  var h='<div id="cpTimelineRoot" style="margin-bottom:16px">';
+
+  // ── Plan Milestones (per-phase tracks) ──
+  h+='<div style="padding:18px 22px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:12px">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">PLAN MILESTONES</div>';
+  h+='<div style="font-family:var(--fh);font-size:10px;color:var(--mu)">';
+  h+='You are here: <span style="color:#5B9BFF;font-weight:700">'+_tlFmt(monthsElapsed)+'</span> · '+monthsElapsed+' month'+(monthsElapsed===1?'':'s')+' in';
+  h+='</div></div>';
+  // Legend
+  h+='<div style="display:flex;gap:14px;margin-bottom:14px;font-size:10px;color:var(--mu);flex-wrap:wrap">';
+  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#5B9BFF;border:2px solid var(--bg-card);box-shadow:0 0 0 1.5px #5B9BFF"></span>You are here</span>';
+  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(34,197,94,.7)"></span>Completed</span>';
+  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(91,155,255,.4);border:1px dashed rgba(91,155,255,.6)"></span>Future</span>';
+  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#06B6D4"></span>Catch-up</span>';
+  h+='</div>';
+
+  if(!phases.length||phases.every(function(p){return!phaseMilestonesByPhase[p].length&&p!==1;})){
+    h+='<div style="text-align:center;padding:18px;color:var(--mu);font-size:12px">Add allocations to see your plan timeline.</div>';
+  } else {
+    phases.forEach(function(p){
+      var status=_phaseStatus(p);
+      var pStart=phaseStartByPhase[p]||0;
+      var pEnd=phaseEndByPhase[p]||horizon;
+      // Display window — pad ends slightly so milestones at boundaries don't get clipped
+      var visMin=Math.max(0,pStart-1);
+      var visMax=Math.max(visMin+12,pEnd+1);
+      var pColor=_phaseColor(p);
+      var phaseName=CPLAN['_phase'+p+'Name']||'Phase '+p;
+      // Phase header row
+      var statusBadge='';
+      if(status==='completed'){
+        statusBadge='<span style="font-family:var(--fh);font-size:9px;font-weight:700;color:#22C55E;background:rgba(34,197,94,.1);padding:3px 8px;border-radius:2px;letter-spacing:.08em">✓ COMPLETED</span>';
+      } else if(status==='current'){
+        statusBadge='<span style="font-family:var(--fh);font-size:9px;font-weight:700;color:#5B9BFF;background:rgba(91,155,255,.12);padding:3px 8px;border-radius:2px;letter-spacing:.08em">● ACTIVE</span>';
+      } else {
+        statusBadge='<span style="font-family:var(--fh);font-size:9px;font-weight:700;color:var(--mu);background:rgba(100,116,139,.1);padding:3px 8px;border-radius:2px;letter-spacing:.08em">STARTS '+_relMonths(pStart).toUpperCase()+'</span>';
+      }
+      h+='<div style="margin-bottom:18px">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+      h+='<div style="display:flex;align-items:center;gap:8px"><div style="width:6px;height:14px;background:'+pColor+';border-radius:1px"></div><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">'+phaseName+'</span>'+statusBadge+'</div>';
+      h+='<div style="font-size:10px;color:var(--mu);font-family:var(--fh)">'+_tlFmt(visMin)+' → '+_tlFmt(visMax)+'</div>';
+      h+='</div>';
+      // Track wrapper — 2 label rows above the bar, 2 below
+      var milestones=phaseMilestonesByPhase[p]||[];
+      var placed=_placeLabels(milestones,3,97,visMin,visMax);
+      // Compute youAreHerePct on this phase's window — clamp into visible range
+      var yahPct=null;
+      if(monthsElapsed>=visMin&&monthsElapsed<=visMax){
+        yahPct=3+((monthsElapsed-visMin)/Math.max(1,visMax-visMin))*94;
+      }
+      // ── Top label rows (above bar) ──
+      h+='<div style="position:relative;height:28px;margin:0 6px">';
+      placed.forEach(function(it){
+        if(it.row!==0)return;
+        h+='<div style="position:absolute;left:'+it.pct+'%;bottom:0;transform:translateX(-50%);text-align:center;max-width:140px">';
+        h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
+        h+='<div style="font-size:8px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
+        h+='</div>';
+      });
+      h+='</div>';
+      // ── The actual bar ──
+      // Phase status determines fill: completed = solid green, current = filled to YAH point
+      var barBgColor='rgba(91,155,255,.06)';
+      var barBdColor='rgba(91,155,255,.18)';
+      if(status==='completed'){barBgColor='rgba(34,197,94,.15)';barBdColor='rgba(34,197,94,.4)';}
+      else if(status==='current'){barBgColor='rgba(91,155,255,.08)';barBdColor='rgba(91,155,255,.25)';}
+      else {barBgColor='rgba(100,116,139,.05)';barBdColor='rgba(100,116,139,.18)';}
+      h+='<div style="position:relative;height:14px;margin:0 6px;background:'+barBgColor+';border:1px solid '+barBdColor+';border-radius:7px;'+(status==='future'?'border-style:dashed;':'')+'">';
+      // Filled portion (current or completed phases)
+      if(status==='completed'){
+        h+='<div style="position:absolute;inset:0;background:linear-gradient(90deg,rgba(34,197,94,.5),rgba(34,197,94,.3));border-radius:7px"></div>';
+      } else if(status==='current'&&yahPct!=null){
+        h+='<div style="position:absolute;left:0;top:0;bottom:0;width:'+yahPct+'%;background:linear-gradient(90deg,rgba(91,155,255,.4),rgba(91,155,255,.2));border-radius:7px 0 0 7px"></div>';
+      }
+      // Milestone dots on the bar
+      placed.forEach(function(it){
+        var isPast=it.month<=monthsElapsed;
+        h+='<div style="position:absolute;left:'+it.pct+'%;top:50%;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:'+it.color+';border:2px solid var(--bg-card);box-shadow:0 0 0 1.5px '+it.color+(isPast?'':';opacity:.7')+(it.catchUp?';animation:pulse 2s infinite':'')+';z-index:2"';
+        h+=' title="'+it.label+' — '+it.dateLabel+'"></div>';
+      });
+      // "You are here" diamond marker on this phase's bar (if it falls within window)
+      if(yahPct!=null){
+        h+='<div style="position:absolute;left:'+yahPct+'%;top:50%;transform:translate(-50%,-50%) rotate(45deg);width:14px;height:14px;background:#5B9BFF;border:2px solid var(--bg-card);box-shadow:0 0 0 2px #5B9BFF,0 0 12px rgba(91,155,255,.6);z-index:3"></div>';
+      }
+      h+='</div>';
+      // ── Bottom label rows (below bar) ──
+      h+='<div style="position:relative;height:28px;margin:0 6px;margin-top:4px">';
+      placed.forEach(function(it){
+        if(it.row!==1)return;
+        h+='<div style="position:absolute;left:'+it.pct+'%;top:0;transform:translateX(-50%);text-align:center;max-width:140px">';
+        h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
+        h+='<div style="font-size:8px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
+        h+='</div>';
+      });
+      h+='</div>';
+      h+='</div>';// phase block
+    });
+  }
+
+  h+='</div>';// Plan Milestones panel
+
+  // ── Wealth Trajectory ──
+  // Net-worth threshold markers at the year they're projected to be hit
+  if(sim&&sim.netWorth&&sim.netWorth.length>1){
+    var nwData=sim.netWorth;
+    var curYr=Math.floor(monthsElapsed/12);
+    var curNW=nwData[curYr]||nwData[0]||0;
+    // Build threshold list — only those within reach
+    var horizonNW=nwData[nwData.length-1]||0;
+    var allThresholds=[
+      {val:25000,label:'$25K',icon:'•'},
+      {val:50000,label:'$50K',icon:'•'},
+      {val:100000,label:'$100K',icon:'💎'},
+      {val:250000,label:'$250K',icon:'💎'},
+      {val:500000,label:'$500K',icon:'🏆'},
+      {val:1000000,label:'$1M',icon:'🌟'},
+      {val:2500000,label:'$2.5M',icon:'🌟'},
+      {val:5000000,label:'$5M',icon:'⭐'}
+    ];
+    // Pick thresholds that are between current NW and horizon
+    var nwThresholds=allThresholds.filter(function(t){return t.val>curNW&&t.val<=horizonNW*1.05;});
+    // Cap to first 5 to avoid clutter
+    nwThresholds=nwThresholds.slice(0,5);
+    // Find FI / retirement target if known
+    var fiTarget=(CPLAN.calcs&&CPLAN.calcs.fiNumber)||0;
+    if(!fiTarget){var rawS=(APP._portalFd&&APP._portalFd.S)||{};fiTarget=parseFloat((rawS.calcs&&rawS.calcs.fiNumber)||rawS.fiNumber||0);}
+    if(fiTarget>0&&fiTarget>curNW&&fiTarget<=horizonNW*1.05){
+      nwThresholds.push({val:fiTarget,label:'FI ('+fmt(fiTarget)+')',icon:'🎯',isFI:true});
+    }
+    // Find when each threshold is hit
+    var nwMilestones=[];
     nwThresholds.forEach(function(t){
-      for(var y=1;y<sim.netWorth.length;y++){
-        if(sim.netWorth[y-1]<t.val&&sim.netWorth[y]>=t.val){
-          milestones.push({month:y*12,label:t.label,color:t.color,icon:t.icon});
+      for(var y=1;y<nwData.length;y++){
+        if(nwData[y-1]<t.val&&nwData[y]>=t.val){
+          nwMilestones.push({month:y*12,label:t.label,icon:t.icon,color:t.isFI?'#06B6D4':'#A855F7',value:t.val});
           break;
         }
       }
     });
-  }
-  milestones.sort(function(a,b){return a.month-b.month;});
-  if(!milestones.length)return'<div id="cpTimelineRoot"></div>';
-  var maxMo=Math.max(milestones[milestones.length-1].month,12);
-  var h='<div id="cpTimelineRoot" style="margin-bottom:16px;padding:16px 20px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px">';
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:14px">Projected Timeline</div>';
-  h+='<div style="position:relative;height:'+(Math.max(60,milestones.length*16+30))+'px;margin:0 16px">';
-  // Track line
-  h+='<div style="position:absolute;top:20px;left:0;right:0;height:4px;background:linear-gradient(90deg,rgba(91,155,255,.2),rgba(34,197,94,.2));border-radius:2px"></div>';
-  // Start marker
-  h+='<div style="position:absolute;left:0;top:16px"><div style="width:12px;height:12px;border-radius:6px;background:rgba(91,155,255,.3);border:2px solid #5B9BFF"></div><div style="font-size:9px;color:var(--mu);text-align:center;margin-top:6px;margin-left:-4px">Now</div></div>';
-  // Stagger labels vertically to avoid overlap
-  var usedPcts=[];
-  milestones.forEach(function(m,mi){
-    var pct=Math.min(92,Math.max(8,Math.round(m.month/maxMo*100)));
-    var dateEst=new Date(Date.now()+m.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'2-digit'});
-    var vOff=0;usedPcts.forEach(function(up){if(Math.abs(up-pct)<10)vOff+=18;});usedPcts.push(pct);
-    h+='<div style="position:absolute;left:'+pct+'%;top:'+vOff+'px;transform:translateX(-50%);text-align:center;max-width:140px">';
-    h+='<div style="width:14px;height:14px;border-radius:7px;background:'+m.color+';border:3px solid var(--bg-card);margin:13px auto 0;box-shadow:0 0 0 2px '+m.color+'40"></div>';
-    h+='<div style="font-size:10px;color:'+m.color+';font-family:var(--fh);font-weight:700;white-space:nowrap;margin-top:3px">'+m.label+'</div>';
-    if(m.sublabel)h+='<div style="font-size:8px;color:var(--mu);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:140px" title="'+m.sublabel+'">'+m.sublabel+'</div>';
-    h+='<div style="font-size:9px;color:var(--mu)">'+dateEst+'</div>';
+    nwMilestones.sort(function(a,b){return a.month-b.month;});
+
+    h+='<div style="padding:18px 22px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:14px">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">WEALTH TRAJECTORY</div>';
+    h+='<div style="font-family:var(--fh);font-size:10px;color:var(--mu)">Now: <span style="color:var(--wh);font-weight:700">'+fmt(Math.round(curNW))+'</span></div>';
     h+='</div>';
-  });
-  h+='</div></div>';
+
+    if(!nwMilestones.length){
+      h+='<div style="text-align:center;padding:18px;color:var(--mu);font-size:12px">Your net-worth thresholds will appear here as the plan develops.</div>';
+    } else {
+      var nwMaxMo=nwMilestones[nwMilestones.length-1].month+12;
+      var nwMinMo=0;
+      var nwPlaced=_placeLabels(nwMilestones,4,96,nwMinMo,nwMaxMo);
+      var nwYahPct=4+((monthsElapsed-nwMinMo)/Math.max(1,nwMaxMo-nwMinMo))*92;
+      // Top labels
+      h+='<div style="position:relative;height:30px;margin:0 6px">';
+      nwPlaced.forEach(function(it){
+        if(it.row!==0)return;
+        h+='<div style="position:absolute;left:'+it.pct+'%;bottom:0;transform:translateX(-50%);text-align:center;max-width:140px">';
+        h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
+        h+='<div style="font-size:8px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
+        h+='</div>';
+      });
+      h+='</div>';
+      // Bar
+      h+='<div style="position:relative;height:14px;margin:0 6px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);border-radius:7px">';
+      h+='<div style="position:absolute;left:0;top:0;bottom:0;width:'+nwYahPct+'%;background:linear-gradient(90deg,rgba(91,155,255,.35),rgba(168,85,247,.25));border-radius:7px 0 0 7px"></div>';
+      nwPlaced.forEach(function(it){
+        h+='<div style="position:absolute;left:'+it.pct+'%;top:50%;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:'+it.color+';border:2px solid var(--bg-card);box-shadow:0 0 0 1.5px '+it.color+';z-index:2" title="'+it.label+' — '+it.dateLabel+'"></div>';
+      });
+      // You-are-here on wealth trajectory
+      h+='<div style="position:absolute;left:'+nwYahPct+'%;top:50%;transform:translate(-50%,-50%) rotate(45deg);width:14px;height:14px;background:#5B9BFF;border:2px solid var(--bg-card);box-shadow:0 0 0 2px #5B9BFF,0 0 12px rgba(91,155,255,.6);z-index:3"></div>';
+      h+='</div>';
+      // Bottom labels
+      h+='<div style="position:relative;height:30px;margin:0 6px;margin-top:4px">';
+      nwPlaced.forEach(function(it){
+        if(it.row!==1)return;
+        h+='<div style="position:absolute;left:'+it.pct+'%;top:0;transform:translateX(-50%);text-align:center;max-width:140px">';
+        h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
+        h+='<div style="font-size:8px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
+        h+='</div>';
+      });
+      h+='</div>';
+    }
+
+    h+='</div>';// Wealth Trajectory panel
+  }
+
+  h+='</div>';// cpTimelineRoot
   return h;
 }
 
@@ -21394,14 +22435,41 @@ async function _cpLoadCouplePlan(){
   }
 }
 function _cpCheckIn(type,status){
-  var now4=new Date();var moKey=now4.getFullYear()+'-'+(now4.getMonth()+1);
+  // Phase D: zero-padded YYYY-MM key (matches Phase A/B convention) — the previous
+  // implementation produced "2026-5" instead of "2026-05" and stored a bare string.
+  var now4=new Date();
+  var mo=now4.getMonth()+1;
+  var moKey=now4.getFullYear()+'-'+(mo<10?'0':'')+mo;
   if(!CPLAN._checkIns)CPLAN._checkIns={};
   if(!CPLAN._checkIns[moKey])CPLAN._checkIns[moKey]={};
-  // Toggle: if already this status, clear it
-  if(CPLAN._checkIns[moKey][type]===status)CPLAN._checkIns[moKey][type]='';
-  else CPLAN._checkIns[moKey][type]=status;
-  // Save check-ins to plan
-  try{var plan2=APP._portalFd&&APP._portalFd.allocation_plan;if(plan2){plan2.checkIns=CPLAN._checkIns;}}catch(e){}
+  // Find the planned amount for this type (first matching allocation)
+  var alloc=CPLAN.allocations.find(function(a){return a.type===type;});
+  var planned=alloc?(parseFloat(alloc.amount)||0):0;
+  // Toggle: clicking the same status clears it
+  var existing=CPLAN._checkIns[moKey][type];
+  var existingStatus=(typeof existing==='object'&&existing)?existing.status:existing;
+  if(existingStatus===status){
+    CPLAN._checkIns[moKey][type]='';
+  } else {
+    var actual=status==='on'?planned:status==='off'?0:planned;
+    CPLAN._checkIns[moKey][type]={
+      status:status,
+      actual:actual,
+      plannedAt:planned,
+      recordedAt:new Date().toISOString(),
+      source:'cpCheckIn'
+    };
+  }
+  // Persist via cplanSave so checkIns flow to Supabase + localStorage backup
+  try{if(typeof cplanSave==='function')cplanSave();}catch(e){
+    // Fallback to in-memory only
+    try{var plan2=APP._portalFd&&APP._portalFd.allocation_plan;if(plan2){plan2.checkIns=CPLAN._checkIns;}}catch(e2){}
+  }
+  // Re-run simulation + refresh banner so projections reflect the change
+  try{
+    if(typeof _cpRunSimulation==='function')_cpRunSimulation();
+    if(typeof _cpRenderAccountabilityBanner==='function')_cpRenderAccountabilityBanner();
+  }catch(e){}
   renderClientTracking();
 }
 function _cpShowDoNothing(){
@@ -22285,6 +23353,11 @@ function initClientPlan(){
     if(loadedPlan.approaches)CPLAN._approaches=loadedPlan.approaches;
     if(loadedPlan.selectedApproach)CPLAN._selectedApproach=loadedPlan.selectedApproach;
     if(loadedPlan.phaseNames){for(var pni=1;pni<=4;pni++){if(loadedPlan.phaseNames[pni])CPLAN['_phase'+pni+'Name']=loadedPlan.phaseNames[pni];}}
+    // Phase A: time anchor + original-projection baseline (for "you are here" + accountability)
+    if(loadedPlan.planStartDate)CPLAN._planStartDate=loadedPlan.planStartDate;
+    if(loadedPlan.originalProjection)CPLAN._originalProjection=loadedPlan.originalProjection;
+    // Phase B: restore catch-up boosts so they keep applying after reload
+    if(loadedPlan.catchUpBoosts)CPLAN._catchUpBoosts=loadedPlan.catchUpBoosts;
     if(CPLAN.hasAdvisor)CPLAN.advisorPlan=JSON.parse(JSON.stringify(loadedPlan.allocations));
   }
   CPLAN.mode=localStorage.getItem('pfos_ui_mode')||'guided';
@@ -22331,6 +23404,9 @@ function initClientPlan(){
     // Track income for change detection
     if(savedPlan2&&savedPlan2.surplus)CPLAN._lastIncome=savedPlan2.surplus+CPLAN.expenses;
   }catch(e){}
+  // Phase B: detect missing check-ins and prompt the user. Defers slightly inside the
+  // helper so the page render finishes first. Also renders the persistent banner.
+  try{if(typeof _cpRunCheckInFlow==='function')_cpRunCheckInFlow();}catch(e){console.warn('Check-in flow:',e);}
 }
 
 // ── TIER GATING ──
@@ -22425,6 +23501,1278 @@ var _cpRetFeeTypes=['roth','401k','invest','iul','wl','edu'];
 // amounts, and net worth trajectory. Pure math, no API.
 // Re-runs on every render. Stored in CPLAN._sim.
 // ══════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase H — SPENDING VISIBILITY PERMISSION SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Controls whether (and how much) a client's spending data is visible to their
+// advisor. The CLIENT owns this decision — the advisor cannot grant access on the
+// client's behalf, only request it. Default state is "not shared."
+//
+// Tiers:
+//   0 — Not shared (default). Advisor sees a "client hasn't shared" state.
+//   1 — Status only. Advisor sees severity, projected overspend, plan impact.
+//   2 — Status + Categories. Adds the category breakdown bars.
+//   3 — Status + Categories + Transactions. Adds the recent transactions list.
+//
+// Storage: client_profiles.spending_visibility (JSONB column added by migration-spending-visibility.sql).
+// Migration is idempotent and safe to run multiple times.
+//
+// On revoke: advisor's UI immediately hides spending data (no historical snapshots
+// preserved). The audit log records when access was granted / revoked / changed.
+
+// ── Default visibility shape (returned when no record exists yet) ──
+function _pvDefaultVisibility(){
+  return{
+    tier:0,
+    grantedAt:null,
+    expiresAt:null,
+    promptedAt:null,
+    advisorRequest:null,
+    auditLog:[]
+  };
+}
+
+// ── Read visibility from a client_profiles row, with defaults filled in ──
+// Accepts either the raw row, the spending_visibility object directly, or null.
+// Always returns a usable object — never null/undefined.
+function _pvGetVisibility(profileOrVis){
+  if(!profileOrVis)return _pvDefaultVisibility();
+  // If passed a profile row, dig into the column
+  var vis=profileOrVis;
+  if(vis.spending_visibility!==undefined)vis=vis.spending_visibility;
+  if(!vis||typeof vis!=='object')return _pvDefaultVisibility();
+  // Backfill any missing fields with defaults (forward-compat with shape changes)
+  var defaults=_pvDefaultVisibility();
+  Object.keys(defaults).forEach(function(k){
+    if(vis[k]===undefined)vis[k]=defaults[k];
+  });
+  return vis;
+}
+
+// ── Check whether a visibility record has expired ──
+// Returns true if there's an expiresAt and it's in the past. Returns false otherwise.
+function _pvIsExpired(vis){
+  if(!vis||!vis.expiresAt)return false;
+  try{
+    var exp=new Date(vis.expiresAt);
+    if(isNaN(exp.getTime()))return false;
+    return exp.getTime()<Date.now();
+  }catch(e){return false;}
+}
+
+// ── Get the EFFECTIVE tier — accounts for expiry + tier 0 ──
+// This is what consumers should call. If a grant was issued but has now expired,
+// effective tier is 0 (no access). The actual stored tier remains until next save,
+// which appends an 'expired' audit entry and zeroes the tier.
+function _pvEffectiveTier(profileOrVis){
+  var vis=_pvGetVisibility(profileOrVis);
+  if(_pvIsExpired(vis))return 0;
+  var t=parseInt(vis.tier);
+  if(isNaN(t)||t<0)return 0;
+  if(t>3)return 3;
+  return t;
+}
+
+// ── Append an audit entry. Returns a NEW visibility object (does not mutate). ──
+// Cap the log at 200 entries (oldest dropped) to keep the column from growing forever.
+function _pvAuditAppend(vis,entry){
+  var v=_pvGetVisibility(vis);
+  var log=(v.auditLog||[]).slice();
+  // Stamp `at` if missing; preserve provided value if caller wants to backdate
+  var newEntry={
+    action:entry.action||'unknown',
+    at:entry.at||new Date().toISOString(),
+    byActor:entry.byActor||'system'
+  };
+  if(entry.tier!=null)newEntry.tier=entry.tier;
+  if(entry.prevTier!=null)newEntry.prevTier=entry.prevTier;
+  if(entry.note)newEntry.note=String(entry.note);
+  log.push(newEntry);
+  // Cap at 200
+  if(log.length>200)log.splice(0,log.length-200);
+  v.auditLog=log;
+  return v;
+}
+
+// ── Apply expiry: if grant has expired, mutate to tier=0 + log it ──
+// Returns the updated visibility (with the 'expired' audit entry) — only modifies
+// if expiry actually happened. Caller is responsible for persisting.
+function _pvApplyExpiryIfDue(vis){
+  var v=_pvGetVisibility(vis);
+  if(!_pvIsExpired(v))return v;
+  if(v.tier===0)return v;// already zeroed, nothing to do
+  var prevTier=v.tier;
+  v=_pvAuditAppend(v,{action:'expired',byActor:'system',prevTier:prevTier,tier:0,note:'Auto-expired by expiresAt timestamp'});
+  v.tier=0;
+  v.grantedAt=null;
+  v.expiresAt=null;
+  return v;
+}
+
+// ── Build a fresh "granted" visibility update — used by the client UI ──
+// daysValid = how long the grant lasts (null = no expiry). Standard offering: 90 days.
+function _pvBuildGrant(tier,daysValid,note){
+  var t=Math.max(0,Math.min(3,parseInt(tier)||0));
+  var now=new Date();
+  var expiresAt=null;
+  if(daysValid&&daysValid>0){
+    var exp=new Date(now.getTime()+daysValid*86400000);
+    expiresAt=exp.toISOString();
+  }
+  var v=_pvDefaultVisibility();
+  v.tier=t;
+  v.grantedAt=now.toISOString();
+  v.expiresAt=expiresAt;
+  return v;
+}
+
+// ── Mutate an existing visibility into the revoked state ──
+// Wipes tier, grantedAt, expiresAt; appends a 'revoked' audit entry. The
+// PROMPTED state is preserved (we don't re-prompt the client just because they
+// chose to revoke — they made an informed choice).
+function _pvBuildRevoke(prevVis,byActor,note){
+  var v=_pvGetVisibility(prevVis);
+  var prevTier=v.tier;
+  if(prevTier===0)return v;// already revoked
+  v=_pvAuditAppend(v,{action:'revoked',byActor:byActor||'client',prevTier:prevTier,tier:0,note:note||''});
+  v.tier=0;
+  v.grantedAt=null;
+  v.expiresAt=null;
+  return v;
+}
+
+// ── Helper: human-readable tier label ──
+function _pvTierLabel(tier){
+  var t=parseInt(tier)||0;
+  if(t===0)return 'Not shared';
+  if(t===1)return 'Status only';
+  if(t===2)return 'Status + categories';
+  if(t===3)return 'Full visibility';
+  return 'Unknown';
+}
+
+// ── Helper: short description of what each tier shows ──
+function _pvTierDescription(tier){
+  var t=parseInt(tier)||0;
+  if(t===0)return 'Your advisor cannot see your spending data.';
+  if(t===1)return 'Your advisor sees how you\'re tracking against your budget and the projected impact on your plan — no categories or transactions.';
+  if(t===2)return 'Your advisor sees the above plus how spending breaks down across categories (food, transport, etc.) — no individual transactions.';
+  if(t===3)return 'Your advisor sees all of the above plus your recent logged expenses and their descriptions.';
+  return '';
+}
+
+// ── Helper: format an audit entry as a human sentence ──
+function _pvFormatAuditEntry(entry){
+  if(!entry||!entry.action)return '';
+  var when='';
+  try{
+    var d=new Date(entry.at);
+    when=d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+  }catch(e){when=entry.at||'';}
+  var who=entry.byActor||'system';
+  switch(entry.action){
+    case 'granted':return when+': '+who+' granted '+_pvTierLabel(entry.tier).toLowerCase()+' access';
+    case 'revoked':return when+': '+who+' revoked access (was '+_pvTierLabel(entry.prevTier).toLowerCase()+')';
+    case 'tier_changed':return when+': '+who+' changed access from '+_pvTierLabel(entry.prevTier).toLowerCase()+' to '+_pvTierLabel(entry.tier).toLowerCase();
+    case 'prompted':return when+': '+who+' prompted client to choose a sharing tier';
+    case 'expired':return when+': access auto-expired (was '+_pvTierLabel(entry.prevTier).toLowerCase()+')';
+    case 'access_requested':return when+': advisor requested access'+(entry.note?' — "'+entry.note+'"':'');
+    case 'request_denied':return when+': '+who+' denied the access request';
+    case 'request_approved':return when+': '+who+' approved the access request — '+_pvTierLabel(entry.tier).toLowerCase();
+    default:return when+': '+entry.action;
+  }
+}
+
+// ── Portal-only: persist visibility to Supabase + update in-memory mirror ──
+// Returns a Promise resolving with {ok:true} or {ok:false, error}.
+// Use this whenever the client UI changes their visibility setting (Phase I).
+async function _pvPersistVisibility(newVis){
+  // Update in-memory mirror first so reads from this session are immediate
+  if(APP._portalFd)APP._portalFd._spendingVisibility=newVis;
+  if(!APP.currentClientId)return{ok:false,error:'no client id'};
+  try{
+    // Locate the profile row for this client (or for the joint primary)
+    var _pvSv=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+    var _pvSvId=(_pvSv&&_pvSv.household_type==='joint')?_pvSv.client_a_id:APP.currentClientId;
+    var check=await db.from('client_profiles').select('id').eq('client_id',_pvSvId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!check||!check.data)return{ok:false,error:'no profile row'};
+    var res=await db.from('client_profiles').update({spending_visibility:newVis,updated_at:new Date().toISOString()}).eq('id',check.data.id);
+    if(res&&res.error)return{ok:false,error:res.error.message};
+    return{ok:true};
+  }catch(e){return{ok:false,error:(e&&e.message)||String(e)};}
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase I — SPENDING SHARING UI (CLIENT SIDE)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Three surfaces:
+//   1. Spending Sharing panel on the Privacy page (manual controls)
+//   2. Auto-prompt modal — fires once for advisory clients on first portal load
+//   3. Advisor-request banner on the Dashboard when advisor has asked for access
+//
+// All three read from APP._portalFd._spendingVisibility (loaded by Phase H).
+// All write paths go through _pvPersistVisibility (Phase H).
+
+// ── Helper: get current visibility (with fallback to default) ──
+function _pvCurrentVisibility(){
+  if(APP._portalFd&&APP._portalFd._spendingVisibility)return APP._portalFd._spendingVisibility;
+  return _pvDefaultVisibility();
+}
+
+// ── Render the Spending Sharing panel on the Privacy page ──
+function _pvRenderSpendingSharing(){
+  var el=document.getElementById('spendingSharingPanel');
+  if(!el)return;
+  var vis=_pvCurrentVisibility();
+  var tier=_pvEffectiveTier(vis);
+  var isAdvisory=APP.currentClient&&APP.currentClient.client_type==='advisory';
+  var advisorName=(APP.currentClient&&(APP.currentClient.advisor_name||APP.currentClient.agent_name))||'your advisor';
+
+  var h='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px">';
+  // Header
+  h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:8px">';
+  h+='<div><div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">💰 Spending Sharing</div>';
+  h+='<div style="font-size:10px;color:var(--mu);margin-top:2px">'+esc(_pvTierLabel(tier))+(tier>0&&vis.expiresAt?' · expires '+_pvFormatExpiry(vis.expiresAt):'')+'</div></div>';
+  // Status pill
+  var pillBg='rgba(100,116,139,.15)',pillFg='var(--mu)',pillIcon='○';
+  if(tier>0){pillBg='rgba(34,197,94,.12)';pillFg='var(--gr)';pillIcon='●';}
+  h+='<span style="padding:4px 10px;background:'+pillBg+';border:1px solid '+pillBg+';color:'+pillFg+';font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;border-radius:10px;text-transform:uppercase">'+pillIcon+' '+esc(_pvTierLabel(tier))+'</span>';
+  h+='</div>';
+
+  // Description / context
+  if(!isAdvisory){
+    h+='<div style="font-size:12px;color:var(--mu);margin-bottom:12px;line-height:1.7">You don\'t currently have an advisor relationship. Spending sharing controls let advisory clients give their advisor permission to coach them through spending decisions.</div>';
+  } else {
+    h+='<div style="font-size:12px;color:var(--mu);margin-bottom:12px;line-height:1.7">Choose what spending information '+esc(advisorName)+' can see. This is opt-in — your data is private by default. You can change or revoke at any time.</div>';
+  }
+
+  // ── Tier cards ──
+  var tiers=[
+    {n:0,name:'Not shared',desc:'Your advisor can\'t see any spending data.',icon:'🔒'},
+    {n:1,name:'Status only',desc:'Severity, projected overspend, and the impact on your plan. No categories or transactions.',icon:'📊'},
+    {n:2,name:'Status + categories',desc:'Adds a breakdown across categories like food, transport, and subscriptions.',icon:'📁'},
+    {n:3,name:'Full visibility',desc:'Adds your recent logged expenses and their descriptions.',icon:'🔍'}
+  ];
+  if(isAdvisory){
+    h+='<div style="display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:12px">';
+    tiers.forEach(function(t){
+      var sel=tier===t.n;
+      var bdCol=sel?(t.n===0?'rgba(100,116,139,.4)':'rgba(34,197,94,.4)'):'var(--bd)';
+      var bgCol=sel?(t.n===0?'rgba(100,116,139,.06)':'rgba(34,197,94,.04)'):'transparent';
+      var fgCol=sel?(t.n===0?'var(--mu)':'var(--gr)'):'var(--wh)';
+      h+='<div onclick="_pvSelectTier('+t.n+')" role="button" tabindex="0" onkeypress="if(event.key===\'Enter\')_pvSelectTier('+t.n+')" style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:'+bgCol+';border:1px solid '+bdCol+';border-radius:4px;cursor:pointer;transition:.15s" onmouseover="this.style.background=\''+(sel?bgCol:'rgba(91,155,255,.04)')+'\'" onmouseout="this.style.background=\''+bgCol+'\'">';
+      h+='<div style="font-size:18px;line-height:1.2;flex-shrink:0">'+t.icon+'</div>';
+      h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+fgCol+'">'+t.name+(sel?' <span style="font-size:9px;color:var(--gr);margin-left:4px">✓ ACTIVE</span>':'')+'</div>';
+      h+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin-top:2px">'+esc(t.desc)+'</div></div>';
+      h+='</div>';
+    });
+    h+='</div>';
+
+    // Action buttons row
+    if(tier>0){
+      h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-bottom:10px">';
+      h+='<button onclick="_pvOpenRevokeConfirm()" style="padding:8px 14px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.25);color:var(--rd);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:34px">Revoke access</button>';
+      h+='</div>';
+    }
+  }
+
+  // ── Audit history (collapsed by default) ──
+  if(vis.auditLog&&vis.auditLog.length){
+    h+='<details style="margin-top:8px"><summary style="cursor:pointer;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);padding:6px 0">View history ('+vis.auditLog.length+' '+(vis.auditLog.length===1?'entry':'entries')+')</summary>';
+    h+='<div style="margin-top:8px;padding:10px 12px;background:rgba(0,68,191,.04);border-radius:4px;max-height:240px;overflow-y:auto">';
+    // Newest first
+    var sortedLog=vis.auditLog.slice().reverse();
+    sortedLog.forEach(function(entry){
+      h+='<div style="font-size:11px;color:rgba(226,232,240,.7);padding:4px 0;border-bottom:1px dashed rgba(91,155,255,.06);line-height:1.5">'+esc(_pvFormatAuditEntry(entry))+'</div>';
+    });
+    h+='</div></details>';
+  }
+
+  h+='</div>';
+  el.innerHTML=h;
+}
+
+// ── Format expiry date as "May 2 (90 days)" ──
+function _pvFormatExpiry(iso){
+  if(!iso)return '';
+  try{
+    var d=new Date(iso);
+    if(isNaN(d.getTime()))return '';
+    var days=Math.round((d.getTime()-Date.now())/86400000);
+    var label=d.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    if(days<0)return label+' (expired)';
+    if(days===0)return label+' (today)';
+    if(days===1)return label+' (tomorrow)';
+    return label+' ('+days+' days)';
+  }catch(e){return iso;}
+}
+
+// ── Tier selection click handler ──
+async function _pvSelectTier(newTier){
+  var prevVis=_pvCurrentVisibility();
+  var prevTier=_pvEffectiveTier(prevVis);
+  newTier=Math.max(0,Math.min(3,parseInt(newTier)||0));
+  if(newTier===prevTier){
+    // Same tier — no-op (avoid spamming audit log)
+    return;
+  }
+  // Build the new visibility — preserve audit log + promptedAt
+  var newVis;
+  if(newTier===0){
+    // Revoking — use the revoke builder to preserve consistent audit shape
+    newVis=_pvBuildRevoke(prevVis,'client','Tier set to Not shared');
+  } else if(prevTier===0){
+    // First grant — fresh grant, but preserve existing log
+    var fresh=_pvBuildGrant(newTier,90);
+    fresh.auditLog=(prevVis.auditLog||[]).slice();
+    fresh.promptedAt=prevVis.promptedAt;
+    fresh.advisorRequest=null;// granting clears any pending request — request was approved
+    newVis=_pvAuditAppend(fresh,{action:'granted',byActor:'client',tier:newTier});
+    // If this came from an advisor request, log that too
+    if(prevVis.advisorRequest){
+      newVis=_pvAuditAppend(newVis,{action:'request_approved',byActor:'client',tier:newTier});
+    }
+  } else {
+    // Tier change (between 1/2/3)
+    newVis=Object.assign({},prevVis);
+    newVis.tier=newTier;
+    // Keep the existing grantedAt/expiresAt — this is a tier change, not a new grant
+    newVis=_pvAuditAppend(newVis,{action:'tier_changed',byActor:'client',prevTier:prevTier,tier:newTier});
+  }
+  // Persist + re-render
+  var res=await _pvPersistVisibility(newVis);
+  if(!res.ok){
+    _pvShowToast('Could not save: '+(res.error||'unknown'),'error');
+    return;
+  }
+  _pvShowToast(newTier===0?'Sharing revoked':'Sharing set to '+_pvTierLabel(newTier),newTier===0?'warning':'success');
+  // Re-render UI surfaces
+  _pvRenderSpendingSharing();
+  _pvRenderAdvisorRequestBanner();
+}
+
+// ── Open the revoke confirmation modal ──
+function _pvOpenRevokeConfirm(){
+  var vis=_pvCurrentVisibility();
+  var prevTier=_pvEffectiveTier(vis);
+  if(prevTier===0)return;
+  var advisorName=(APP.currentClient&&(APP.currentClient.advisor_name||APP.currentClient.agent_name))||'your advisor';
+  var el=document.getElementById('pvRevokeModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='pvRevokeModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('pvRevokeModal');};
+    document.body.appendChild(el);
+  }
+  var h='<div class="modal" style="max-width:480px">';
+  h+='<button class="modal-close" onclick="closeModal(\'pvRevokeModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">Revoke spending access?</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:14px">';
+  h+='Revoking immediately removes '+esc(advisorName)+'\'s access to your spending data. Any view they have open will refresh to show that you\'ve revoked access.';
+  h+='</div>';
+  h+='<div style="padding:11px 12px;background:rgba(234,179,8,.05);border-left:3px solid var(--yl);border-radius:0 4px 4px 0;margin-bottom:14px">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--yl);margin-bottom:4px">Note</div>';
+  h+='<div style="font-size:11px;color:rgba(226,232,240,.8);line-height:1.6">';
+  h+='Your data isn\'t deleted — it stays in your account. Only your advisor\'s ability to view it is removed. You can re-grant access later if you change your mind.';
+  h+='</div></div>';
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'pvRevokeModal\')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Cancel</button>';
+  h+='<button onclick="_pvConfirmRevoke()" style="padding:9px 16px;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.4);color:var(--rd);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Revoke access</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('pvRevokeModal');
+}
+
+async function _pvConfirmRevoke(){
+  closeModal('pvRevokeModal');
+  await _pvSelectTier(0);
+}
+
+// ── Auto-prompt modal — fires once for advisory clients on first portal load ──
+// Conditions: client_type === 'advisory' AND promptedAt is null AND tier is 0
+// (someone who already has a tier set has already made a choice).
+function _pvMaybeShowAutoPrompt(){
+  if(APP._pvAutoPromptShown)return;// don't re-show in the same session
+  if(!APP.currentClient||APP.currentClient.client_type!=='advisory')return;
+  var vis=_pvCurrentVisibility();
+  if(vis.promptedAt)return;// already prompted on a previous visit
+  if(_pvEffectiveTier(vis)>0)return;// user already has a tier (somehow without being prompted — respect it)
+  APP._pvAutoPromptShown=true;
+  // Defer slightly so the rest of the page settles first
+  setTimeout(function(){_pvShowAutoPrompt();},900);
+}
+
+function _pvShowAutoPrompt(){
+  var advisorName=(APP.currentClient&&(APP.currentClient.advisor_name||APP.currentClient.agent_name))||'Your advisor';
+  var el=document.getElementById('pvAutoPromptModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='pvAutoPromptModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    // Don't allow click-outside-to-dismiss — this is a meaningful choice the
+    // client should engage with rather than fall out of by accident
+    document.body.appendChild(el);
+  }
+  var h='<div class="modal" style="max-width:560px;max-height:90vh;overflow-y:auto">';
+  h+='<button class="modal-close" onclick="_pvDeferAutoPrompt()" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">💡 A quick choice</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:14px">';
+  h+=esc(advisorName)+' can be a more effective coach when they have insight into your spending between meetings. Right now your spending data is private — totally fine to keep it that way. But if you\'d like, you can choose how much to share.';
+  h+='</div>';
+  h+='<div style="font-size:11px;color:var(--mu);margin-bottom:10px;font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase">Choose a level</div>';
+
+  var tiers=[
+    {n:1,name:'Status only',desc:'They see how you\'re tracking and the projected impact on your plan. No categories, no transactions.',icon:'📊',rec:true},
+    {n:2,name:'Status + categories',desc:'Adds a breakdown across categories like food, transport, and subscriptions.',icon:'📁'},
+    {n:3,name:'Full visibility',desc:'Adds your recent logged expenses and descriptions.',icon:'🔍'},
+    {n:0,name:'Not now',desc:'Keep your spending private. You can change this anytime in Privacy & Sharing.',icon:'🔒'}
+  ];
+  h+='<div style="display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:14px">';
+  tiers.forEach(function(t){
+    var bdCol=t.rec?'rgba(91,155,255,.4)':'var(--bd)';
+    var bgCol=t.rec?'rgba(91,155,255,.04)':'transparent';
+    h+='<div onclick="_pvAutoPromptChoose('+t.n+')" role="button" tabindex="0" onkeypress="if(event.key===\'Enter\')_pvAutoPromptChoose('+t.n+')" style="display:flex;align-items:flex-start;gap:10px;padding:11px 13px;background:'+bgCol+';border:1px solid '+bdCol+';border-radius:4px;cursor:pointer;transition:.15s;position:relative" onmouseover="this.style.background=\'rgba(91,155,255,.08)\'" onmouseout="this.style.background=\''+bgCol+'\'">';
+    h+='<div style="font-size:18px;line-height:1.2;flex-shrink:0">'+t.icon+'</div>';
+    h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+t.name+(t.rec?' <span style="font-size:9px;color:#5B9BFF;font-weight:700;margin-left:4px">RECOMMENDED</span>':'')+'</div>';
+    h+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin-top:2px">'+esc(t.desc)+'</div></div>';
+    h+='</div>';
+  });
+  h+='</div>';
+  h+='<div style="font-size:11px;color:var(--mu);line-height:1.6;padding-top:10px;border-top:1px solid var(--bd)">You can change or revoke this anytime in <strong style="color:#5B9BFF;cursor:pointer" onclick="closeModal(\'pvAutoPromptModal\');showClientPage(\'privacy\');_pvRenderSpendingSharing()">Privacy &amp; Sharing</strong>.</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('pvAutoPromptModal');
+}
+
+// ── Client picked a tier from the auto-prompt ──
+async function _pvAutoPromptChoose(tier){
+  var prevVis=_pvCurrentVisibility();
+  // Stamp promptedAt so we don't auto-prompt again, regardless of choice
+  var newVis;
+  if(tier>0){
+    // First-grant flow same as _pvSelectTier(tier>0 from tier=0)
+    var fresh=_pvBuildGrant(tier,90);
+    fresh.auditLog=(prevVis.auditLog||[]).slice();
+    fresh.promptedAt=new Date().toISOString();
+    newVis=_pvAuditAppend(fresh,{action:'prompted',byActor:'system'});
+    newVis=_pvAuditAppend(newVis,{action:'granted',byActor:'client',tier:tier,note:'From auto-prompt'});
+  } else {
+    // Decline — keep tier 0 but record the prompt so we don't re-show
+    newVis=Object.assign({},prevVis);
+    newVis.promptedAt=new Date().toISOString();
+    newVis=_pvAuditAppend(newVis,{action:'prompted',byActor:'system',note:'Client declined'});
+  }
+  closeModal('pvAutoPromptModal');
+  var res=await _pvPersistVisibility(newVis);
+  if(!res.ok){
+    _pvShowToast('Could not save: '+(res.error||'unknown'),'error');
+    return;
+  }
+  if(tier>0)_pvShowToast('Sharing set to '+_pvTierLabel(tier),'success');
+  // Refresh privacy page if visible
+  _pvRenderSpendingSharing();
+  _pvRenderAdvisorRequestBanner();
+}
+
+// ── Defer the auto-prompt (X button) ──
+// Same as choosing "Not now" — sets promptedAt so it doesn't re-show automatically.
+async function _pvDeferAutoPrompt(){
+  await _pvAutoPromptChoose(0);
+}
+
+// ── Advisor-request banner on the Dashboard ──
+// Renders into #advisorRequestBanner if pending advisorRequest exists.
+function _pvRenderAdvisorRequestBanner(){
+  var el=document.getElementById('advisorRequestBanner');
+  if(!el)return;
+  var vis=_pvCurrentVisibility();
+  if(!vis||!vis.advisorRequest||_pvEffectiveTier(vis)>0){
+    // No pending request, OR client already granted (in which case the request is fulfilled)
+    el.innerHTML='';
+    el.style.display='none';
+    return;
+  }
+  // Don't show if user dismissed in this session
+  if(APP._pvBannerDismissed)return;
+  var advisorName=(APP.currentClient&&(APP.currentClient.advisor_name||APP.currentClient.agent_name))||'Your advisor';
+  var when='';
+  try{
+    var d=new Date(vis.advisorRequest.at);
+    var hrs=Math.round((Date.now()-d.getTime())/3600000);
+    when=hrs<24?(hrs<=1?'just now':hrs+' hours ago'):(Math.round(hrs/24)+' days ago');
+  }catch(e){}
+  var msg=vis.advisorRequest.message?String(vis.advisorRequest.message).slice(0,200):'';
+  el.style.display='';
+  var h='<div style="padding:13px 16px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.28);border-left:3px solid #5B9BFF;border-radius:4px;margin-bottom:14px">';
+  h+='<div style="display:flex;align-items:flex-start;gap:11px;flex-wrap:wrap">';
+  h+='<span style="font-size:18px;line-height:1.2;flex-shrink:0">📩</span>';
+  h+='<div style="flex:1;min-width:200px">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;letter-spacing:.06em;text-transform:uppercase">Access Request</div>';
+  h+='<div style="font-size:12px;color:rgba(226,232,240,.85);margin-top:3px;line-height:1.6">'+esc(advisorName)+' is asking to see your spending data'+(when?' — sent '+when:'')+'.</div>';
+  if(msg)h+='<div style="font-size:11px;color:var(--mu);font-style:italic;margin-top:5px;padding-left:8px;border-left:2px solid rgba(91,155,255,.2)">"'+esc(msg)+'"</div>';
+  h+='</div>';
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0">';
+  h+='<button onclick="_pvOpenRequestResponse()" style="padding:8px 14px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:34px;white-space:nowrap">Choose what to share</button>';
+  h+='<button onclick="_pvDismissBanner()" style="padding:8px 12px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:34px;white-space:nowrap">Not now</button>';
+  h+='</div></div></div>';
+  el.innerHTML=h;
+}
+
+// ── Banner dismiss (session-only — banner returns next portal load) ──
+function _pvDismissBanner(){
+  APP._pvBannerDismissed=true;
+  _pvRenderAdvisorRequestBanner();
+}
+
+// ── Open the request-response modal (jumps to Privacy and shows tier picker pre-focused) ──
+function _pvOpenRequestResponse(){
+  // Simple flow: navigate to Privacy and ensure the panel renders. The tier picker
+  // already includes a "Not shared (decline)" option, so no separate decline UI needed.
+  showClientPage('privacy');
+  setTimeout(function(){
+    if(typeof initSharingControls==='function')initSharingControls();
+    _pvRenderSpendingSharing();
+    // Scroll to the spending sharing panel
+    var p=document.getElementById('spendingSharingPanel');
+    if(p)p.scrollIntoView({behavior:'smooth',block:'start'});
+  },80);
+}
+
+// ── Lightweight toast helper (used by Phase I writes) ──
+function _pvShowToast(msg,kind){
+  var toast=document.createElement('div');
+  var bg=kind==='error'?'rgba(239,68,68,.95)':kind==='warning'?'rgba(234,179,8,.95)':'rgba(34,197,94,.95)';
+  toast.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:'+bg+';color:#fff;padding:10px 18px;border-radius:6px;font-family:var(--fh);font-size:12px;font-weight:700;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.3);transition:opacity .3s';
+  toast.textContent=msg;
+  document.body.appendChild(toast);
+  setTimeout(function(){toast.style.opacity='0';setTimeout(function(){toast.remove();},300);},2400);
+}
+
+
+// Phase A — TIME ANCHOR + PAST-AWARE SIMULATION
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// The plan engine projects from "today" forward. To track real-world progress and
+// show an honest "you are here" anchor, we need three things:
+//
+//   1. A plan-start date (anchor for "month 0")
+//   2. A way to compute how many months have elapsed since plan start
+//   3. A way to feed actual past contributions (from check-ins) into the simulation
+//
+// All three are below. The simulation's projection numerically matches the previous
+// behavior for plans with NO check-in data, because absent any actuals we treat past
+// months as having been contributed exactly as planned.
+//
+// CPLAN._planStartDate: ISO date string. Captured on first save (with backwards-compat
+//   fallback to plan.created). Should be IMMUTABLE — never overwrite once set.
+
+// ── Get or capture the plan-start date (idempotent — only sets once) ──
+function _cpGetPlanStartDate(){
+  if(CPLAN._planStartDate)return new Date(CPLAN._planStartDate);
+  // Backwards compat: legacy saved plans have plan.created
+  try{
+    var savedPlan=APP._portalFd&&APP._portalFd.allocation_plan;
+    if(savedPlan&&savedPlan.created){
+      var d=new Date(savedPlan.created);
+      if(!isNaN(d.getTime())){
+        // Anchor to the 1st of the month it was created in — see _cpRunSimulation comment
+        var anchored=new Date(d.getFullYear(),d.getMonth(),1);
+        CPLAN._planStartDate=anchored.toISOString();
+        return anchored;
+      }
+    }
+  }catch(e){}
+  // No anchor found yet — set today (1st of current month)
+  var now=new Date();
+  var anchor=new Date(now.getFullYear(),now.getMonth(),1);
+  CPLAN._planStartDate=anchor.toISOString();
+  return anchor;
+}
+
+// ── Integer count of FULL calendar months elapsed since plan start ──
+// If plan started March 1 and today is May 15, returns 2 (April + March are complete).
+// This is what "you are here" anchors to and what bounds the past-aware projection.
+function _cpMonthsElapsed(){
+  var start=_cpGetPlanStartDate();
+  var now=new Date();
+  // Number of month boundaries crossed
+  var monthsDiff=(now.getFullYear()-start.getFullYear())*12+(now.getMonth()-start.getMonth());
+  return Math.max(0,monthsDiff);
+}
+
+// ── Build a YYYY-MM key for a given offset (in months) from plan start ──
+function _cpMonthKeyForOffset(monthOffset){
+  var start=_cpGetPlanStartDate();
+  var d=new Date(start.getFullYear(),start.getMonth()+monthOffset,1);
+  var yr=d.getFullYear();var mo=d.getMonth()+1;
+  return yr+'-'+(mo<10?'0':'')+mo;
+}
+
+// ── Format a month offset as a human-readable label (e.g. "Apr 2026") ──
+function _cpMonthLabelForOffset(monthOffset){
+  var start=_cpGetPlanStartDate();
+  var d=new Date(start.getFullYear(),start.getMonth()+monthOffset,1);
+  var monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return monthNames[d.getMonth()]+' '+d.getFullYear();
+}
+
+// ── Read a check-in record for a specific allocation type at a specific month offset ──
+// Returns {status, actual} where status is 'on'/'partial'/'off'/'skip'/null and actual is
+// dollars contributed that month. Returns null if no check-in exists yet for that month.
+//
+// Backwards-compat: if the check-in is a bare string (legacy shape), translates to {status:str}.
+// For 'on': actual = planned; for 'off': actual = 0; for 'partial': uses recorded actual.
+//
+// `plannedAmount` is required so we can compute 'on' status correctly without storing
+// redundant data in the check-in record.
+function _cpGetActualContribution(allocType,monthOffset,plannedAmount){
+  var moKey=_cpMonthKeyForOffset(monthOffset);
+  // Primary store: CPLAN._checkIns (Phase B modal)
+  var moRec=(CPLAN._checkIns||{})[moKey];
+  var rec=moRec?moRec[allocType]:null;
+  if(rec!=null&&rec!==''){
+    // Legacy string-based check-in
+    if(typeof rec==='string'){
+      if(rec==='on'||rec==='done')return {status:'on',actual:plannedAmount};
+      if(rec==='off'||rec==='missed')return {status:'off',actual:0};
+      if(rec==='skip')return {status:'skip',actual:plannedAmount};// "Skip" = no impact — treat as planned
+    }
+    // Object form (new)
+    if(typeof rec==='object'){
+      if(rec.status==='skip')return {status:'skip',actual:plannedAmount};
+      if(rec.status==='off')return {status:'off',actual:0};
+      if(rec.status==='on')return {status:'on',actual:plannedAmount};
+      if(rec.status==='partial'){
+        var a=parseFloat(rec.actual);
+        if(isNaN(a))a=0;
+        return {status:'partial',actual:a};
+      }
+    }
+  }
+  // Phase D fallback: read from the legacy tracking store (_cpTracking) — this is what the
+  // Tracking page writes when the user clicks ✓ Done / ✗ Miss. Shape is keyed by allocation
+  // INDEX (not type), so we look up the index of the first allocation matching this type.
+  if(typeof _cpTracking!=='undefined'&&_cpTracking[moKey]){
+    // Find allocation index for this type. If multiple allocations share a type, prefer
+    // the first funded one (matches what the tracking UI binds buttons to).
+    var idx=-1;
+    for(var i=0;i<CPLAN.allocations.length;i++){
+      if(CPLAN.allocations[i].type===allocType&&CPLAN.allocations[i].amount>0){idx=i;break;}
+    }
+    if(idx<0){
+      for(var j=0;j<CPLAN.allocations.length;j++){
+        if(CPLAN.allocations[j].type===allocType){idx=j;break;}
+      }
+    }
+    if(idx>=0){
+      var trk=_cpTracking[moKey][idx];
+      if(trk){
+        if(trk.done===true){
+          // Use recorded `actual` if it's lower than planned (partial). If equal/higher, on plan.
+          var actualV=parseFloat(trk.actual);
+          if(isNaN(actualV))actualV=plannedAmount;
+          if(actualV>=plannedAmount)return {status:'on',actual:plannedAmount,source:'tracking'};
+          if(actualV<=0)return {status:'off',actual:0,source:'tracking'};
+          return {status:'partial',actual:actualV,source:'tracking'};
+        }
+        if(trk.done===false)return {status:'off',actual:0,source:'tracking'};
+      }
+    }
+  }
+  return null;
+}
+
+// ── Get the effective contribution for an allocation in a given month ──
+// For past months: returns actual if user has checked in, else falls back to planned (we
+// don't penalize before they answer the question). For future months: always returns planned.
+function _cpEffectiveContribution(allocType,monthOffset,plannedAmount,monthsElapsed){
+  // Future month — use planned
+  if(monthOffset>=monthsElapsed)return plannedAmount;
+  // Past month — try to read actuals
+  var rec=_cpGetActualContribution(allocType,monthOffset,plannedAmount);
+  if(rec)return rec.actual;
+  // No check-in yet — assume on plan (don't pre-emptively shift the projection)
+  return plannedAmount;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase B — CHECK-IN MODAL + ACCOUNTABILITY MESSAGE
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Flow:
+//   1. initClientPlan runs (Phase A) → after render → _cpDetectMissingCheckIns()
+//   2. If user has unanswered past months → _cpShowCheckInModal()
+//   3. User answers (on/partial/off/skip) → _cpSubmitCheckIns()
+//   4. Submit re-runs simulation with new actuals → checks for drift vs originalProjection
+//   5. If any partial/off → _cpShowAccountabilityModal() (popup, dismissible)
+//   6. After dismiss, _cpRenderAccountabilityBanner() shows persistent inline banner
+//      until shortfall is addressed (catch-up boost added or condition cleared)
+
+// ── Detect months that need a check-in ──
+// Returns an array of {monthOffset, monthKey, label} for each PAST month that has
+// at least one funded allocation without a check-in record. Skip months that have
+// already been fully answered. Cap at the last 6 months to avoid overwhelming a user
+// returning after a long absence.
+function _cpDetectMissingCheckIns(){
+  if(!CPLAN.allocations||!CPLAN.allocations.length)return [];
+  var monthsElapsed=_cpMonthsElapsed();
+  if(monthsElapsed<=0)return [];
+  // Allocations that should be checked in on (skip protection — action-only, no monthly $)
+  var trackable=CPLAN.allocations.filter(function(a){
+    return a.amount>0 && a.type!=='protection' && !a._completed;
+  });
+  if(!trackable.length)return [];
+  var missing=[];
+  // Cap depth: oldest 6 months only (avoid overwhelming returning users)
+  var earliestOffset=Math.max(0,monthsElapsed-6);
+  for(var mo=earliestOffset;mo<monthsElapsed;mo++){
+    var moKey=_cpMonthKeyForOffset(mo);
+    var moRec=(CPLAN._checkIns||{})[moKey]||{};
+    // Need check-in if any trackable allocation has no record for this month
+    var anyMissing=trackable.some(function(a){
+      var rec=moRec[a.type];
+      return rec==null || rec==='';
+    });
+    if(anyMissing){
+      missing.push({
+        monthOffset:mo,
+        monthKey:moKey,
+        label:_cpMonthLabelForOffset(mo)
+      });
+    }
+  }
+  return missing;
+}
+
+// ── Build the check-in modal HTML ──
+// Renders one section per missing month, one row per trackable allocation in that month.
+// Each row has 4 radio options: Full / Partial (with input) / Missed / Skip.
+function _cpBuildCheckInModalHtml(missingMonths){
+  var trackable=CPLAN.allocations.filter(function(a){
+    return a.amount>0 && a.type!=='protection' && !a._completed;
+  });
+  var h='';
+  h+='<div class="modal" style="max-width:640px;max-height:90vh;overflow-y:auto">';
+  h+='<button class="modal-close" onclick="closeModal(\'cpCheckInModal\');CPLAN._checkInModalDismissed=true" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">📝 Catch up on your plan</div></div>';
+  h+='<div style="padding:0 4px 8px"><div style="font-size:13px;color:var(--mu);line-height:1.6;margin-bottom:14px">'+
+     'Welcome back. To keep your plan accurate, let us know how the past '+
+     (missingMonths.length===1?'month':missingMonths.length+' months')+' went. '+
+     'This is just a self-report — only you see it, and it powers your projections.</div>';
+  // Per-month sections
+  missingMonths.forEach(function(mm,mIdx){
+    h+='<div style="margin-bottom:18px;padding:14px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:6px">';
+    h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:10px">'+mm.label+'</div>';
+    trackable.forEach(function(a,aIdx){
+      var moRec=(CPLAN._checkIns||{})[mm.monthKey]||{};
+      var existing=moRec[a.type];
+      // Skip rows that have already been answered for this month (so the modal is targeted)
+      if(existing!=null && existing!=='')return;
+      var nm=a.customName||CP_NM[a.type]||a.type;
+      var ic=CP_IC[a.type]||'•';
+      var planned=Math.round(a.amount);
+      var inputId='ci_'+mIdx+'_'+aIdx;
+      var radioName='ci_'+mIdx+'_'+aIdx+'_status';
+      h+='<div style="margin-bottom:14px;padding-bottom:12px;border-bottom:1px solid rgba(91,155,255,.1)" data-ci-month="'+mm.monthKey+'" data-ci-type="'+a.type+'">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+      h+='<div style="display:flex;align-items:center;gap:8px"><span style="font-size:16px">'+ic+'</span><span style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+nm+'</span></div>';
+      h+='<span style="font-family:var(--fh);font-size:11px;color:var(--mu)">Planned $'+planned+'</span>';
+      h+='</div>';
+      // 4 radio options
+      h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
+      // On (full)
+      h+='<label style="display:flex;align-items:center;gap:6px;padding:8px 10px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:4px;cursor:pointer;font-size:12px;color:var(--gr)">';
+      h+='<input type="radio" name="'+radioName+'" value="on" data-actual="'+planned+'" style="margin:0">';
+      h+='<span>✓ Full ($'+planned+')</span></label>';
+      // Partial — opens an input
+      h+='<label style="display:flex;align-items:center;gap:6px;padding:8px 10px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.18);border-radius:4px;cursor:pointer;font-size:12px;color:var(--yl)">';
+      h+='<input type="radio" name="'+radioName+'" value="partial" data-input-id="'+inputId+'" style="margin:0">';
+      h+='<span>~ Partial</span></label>';
+      // Off (missed)
+      h+='<label style="display:flex;align-items:center;gap:6px;padding:8px 10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.18);border-radius:4px;cursor:pointer;font-size:12px;color:var(--rd)">';
+      h+='<input type="radio" name="'+radioName+'" value="off" data-actual="0" style="margin:0">';
+      h+='<span>✗ Missed</span></label>';
+      // Skip (don't count this month in math)
+      h+='<label style="display:flex;align-items:center;gap:6px;padding:8px 10px;background:rgba(100,116,139,.04);border:1px solid rgba(100,116,139,.18);border-radius:4px;cursor:pointer;font-size:12px;color:var(--mu)">';
+      h+='<input type="radio" name="'+radioName+'" value="skip" data-actual="'+planned+'" style="margin:0">';
+      h+='<span>— Skip</span></label>';
+      h+='</div>';
+      // Hidden partial-amount input
+      h+='<div id="'+inputId+'_wrap" style="display:none;margin-top:8px"><div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:12px">$</span><input type="number" id="'+inputId+'" placeholder="How much did you contribute?" min="0" max="'+planned+'" step="1" style="width:100%;padding:8px 10px 8px 24px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:4px;box-sizing:border-box" oninput="(function(el){var w=el.parentElement.parentElement;w.setAttribute(\'data-partial-val\',el.value);})(this)"></div></div>';
+      h+='</div>';
+    });
+    h+='</div>';
+  });
+  // Footer buttons
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'cpCheckInModal\');CPLAN._checkInModalDismissed=true" style="padding:10px 18px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">I\'ll do this later</button>';
+  h+='<button onclick="_cpSubmitCheckIns()" style="padding:10px 22px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Submit</button>';
+  h+='</div>';
+  h+='</div>';// content padding
+  h+='</div>';// modal
+  return h;
+}
+
+// ── Open the check-in modal ──
+function _cpShowCheckInModal(missingMonths){
+  if(!missingMonths||!missingMonths.length)return;
+  // Ensure modal container exists in the DOM
+  var el=document.getElementById('cpCheckInModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='cpCheckInModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el){closeModal('cpCheckInModal');CPLAN._checkInModalDismissed=true;}};
+    document.body.appendChild(el);
+  }
+  el.innerHTML=_cpBuildCheckInModalHtml(missingMonths);
+  // Wire up partial-input toggle behavior (radio change shows/hides the partial input)
+  setTimeout(function(){
+    el.querySelectorAll('input[type="radio"]').forEach(function(r){
+      r.addEventListener('change',function(){
+        var inputId=this.getAttribute('data-input-id');
+        // Hide all inputs in this row first
+        var row=this.closest('[data-ci-month]');
+        if(row){
+          var inputs=row.querySelectorAll('[id^="ci_"][id$="_wrap"]');
+          inputs.forEach(function(w){w.style.display='none';});
+        }
+        // Show the partial input if this radio is "partial"
+        if(this.value==='partial' && inputId){
+          var wrap=document.getElementById(inputId+'_wrap');
+          if(wrap){wrap.style.display='';
+            var inp=document.getElementById(inputId);
+            if(inp)setTimeout(function(){inp.focus();},50);
+          }
+        }
+      });
+    });
+  },50);
+  openModal('cpCheckInModal');
+}
+
+// ── Submit check-in answers ──
+// Reads all radio answers, writes to CPLAN._checkIns, saves, then evaluates whether
+// to fire the accountability popup.
+function _cpSubmitCheckIns(){
+  var modal=document.getElementById('cpCheckInModal');
+  if(!modal)return;
+  if(!CPLAN._checkIns)CPLAN._checkIns={};
+  var rows=modal.querySelectorAll('[data-ci-month]');
+  var anyShortfall=false;
+  var collected=[];
+  rows.forEach(function(row){
+    var moKey=row.getAttribute('data-ci-month');
+    var aType=row.getAttribute('data-ci-type');
+    var picked=row.querySelector('input[type="radio"]:checked');
+    if(!picked)return;// row left unanswered — don't write anything (modal can re-prompt next time)
+    var status=picked.value;
+    var actual;
+    if(status==='partial'){
+      var inputId=picked.getAttribute('data-input-id');
+      var inp=document.getElementById(inputId);
+      var v=parseFloat(inp&&inp.value);
+      if(isNaN(v)||v<0)v=0;
+      actual=v;
+    } else {
+      actual=parseFloat(picked.getAttribute('data-actual'))||0;
+    }
+    if(!CPLAN._checkIns[moKey])CPLAN._checkIns[moKey]={};
+    var planned=parseFloat((CPLAN.allocations.find(function(a){return a.type===aType;})||{}).amount)||0;
+    CPLAN._checkIns[moKey][aType]={
+      status:status,
+      actual:actual,
+      plannedAt:planned,
+      recordedAt:new Date().toISOString()
+    };
+    // Phase D: also write to legacy _cpTracking store so the Tracking page shows the
+    // same data without a re-render gap. Both stores are read by _cpGetActualContribution.
+    try{
+      var allocIdxD=CPLAN.allocations.findIndex(function(a){return a.type===aType&&a.amount>0;});
+      if(allocIdxD<0)allocIdxD=CPLAN.allocations.findIndex(function(a){return a.type===aType;});
+      if(allocIdxD>=0&&typeof _cpTracking!=='undefined'){
+        if(!_cpTracking[moKey])_cpTracking[moKey]={};
+        // For 'on'/'partial': done=true with actual amount.
+        // For 'off': done=false (matches what _trackMiss writes).
+        // For 'skip': leave _cpTracking alone so the Tracking page shows it as not-yet-tracked.
+        if(status==='on'||status==='partial'){
+          _cpTracking[moKey][allocIdxD]={done:true,actual:actual,ts:Date.now(),source:'checkin_modal'};
+        } else if(status==='off'){
+          _cpTracking[moKey][allocIdxD]={done:false,actual:0,ts:Date.now(),source:'checkin_modal'};
+        }
+      }
+    }catch(e){}
+    collected.push({moKey:moKey,aType:aType,status:status,actual:actual,planned:planned});
+    if(status==='partial'||status==='off'){
+      anyShortfall=true;
+    }
+  });
+  closeModal('cpCheckInModal');
+  // Persist immediately — both stores
+  try{cplanSave();}catch(e){console.warn('Save after check-in:',e);}
+  try{if(typeof _trackSave==='function')_trackSave();}catch(e){}
+  // Re-run simulation so projections reflect new actuals
+  try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
+  // Refresh UI components that depend on the simulation
+  try{
+    if(typeof _cpRenderChart==='function')_cpRenderChart();
+    if(typeof _cpRenderHealthScore==='function')_cpRenderHealthScore();
+    if(typeof _cpRenderEFRunway==='function')_cpRenderEFRunway();
+    if(typeof _cpRenderIncomeReplacement==='function')_cpRenderIncomeReplacement();
+  }catch(e){}
+  // If anything was missed/partial, show accountability message
+  if(anyShortfall){
+    _cpShowAccountabilityModal(collected);
+  } else {
+    _cpShowOnTrackModal(collected);
+  }
+  // Keep the inline banner in sync
+  _cpRenderAccountabilityBanner();
+}
+
+// ── Compute drift between current projection and original snapshot ──
+// Returns an object describing what shifted, or null if no original snapshot exists.
+function _cpComputeDrift(){
+  if(!CPLAN._originalProjection||!CPLAN._sim)return null;
+  var orig=CPLAN._originalProjection;
+  var cur=CPLAN._sim;
+  // Find original event months by type (label not always reliable across versions)
+  function origEventMonth(type){
+    var ev=(orig.events||[]).find(function(e){return e.type===type;});
+    return ev?ev.month:null;
+  }
+  function curEventMonth(type){
+    var ev=(cur.events||[]).find(function(e){return e.type===type;});
+    return ev?ev.month:null;
+  }
+  var efOrig=origEventMonth('ef');
+  var efCur=curEventMonth('ef');
+  var debtOrig=origEventMonth('debt');
+  var debtCur=curEventMonth('debt');
+  // Retirement at age 65
+  var origRet=orig.projRetValue||0;
+  var curRet=cur.projRetValue||0;
+  var retDelta=curRet-origRet;
+  // Retirement income
+  var origInc=orig.projRetIncome||0;
+  var curInc=cur.projRetIncome||0;
+  var incDelta=curInc-origInc;
+  return {
+    efShiftMonths:(efOrig!=null&&efCur!=null)?(efCur-efOrig):null,
+    debtShiftMonths:(debtOrig!=null&&debtCur!=null)?(debtCur-debtOrig):null,
+    fullFundingShiftMonths:(orig.fullFundingMonth&&cur.fullFundingMonth)?(cur.fullFundingMonth-orig.fullFundingMonth):0,
+    origRetValue:origRet,curRetValue:curRet,retValueDelta:retDelta,
+    origRetIncome:origInc,curRetIncome:curInc,retIncomeDelta:incDelta
+  };
+}
+
+// ── Compute the catch-up suggestion ──
+// total shortfall = sum of (planned - actual) across all reported partial/missed
+// Returns {total, perMonth3} for the lump-sum and 3-month-spread options
+function _cpComputeCatchUp(collected){
+  var total=0;
+  collected.forEach(function(c){
+    if(c.status==='partial'||c.status==='off'){
+      total+=Math.max(0,c.planned-c.actual);
+    }
+  });
+  return {
+    total:Math.round(total),
+    perMonth3:Math.round(total/3)
+  };
+}
+
+// ── Show the accountability modal (popup variant — first time after submit) ──
+function _cpShowAccountabilityModal(collected){
+  var drift=_cpComputeDrift();
+  var catchUp=_cpComputeCatchUp(collected);
+  // Build modal
+  var el=document.getElementById('cpAccountModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='cpAccountModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('cpAccountModal');};
+    document.body.appendChild(el);
+  }
+  var h='<div class="modal" style="max-width:560px;max-height:90vh;overflow-y:auto">';
+  h+='<button class="modal-close" onclick="closeModal(\'cpAccountModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">⚖️ Here\'s the impact</div></div>';
+  // Yellow/amber tone — not red. We're showing consequences, not punishing.
+  h+='<div style="padding:0 4px 8px">';
+  // 1. What was missed/partial
+  var shortfallItems=collected.filter(function(c){return c.status==='partial'||c.status==='off';});
+  if(shortfallItems.length){
+    h+='<div style="margin-bottom:14px;padding:12px;background:rgba(234,179,8,.05);border-left:3px solid var(--yl);border-radius:0 4px 4px 0">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--yl);margin-bottom:8px">What you reported</div>';
+    shortfallItems.forEach(function(c){
+      var nm=(CP_NM[c.aType]||c.aType);
+      var monthLabel='';
+      try{var d=c.moKey.split('-');var monthNames=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];monthLabel=monthNames[parseInt(d[1])-1]+' '+d[0];}catch(e){monthLabel=c.moKey;}
+      var shortfall=Math.max(0,c.planned-c.actual);
+      h+='<div style="font-size:12px;color:rgba(226,232,240,.85);margin-bottom:4px">';
+      h+='<span style="color:var(--mu)">'+monthLabel+'</span> · '+nm+' — ';
+      if(c.status==='off')h+='missed ($'+Math.round(c.planned)+')';
+      else h+='partial ($'+Math.round(c.actual)+' of $'+Math.round(c.planned)+', shortfall $'+Math.round(shortfall)+')';
+      h+='</div>';
+    });
+    var totalShort=shortfallItems.reduce(function(t,c){return t+Math.max(0,c.planned-c.actual);},0);
+    h+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(234,179,8,.18);font-family:var(--fh);font-size:12px;font-weight:700;color:var(--yl)">Total shortfall: $'+Math.round(totalShort)+'</div>';
+    h+='</div>';
+  }
+  // 2. What this does (the projection drift)
+  if(drift){
+    h+='<div style="margin-bottom:14px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--wh);margin-bottom:10px">What this does to your projections</div>';
+    var anyDrift=false;
+    var rows='';
+    if(drift.efShiftMonths!=null && drift.efShiftMonths!==0){
+      anyDrift=true;
+      rows+='<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:6px">';
+      rows+='<span style="font-size:12px;color:var(--mu)">Emergency fund finished</span>';
+      rows+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(drift.efShiftMonths>0?'var(--yl)':'var(--gr)')+'">'+(drift.efShiftMonths>0?'+':'')+drift.efShiftMonths+' mo</span>';
+      rows+='</div>';
+    }
+    if(drift.debtShiftMonths!=null && drift.debtShiftMonths!==0){
+      anyDrift=true;
+      rows+='<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:6px">';
+      rows+='<span style="font-size:12px;color:var(--mu)">Debt-free month</span>';
+      rows+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(drift.debtShiftMonths>0?'var(--yl)':'var(--gr)')+'">'+(drift.debtShiftMonths>0?'+':'')+drift.debtShiftMonths+' mo</span>';
+      rows+='</div>';
+    }
+    if(drift.retValueDelta && Math.abs(drift.retValueDelta)>=100){
+      anyDrift=true;
+      rows+='<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:6px">';
+      rows+='<span style="font-size:12px;color:var(--mu)">Projected at retirement</span>';
+      rows+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(drift.retValueDelta<0?'var(--yl)':'var(--gr)')+'">$'+Math.round(drift.origRetValue/1000)+'K → $'+Math.round(drift.curRetValue/1000)+'K ('+(drift.retValueDelta<0?'-':'+')+'$'+Math.abs(Math.round(drift.retValueDelta/1000))+'K)</span>';
+      rows+='</div>';
+    }
+    if(drift.retIncomeDelta && Math.abs(drift.retIncomeDelta)>=5){
+      anyDrift=true;
+      rows+='<div style="display:flex;justify-content:space-between;padding:8px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:6px">';
+      rows+='<span style="font-size:12px;color:var(--mu)">Monthly retirement income</span>';
+      rows+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(drift.retIncomeDelta<0?'var(--yl)':'var(--gr)')+'">$'+Math.round(drift.origRetIncome)+' → $'+Math.round(drift.curRetIncome)+' ('+(drift.retIncomeDelta<0?'-':'+')+'$'+Math.abs(Math.round(drift.retIncomeDelta))+')</span>';
+      rows+='</div>';
+    }
+    if(!anyDrift){
+      h+='<div style="font-size:12px;color:var(--mu);padding:10px 0">A few months\' shortfall doesn\'t materially shift your long-run projections — but it stacks if it becomes a habit.</div>';
+    } else {
+      h+=rows;
+    }
+    h+='</div>';
+  }
+  // 3. Catch-up suggestion
+  if(catchUp.total>0){
+    h+='<div style="margin-bottom:14px;padding:12px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:4px">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--gr);margin-bottom:8px">Get back on track</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:10px">Add <strong style="color:var(--gr)">$'+catchUp.total+'</strong> to next month\'s contributions to fully recover. Or spread it over 3 months at <strong style="color:var(--gr)">$'+catchUp.perMonth3+'/mo</strong>.</div>';
+    h+='<div style="display:flex;gap:6px;flex-wrap:wrap">';
+    h+='<button onclick="_cpAddCatchUpBoost('+catchUp.total+',1)" style="padding:8px 14px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr);font-family:var(--fh);font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;min-height:36px">Add $'+catchUp.total+' next month</button>';
+    h+='<button onclick="_cpAddCatchUpBoost('+catchUp.total+',3)" style="padding:8px 14px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.2);color:var(--gr);font-family:var(--fh);font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;min-height:36px">Spread over 3 months</button>';
+    h+='</div></div>';
+  }
+  // 4. Footer — "I'll handle it" closes the modal but the inline banner persists
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'cpAccountModal\')" style="padding:10px 18px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">I\'ll handle it</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('cpAccountModal');
+  // Mark popup as shown so re-rendering doesn't re-pop it
+  CPLAN._accountabilityPopupShown=true;
+}
+
+// ── Show "on track" reinforcement modal (no shortfall) ──
+function _cpShowOnTrackModal(collected){
+  // Only show if there were actual on-status answers (not just skips)
+  var anyOn=collected.some(function(c){return c.status==='on';});
+  if(!anyOn)return;
+  var el=document.getElementById('cpAccountModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='cpAccountModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('cpAccountModal');};
+    document.body.appendChild(el);
+  }
+  var sim=CPLAN._sim||{};
+  var retVal=sim.projRetValue||0;
+  var retAge=65;
+  var h='<div class="modal" style="max-width:480px">';
+  h+='<button class="modal-close" onclick="closeModal(\'cpAccountModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title" style="color:var(--gr)">✓ All caught up</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="text-align:center;padding:18px 12px"><div style="font-size:48px;margin-bottom:8px">🎯</div>';
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;max-width:380px;margin:0 auto">You\'ve hit your plan targets for this round. ';
+  if(retVal>0)h+='At this pace, you\'re on track for retirement at age '+retAge+' with <strong style="color:var(--gr)">$'+Math.round(retVal/1000)+'K</strong>.';
+  else h+='Keep going.';
+  h+='</div></div>';
+  h+='<div style="display:flex;justify-content:flex-end;margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'cpAccountModal\')" style="padding:10px 22px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Looks good</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('cpAccountModal');
+}
+
+// ── Catch-up boost: add a one-time boost to the next month's contribution ──
+// `months` = 1 (lump) or 3 (spread). Distributes the catch-up amount across the
+// growth allocations proportionally to their planned amounts.
+function _cpAddCatchUpBoost(amount,months){
+  if(!amount||amount<=0)return;
+  if(!CPLAN._sim||!CPLAN._sim.allocFuture){
+    try{_cpRunSimulation();}catch(e){}
+  }
+  // Identify destination allocations: prefer growth vehicles, sorted by phase
+  var growth=CPLAN.allocations.map(function(a,i){return{a:a,i:i};})
+    .filter(function(x){return x.a.amount>0 && x.a.type!=='protection' && x.a.type!=='debt' && x.a.type!=='ef';})
+    .sort(function(a,b){return(a.a.phase||99)-(b.a.phase||99);});
+  if(!growth.length){
+    // Fall back to ANY funded allocation
+    growth=CPLAN.allocations.map(function(a,i){return{a:a,i:i};}).filter(function(x){return x.a.amount>0 && x.a.type!=='protection';});
+  }
+  if(!growth.length)return;
+  // Save catch-up boosts as flat structure on CPLAN — Phase D will use them in the sim
+  if(!CPLAN._catchUpBoosts)CPLAN._catchUpBoosts=[];
+  var monthsElapsed=_cpMonthsElapsed();
+  var perBoost=Math.round(amount/months);
+  var growthTotal=growth.reduce(function(t,g){return t+g.a.amount;},0)||1;
+  for(var k=0;k<months;k++){
+    var boostMonth=monthsElapsed+1+k;// Next month and beyond
+    growth.forEach(function(g){
+      var portion=Math.round(perBoost*(g.a.amount/growthTotal));
+      if(portion<=0)return;
+      CPLAN._catchUpBoosts.push({
+        allocType:g.a.type,
+        allocIdx:g.i,
+        monthOffset:boostMonth,
+        amount:portion,
+        addedAt:new Date().toISOString(),
+        reason:'Catch-up boost for missed/partial months'
+      });
+    });
+  }
+  closeModal('cpAccountModal');
+  try{cplanSave();}catch(e){}
+  // Toast confirmation
+  var toast=document.createElement('div');
+  toast.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(34,197,94,.95);color:#fff;padding:12px 20px;border-radius:6px;font-family:var(--fh);font-size:13px;font-weight:700;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,.3);transition:opacity .3s';
+  toast.textContent='✓ Added $'+amount+' catch-up boost'+(months>1?' across '+months+' months':'');
+  document.body.appendChild(toast);
+  setTimeout(function(){toast.style.opacity='0';setTimeout(function(){toast.remove();},300);},2600);
+  // Refresh banner
+  _cpRenderAccountabilityBanner();
+}
+
+// ── Render persistent inline banner ──
+// Shows when there's an unresolved shortfall (any partial/off check-in this month).
+// Disappears once the shortfall is addressed (catch-up boost added or condition cleared).
+function _cpRenderAccountabilityBanner(){
+  var container=document.getElementById('cpAccountabilityBanner');
+  if(!container){
+    // Create container at the top of the plan render area if missing
+    var planRoot=document.getElementById('cplanRoot');
+    if(planRoot){
+      container=document.createElement('div');
+      container.id='cpAccountabilityBanner';
+      container.style.cssText='margin-bottom:12px';
+      planRoot.insertBefore(container,planRoot.firstChild);
+    } else {
+      return;
+    }
+  }
+  // Detect any shortfall in the most-recently checked-in months
+  var checkIns=CPLAN._checkIns||{};
+  var shortfallTotal=0;
+  var shortfallMonths={};
+  Object.keys(checkIns).forEach(function(moKey){
+    var rec=checkIns[moKey];
+    Object.keys(rec).forEach(function(type){
+      var entry=rec[type];
+      if(typeof entry==='string')return;// legacy — no actual amount
+      if(entry&&(entry.status==='partial'||entry.status==='off')){
+        var planned=entry.plannedAt||0;
+        var actual=entry.actual||0;
+        var diff=Math.max(0,planned-actual);
+        if(diff>0){
+          shortfallTotal+=diff;
+          shortfallMonths[moKey]=(shortfallMonths[moKey]||0)+diff;
+        }
+      }
+    });
+  });
+  // If a catch-up boost has already been added that covers the shortfall, hide banner
+  var coveredByBoost=(CPLAN._catchUpBoosts||[]).reduce(function(t,b){return t+(b.amount||0);},0);
+  var net=Math.max(0,Math.round(shortfallTotal)-Math.round(coveredByBoost));
+  if(net<=0){
+    container.innerHTML='';
+    return;
+  }
+  // Build banner
+  var monthCount=Object.keys(shortfallMonths).length;
+  var h='<div style="padding:12px 14px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.25);border-left:3px solid var(--yl);border-radius:4px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">';
+  h+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:240px">';
+  h+='<span style="font-size:18px;flex-shrink:0">⚖️</span>';
+  h+='<div><div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--yl);letter-spacing:.06em">UNRESOLVED SHORTFALL</div>';
+  h+='<div style="font-size:12px;color:rgba(226,232,240,.8);margin-top:2px">$'+Math.round(net)+' missing across '+monthCount+' month'+(monthCount>1?'s':'')+'. Your projection has shifted accordingly.</div></div></div>';
+  h+='<div style="display:flex;gap:6px;flex-wrap:wrap">';
+  h+='<button onclick="_cpShowAccountabilityModalFromBanner()" style="padding:8px 14px;background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);color:var(--yl);font-family:var(--fh);font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;min-height:34px">View impact</button>';
+  h+='<button onclick="_cpAddCatchUpBoost('+Math.round(net)+',1)" style="padding:8px 14px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:var(--gr);font-family:var(--fh);font-size:11px;font-weight:700;cursor:pointer;border-radius:4px;min-height:34px">Add $'+Math.round(net)+' catch-up</button>';
+  h+='</div></div>';
+  container.innerHTML=h;
+}
+
+// ── Re-open accountability modal from the banner click ──
+function _cpShowAccountabilityModalFromBanner(){
+  var checkIns=CPLAN._checkIns||{};
+  var collected=[];
+  Object.keys(checkIns).forEach(function(moKey){
+    var rec=checkIns[moKey];
+    Object.keys(rec).forEach(function(type){
+      var entry=rec[type];
+      if(typeof entry==='object'&&entry){
+        collected.push({moKey:moKey,aType:type,status:entry.status,actual:entry.actual||0,planned:entry.plannedAt||0});
+      }
+    });
+  });
+  if(collected.length)_cpShowAccountabilityModal(collected);
+}
+
+// ── Entry point: called from initClientPlan after render ──
+// Detects missing check-ins, shows modal if appropriate, renders banner.
+function _cpRunCheckInFlow(){
+  // Don't pop if user dismissed in the same session
+  if(CPLAN._checkInModalDismissed)return;
+  // Don't pop if no plan exists yet
+  if(!CPLAN.allocations||!CPLAN.allocations.length)return;
+  // Don't pop on advisor pending state
+  if(CPLAN.hasAdvisor&&CPLAN._planStatus!=='published')return;
+  var missing=_cpDetectMissingCheckIns();
+  if(missing.length>0){
+    // Defer slightly so the page render finishes first
+    setTimeout(function(){_cpShowCheckInModal(missing);},400);
+  }
+  // Always render banner state
+  _cpRenderAccountabilityBanner();
+}
+
 function _cpRunSimulation(){
   var years=30;
   var maxMonths=years*12;
@@ -22614,6 +24962,10 @@ function _cpRunSimulation(){
   var _homeAppreciation=0.035;// 3.5% annual appreciation
   var _mortgageBal=loRateDebts.filter(function(d){var nm=(d.name||d.type||'').toLowerCase();return nm.indexOf('house')>=0||nm.indexOf('mortgage')>=0||nm.indexOf('home')>=0;}).reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
 
+  // Phase A: how many full months have actually elapsed since plan start.
+  // Used below to substitute actual contributions (from check-ins) for past months.
+  var _monthsElapsed=_cpMonthsElapsed();
+
   for(var yr=0;yr<=years;yr++){
     // Baseline: idle cash at 0%, ALL debt with min payments only
     var baseCash=CPLAN.surplus*12*yr;
@@ -22625,6 +24977,11 @@ function _cpRunSimulation(){
     // We walk month-by-month so that when an allocation caps (EF/house/custom hits target),
     // the freed monthly amount is properly recaptured into unallocated surplus (unBal)
     // and doesn't disappear from the projection.
+    //
+    // Phase A: for past months (m <= _monthsElapsed), the effective contribution is the
+    // ACTUAL amount the user contributed (per check-ins) rather than the planned amount.
+    // For future months, the planned amount is used. When no check-in exists for a past
+    // month, we fall back to planned (don't pre-emptively shift the projection).
     var totalAssets=0;
     var balByIdx={};                       // running balance per alloc, persists across months within this year
     var unBalAccum=0;                      // running unallocated surplus (0% growth, just stacks)
@@ -22640,9 +24997,28 @@ function _cpRunSimulation(){
         var monthlyAmt=af.currentAmount;
         af.boosts.forEach(function(b){if(m>=b.month)monthlyAmt=af.futureAmount;});
         if((a.type==='ef'||a.type==='house'||a.type==='custom')&&a.target>0&&balByIdx[idx]>=a.target){monthlyAmt=0;}
-        var contrib=monthlyAmt*cf;
+        // Phase A: substitute actual contribution for past months. m is 1-indexed in this
+        // loop but _cpEffectiveContribution wants 0-indexed offset, so we pass m-1.
+        // We only substitute for months that have actually elapsed (m-1 < _monthsElapsed).
+        var effectiveAmt=monthlyAmt;
+        if((m-1)<_monthsElapsed){
+          effectiveAmt=_cpEffectiveContribution(a.type,m-1,monthlyAmt,_monthsElapsed);
+        }
+        // Phase B: layer catch-up boosts. These represent extra contributions the user
+        // committed to in specific future months to recover from a missed/partial month.
+        // Boost monthOffset is 0-indexed (matches _cpMonthsElapsed); the loop's m is
+        // 1-indexed, so we match m === monthOffset+1 (boost fires that month only, not
+        // forever after — they're one-time top-ups).
+        if(CPLAN._catchUpBoosts&&CPLAN._catchUpBoosts.length){
+          CPLAN._catchUpBoosts.forEach(function(b){
+            if(b.allocType===a.type && (m===b.monthOffset+1)){
+              effectiveAmt+=(parseFloat(b.amount)||0);
+            }
+          });
+        }
+        var contrib=effectiveAmt*cf;
         balByIdx[idx]=(balByIdx[idx]+contrib)*(1+(rate/12));
-        monthDeployed+=monthlyAmt;
+        monthDeployed+=effectiveAmt;
       });
       // Anything not deployed this month sits in unallocated cash at 0%
       var leftover=Math.max(0,monthlySurplus-monthDeployed);
@@ -22709,7 +25085,11 @@ function _cpRunSimulation(){
     debtFreeMonth:debtFreeMonth,
     fullFundingMonth:fullFundingMonth,
     projRetValue:projRetValue,
-    projRetIncome:projRetIncome
+    projRetIncome:projRetIncome,
+    // Phase A: time-anchored fields. Consumers (timeline, you-are-here marker,
+    // accountability messaging) read these to align display with real elapsed time.
+    monthsElapsed:_monthsElapsed,
+    planStartDate:CPLAN._planStartDate||null
   };
   return CPLAN._sim;
 }
@@ -23480,9 +25860,41 @@ function cplanUnlockExplore(){CPLAN.exploring=true;_cpRender();}
 
 // ── Save ──
 function cplanSave(){
+  // Phase A: capture immutable plan-start anchor on first save. The helper handles
+  // backwards-compat fallback (legacy plan.created) and only sets if not already set.
+  _cpGetPlanStartDate();
+
+  // Phase A: capture original projection snapshot on first save. This is the baseline
+  // we'll compare against in Phase B's accountability message ("you've drifted from
+  // your original retirement age by N months"). Idempotent — only set once.
+  if(!CPLAN._originalProjection){
+    try{
+      // Run a clean simulation NOW (before any check-ins exist) to establish the baseline
+      var _origSim=_cpRunSimulation();
+      CPLAN._originalProjection={
+        capturedAt:new Date().toISOString(),
+        netWorthByYear:(_origSim.netWorth||[]).slice(),
+        retirementByYear:(_origSim.retirement||[]).slice(),
+        projRetValue:_origSim.projRetValue||0,
+        projRetIncome:_origSim.projRetIncome||0,
+        debtFreeMonth:_origSim.debtFreeMonth||0,
+        fullFundingMonth:_origSim.fullFundingMonth||0,
+        // Snapshot key cascade event months for milestone comparison
+        events:(_origSim.events||[]).map(function(ev){return{month:ev.month,type:ev.type,label:ev.label};})
+      };
+    }catch(e){console.warn('Original projection snapshot failed:',e);}
+  }
+
   // Clean allocations for serialization (strip timers/functions)
   var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0};});
-  var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,selectedApproach:CPLAN._selectedApproach||'',approaches:CPLAN._approaches||null,planSource:CPLAN.hasAdvisor?'advisor':'self',planMode:CPLAN.planMode||'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString(),phaseNames:{1:CPLAN._phase1Name||'',2:CPLAN._phase2Name||'',3:CPLAN._phase3Name||'',4:CPLAN._phase4Name||''},ai_generations:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.ai_generations)||[],checkIns:CPLAN._checkIns||{}};
+  var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,selectedApproach:CPLAN._selectedApproach||'',approaches:CPLAN._approaches||null,planSource:CPLAN.hasAdvisor?'advisor':'self',planMode:CPLAN.planMode||'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString(),phaseNames:{1:CPLAN._phase1Name||'',2:CPLAN._phase2Name||'',3:CPLAN._phase3Name||'',4:CPLAN._phase4Name||''},ai_generations:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.ai_generations)||[],checkIns:CPLAN._checkIns||{},
+    // Phase A: persist time anchor + original-projection baseline. Both are immutable
+    // after first save — they're only re-captured if missing (legacy plan migration).
+    planStartDate:CPLAN._planStartDate||null,
+    originalProjection:CPLAN._originalProjection||null,
+    // Phase B: persist user-committed catch-up boosts (one-time top-ups for missed months)
+    catchUpBoosts:CPLAN._catchUpBoosts||[]
+  };
   // Always save to localStorage as backup
   try{localStorage.setItem('pfos_plan_backup',JSON.stringify(plan));}catch(e){}
   // Update in-memory portal data so same-session re-init works
