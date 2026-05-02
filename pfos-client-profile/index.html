@@ -1713,7 +1713,39 @@ function _advWasRevoked(vis){
 }
 
 // ── Master render function for the advisor's Spending page ──
-function renderAdvisorSpending(){
+// ── Master render function for the advisor's Spending page ──
+// Refreshes visibility from Supabase before rendering so that client revokes that
+// happened since the advisor opened the profile take effect immediately. The actual
+// drawing happens in _advRenderSpendingFromVis after the fetch resolves.
+async function renderAdvisorSpending(){
+  var el=document.getElementById('advisorSpendingContent');
+  if(!el)return;
+  // Show a brief loading indicator while we re-fetch (skip on very first render
+  // where APP._spendingVisibility is already populated and we don't want a flash)
+  var hadPrev=!!APP._spendingVisibility;
+  if(!hadPrev){
+    el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:20px 0;text-align:center">Loading spending data...</div>';
+  }
+  // Fetch fresh visibility — this is what enforces "wipe-on-revoke" without requiring
+  // the advisor to reload the entire profile. Cheap query (single row, single column).
+  var clientId=APP.currentClientId;
+  if(clientId){
+    try{
+      var _rqSv=typeof getCoupleForClient==='function'?getCoupleForClient(clientId):null;
+      var _rqSvId=(_rqSv&&_rqSv.household_type==='joint')?_rqSv.client_a_id:clientId;
+      var fresh=await db.from('client_profiles').select('id,spending_visibility').eq('client_id',_rqSvId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(fresh&&fresh.data){
+        var freshVis=_pvGetVisibility(fresh.data.spending_visibility);
+        // Apply expiry if due (read-only — only client can persist expiry)
+        APP._spendingVisibility=_pvApplyExpiryIfDue(freshVis);
+        APP._spendingVisibilityProfileId=fresh.data.id;
+      }
+    }catch(e){console.warn('Phase J vis refresh:',e&&e.message);/* fall through with cached */}
+  }
+  _advRenderSpendingFromVis();
+}
+
+function _advRenderSpendingFromVis(){
   var el=document.getElementById('advisorSpendingContent');
   if(!el)return;
   var vis=APP._spendingVisibility||_pvDefaultVisibility();
@@ -1902,10 +1934,11 @@ function renderAdvisorSpending(){
   }
 
   // ── Coaching context: was the popup shown / dismissed? ──
-  // (Read from S._spendingPopupShown if pfos-main mirrors it. If not present, we
-  // gracefully omit this section.)
+  // pfos-main writes dismissed state to S._spendAccountability.shown[triggerKey]=timestamp
+  // when it auto-pops the spending accountability popup. We surface this to the advisor
+  // so they can lead with informed coaching ("I saw you got the warning on Tuesday...").
   var S=(_lastPfosState&&_lastPfosState.state)||{};
-  var popupHistory=S._spendingPopupShown||{};
+  var popupHistory=(S._spendAccountability&&S._spendAccountability.shown)||{};
   var popupKeys=Object.keys(popupHistory);
   if(popupKeys.length>0){
     var sortedKeys=popupKeys.sort(function(a,b){return (popupHistory[b]||0)-(popupHistory[a]||0);});
@@ -1916,9 +1949,12 @@ function renderAdvisorSpending(){
         var when=new Date(ts);
         var hrs=Math.round((Date.now()-when.getTime())/3600000);
         var whenStr=hrs<24?(hrs<=1?'less than an hour ago':hrs+' hours ago'):(Math.round(hrs/24)+' days ago');
+        // Trigger key format from _acctTriggerKey: "monthLabel|severity|overspendBucket"
+        var keyParts=mostRecent.split('|');
+        var triggerLabel=keyParts.length>=2?(keyParts[1]+(keyParts[2]?' · ~$'+keyParts[2]+' projected overspend':'')):mostRecent;
         h+='<div style="padding:11px 13px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:14px;font-size:11px;color:rgba(226,232,240,.75);line-height:1.6">';
         h+='<span style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#5B9BFF">Coaching context · </span>';
-        h+=esc(firstName)+' saw the spending accountability popup '+whenStr+'. Trigger: '+esc(mostRecent.split('|').slice(1).join(' · '))+'.';
+        h+=esc(firstName)+' saw the spending accountability popup '+whenStr+'. Trigger: '+esc(triggerLabel)+'.';
         h+='</div>';
       }catch(e){}
     }
@@ -5686,6 +5722,8 @@ window.addEventListener('message', async function(e){
           if(_activePg.id==='pg-projections'&&typeof renderAdvisorProjections==='function')renderAdvisorProjections();
           if(_activePg.id==='pg-analysis'&&typeof renderAdvisorAnalysis==='function')renderAdvisorAnalysis();
           if(_activePg.id==='pg-insurance'&&typeof renderAdvisorInsurance==='function')renderAdvisorInsurance();
+          // Phase J: refresh Spending page when state updates (also re-fetches visibility)
+          if(_activePg.id==='pg-spending'&&typeof renderAdvisorSpending==='function')renderAdvisorSpending();
         }
       }catch(e6){}
     } catch(err){ console.warn('Auto-save failed:', err); }
