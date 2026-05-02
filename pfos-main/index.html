@@ -3577,9 +3577,10 @@ function renderHome(){
   var barCol=barPct>90?'var(--rd)':barPct>70?'var(--or)':'var(--gr)';
   h+='<div style="margin-bottom:12px"><div style="height:8px;background:rgba(0,68,191,.08);border-radius:4px;overflow:hidden"><div style="height:100%;width:'+barPct+'%;background:'+barCol+';border-radius:4px;transition:width .5s ease"></div></div>';
   h+='<div style="display:flex;justify-content:space-between;margin-top:4px;font-size:10px;color:var(--mu)"><span>'+barPct+'% spent</span><span>'+(100-barPct)+'% remaining</span></div></div>';
-  // Pace check
-  var paceOk=pctSpent<=(dayOfMonth/daysInMonth*100+5);
-  h+='<div style="padding:10px 14px;background:'+(paceOk?'rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.15)':'rgba(249,115,22,.06);border:1px solid rgba(249,115,22,.15)')+';border-radius:4px;font-size:12px;color:'+(paceOk?'var(--gr)':'var(--or)')+';margin-bottom:16px">'+(paceOk?'✅ On track — spending under pace':'⚠️ Spending ahead of pace — '+(100-pctSpent)+'% of budget left for '+(100-Math.round(dayOfMonth/daysInMonth*100))+'% of the month')+'</div>';
+  // Phase E: rich accountability banner — replaces the simple pace check.
+  // Detects multiple severity tiers (caution/warning/over) plus per-category overspend.
+  // Clickable to open the full accountability popup with plan-impact comparison.
+  h+=_acctRenderBanner();
   h+='<div style="text-align:right;margin-bottom:12px"><button onclick="showSnapshotSetup()" style="background:none;border:1px solid rgba(91,155,255,.2);color:var(--mu);font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;padding:6px 14px;border-radius:2px;cursor:pointer">📍 Recalibrate Starting Point</button></div></div>';
 
   // ── FINANCIAL TRACKING + TRUE COST OF LIVING ──
@@ -3714,7 +3715,364 @@ function renderHome(){
   }
   h+='</div>';
   el.innerHTML=h;
+  // Phase E: auto-show the accountability popup if a new trigger event has occurred.
+  // _acctMaybeShowPopup is idempotent — it only pops once per (month + severity + ~$50 overspend bucket).
+  try{if(typeof _acctMaybeShowPopup==='function')_acctMaybeShowPopup();}catch(e){}
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase E — SPENDING ACCOUNTABILITY (popup + inline banner)
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Detects spending velocity issues during the month, classifies severity, and surfaces
+// the plan impact (using S._plan from the portal sync). Pattern mirrors Phase B from
+// the portal: popup appears once per trigger event, then a persistent banner stays
+// visible until the user resolves the issue or the next trigger event upgrades severity.
+
+// ── Compute current spending status with severity classification ──
+function _acctSpendStatus(){
+  var c=S.calcs||{};
+  var entries=S.spendingEntries||[];
+  var now=new Date();var curMonth=now.getMonth(),curYear=now.getFullYear();
+  var daysInMonth=new Date(curYear,curMonth+1,0).getDate();
+  var dayOfMonth=now.getDate();
+  var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
+  var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
+  var moneyIn=Math.round(c.inc||0);
+  if(moneyIn<=0){return{severity:'ok',paceRatio:0,overspend:0,categories:[],reasons:[],projected:0,daysLeft:daysInMonth-dayOfMonth};}
+
+  // Mid-month snapshot adjustment (already-spent before tracking started)
+  var snap=S.snapshot||{};
+  var isSnapMonth=snap.month===curMonth&&snap.year===curYear;
+  if(isSnapMonth)moneyOut+=snap.alreadySpent||0;
+
+  var pctSpent=Math.round((moneyOut/moneyIn)*100);
+  var pctOfMonthGone=Math.round((dayOfMonth/daysInMonth)*100);
+  // Pace ratio: 1.0 = exactly on pace, >1 = overspending, <1 = underspending
+  var paceRatio=pctOfMonthGone>0?(pctSpent/pctOfMonthGone):0;
+  // Projected end-of-month spend if current pace continues
+  var dailyPace=dayOfMonth>0?moneyOut/dayOfMonth:0;
+  var projected=Math.round(dailyPace*daysInMonth);
+  var overspend=Math.max(0,projected-moneyIn);
+
+  // Severity tiers — chosen so that early-month over-pace doesn't immediately scream
+  // (you can spend $300 on day 1 and recover by day 30), but mid/late month
+  // overshoots get appropriate urgency.
+  var severity='ok';
+  var reasons=[];
+  if(pctSpent>=100){
+    severity='over';
+    reasons.push('All monthly income is spent — '+(daysInMonth-dayOfMonth)+' days left.');
+  } else if(paceRatio>=1.4&&pctOfMonthGone>=20){
+    severity='warning';
+    reasons.push('Spending '+Math.round((paceRatio-1)*100)+'% over pace through day '+dayOfMonth+'.');
+  } else if(paceRatio>=1.2&&pctOfMonthGone>=15){
+    severity='caution';
+    reasons.push(Math.round((paceRatio-1)*100)+'% over pace through day '+dayOfMonth+'.');
+  } else if(projected>moneyIn&&pctOfMonthGone>=25){
+    severity='caution';
+    reasons.push('On pace to overspend by '+_acctFmt(overspend)+' this month.');
+  }
+
+  // Per-category check — flag any category at >50% of budget by middle of month, or
+  // any category that has already exceeded its monthly budget.
+  var bucketMap={food:'Food',housing:'Housing',transportation:'Transport',discretionary:'Entertainment',subscriptions:'Subscriptions',misc:'Other',utilities:'Utilities',insurance:'Insurance'};
+  var catSpend={};
+  monthEntries.forEach(function(e){
+    var bk=e.category_bucket||e.category||'misc';
+    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(e.amount)||0);
+  });
+  var categories=[];
+  Object.keys(bucketMap).forEach(function(bk){
+    var spent=catSpend[bk]||0;
+    if(spent<=0)return;
+    var budget=0;
+    if(S.expData&&S.expData[bk]&&typeof getMonthlyExp==='function'){
+      try{budget=getMonthlyExp(bk);}catch(e){budget=0;}
+    }
+    if(budget<=0)return;
+    var pct=Math.round(spent/budget*100);
+    var catSev='ok';
+    if(spent>budget){catSev='over';}
+    else if(pct>=80&&pctOfMonthGone<=70){catSev='warning';}
+    else if(pct>=50&&pctOfMonthGone<=40){catSev='caution';}
+    if(catSev!=='ok'){
+      categories.push({key:bk,name:bucketMap[bk],spent:Math.round(spent),budget:Math.round(budget),pct:pct,severity:catSev});
+      // Bump overall severity if a category is in trouble — but don't downgrade existing
+      if(catSev==='over'&&severity!=='over')severity='over';
+      else if(catSev==='warning'&&severity==='ok'||severity==='caution')severity='warning';
+      else if(catSev==='caution'&&severity==='ok')severity='caution';
+      var reasonText=bucketMap[bk]+' is at '+pct+'% of budget by day '+dayOfMonth;
+      if(reasons.indexOf(reasonText)<0)reasons.push(reasonText);
+    }
+  });
+
+  return{
+    severity:severity,
+    paceRatio:Math.round(paceRatio*100)/100,
+    pctSpent:pctSpent,
+    pctOfMonthGone:pctOfMonthGone,
+    moneyIn:moneyIn,
+    moneyOut:Math.round(moneyOut),
+    projected:projected,
+    overspend:Math.round(overspend),
+    categories:categories,
+    reasons:reasons,
+    dayOfMonth:dayOfMonth,
+    daysInMonth:daysInMonth,
+    daysLeft:daysInMonth-dayOfMonth,
+    monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'})
+  };
+}
+
+// ── Compute plan impact from a hypothetical surplus reduction ──
+// Uses S._plan synced from the portal. If no plan exists, returns null and the popup
+// falls back to a simpler "you're losing savings" message.
+function _acctComputePlanImpact(monthlyShortfall){
+  if(!S._plan||!S._plan.allocations||!S._plan.allocations.length)return null;
+  if(monthlyShortfall<=0)return null;
+  var plan=S._plan;
+  // Find the most likely affected allocation: the smallest growth allocation in Phase 1,
+  // because reducing surplus first squeezes the most flexible (lowest-priority) item.
+  // For display purposes we show "Roth IRA may drop $X" rather than spreading across all.
+  var growthTypes=['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','custom'];
+  var growthAllocs=plan.allocations.filter(function(a){return a.amount>0&&growthTypes.indexOf(a.type)>=0;});
+  // Sort by phase descending (later phases get hit first), then by amount ascending
+  growthAllocs.sort(function(a,b){
+    var pa=(a.phase!=null)?a.phase:1;var pb=(b.phase!=null)?b.phase:1;
+    if(pa!==pb)return pb-pa;// later phase first
+    return a.amount-b.amount;// smaller amount first within same phase
+  });
+  var mostAffected=growthAllocs[0]||plan.allocations.find(function(a){return a.amount>0;});
+  var mostAffectedName='your savings';
+  var mostAffectedType='';
+  if(mostAffected){
+    mostAffectedType=mostAffected.type;
+    if(plan.names&&plan.names[mostAffected.type]){mostAffectedName=plan.names[mostAffected.type];}
+    else if(mostAffected.customName){mostAffectedName=mostAffected.customName;}
+    else {mostAffectedName=mostAffected.type;}
+  }
+
+  // Compute compounded impact at retirement.
+  // Use planned retirement age 65 if not stored. Use a 6.5% blended growth rate as the
+  // baseline approximation — actual portal sim would do better, but this is a quick
+  // illustration meant to motivate behavior, not produce AG49-A precision.
+  var age=plan.age||30;
+  var retAge=65;
+  var yrs=Math.max(1,retAge-age);
+  var rate=0.065;
+  // Annuity-due future value of $shortfall/mo at given rate over yrs
+  var monthsRem=yrs*12;
+  var monthRate=rate/12;
+  var compoundedShortfall=Math.round(monthlyShortfall*((Math.pow(1+monthRate,monthsRem)-1)/monthRate));
+
+  // Compare to original retirement value if available
+  var origRetValue=null,newRetValue=null;
+  if(plan.sim&&plan.sim.retirement&&plan.sim.retirement.length){
+    origRetValue=plan.sim.retirement[Math.min(yrs,plan.sim.retirement.length-1)];
+    newRetValue=Math.max(0,origRetValue-compoundedShortfall);
+  }
+
+  return{
+    monthlyShortfall:monthlyShortfall,
+    yearsToRetirement:yrs,
+    compoundedShortfall:compoundedShortfall,
+    origRetValue:origRetValue,
+    newRetValue:newRetValue,
+    mostAffectedName:mostAffectedName,
+    mostAffectedType:mostAffectedType
+  };
+}
+
+// ── Build a stable trigger key for the dismiss flag ──
+// Same month + severity + rounded-to-50 overspend = same event. Different overspend
+// (the situation worsened) creates a new key, so the popup re-pops appropriately.
+function _acctTriggerKey(status){
+  if(!status||status.severity==='ok')return null;
+  var bucket=Math.round(status.overspend/50)*50;
+  return status.monthLabel+'|'+status.severity+'|'+bucket;
+}
+
+// ── Format helper that uses the page's existing `fmt` if available ──
+function _acctFmt(n){
+  if(typeof fmt==='function')return fmt(n);
+  var v=Math.round(parseFloat(n)||0);
+  return(v<0?'-$'+Math.abs(v).toLocaleString():'$'+v.toLocaleString());
+}
+
+// ── Render the inline banner that replaces the old pace-check ──
+function _acctRenderBanner(){
+  var status=_acctSpendStatus();
+  var on=status.severity!=='ok';
+  // Color theme by severity
+  var theme={
+    ok:{bg:'rgba(34,197,94,.06)',bd:'rgba(34,197,94,.18)',fg:'var(--gr)',icon:'✅'},
+    caution:{bg:'rgba(234,179,8,.06)',bd:'rgba(234,179,8,.22)',fg:'var(--yl)',icon:'👁️'},
+    warning:{bg:'rgba(249,115,22,.07)',bd:'rgba(249,115,22,.28)',fg:'var(--or)',icon:'⚠️'},
+    over:{bg:'rgba(239,68,68,.07)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️'}
+  };
+  var t=theme[status.severity]||theme.ok;
+  var h='';
+  if(!on){
+    h='<div style="padding:10px 14px;background:'+t.bg+';border:1px solid '+t.bd+';border-radius:4px;font-size:12px;color:'+t.fg+';margin-bottom:16px">'+t.icon+' On track — spending under pace</div>';
+    return h;
+  }
+  // Active warning banner — clickable to open accountability popup
+  h+='<div onclick="_acctShowPopup()" role="button" tabindex="0" onkeypress="if(event.key===\'Enter\')_acctShowPopup()" style="padding:12px 14px;background:'+t.bg+';border:1px solid '+t.bd+';border-left:3px solid '+t.fg+';border-radius:4px;margin-bottom:16px;cursor:pointer;transition:.15s" onmouseover="this.style.background=\''+t.bg.replace('.06','.10').replace('.07','.10').replace('.05','.10')+'\'" onmouseout="this.style.background=\''+t.bg+'\'">';
+  h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">';
+  h+='<div style="display:flex;align-items:flex-start;gap:10px;flex:1;min-width:200px">';
+  h+='<span style="font-size:18px;line-height:1">'+t.icon+'</span>';
+  h+='<div><div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.06em;color:'+t.fg+';text-transform:uppercase">';
+  h+=(status.severity==='over'?'OVER BUDGET':status.severity==='warning'?'SPENDING WARNING':'HEADS UP');
+  h+='</div>';
+  h+='<div style="font-size:12px;color:rgba(226,232,240,.85);margin-top:2px">'+status.reasons[0];
+  if(status.overspend>0)h+=' · projected overspend <strong>'+_acctFmt(status.overspend)+'</strong>';
+  h+='</div></div></div>';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+t.fg+';white-space:nowrap">View impact →</div>';
+  h+='</div></div>';
+  return h;
+}
+
+// ── Show the accountability modal popup ──
+// Triggered automatically (once per trigger key) and also from the banner click.
+function _acctShowPopup(forceShow){
+  var status=_acctSpendStatus();
+  if(status.severity==='ok'&&!forceShow)return;
+  // Ensure the modal container exists — created on demand (not in HTML markup)
+  var el=document.getElementById('acctPopupModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='acctPopupModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('acctPopupModal');};
+    document.body.appendChild(el);
+  }
+  var theme={
+    caution:{fg:'var(--yl)',label:'Heads up',icon:'👁️'},
+    warning:{fg:'var(--or)',label:'Spending warning',icon:'⚠️'},
+    over:{fg:'var(--rd)',label:'Over budget',icon:'⚖️'}
+  };
+  var t=theme[status.severity]||theme.caution;
+
+  var h='<div class="modal-box" style="max-width:560px;max-height:90vh;overflow-y:auto;padding:24px">';
+  // Header
+  h+='<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:14px">';
+  h+='<div><div style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh)">'+t.icon+' '+t.label+'</div>';
+  h+='<div style="font-size:11px;color:var(--mu);margin-top:2px">'+status.monthLabel+' · day '+status.dayOfMonth+' of '+status.daysInMonth+'</div></div>';
+  h+='<button onclick="closeModal(\'acctPopupModal\')" style="background:transparent;border:none;color:var(--mu);font-size:18px;cursor:pointer;padding:4px 8px" aria-label="Close">✕</button>';
+  h+='</div>';
+
+  // 1. What's happening
+  h+='<div style="margin-bottom:14px;padding:12px;background:rgba(249,115,22,.04);border-left:3px solid '+t.fg+';border-radius:0 4px 4px 0">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:'+t.fg+';margin-bottom:6px">What\'s happening</div>';
+  status.reasons.forEach(function(r){
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.85);margin-bottom:3px">• '+r+'</div>';
+  });
+  h+='<div style="display:flex;gap:14px;margin-top:10px;font-size:11px">';
+  h+='<div><span style="color:var(--mu)">Spent so far:</span> <strong style="color:var(--wh)">'+_acctFmt(status.moneyOut)+'</strong></div>';
+  h+='<div><span style="color:var(--mu)">Income:</span> <strong style="color:var(--wh)">'+_acctFmt(status.moneyIn)+'</strong></div>';
+  if(status.projected>status.moneyIn)h+='<div><span style="color:var(--mu)">Projected:</span> <strong style="color:'+t.fg+'">'+_acctFmt(status.projected)+'</strong></div>';
+  h+='</div>';
+  h+='</div>';
+
+  // 2. Plan impact (if a plan exists)
+  if(status.overspend>0){
+    var impact=_acctComputePlanImpact(status.overspend);
+    if(impact){
+      h+='<div style="margin-bottom:14px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--wh);margin-bottom:10px">What this does to your plan</div>';
+      // Most affected allocation
+      h+='<div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:6px">';
+      h+='<span style="font-size:12px;color:var(--mu)">Less for '+impact.mostAffectedName+' this month</span>';
+      h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+t.fg+'">−'+_acctFmt(impact.monthlyShortfall)+'</span>';
+      h+='</div>';
+      // Compounded shortfall
+      if(impact.compoundedShortfall>0){
+        h+='<div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:6px">';
+        h+='<span style="font-size:12px;color:var(--mu)">Compounded over '+impact.yearsToRetirement+' years (at ~6.5%)</span>';
+        h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+t.fg+'">−'+_acctFmt(impact.compoundedShortfall)+'</span>';
+        h+='</div>';
+      }
+      // Retirement projection delta (if known)
+      if(impact.origRetValue!=null&&impact.newRetValue!=null&&impact.origRetValue>0){
+        h+='<div style="display:flex;justify-content:space-between;padding:10px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">';
+        h+='<span style="font-size:12px;color:var(--mu)">Retirement projection</span>';
+        h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+t.fg+'">'+_acctFmt(Math.round(impact.origRetValue/1000)*1000).replace(/,000$/,'K')+' → '+_acctFmt(Math.round(impact.newRetValue/1000)*1000).replace(/,000$/,'K')+'</span>';
+        h+='</div>';
+      }
+      h+='</div>';
+    } else {
+      // No plan synced — show the simpler version
+      h+='<div style="margin-bottom:14px;padding:12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:4px;font-size:12px;color:var(--mu);line-height:1.7">';
+      h+='Build a financial plan in the portal to see how this overspend affects your long-term goals.';
+      h+='</div>';
+    }
+  }
+
+  // 3. Course-correct suggestion
+  if(status.overspend>0&&status.daysLeft>0){
+    var dailyCut=Math.ceil(status.overspend/Math.max(1,status.daysLeft));
+    h+='<div style="margin-bottom:14px;padding:12px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:4px">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--gr);margin-bottom:6px">Course correct</div>';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.85);line-height:1.7">Cut about <strong style="color:var(--gr)">'+_acctFmt(dailyCut)+'/day</strong> for the rest of the month to land at budget.';
+    if(status.categories.length>0){
+      var topCat=status.categories[0];
+      h+=' Top spending pressure: <strong style="color:var(--wh)">'+topCat.name+'</strong> ('+topCat.pct+'% of budget).';
+    }
+    h+='</div></div>';
+  }
+
+  // Footer
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'acctPopupModal\')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">I\'ll handle it</button>';
+  // "Show me what to cut" — scrolls to category breakdown
+  h+='<button onclick="_acctScrollToCategories();closeModal(\'acctPopupModal\')" style="padding:9px 16px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Show me what to cut</button>';
+  h+='</div>';
+
+  h+='</div>';
+  el.innerHTML=h;
+  openModal('acctPopupModal');
+
+  // Mark this trigger event as shown so it doesn't auto-pop again until severity escalates
+  if(!S._spendAccountability)S._spendAccountability={};
+  if(!S._spendAccountability.shown)S._spendAccountability.shown={};
+  var key=_acctTriggerKey(status);
+  if(key)S._spendAccountability.shown[key]=Date.now();
+  // Persist (debounced)
+  try{clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,500);}catch(e){}
+}
+
+// ── Scroll the page to the "Where Your Money Went" section ──
+function _acctScrollToCategories(){
+  // Wait for popup close animation
+  setTimeout(function(){
+    var titles=document.querySelectorAll('.sec-group-title');
+    for(var i=0;i<titles.length;i++){
+      if(/Where Your Money Went/i.test(titles[i].textContent||'')){
+        titles[i].scrollIntoView({behavior:'smooth',block:'center'});
+        return;
+      }
+    }
+    // Fallback — scroll to TCOL section if categories not visible
+    var trk=document.querySelector('[id^="trackHTML"], #homeContent');
+    if(trk)trk.scrollIntoView({behavior:'smooth',block:'start'});
+  },200);
+}
+
+// ── Trigger the popup automatically when home renders, if appropriate ──
+// Pops at most once per unique trigger key (severity + month + ~$50 overspend bucket).
+function _acctMaybeShowPopup(){
+  var status=_acctSpendStatus();
+  if(status.severity==='ok')return;
+  var key=_acctTriggerKey(status);
+  if(!key)return;
+  var shown=(S._spendAccountability&&S._spendAccountability.shown)||{};
+  if(shown[key])return;
+  // Defer slightly so the page render lands first
+  setTimeout(function(){_acctShowPopup();},500);
+}
+
 
 var _calMonth=null,_calYear=null;
 function getPayDatesForMonth(month,year){
@@ -9426,6 +9784,43 @@ function submitAdvisorRequestFromModal(){
     if(msg.type==='PFOS_PLAN_SYNC'){
       S._plan=msg.plan||{};
       if(_currentSection==='plan'){renderPlanSection();var t2Vis=document.getElementById('planTab2Content');if(t2Vis&&t2Vis.style.display!=='none')renderPlanProjections();}
+      return;
+    }
+    // Phase F: receive quick-add expense from portal overlay. Portal writes optimistically
+    // to its mirror; pfos-main is the canonical store, so append, recalc, and save.
+    if(msg.type==='PFOS_QUICK_ADD'){
+      try{
+        var entry=msg.entry||{};
+        // Validate minimum required fields
+        if(!entry.amount||parseFloat(entry.amount)<=0)return;
+        if(!S.spendingEntries)S.spendingEntries=[];
+        // De-dupe in case the portal also retried (match by id)
+        if(entry.id&&S.spendingEntries.some(function(e){return e.id===entry.id;}))return;
+        // Normalize fields with defaults
+        var normalized={
+          id:entry.id||Date.now(),
+          amount:parseFloat(entry.amount)||0,
+          description:entry.description||'',
+          category:entry.category||'misc',
+          category_bucket:entry.category_bucket||(typeof simplifyCategory==='function'?simplifyCategory(entry.category||'misc'):(entry.category||'misc')),
+          expense_type:entry.expense_type||'regular',
+          payment_method:entry.payment_method||'debit',
+          payment_detail:entry.payment_detail||{},
+          couple_owner:entry.couple_owner||'self',
+          is_recurring:!!entry.is_recurring,
+          recurrence_freq:entry.recurrence_freq||'monthly',
+          date:entry.date||new Date().toISOString().split('T')[0],
+          created_at:entry.created_at||new Date().toISOString(),
+          _source:entry._source||'portal'
+        };
+        S.spendingEntries.push(normalized);
+        // Recalc + persist (debounced to coalesce with any other changes)
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        // Refresh whatever section is currently visible
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+        else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+      }catch(e){console.warn('PFOS_QUICK_ADD:',e);}
       return;
     }
     // ── REVERSE CHANNEL: receive completion data from financial plan ──
