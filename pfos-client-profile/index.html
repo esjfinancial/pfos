@@ -768,6 +768,7 @@ html[data-theme="light"] .tip-pop{background:#FFFFFF!important;color:#334155!imp
     <div class="sb-item" id="nav-tracking" onclick="showPage('tracking');renderAdvisorTracking()"><span class="icon">✅</span> Financial Tracking</div>
     <div class="sb-item" id="nav-projections" onclick="showPage('projections');renderAdvisorProjections()"><span class="icon">📈</span> Financial Projections</div>
     <div class="sb-item" id="nav-analysis" onclick="showPage('analysis');renderAdvisorAnalysis()"><span class="icon">🔍</span> Financial Analysis</div>
+    <div class="sb-item" id="nav-spending" onclick="showPage('spending');renderAdvisorSpending()"><span class="icon">💰</span> Spending</div>
     <div class="sb-item" id="nav-insurance" onclick="showPage('insurance');renderAdvisorInsurance()"><span class="icon">🛡️</span> Insurance & Annuities</div>
     <div class="sb-item" id="nav-messages" onclick="showPage('messages');loadAdvisorMessages()"><span class="icon">💬</span> Messages <span id="advMsgBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:9px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
     <div class="sb-item" onclick="generateProgressReport(APP.currentClientId)"><span class="icon">📈</span> Progress Report</div>
@@ -895,6 +896,13 @@ html[data-theme="light"] .tip-pop{background:#FFFFFF!important;color:#334155!imp
       <div class="pg-title">Financial Analysis</div>
       <div class="pg-sub">Complete financial health diagnostic.</div>
       <div id="advisorAnalysisContent"><div style="color:var(--mu);font-size:13px;padding:20px 0;text-align:center">Loading analysis...</div></div>
+    </div>
+    <!-- Phase J: Spending — tier-respecting view of client's spending data -->
+    <div class="pg" id="pg-spending">
+      <div onclick="showPage('client-profile')" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;margin-bottom:12px;padding:4px 0" onmouseover="this.style.opacity='.7'" onmouseout="this.style.opacity='1'"><span>←</span> Back to Client Profile</div>
+      <div class="pg-title">💰 Spending</div>
+      <div class="pg-sub">Live this-month spending status — visible only with the client's permission.</div>
+      <div id="advisorSpendingContent" style="margin-top:14px"><div style="color:var(--mu);font-size:13px;padding:20px 0;text-align:center">Loading spending data...</div></div>
     </div>
     <div class="pg" id="pg-insurance">
       <div onclick="showPage('client-profile')" style="display:inline-flex;align-items:center;gap:6px;cursor:pointer;font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;margin-bottom:12px;padding:4px 0" onmouseover="this.style.opacity='.7'" onmouseout="this.style.opacity='1'"><span>←</span> Back to Client Profile</div>
@@ -1334,6 +1342,659 @@ function showPage(id){
   if(id==='agents') renderAgentsPage();
   if(id==='couples') renderCouplesPage();
 }
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase H — SPENDING VISIBILITY PERMISSION SYSTEM
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Controls whether (and how much) a client's spending data is visible to their
+// advisor. The CLIENT owns this decision — the advisor cannot grant access on the
+// client's behalf, only request it. Default state is "not shared."
+//
+// Tiers:
+//   0 — Not shared (default). Advisor sees a "client hasn't shared" state.
+//   1 — Status only. Advisor sees severity, projected overspend, plan impact.
+//   2 — Status + Categories. Adds the category breakdown bars.
+//   3 — Status + Categories + Transactions. Adds the recent transactions list.
+//
+// Storage: client_profiles.spending_visibility (JSONB column added by migration-spending-visibility.sql).
+// Migration is idempotent and safe to run multiple times.
+//
+// On revoke: advisor's UI immediately hides spending data (no historical snapshots
+// preserved). The audit log records when access was granted / revoked / changed.
+
+// ── Default visibility shape (returned when no record exists yet) ──
+function _pvDefaultVisibility(){
+  return{
+    tier:0,
+    grantedAt:null,
+    expiresAt:null,
+    promptedAt:null,
+    advisorRequest:null,
+    auditLog:[]
+  };
+}
+
+// ── Read visibility from a client_profiles row, with defaults filled in ──
+// Accepts either the raw row, the spending_visibility object directly, or null.
+// Always returns a usable object — never null/undefined.
+function _pvGetVisibility(profileOrVis){
+  if(!profileOrVis)return _pvDefaultVisibility();
+  // If passed a profile row, dig into the column
+  var vis=profileOrVis;
+  if(vis.spending_visibility!==undefined)vis=vis.spending_visibility;
+  if(!vis||typeof vis!=='object')return _pvDefaultVisibility();
+  // Backfill any missing fields with defaults (forward-compat with shape changes)
+  var defaults=_pvDefaultVisibility();
+  Object.keys(defaults).forEach(function(k){
+    if(vis[k]===undefined)vis[k]=defaults[k];
+  });
+  return vis;
+}
+
+// ── Check whether a visibility record has expired ──
+// Returns true if there's an expiresAt and it's in the past. Returns false otherwise.
+function _pvIsExpired(vis){
+  if(!vis||!vis.expiresAt)return false;
+  try{
+    var exp=new Date(vis.expiresAt);
+    if(isNaN(exp.getTime()))return false;
+    return exp.getTime()<Date.now();
+  }catch(e){return false;}
+}
+
+// ── Get the EFFECTIVE tier — accounts for expiry + tier 0 ──
+// This is what consumers should call. If a grant was issued but has now expired,
+// effective tier is 0 (no access). The actual stored tier remains until next save,
+// which appends an 'expired' audit entry and zeroes the tier.
+function _pvEffectiveTier(profileOrVis){
+  var vis=_pvGetVisibility(profileOrVis);
+  if(_pvIsExpired(vis))return 0;
+  var t=parseInt(vis.tier);
+  if(isNaN(t)||t<0)return 0;
+  if(t>3)return 3;
+  return t;
+}
+
+// ── Append an audit entry. Returns a NEW visibility object (does not mutate). ──
+// Cap the log at 200 entries (oldest dropped) to keep the column from growing forever.
+function _pvAuditAppend(vis,entry){
+  var v=_pvGetVisibility(vis);
+  var log=(v.auditLog||[]).slice();
+  // Stamp `at` if missing; preserve provided value if caller wants to backdate
+  var newEntry={
+    action:entry.action||'unknown',
+    at:entry.at||new Date().toISOString(),
+    byActor:entry.byActor||'system'
+  };
+  if(entry.tier!=null)newEntry.tier=entry.tier;
+  if(entry.prevTier!=null)newEntry.prevTier=entry.prevTier;
+  if(entry.note)newEntry.note=String(entry.note);
+  log.push(newEntry);
+  // Cap at 200
+  if(log.length>200)log.splice(0,log.length-200);
+  v.auditLog=log;
+  return v;
+}
+
+// ── Apply expiry: if grant has expired, mutate to tier=0 + log it ──
+// Returns the updated visibility (with the 'expired' audit entry) — only modifies
+// if expiry actually happened. Caller is responsible for persisting.
+function _pvApplyExpiryIfDue(vis){
+  var v=_pvGetVisibility(vis);
+  if(!_pvIsExpired(v))return v;
+  if(v.tier===0)return v;// already zeroed, nothing to do
+  var prevTier=v.tier;
+  v=_pvAuditAppend(v,{action:'expired',byActor:'system',prevTier:prevTier,tier:0,note:'Auto-expired by expiresAt timestamp'});
+  v.tier=0;
+  v.grantedAt=null;
+  v.expiresAt=null;
+  return v;
+}
+
+// ── Build a fresh "granted" visibility update — used by the client UI ──
+// daysValid = how long the grant lasts (null = no expiry). Standard offering: 90 days.
+function _pvBuildGrant(tier,daysValid,note){
+  var t=Math.max(0,Math.min(3,parseInt(tier)||0));
+  var now=new Date();
+  var expiresAt=null;
+  if(daysValid&&daysValid>0){
+    var exp=new Date(now.getTime()+daysValid*86400000);
+    expiresAt=exp.toISOString();
+  }
+  var v=_pvDefaultVisibility();
+  v.tier=t;
+  v.grantedAt=now.toISOString();
+  v.expiresAt=expiresAt;
+  return v;
+}
+
+// ── Mutate an existing visibility into the revoked state ──
+// Wipes tier, grantedAt, expiresAt; appends a 'revoked' audit entry. The
+// PROMPTED state is preserved (we don't re-prompt the client just because they
+// chose to revoke — they made an informed choice).
+function _pvBuildRevoke(prevVis,byActor,note){
+  var v=_pvGetVisibility(prevVis);
+  var prevTier=v.tier;
+  if(prevTier===0)return v;// already revoked
+  v=_pvAuditAppend(v,{action:'revoked',byActor:byActor||'client',prevTier:prevTier,tier:0,note:note||''});
+  v.tier=0;
+  v.grantedAt=null;
+  v.expiresAt=null;
+  return v;
+}
+
+// ── Helper: human-readable tier label ──
+function _pvTierLabel(tier){
+  var t=parseInt(tier)||0;
+  if(t===0)return 'Not shared';
+  if(t===1)return 'Status only';
+  if(t===2)return 'Status + categories';
+  if(t===3)return 'Full visibility';
+  return 'Unknown';
+}
+
+// ── Helper: short description of what each tier shows ──
+function _pvTierDescription(tier){
+  var t=parseInt(tier)||0;
+  if(t===0)return 'Your advisor cannot see your spending data.';
+  if(t===1)return 'Your advisor sees how you\'re tracking against your budget and the projected impact on your plan — no categories or transactions.';
+  if(t===2)return 'Your advisor sees the above plus how spending breaks down across categories (food, transport, etc.) — no individual transactions.';
+  if(t===3)return 'Your advisor sees all of the above plus your recent logged expenses and their descriptions.';
+  return '';
+}
+
+// ── Helper: format an audit entry as a human sentence ──
+function _pvFormatAuditEntry(entry){
+  if(!entry||!entry.action)return '';
+  var when='';
+  try{
+    var d=new Date(entry.at);
+    when=d.toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
+  }catch(e){when=entry.at||'';}
+  var who=entry.byActor||'system';
+  switch(entry.action){
+    case 'granted':return when+': '+who+' granted '+_pvTierLabel(entry.tier).toLowerCase()+' access';
+    case 'revoked':return when+': '+who+' revoked access (was '+_pvTierLabel(entry.prevTier).toLowerCase()+')';
+    case 'tier_changed':return when+': '+who+' changed access from '+_pvTierLabel(entry.prevTier).toLowerCase()+' to '+_pvTierLabel(entry.tier).toLowerCase();
+    case 'prompted':return when+': '+who+' prompted client to choose a sharing tier';
+    case 'expired':return when+': access auto-expired (was '+_pvTierLabel(entry.prevTier).toLowerCase()+')';
+    case 'access_requested':return when+': advisor requested access'+(entry.note?' — "'+entry.note+'"':'');
+    case 'request_denied':return when+': '+who+' denied the access request';
+    case 'request_approved':return when+': '+who+' approved the access request — '+_pvTierLabel(entry.tier).toLowerCase();
+    default:return when+': '+entry.action;
+  }
+}
+
+// ── Advisor-only: request spending access from a client ──
+// Writes an `advisorRequest` to the client's visibility record and appends an
+// `access_requested` audit entry. The client sees this as a banner the next time
+// they open the portal (Phase I will surface it). Returns {ok, error?}.
+async function _pvRequestSpendingAccess(clientId,message){
+  if(!clientId)return{ok:false,error:'no client id'};
+  try{
+    // Locate the profile row (joint primary if applicable)
+    var _rqSv=typeof getCoupleForClient==='function'?getCoupleForClient(clientId):null;
+    var _rqSvId=(_rqSv&&_rqSv.household_type==='joint')?_rqSv.client_a_id:clientId;
+    var check=await db.from('client_profiles').select('id,spending_visibility').eq('client_id',_rqSvId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!check||!check.data)return{ok:false,error:'no profile row'};
+    var vis=_pvGetVisibility(check.data.spending_visibility);
+    // Stash the pending request — overwrites any prior pending request
+    vis.advisorRequest={
+      at:new Date().toISOString(),
+      message:String(message||'').slice(0,500)
+    };
+    vis=_pvAuditAppend(vis,{action:'access_requested',byActor:'advisor',note:message||''});
+    var res=await db.from('client_profiles').update({spending_visibility:vis,updated_at:new Date().toISOString()}).eq('id',check.data.id);
+    if(res&&res.error)return{ok:false,error:res.error.message};
+    // Update advisor's local mirror so the UI immediately reflects the request
+    APP._spendingVisibility=vis;
+    return{ok:true};
+  }catch(e){return{ok:false,error:(e&&e.message)||String(e)};}
+}
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Phase J — ADVISOR-SIDE SPENDING TAB
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// Renders the client's spending data subject to the visibility tier they granted.
+// Tier 0: "client hasn't shared" gated experience with a "Request access" CTA.
+// Tier 1: status card + projected overspend + plan impact.
+// Tier 2: + category breakdown bars.
+// Tier 3: + recent transactions list.
+//
+// Special state: if audit log shows a prior grant but current tier is 0, render an
+// explicit "client revoked your access" message instead of the generic "not shared"
+// state. This is the legal requirement — make the revocation visible to the advisor
+// rather than silently degrading.
+//
+// Data sources:
+//   APP._spendingVisibility — set in Phase H profile init. Authoritative.
+//   _lastPfosState.state    — client's S object (spendingEntries, snapshot, expData).
+//   CPLAN                   — advisor's plan engine (already populated when client opens).
+
+// ── Compute spending status (advisor-side mirror of _portalSpendStatus) ──
+// Same severity classification logic as portal/main; reads from advisor's mirror.
+function _advSpendStatus(){
+  var S=(_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=(_lastPfosState&&_lastPfosState.calcs)||{};
+  var entries=S.spendingEntries||[];
+  var now=new Date();var curMonth=now.getMonth(),curYear=now.getFullYear();
+  var daysInMonth=new Date(curYear,curMonth+1,0).getDate();
+  var dayOfMonth=now.getDate();
+  var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
+  var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
+  var moneyIn=Math.round(calcs.inc||0);
+  if(moneyIn<=0){
+    return{severity:'ok',paceRatio:0,overspend:0,categories:[],reasons:[],projected:0,daysLeft:daysInMonth-dayOfMonth,
+      monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'}),
+      moneyIn:0,moneyOut:0,dayOfMonth:dayOfMonth,daysInMonth:daysInMonth,pctSpent:0,pctOfMonthGone:0,monthEntries:[],hasIncome:false};
+  }
+  var snap=S.snapshot||{};
+  if(snap.month===curMonth&&snap.year===curYear)moneyOut+=snap.alreadySpent||0;
+  var pctSpent=Math.round((moneyOut/moneyIn)*100);
+  var pctOfMonthGone=Math.round((dayOfMonth/daysInMonth)*100);
+  var paceRatio=pctOfMonthGone>0?(pctSpent/pctOfMonthGone):0;
+  var dailyPace=dayOfMonth>0?moneyOut/dayOfMonth:0;
+  var projected=Math.round(dailyPace*daysInMonth);
+  var overspend=Math.max(0,projected-moneyIn);
+  var severity='ok';
+  var reasons=[];
+  if(pctSpent>=100){
+    severity='over';
+    reasons.push('All monthly income is spent — '+(daysInMonth-dayOfMonth)+' days left.');
+  } else if(paceRatio>=1.4&&pctOfMonthGone>=20){
+    severity='warning';
+    reasons.push('Spending '+Math.round((paceRatio-1)*100)+'% over pace through day '+dayOfMonth+'.');
+  } else if(paceRatio>=1.2&&pctOfMonthGone>=15){
+    severity='caution';
+    reasons.push(Math.round((paceRatio-1)*100)+'% over pace through day '+dayOfMonth+'.');
+  } else if(projected>moneyIn&&pctOfMonthGone>=25){
+    severity='caution';
+    reasons.push('On pace to overspend by $'+overspend.toLocaleString()+' this month.');
+  }
+  // Per-category checks
+  var bucketMap={food:'Food',housing:'Housing',transportation:'Transport',discretionary:'Entertainment',subscriptions:'Subscriptions',misc:'Other',utilities:'Utilities',insurance:'Insurance'};
+  var catSpend={};
+  monthEntries.forEach(function(e){
+    var bk=e.category_bucket||e.category||'misc';
+    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(e.amount)||0);
+  });
+  var categories=[];
+  var expData=S.expData||{};
+  Object.keys(bucketMap).forEach(function(bk){
+    var spent=catSpend[bk]||0;
+    var budget=0;
+    var ed=expData[bk];
+    if(ed){
+      if(ed.total!=null)budget=parseFloat(ed.total)||0;
+      else if(ed.amount!=null){budget=parseFloat(ed.amount)||0;if(ed.period==='annual')budget=budget/12;}
+      else if(ed.subs){Object.keys(ed.subs).forEach(function(sk){budget+=(parseFloat(ed.subs[sk])||0);});}
+    }
+    if(spent>0||budget>0){
+      var pct=budget>0?Math.round(spent/budget*100):0;
+      var catSev='ok';
+      if(spent>budget&&budget>0)catSev='over';
+      else if(pct>=80&&pctOfMonthGone<=70)catSev='warning';
+      else if(pct>=50&&pctOfMonthGone<=40)catSev='caution';
+      categories.push({key:bk,name:bucketMap[bk],spent:Math.round(spent),budget:Math.round(budget),pct:pct,severity:catSev});
+      if(catSev==='over'&&severity!=='over')severity='over';
+      else if(catSev==='warning'&&(severity==='ok'||severity==='caution'))severity='warning';
+      else if(catSev==='caution'&&severity==='ok')severity='caution';
+    }
+  });
+  // Sort categories by severity then by overage size
+  categories.sort(function(a,b){
+    var sevOrder={over:0,warning:1,caution:2,ok:3};
+    if(sevOrder[a.severity]!==sevOrder[b.severity])return sevOrder[a.severity]-sevOrder[b.severity];
+    return (b.spent-b.budget)-(a.spent-a.budget);
+  });
+  return{
+    severity:severity,paceRatio:Math.round(paceRatio*100)/100,
+    pctSpent:pctSpent,pctOfMonthGone:pctOfMonthGone,
+    moneyIn:moneyIn,moneyOut:Math.round(moneyOut),
+    projected:projected,overspend:Math.round(overspend),
+    categories:categories,reasons:reasons,
+    dayOfMonth:dayOfMonth,daysInMonth:daysInMonth,daysLeft:daysInMonth-dayOfMonth,
+    monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'}),
+    monthEntries:monthEntries,
+    hasIncome:true
+  };
+}
+
+// ── Plan-impact computation (advisor-side mirror — same logic as portal) ──
+function _advSpendPlanImpact(monthlyShortfall){
+  if(monthlyShortfall<=0)return null;
+  if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length)return null;
+  var growthTypes=['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','custom'];
+  var growthAllocs=CPLAN.allocations.filter(function(a){return a.amount>0&&growthTypes.indexOf(a.type)>=0;});
+  growthAllocs.sort(function(a,b){
+    var pa=(a.phase!=null)?a.phase:1;var pb=(b.phase!=null)?b.phase:1;
+    if(pa!==pb)return pb-pa;
+    return a.amount-b.amount;
+  });
+  var mostAffected=growthAllocs[0]||CPLAN.allocations.find(function(a){return a.amount>0;});
+  var mostAffectedName='savings';
+  if(mostAffected){
+    if(typeof CP_NM!=='undefined'&&CP_NM[mostAffected.type]){mostAffectedName=CP_NM[mostAffected.type];}
+    else if(mostAffected.customName){mostAffectedName=mostAffected.customName;}
+    else mostAffectedName=mostAffected.type;
+  }
+  var age=CPLAN.age||30;
+  var retAge=65;
+  var yrs=Math.max(1,retAge-age);
+  var rate=0.065;
+  var monthsRem=yrs*12;
+  var monthRate=rate/12;
+  var compoundedShortfall=Math.round(monthlyShortfall*((Math.pow(1+monthRate,monthsRem)-1)/monthRate));
+  var origRetValue=null,newRetValue=null;
+  if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length){
+    origRetValue=CPLAN._sim.retirement[Math.min(yrs,CPLAN._sim.retirement.length-1)];
+    newRetValue=Math.max(0,origRetValue-compoundedShortfall);
+  }
+  return{monthlyShortfall:monthlyShortfall,yearsToRetirement:yrs,
+    compoundedShortfall:compoundedShortfall,origRetValue:origRetValue,
+    newRetValue:newRetValue,mostAffectedName:mostAffectedName};
+}
+
+// ── Detect "client revoked your access" from audit log ──
+// True if there's a `revoked` entry AFTER the most recent `granted` entry
+// (and current tier is 0). Used to show a different empty state than first-time visitors.
+function _advWasRevoked(vis){
+  if(!vis||!vis.auditLog||!vis.auditLog.length)return false;
+  if(_pvEffectiveTier(vis)>0)return false;
+  // Walk backwards — find the most recent revoke or expire
+  for(var i=vis.auditLog.length-1;i>=0;i--){
+    var entry=vis.auditLog[i];
+    if(entry.action==='revoked'||entry.action==='expired')return entry;
+    if(entry.action==='granted')return false;// granted more recently than any revoke
+  }
+  return false;
+}
+
+// ── Master render function for the advisor's Spending page ──
+function renderAdvisorSpending(){
+  var el=document.getElementById('advisorSpendingContent');
+  if(!el)return;
+  var vis=APP._spendingVisibility||_pvDefaultVisibility();
+  var tier=_pvEffectiveTier(vis);
+  var clientName=(APP.currentClient&&APP.currentClient.name)||'Client';
+  var firstName=clientName.split(' ')[0]||'Client';
+
+  var h='';
+
+  // ── State 1: Tier 0 with prior grant → REVOKED message ──
+  var revokeEntry=_advWasRevoked(vis);
+  if(tier===0&&revokeEntry){
+    var revokeWhen='';
+    try{
+      var d=new Date(revokeEntry.at);
+      revokeWhen=d.toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
+    }catch(e){}
+    var icon=revokeEntry.action==='expired'?'⏱️':'🔒';
+    var label=revokeEntry.action==='expired'?'Access expired':'Access revoked';
+    var msgText=revokeEntry.action==='expired'
+      ?firstName+'\'s spending access expired on '+esc(revokeWhen)+'. Per the time-bound grant they set up, your visibility automatically ended. Their spending data is no longer available to you.'
+      :firstName+' revoked your access to their spending data on '+esc(revokeWhen)+'. Their data has been hidden from this view as required by their request.';
+    h+='<div style="padding:24px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.2);border-left:3px solid var(--rd);border-radius:4px;margin-bottom:16px">';
+    h+='<div style="display:flex;align-items:flex-start;gap:14px;flex-wrap:wrap">';
+    h+='<div style="font-size:28px;line-height:1.2;flex-shrink:0">'+icon+'</div>';
+    h+='<div style="flex:1;min-width:240px">';
+    h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--rd);letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">'+label+'</div>';
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7">'+msgText+'</div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:10px;line-height:1.6">You can request access again. Until '+esc(firstName)+' approves, you won\'t see any spending information here.</div>';
+    h+='</div></div>';
+    // Re-request button
+    h+='<div style="margin-top:14px;display:flex;justify-content:flex-end">';
+    h+='<button onclick="_advOpenRequestAccess()" style="padding:9px 16px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Request access again</button>';
+    h+='</div></div>';
+    el.innerHTML=h;
+    return;
+  }
+
+  // ── State 2: Tier 0, no prior grant → "Not yet shared" ──
+  if(tier===0){
+    var pendingReq=vis&&vis.advisorRequest;
+    h+='<div style="padding:24px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;text-align:center">';
+    h+='<div style="font-size:36px;margin-bottom:10px">🔒</div>';
+    h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:6px">'+esc(firstName)+' hasn\'t shared spending data</div>';
+    h+='<div style="font-size:12px;color:var(--mu);line-height:1.7;max-width:480px;margin:0 auto 14px">By default, clients\' spending data is private. To see how '+esc(firstName)+' is tracking month-over-month and to coach them through accountability moments, you can request access. They control whether to grant it and at what level.</div>';
+    if(pendingReq){
+      var reqWhen='';
+      try{var rd=new Date(pendingReq.at);reqWhen=rd.toLocaleDateString('en-US',{month:'short',day:'numeric'});}catch(e){}
+      h+='<div style="padding:11px 14px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.25);border-radius:4px;margin:0 auto 12px;max-width:420px;text-align:left">';
+      h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#5B9BFF;margin-bottom:4px">📩 Request pending</div>';
+      h+='<div style="font-size:11px;color:rgba(226,232,240,.85);line-height:1.6">You requested access on '+esc(reqWhen)+'. '+esc(firstName)+' will see this on their next portal visit.</div>';
+      h+='</div>';
+      h+='<button onclick="_advOpenRequestAccess()" style="padding:9px 18px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Update request</button>';
+    } else {
+      h+='<button onclick="_advOpenRequestAccess()" style="padding:10px 22px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.4);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">📩 Request access</button>';
+    }
+    h+='</div>';
+    // What you'll see info card
+    h+='<div style="margin-top:16px;padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">What this view will show</div>';
+    h+='<div style="font-size:11px;color:rgba(226,232,240,.7);line-height:1.7">Once '+esc(firstName)+' grants access, this page surfaces their live this-month status — how spending is pacing, projected overspend if any, and the impact on their financial plan. Higher tiers add category breakdowns and individual transactions.</div>';
+    h+='</div>';
+    el.innerHTML=h;
+    return;
+  }
+
+  // ── State 3: Tier 1+ → render the data ──
+  var status=_advSpendStatus();
+  if(!status.hasIncome){
+    h+='<div style="padding:18px;text-align:center;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">';
+    h+='<div style="font-size:24px;margin-bottom:6px">💰</div>';
+    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh);margin-bottom:4px">No income data yet</div>';
+    h+='<div style="font-size:11px;color:var(--mu);line-height:1.6">'+esc(firstName)+' shared spending access, but they haven\'t entered income yet. Spending status will appear here once they do.</div>';
+    h+='</div>';
+    el.innerHTML=h;
+    return;
+  }
+
+  // Header bar — what tier is in effect, when it expires
+  var tierLabel=_pvTierLabel(tier);
+  var expiryStr='';
+  if(vis.expiresAt){
+    try{
+      var exp=new Date(vis.expiresAt);
+      var daysToExp=Math.round((exp.getTime()-Date.now())/86400000);
+      if(daysToExp<=14)expiryStr=' · expires in '+daysToExp+' day'+(daysToExp===1?'':'s');
+      else expiryStr=' · expires '+exp.toLocaleDateString('en-US',{month:'short',day:'numeric'});
+    }catch(e){}
+  }
+  h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 13px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.2);border-radius:4px;margin-bottom:14px;flex-wrap:wrap;gap:8px">';
+  h+='<div style="display:flex;align-items:center;gap:8px"><span style="font-size:13px">●</span><span style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--gr)">Sharing: '+esc(tierLabel)+esc(expiryStr)+'</span></div>';
+  h+='<div style="font-size:10px;color:var(--mu)">'+esc(status.monthLabel)+' · day '+status.dayOfMonth+'/'+status.daysInMonth+'</div>';
+  h+='</div>';
+
+  // ── Tier 1 content: Status + plan impact ──
+  // Severity-themed top card
+  var theme={
+    ok:{bg:'rgba(34,197,94,.04)',bd:'rgba(34,197,94,.18)',fg:'var(--gr)',icon:'✅',label:'On track'},
+    caution:{bg:'rgba(234,179,8,.05)',bd:'rgba(234,179,8,.22)',fg:'var(--yl)',icon:'👁️',label:'Heads up'},
+    warning:{bg:'rgba(249,115,22,.06)',bd:'rgba(249,115,22,.28)',fg:'var(--or)',icon:'⚠️',label:'Spending warning'},
+    over:{bg:'rgba(239,68,68,.06)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️',label:'Over budget'}
+  };
+  var t=theme[status.severity]||theme.ok;
+  h+='<div style="padding:16px;background:'+t.bg+';border:1px solid '+t.bd+';border-left:3px solid '+t.fg+';border-radius:4px;margin-bottom:14px">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;flex-wrap:wrap;margin-bottom:10px">';
+  h+='<div style="display:flex;align-items:center;gap:10px">';
+  h+='<span style="font-size:22px;line-height:1.2">'+t.icon+'</span>';
+  h+='<div><div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.06em;color:'+t.fg+';text-transform:uppercase">'+t.label+'</div>';
+  h+='<div style="font-size:13px;color:var(--wh);font-family:var(--fd);margin-top:2px">'+fmt(status.moneyOut)+' <span style="font-size:11px;color:var(--mu);font-family:var(--fh)">of '+fmt(status.moneyIn)+' ('+status.pctSpent+'%)</span></div>';
+  h+='</div></div>';
+  if(status.overspend>0){
+    h+='<div style="text-align:right"><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.06em;color:var(--mu);text-transform:uppercase">Projected overspend</div>';
+    h+='<div style="font-family:var(--fd);font-size:18px;color:'+t.fg+';font-weight:700">'+fmt(status.overspend)+'</div></div>';
+  }
+  h+='</div>';
+  // Progress bar
+  var barCol=status.pctSpent>=100?'var(--rd)':status.pctSpent>90?'var(--rd)':status.pctSpent>70?'var(--or)':'var(--gr)';
+  h+='<div style="height:6px;background:rgba(0,68,191,.1);border-radius:3px;overflow:hidden;margin-bottom:8px"><div style="height:100%;width:'+Math.min(100,status.pctSpent)+'%;background:'+barCol+';border-radius:3px"></div></div>';
+  if(status.reasons.length>0){
+    h+='<div style="font-size:11px;color:rgba(226,232,240,.8);line-height:1.6;margin-top:6px"><strong style="color:'+t.fg+'">Why:</strong> '+esc(status.reasons.join(' · '))+'</div>';
+  }
+  h+='</div>';
+
+  // Plan impact card
+  if(status.overspend>0){
+    var impact=_advSpendPlanImpact(status.overspend);
+    if(impact){
+      h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:14px">';
+      h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--wh);margin-bottom:10px">Plan impact</div>';
+      h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:10px">';
+      h+='<div style="padding:10px 12px;background:rgba(0,68,191,.04);border:1px solid rgba(91,155,255,.15);border-radius:4px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase">Less for '+esc(impact.mostAffectedName)+'</div><div style="font-family:var(--fd);font-size:18px;color:'+t.fg+';margin-top:3px;font-weight:700">−'+fmt(impact.monthlyShortfall)+'</div><div style="font-size:9px;color:var(--mu);margin-top:1px">this month</div></div>';
+      if(impact.compoundedShortfall>0){
+        h+='<div style="padding:10px 12px;background:rgba(0,68,191,.04);border:1px solid rgba(91,155,255,.15);border-radius:4px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase">Compounded over '+impact.yearsToRetirement+'y</div><div style="font-family:var(--fd);font-size:18px;color:'+t.fg+';margin-top:3px;font-weight:700">−'+fmt(impact.compoundedShortfall)+'</div><div style="font-size:9px;color:var(--mu);margin-top:1px">at 6.5% blended growth</div></div>';
+      }
+      if(impact.origRetValue!=null&&impact.newRetValue!=null&&impact.origRetValue>0){
+        h+='<div style="padding:10px 12px;background:rgba(0,68,191,.04);border:1px solid rgba(91,155,255,.15);border-radius:4px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase">Retirement projection</div><div style="font-family:var(--fd);font-size:14px;color:var(--wh);margin-top:3px;font-weight:700">$'+Math.round(impact.origRetValue/1000)+'K → <span style="color:'+t.fg+'">$'+Math.round(impact.newRetValue/1000)+'K</span></div></div>';
+      }
+      h+='</div></div>';
+    }
+  }
+
+  // ── Tier 2 content: Category breakdown ──
+  if(tier>=2&&status.categories.length>0){
+    h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:14px">';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--wh);margin-bottom:10px">Category breakdown</div>';
+    var iconMap={food:'🍽️',housing:'🏠',transportation:'🚗',discretionary:'🎬',subscriptions:'📱',utilities:'⚡',insurance:'🛡️',misc:'📦'};
+    status.categories.forEach(function(c){
+      var ctheme=theme[c.severity]||theme.ok;
+      h+='<div style="margin-bottom:9px"><div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:3px">';
+      h+='<span style="color:var(--wh)">'+(iconMap[c.key]||'📦')+' '+esc(c.name)+(c.severity!=='ok'?' <span style="font-size:9px;color:'+ctheme.fg+';font-family:var(--fh);font-weight:700;margin-left:4px">'+c.severity.toUpperCase()+'</span>':'')+'</span>';
+      h+='<span style="font-family:var(--fh);font-weight:700;color:'+ctheme.fg+'">'+fmt(c.spent)+(c.budget>0?' / '+fmt(c.budget):'')+'</span></div>';
+      if(c.budget>0){
+        var cBarPct=Math.min(100,c.pct);
+        var cBarCol=c.severity==='over'?'var(--rd)':c.severity==='warning'?'var(--or)':c.severity==='caution'?'var(--yl)':'var(--gr)';
+        h+='<div style="height:5px;background:rgba(0,68,191,.08);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+cBarPct+'%;background:'+cBarCol+';border-radius:3px"></div></div>';
+      }
+      h+='</div>';
+    });
+    h+='</div>';
+  }
+
+  // ── Tier 3 content: Recent transactions ──
+  if(tier>=3){
+    var recent=status.monthEntries.slice().sort(function(a,b){return new Date(b.date)-new Date(a.date);}).slice(0,15);
+    if(recent.length>0){
+      h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:14px">';
+      h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">';
+      h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--wh)">Recent transactions</div>';
+      h+='<div style="font-size:10px;color:var(--mu)">'+status.monthEntries.length+' this month</div>';
+      h+='</div>';
+      var iconMap2={food:'🍽️',housing:'🏠',transportation:'🚗',discretionary:'🎬',subscriptions:'📱',utilities:'⚡',insurance:'🛡️',misc:'📦',activeSavings:'📈'};
+      recent.forEach(function(e){
+        var bk=e.category_bucket||e.category||'misc';
+        var ic=iconMap2[bk]||'📦';
+        var dateStr='';
+        try{var d=new Date(e.date);dateStr=(d.getMonth()+1)+'/'+d.getDate();}catch(_){}
+        h+='<div style="display:flex;align-items:center;gap:10px;padding:7px 10px;border-bottom:1px solid rgba(0,68,191,.06)">';
+        h+='<span style="font-size:13px;flex-shrink:0">'+ic+'</span>';
+        h+='<div style="flex:1;min-width:0"><div style="font-size:12px;color:var(--wh);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.description||bk)+'</div>';
+        h+='<div style="font-size:9px;color:var(--mu)">'+dateStr+'</div></div>';
+        h+='<div style="font-family:var(--fd);font-size:13px;color:var(--or);font-weight:700">'+fmt(parseFloat(e.amount)||0)+'</div>';
+        h+='</div>';
+      });
+      h+='</div>';
+    }
+  }
+
+  // ── Coaching context: was the popup shown / dismissed? ──
+  // (Read from S._spendingPopupShown if pfos-main mirrors it. If not present, we
+  // gracefully omit this section.)
+  var S=(_lastPfosState&&_lastPfosState.state)||{};
+  var popupHistory=S._spendingPopupShown||{};
+  var popupKeys=Object.keys(popupHistory);
+  if(popupKeys.length>0){
+    var sortedKeys=popupKeys.sort(function(a,b){return (popupHistory[b]||0)-(popupHistory[a]||0);});
+    var mostRecent=sortedKeys[0];
+    var ts=popupHistory[mostRecent];
+    if(ts){
+      try{
+        var when=new Date(ts);
+        var hrs=Math.round((Date.now()-when.getTime())/3600000);
+        var whenStr=hrs<24?(hrs<=1?'less than an hour ago':hrs+' hours ago'):(Math.round(hrs/24)+' days ago');
+        h+='<div style="padding:11px 13px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:14px;font-size:11px;color:rgba(226,232,240,.75);line-height:1.6">';
+        h+='<span style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#5B9BFF">Coaching context · </span>';
+        h+=esc(firstName)+' saw the spending accountability popup '+whenStr+'. Trigger: '+esc(mostRecent.split('|').slice(1).join(' · '))+'.';
+        h+='</div>';
+      }catch(e){}
+    }
+  }
+
+  // Footer: revoke-able note
+  h+='<div style="padding:9px 12px;font-size:10px;color:var(--mu);line-height:1.6;text-align:center">';
+  h+='<span style="font-family:var(--fh);font-weight:700">'+esc(firstName)+'</span> can change or revoke this access anytime in their portal.';
+  h+='</div>';
+
+  el.innerHTML=h;
+}
+
+// ── Open the "Request access" modal ──
+function _advOpenRequestAccess(){
+  var clientName=(APP.currentClient&&APP.currentClient.name)||'this client';
+  var firstName=clientName.split(' ')[0]||clientName;
+  var el=document.getElementById('advRequestAccessModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='advRequestAccessModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('advRequestAccessModal');};
+    document.body.appendChild(el);
+  }
+  var h='<div class="modal" style="max-width:520px">';
+  h+='<button class="modal-close" onclick="closeModal(\'advRequestAccessModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">Request spending access</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:14px">';
+  h+='Send '+esc(firstName)+' a request to see their spending data. They\'ll see this on their next portal visit and can choose what level of detail to share — or decline. You\'ll only see what they explicitly grant.';
+  h+='</div>';
+  h+='<div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin-bottom:5px">Optional message</div>';
+  h+='<textarea id="advReqMsg" placeholder="Why this would help — keep it short and specific" maxlength="500" style="width:100%;min-height:90px;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--ff);font-size:12px;border-radius:4px;box-sizing:border-box;resize:vertical"></textarea>';
+  h+='<div style="font-size:10px;color:var(--mu);margin-top:5px">Up to 500 characters · the client sees this verbatim.</div>';
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'advRequestAccessModal\')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Cancel</button>';
+  h+='<button onclick="_advSubmitRequestAccess()" id="advReqSubmitBtn" style="padding:9px 18px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.4);color:#5B9BFF;font-family:var(--fh);font-size:11px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Send request</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('advRequestAccessModal');
+  setTimeout(function(){var ta=document.getElementById('advReqMsg');if(ta)ta.focus();},120);
+}
+
+async function _advSubmitRequestAccess(){
+  var clientId=APP.currentClientId;
+  if(!clientId)return;
+  var btn=document.getElementById('advReqSubmitBtn');
+  if(btn){btn.disabled=true;btn.textContent='Sending...';}
+  var msg=(document.getElementById('advReqMsg')||{}).value||'';
+  var res=await _pvRequestSpendingAccess(clientId,msg);
+  if(btn){btn.disabled=false;btn.textContent='Send request';}
+  if(!res.ok){
+    _advShowToast('Failed: '+(res.error||'unknown error'),'error');
+    return;
+  }
+  closeModal('advRequestAccessModal');
+  _advShowToast('Request sent — '+esc((APP.currentClient&&APP.currentClient.name||'client').split(' ')[0])+' will see it next time they open the portal','success');
+  // Re-render to show the pending state
+  renderAdvisorSpending();
+}
+
+// ── Lightweight toast for advisor actions ──
+function _advShowToast(msg,kind){
+  var toast=document.createElement('div');
+  var bg=kind==='error'?'rgba(239,68,68,.95)':kind==='warning'?'rgba(234,179,8,.95)':'rgba(34,197,94,.95)';
+  toast.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:'+bg+';color:#fff;padding:10px 18px;border-radius:6px;font-family:var(--fh);font-size:12px;font-weight:700;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.3);transition:opacity .3s;max-width:90vw';
+  toast.textContent=msg;
+  document.body.appendChild(toast);
+  setTimeout(function(){toast.style.opacity='0';setTimeout(function(){toast.remove();},300);},2800);
+}
+
+
 function fmt(n){ var vv=Math.round(parseFloat(n)||0); if(vv<0) return '-$'+Math.abs(vv).toLocaleString(); return '$'+vv.toLocaleString(); }
 function fmtK(n){ var vv=Math.round(parseFloat(n)||0); if(Math.abs(vv)>=1000000) return (vv<0?'-$':'$')+(Math.abs(vv)/1000000).toFixed(1)+'M'; if(Math.abs(vv)>=1000) return (vv<0?'-$':'$')+(Math.abs(vv)/1000).toFixed(0)+'K'; return fmt(vv); }
 function fmtDate(d){ if(!d) return '—'; try{ var s=String(d); if(/^\d{4}-\d{2}-\d{2}$/.test(s)) s+='T12:00:00'; return new Date(s).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}); }catch(e){ return d; } }
@@ -1534,6 +2195,18 @@ async function loadClientDataIntoPFOS(clientId){
   var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'core';
   if(clientEffTier === 'none') clientEffTier = 'core';
   var pfosTier = (mode === 'advisor') ? 'pro_plus' : clientEffTier;
+
+  // Phase H: capture client's spending_visibility tier on the advisor session.
+  // Auto-expiry is applied here too, but the advisor cannot persist changes — that's
+  // the client's right alone. If a grant has expired since the client last logged in,
+  // the advisor view simply treats it as tier 0 and the client's next portal visit
+  // will persist the expiry.
+  try{
+    var _pvAdvVis=_pvGetVisibility(profile&&profile.spending_visibility);
+    var _pvAdvAfterExpiry=_pvApplyExpiryIfDue(_pvAdvVis);
+    APP._spendingVisibility=_pvAdvAfterExpiry;
+    APP._spendingVisibilityProfileId=profile&&profile.id||null;
+  }catch(e){console.warn('PV advisor load:',e&&e.message);APP._spendingVisibility=_pvDefaultVisibility();}
 
   // Seed _lastPfosState immediately so the Save button has correct data for this
   // client even if the advisor saves before the first PFOS_DATA_CHANGE fires (1500ms debounce)
