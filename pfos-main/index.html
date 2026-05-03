@@ -7483,16 +7483,74 @@ function renderDebtAdvancedStrategy(debts,current,hybrid,extra){
   if(!elig.eligible){el.innerHTML='<div class="adv-strat-box"><div style="font-size:12px;color:rgba(226,232,240,.4)">Not available: '+elig.reason+'</div></div>';return;}
   var surplus=c.netCF||0,growthRate=0.05,loanAnnRate=0.05,monthlyGrow=growthRate/12;
   var budget=extra>0?extra:Math.max(50,Math.min(Math.round(surplus*0.20/50)*50,500));
-  var ds=debts.map(function(d,i){return{name:d.name||('Debt '+(i+1)),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,min:parseFloat(d.min)||0,paid:false};});
-  ds.sort(function(a,b){return b.bal-a.bal;});
-  var vehicle=0,monthlyDeposit=budget,totalDebtInt=0,totalLoanInt=0,policyLoans=[],payoffLog=[],origFreeMonth=null,month=0;
+  // ── True IBC mechanics ──────────────────────────────────────────────────
+  // 1. ALL of "budget" (the user's extra) flows to the policy each month.
+  //    Debts get only their minimum payments during accumulation phase.
+  // 2. Avalanche: when CV is enough to cover the highest-INTEREST debt, take a
+  //    loan against the policy and kill that debt. Add its minimum to the
+  //    combined freed-pool. Multiple debts can be loaned out in one month if CV
+  //    is large enough.
+  // 3. The combined freed-minimums pool repays the COMBINED policy-loan
+  //    balance with SIMPLE interest charged against the current outstanding
+  //    balance (no compounding of unpaid interest into principal).
+  // 4. Continue until all original debts are loaned out + all loans repaid.
+  // ────────────────────────────────────────────────────────────────────────
+  var ds=debts.map(function(d,i){return{name:d.name||('Debt '+(i+1)),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,annualRate:(parseFloat(d.rate)||0),min:parseFloat(d.min)||0,paid:false};});
+  // Avalanche order: highest interest rate first. (Was: sort by balance — wrong economic priority.)
+  ds.sort(function(a,b){return b.rate-a.rate;});
+  var vehicle=0,monthlyDeposit=budget,totalDebtInt=0,totalLoanInt=0,payoffLog=[],origFreeMonth=null,month=0;
+  // Combined-loan tracking — all freed debt minimums pool together to repay all
+  // policy loans together. Matches how cash actually flows: a single policy
+  // account holds many "loans" but the money attribution is just bookkeeping.
+  var totalLoanBalance=0;
+  var totalLoanFreedMins=0;
   while(month<720){
-    month++;vehicle=vehicle*(1+monthlyGrow)+monthlyDeposit;
-    ds.forEach(function(d){if(d.bal<0.01)return;var interest=d.bal*d.rate;totalDebtInt+=interest;d.bal+=interest;var pmt=Math.min(d.min,d.bal);d.bal-=pmt;if(d.bal<0.01)d.bal=0;});
-    ds.forEach(function(d){if(d.paid||d.bal<0.01)return;if(vehicle>=d.bal){var loanAmt=d.bal;policyLoans.push({name:d.name,originalBal:loanAmt,remaining:loanAmt,freed:d.min});payoffLog.push({name:d.name,month:month,balAtLoan:loanAmt});d.bal=0;d.paid=true;}});
-    policyLoans.forEach(function(loan){if(loan.remaining<0.01)return;var si=loan.originalBal*loanAnnRate/12;totalLoanInt+=si;loan.remaining+=si;var pmt=Math.min(loan.freed,loan.remaining);loan.remaining-=pmt;if(loan.remaining<0.01)loan.remaining=0;});
-    var origLeft=ds.some(function(d){return d.bal>0.01;});if(!origLeft&&origFreeMonth===null)origFreeMonth=month;
-    var loansLeft=policyLoans.some(function(l){return l.remaining>0.01;});if(!origLeft&&!loansLeft)break;
+    month++;
+    // Step 1: extras flow into policy. Cash value compounds.
+    vehicle=vehicle*(1+monthlyGrow)+monthlyDeposit;
+    // Step 2: each unpaid debt accrues its own interest and gets its minimum payment.
+    ds.forEach(function(d){
+      if(d.bal<0.01||d.paid)return;
+      var interest=d.bal*d.rate;
+      totalDebtInt+=interest;
+      d.bal+=interest;
+      var pmt=Math.min(d.min,d.bal);
+      d.bal-=pmt;
+      if(d.bal<0.01)d.bal=0;
+    });
+    // Step 3: if available CV (vehicle minus existing loans) covers the next-highest-rate
+    // unpaid debt, take a loan against the policy and kill that debt. Add its minimum to
+    // the freed pool. Walk the array (already sorted by rate desc); multiple debts can be
+    // loaned out in the same month if CV is large enough.
+    ds.forEach(function(d){
+      if(d.paid||d.bal<0.01)return;
+      var availableCV=vehicle-totalLoanBalance;
+      if(availableCV>=d.bal){
+        totalLoanBalance+=d.bal;
+        totalLoanFreedMins+=d.min;
+        payoffLog.push({name:d.name,month:month,balAtLoan:Math.round(d.bal),annualRate:d.annualRate});
+        d.bal=0;
+        d.paid=true;
+      }
+    });
+    // Step 4: combined freed-minimums pool repays the combined loan balance.
+    // SIMPLE interest: each month's interest charge = current_balance × rate / 12,
+    // charged against whatever's still outstanding (NOT against original principal).
+    // This matches standard amortization simple interest — as the balance pays down,
+    // the monthly interest shrinks proportionally.
+    if(totalLoanBalance>0){
+      var loanInterest=totalLoanBalance*loanAnnRate/12;
+      totalLoanInt+=loanInterest;
+      totalLoanBalance+=loanInterest;
+      var loanPayment=Math.min(totalLoanFreedMins,totalLoanBalance);
+      totalLoanBalance-=loanPayment;
+      if(totalLoanBalance<0.01)totalLoanBalance=0;
+    }
+    // Step 5: track milestones. origFreeMonth = original debts gone.
+    // Loop terminates when both original debts and policy loans are fully cleared.
+    var origLeft=ds.some(function(d){return d.bal>0.01;});
+    if(!origLeft&&origFreeMonth===null)origFreeMonth=month;
+    if(!origLeft&&totalLoanBalance<=0)break;
   }
   var fullFreeMonth=month,totalAdvInt=Math.round(totalDebtInt+totalLoanInt),finalVehicle=Math.round(vehicle),intSaved=Math.max(0,current.interest-totalAdvInt);
   var logHtml='';
@@ -13320,6 +13378,14 @@ function calcIBCWLIUL(){
 
   // ── Year-by-Year Simulation ──
   var wlD=[],iulD=[];var wlCV=0,iulCV=0;var wlTF=0,iulTF=0;var wlLB=0,iulLB=0;var wlTL=0,iulTL=0;
+  // Annual amortizing payment for each policy's outstanding loan balance. Recomputed
+  // whenever a new loan stacks on. Uses the standard simple-interest amortization
+  // formula M = P*r / (1 - (1+r)^-n), so each year:  balance = balance*(1+r) - M
+  // produces a properly-amortizing repayment — interest charged against current
+  // outstanding balance, principal portion paid down each year, no compounding of
+  // unpaid interest into principal. Replaces the prior (balance/repayYrs)-then-grow
+  // formula which never actually amortized to zero in the stated repayYrs.
+  var wlAnnualPmt=0, iulAnnualPmt=0;
   for(var yr=1;yr<=years;yr++){
     var cAge=age+yr;var coi=0.002+Math.max(0,(cAge-30)*0.0004);
     // WL
@@ -13330,9 +13396,28 @@ function calcIBCWLIUL(){
     var cr=Math.max(iulFloor,Math.min(iulIll,iulCap));iulCV=(iulCV+iulNet-iulCOI)*(1+cr);
     // Loans
     var le=false;
-    if(yr>=loanYr&&(yr-loanYr)%loanInterval===0){le=true;var wla=Math.round(wlCV*0.7-wlLB);var ila=Math.round(iulCV*0.7-iulLB);if(wla>0){wlLB+=wla;wlTL+=wla;}if(ila>0){iulLB+=ila;iulTL+=ila;}}
-    if(wlLB>0){wlLB=Math.max(0,wlLB-wlLB/repayYrs);}if(iulLB>0){iulLB=Math.max(0,iulLB-iulLB/repayYrs);}
-    wlLB*=(1+wlLoan);iulLB*=(1+iulLoan);
+    if(yr>=loanYr&&(yr-loanYr)%loanInterval===0){
+      le=true;var wla=Math.round(wlCV*0.7-wlLB);var ila=Math.round(iulCV*0.7-iulLB);
+      if(wla>0){wlLB+=wla;wlTL+=wla;}
+      if(ila>0){iulLB+=ila;iulTL+=ila;}
+      // Recompute amortizing annual payment for the total outstanding balance over
+      // repayYrs years. This effectively resets the amortization clock when a new
+      // loan stacks onto an existing one — a reasonable simplification for an
+      // annual educational illustration.
+      if(wlLB>0)wlAnnualPmt=wlLB*wlLoan/(1-Math.pow(1+wlLoan,-repayYrs));
+      if(iulLB>0)iulAnnualPmt=iulLB*iulLoan/(1-Math.pow(1+iulLoan,-repayYrs));
+    }
+    // Repay loans with proper simple-interest amortization on outstanding balance.
+    // balance = balance * (1+rate) - fixed_payment; payment shrinks balance to zero
+    // over repayYrs years if no new loan stacks on top.
+    if(wlLB>0){
+      wlLB=wlLB*(1+wlLoan)-wlAnnualPmt;
+      if(wlLB<0.01){wlLB=0;wlAnnualPmt=0;}
+    }
+    if(iulLB>0){
+      iulLB=iulLB*(1+iulLoan)-iulAnnualPmt;
+      if(iulLB<0.01){iulLB=0;iulAnnualPmt=0;}
+    }
     wlD.push({yr:yr,age:cAge,cv:Math.round(wlCV),net:Math.round(Math.max(0,wlCV-wlLB)),lb:Math.round(wlLB),ltv:wlCV>0?Math.round(wlLB/wlCV*100):0,le:le});
     iulD.push({yr:yr,age:cAge,cv:Math.round(iulCV),net:Math.round(Math.max(0,iulCV-iulLB)),lb:Math.round(iulLB),ltv:iulCV>0?Math.round(iulLB/iulCV*100):0,le:le});
   }
