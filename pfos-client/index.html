@@ -6091,6 +6091,46 @@ function _portalQaPayMethodChange(){
     detail.innerHTML=h2;detail.style.display='';
     return;
   }
+  // ── policy_loan branch ──
+  // Gate the policy_loan option on having at least one IBC policy. If none, show
+  // a friendly explanation. If multiple, show a which-policy picker. On save the
+  // submit handler will increment the chosen policy's loan balance.
+  if(pay.value==='policy_loan'){
+    var ibcPolicies = (S.ibcPolicies || []);
+    var allPolicies = ibcPolicies.length > 0 ? ibcPolicies : (S.policies || []).filter(function(p){
+      var t = (p.type || '').toLowerCase();
+      return t.indexOf('whole') >= 0 || t.indexOf('wl') >= 0 || t.indexOf('iul') >= 0;
+    });
+    if(allPolicies.length === 0){
+      detail.innerHTML = '<div style="padding:10px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.15);border-radius:3px;font-size:11px;color:var(--mu);margin-bottom:10px">'
+        + '<strong style="color:var(--yl)">No IBC policy on file.</strong> '
+        + 'Add a participating whole life or IUL policy in My Financial Data first to use policy loans.</div>';
+      detail.style.display = '';
+      return;
+    }
+    var hPL = '<div style="padding:10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.18);border-radius:3px;margin-top:8px;margin-bottom:10px">';
+    hPL += '<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:8px">Policy Loan Details</div>';
+    if(allPolicies.length > 1){
+      hPL += '<div style="margin-bottom:8px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Which Policy?</div>';
+      hPL += '<select id="portalQaPolicyIdx" style="width:100%;padding:8px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:3px;box-sizing:border-box;min-height:36px">';
+      allPolicies.forEach(function(p, i){
+        var label = (p.company || p.carrier || 'Policy') + ' — ' + (p.type || 'WL/IUL');
+        if(p.faceAmount) label += ' · ' + fmt(p.faceAmount);
+        hPL += '<option value="' + i + '">' + esc(label) + '</option>';
+      });
+      hPL += '</select></div>';
+    } else {
+      hPL += '<input type="hidden" id="portalQaPolicyIdx" value="0">';
+      hPL += '<div style="font-size:11px;color:rgba(226,232,240,.85);margin-bottom:8px">Loan against: <strong style="color:var(--wh)">' + esc((allPolicies[0].company || allPolicies[0].carrier || 'Policy') + ' — ' + (allPolicies[0].type || 'WL/IUL')) + '</strong></div>';
+    }
+    hPL += '<div style="margin-bottom:8px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Purpose <span style="color:var(--mu);font-weight:600">(optional)</span></div>';
+    hPL += '<input type="text" id="portalQaPolicyLoanPurpose" placeholder="e.g. Pay off credit card, Auto purchase" style="width:100%;padding:8px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:3px;box-sizing:border-box;min-height:36px"></div>';
+    hPL += '<div style="font-size:10px;color:var(--mu);margin-top:6px">This will increment your policy\'s outstanding loan balance and track the purpose for future reference. Loan accrues interest at your policy\'s loan rate.</div>';
+    hPL += '</div>';
+    detail.innerHTML = hPL;
+    detail.style.display = '';
+    return;
+  }
   // Default — clear and hide
   detail.innerHTML='';detail.style.display='none';
 }
@@ -6155,6 +6195,12 @@ function _portalSubmitAddExpense(){
     // we can extend the handler in pfos-main to do the canonical write. For now, the entry still
     // logs but the new debt won't appear until next manual entry. Acceptable for v1 of full parity;
     // will be tightened in a follow-up if the user uses financed expenses heavily.
+  } else if(payMethod==='policy_loan'){
+    // Policy loan: track which policy and the purpose, flag for pfos-main to increment loanBalance.
+    var pliEl = document.getElementById('portalQaPolicyIdx');
+    var pli = pliEl ? parseInt(pliEl.value) : 0;
+    var pPurpose = (document.getElementById('portalQaPolicyLoanPurpose') || {}).value || desc || 'Policy loan';
+    payDetail = {policy_idx: pli, purpose: pPurpose, _incrementLoanBalance: true};
   }
   var entry={
     id:Date.now(),
@@ -10998,15 +11044,17 @@ function calcIBC(){
   var repayYrs=parseInt(document.getElementById('ibcRepayYrs').value)||5;
   var el=document.getElementById('ibcResults');if(!el||prem<=0)return;
 
-  // Phase 1: Build cash value
-  var cvRate=growth/12;
-  var cvPctOfPrem=type==='wl'?0.30:0.25; // simplified COI allocation
-  var cv=0;
-  for(var m=0;m<buildYrs*12;m++){
-    cv=cv*(1+cvRate)+prem*cvPctOfPrem;
-    if(m>60) cvPctOfPrem=type==='wl'?0.45:0.40;
-    else if(m>24) cvPctOfPrem=type==='wl'?0.38:0.33;
-  }
+  // Phase 1: Build cash value using anniversary-anchored crediting (no monthly compounding).
+  // This matches how real WL and IUL policies actually credit interest — annual on anniversary,
+  // not continuously. The previous monthly compounding overstated CV growth by ~30-40%.
+  var ibcParams = Object.assign({}, _ibcPolicyDefaults(type === 'iul' ? 'iul' : 'wl'), {
+    monthlyPremium: prem
+  });
+  // Override illustrated rate if user supplied a custom growth rate
+  if(type === 'wl'){ibcParams.netEffectiveRate = growth;}
+  else {ibcParams.assumedIndexReturn = growth;}
+  var ibcProjResult = _ibcProjectPolicy(ibcParams, 0, buildYrs * 12);
+  var cv = ibcProjResult.data[ibcProjResult.data.length - 1].cv;
   var totalPremPaid=prem*12*buildYrs;
 
   // Phase 2: Take policy loan for debt
@@ -11018,13 +11066,17 @@ function calcIBC(){
   var tradTotalPaid=tradMonthly*repayYrs*12;
   var ibcTotalRepaid=monthlyRepay*repayYrs*12;
 
-  // CV continues growing during repayment
-  var cvAfterLoan=cv-loanAmt; // net CV after loan
-  var cvEndOfRepay=cvAfterLoan;
-  for(var m2=0;m2<repayYrs*12;m2++){
-    cvEndOfRepay=cvEndOfRepay*(1+cvRate)+prem*0.45; // continuing premiums
+  // CV continues growing during repayment — anniversary-anchored continuation
+  // from end of build phase to end of repay phase, then add the loan's principal
+  // back since it gets repaid into the policy.
+  var cvAfterLoan = cv - loanAmt; // net CV right after loan is taken
+  var cvEndOfRepay = cvAfterLoan;
+  if(repayYrs > 0){
+    var phase2Params = Object.assign({}, ibcParams, {startingCV: cvAfterLoan});
+    var phase2Result = _ibcProjectPolicy(phase2Params, 0, repayYrs * 12);
+    cvEndOfRepay = phase2Result.data[phase2Result.data.length - 1].cv;
   }
-  cvEndOfRepay+=ibcTotalRepaid; // loan repaid back to policy
+  cvEndOfRepay += ibcTotalRepaid; // loan repaid back to policy
 
   // Interest savings
   var tradInterest=tradTotalPaid-debt;
@@ -12256,11 +12308,23 @@ function calcGenWealth(){
     if(i>0) cv+=prevDB;// inherit death benefit
     var startCV=cv;
     var yearMilestones=[];
-    for(var m=0;m<g.yrs*12;m++){
-      var cvFactor=m>120?0.45:m>60?0.35:0.25;
-      cv=cv*(1+mr)+genPrem*cvFactor;
-      totalPrem+=genPrem;
-      if((m+1)%120===0) yearMilestones.push({yr:(m+1)/12,cv:Math.round(cv)});
+    // Use anniversary-anchored crediting via _ibcProjectPolicy. This replaces the
+    // monthly compounding that overstated CV. We use WL defaults (high-CV design) since
+    // generational wealth strategies typically use participating WL with PUA riders.
+    var genParams = Object.assign({}, _ibcPolicyDefaults('wl'), {
+      monthlyPremium: genPrem,
+      netEffectiveRate: mr * 12,  // mr was monthly; convert to annual
+      startingCV: cv
+    });
+    var genProjResult = _ibcProjectPolicy(genParams, 0, g.yrs * 12);
+    cv = genProjResult.data[genProjResult.data.length - 1].cv;
+    totalPrem += genPrem * g.yrs * 12;
+    // Sample milestones every 10 years
+    for(var msIdx = 0; msIdx < genProjResult.data.length; msIdx++){
+      var pt = genProjResult.data[msIdx];
+      if(pt.month > 0 && pt.month % 120 === 0){
+        yearMilestones.push({yr: pt.month/12, cv: pt.cv});
+      }
     }
     var db=Math.max(cv*2,cv+500000);prevDB=db;
     genData.push({name:g.name,icon:g.icon,col:g.col,prem:genPrem,startCV:Math.round(startCV),cv:Math.round(cv),db:Math.round(db),totalPrem:Math.round(totalPrem),milestones:yearMilestones,inherited:i>0?Math.round(startCV):0});
@@ -23012,6 +23076,247 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px">';
     [{y:'5yr',v:_yr5},{y:'10yr',v:_yr10},{y:'20yr',v:_yr20}].forEach(function(yp2){h+='<div style="text-align:center;padding:5px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:8px;color:var(--mu)">'+yp2.y+'</div><div style="font-family:var(--fd);font-size:13px;color:var(--gr)">'+fmtK(Math.round(yp2.v))+'</div></div>';});
     h+='</div></div>';
+    
+    // ── IBC-specific UI: speculation banner + yearly review + drift indicator ──
+    if(a.type==='ibc'){
+      var _ibcType = a._ibcUnderlyingType || 'wl';
+      var _ibcParams = Object.assign({}, _ibcPolicyDefaults(_ibcType), {
+        monthlyPremium: a.amount,
+        history: a.history || []
+      });
+      var _ibcProj = (typeof _ibcProjectPolicy === 'function') ? _ibcProjectPolicy(_ibcParams, 0, 12) : null;
+      var _illustrated = _ibcProj ? _ibcProj.illustratedRate : 0;
+      var _realized = _ibcProj ? _ibcProj.realizedRate : null;
+      var _drift = _ibcProj ? _ibcProj.drift : null;
+      var _historyCount = (a.history || []).length;
+      
+      // Speculation banner — always visible on IBC cards
+      h += '<div style="margin-top:8px;padding:10px 12px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.22);border-left:3px solid var(--yl,#EAB308);border-radius:4px">';
+      h += '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap">';
+      h += '<div style="flex:1;min-width:200px">';
+      h += '<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--yl,#EAB308);letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">⚠ Estimates only</div>';
+      h += '<div style="font-size:11px;color:rgba(226,232,240,.78);line-height:1.5">All projection numbers are computed from industry-typical defaults. For accurate values, request an in-force illustration from your carrier and update via Yearly Review.</div>';
+      h += '</div>';
+      h += '<button onclick="event.stopPropagation();_cpShowIBCYearlyReview('+idx+')" style="padding:7px 12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr,#22C55E);font-family:var(--fh);font-size:10px;font-weight:700;cursor:pointer;border-radius:3px;flex-shrink:0">📋 Yearly Review'+(_historyCount?' ('+_historyCount+')':'')+'</button>';
+      h += '</div>';
+      
+      // ── Provenance markers — per-parameter origin indicators ──
+      // 📊 = illustrated default (industry-typical assumption)
+      // 📌 = anchored to user-provided actual (from yearly review)
+      // ⚠ = projected forward from latest anchor
+      // Logic: if user has at least one yearly review entry, the params at/before
+      // the latest anchor are 📌 anchored. Forward-looking values are ⚠ projected.
+      // Without any anchor, everything is 📊 illustrated.
+      var _hasAnchor = _historyCount > 0;
+      var _anchorIcon = _hasAnchor ? '📌' : '📊';
+      var _anchorLabel = _hasAnchor ? 'anchored' : 'illustrated';
+      var _anchorColor = _hasAnchor ? 'var(--gr,#22C55E)' : 'rgba(226,232,240,.6)';
+      var _projIcon = '⚠';
+      var _projLabel = 'projected';
+      var _projColor = 'var(--yl,#EAB308)';
+      // Show key params with their provenance
+      var _ibcCV = (_ibcProj && _ibcProj.data && _ibcProj.data.length) ? _ibcProj.data[_ibcProj.data.length - 1].cv : 0;
+      var _ibcDB = _ibcParams.deathBenefit || 0;
+      var _ibcLoanRateDisp = ((_ibcParams.loanRate || 0.05) * 100).toFixed(1);
+      var _ibcGrowthRate = ((_illustrated || 0) * 100).toFixed(1);
+      h += '<div style="margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px">';
+      // Cash value (anchored if any history; else illustrated)
+      h += '<div style="padding:6px 8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px">';
+      h += '<div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"><span title="'+_anchorLabel+'">'+_anchorIcon+'</span> Cash value</div>';
+      h += '<div style="font-family:var(--fd,monospace);font-size:13px;color:var(--wh);font-weight:700">'+(typeof fmtK==='function'?fmtK(_ibcCV):'$'+_ibcCV)+'</div>';
+      h += '<div style="font-size:9px;color:'+_anchorColor+'">'+_anchorLabel+'</div>';
+      h += '</div>';
+      // Net growth rate (always projected since net rate combines anchored + assumed forward)
+      h += '<div style="padding:6px 8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px">';
+      h += '<div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"><span title="'+_projLabel+'">'+(_realized != null ? _projIcon : '📊')+'</span> Net rate</div>';
+      h += '<div style="font-family:var(--fd,monospace);font-size:13px;color:var(--wh);font-weight:700">'+(_realized != null ? (_realized*100).toFixed(1) : _ibcGrowthRate)+'%</div>';
+      h += '<div style="font-size:9px;color:'+(_realized != null ? _projColor : 'rgba(226,232,240,.6)')+'">'+(_realized != null ? 'realized fwd' : 'illustrated')+'</div>';
+      h += '</div>';
+      // Loan rate (always illustrated — comes from policy contract terms, default 5%)
+      h += '<div style="padding:6px 8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px">';
+      h += '<div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"><span title="illustrated default">📊</span> Loan rate</div>';
+      h += '<div style="font-family:var(--fd,monospace);font-size:13px;color:var(--wh);font-weight:700">'+_ibcLoanRateDisp+'%</div>';
+      h += '<div style="font-size:9px;color:rgba(226,232,240,.6)">contract</div>';
+      h += '</div>';
+      // Death benefit (anchored if user provided in yearly review)
+      h += '<div style="padding:6px 8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px">';
+      h += '<div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"><span title="'+_anchorLabel+'">'+_anchorIcon+'</span> Death benefit</div>';
+      h += '<div style="font-family:var(--fd,monospace);font-size:13px;color:var(--wh);font-weight:700">'+(_ibcDB > 0 ? (typeof fmtK==='function'?fmtK(_ibcDB):'$'+_ibcDB) : '—')+'</div>';
+      h += '<div style="font-size:9px;color:'+_anchorColor+'">'+(_ibcDB > 0 ? _anchorLabel : 'not set')+'</div>';
+      h += '</div>';
+      h += '</div>';
+      // Provenance legend (small footer below the markers)
+      h += '<div style="margin-top:6px;font-size:9px;color:var(--mu);display:flex;gap:10px;flex-wrap:wrap">';
+      h += '<span><span style="color:rgba(226,232,240,.6)">📊</span> illustrated</span>';
+      h += '<span><span style="color:var(--gr,#22C55E)">📌</span> anchored to actual</span>';
+      h += '<span><span style="color:var(--yl,#EAB308)">⚠</span> projected forward</span>';
+      h += '</div>';
+      
+      // ── CV trajectory mini-chart — shows three modes:
+      // 1. Faded dashed line: the original illustrated projection (what we'd estimate
+      //    from defaults alone) over the full horizon
+      // 2. Solid dots: each anniversary review where the user provided actuals
+      // 3. Solid bright line from the latest anchor projecting forward at the realized
+      //    rate (or illustrated if no realized rate yet)
+      // Useful even with zero anchors — shows the pure illustrated curve.
+      try {
+        var _chartW = 320, _chartH = 80, _chartPadL = 4, _chartPadR = 4, _chartPadT = 10, _chartPadB = 16;
+        var _chartHorizonMo = 240; // 20 years
+        // Build illustrated curve from year 0
+        var _illusParams = Object.assign({}, _ibcPolicyDefaults(_ibcType), {
+          monthlyPremium: a.amount || 0,
+          history: []  // ignore history for the illustrated baseline
+        });
+        var _illusPoints = [];
+        for(var _mt = 0; _mt <= _chartHorizonMo; _mt += 12){
+          var _illus = (typeof _ibcProjectPolicy === 'function') ? _ibcProjectPolicy(_illusParams, 0, _mt) : null;
+          _illusPoints.push({ m: _mt, cv: (_illus && _illus.data && _illus.data.length) ? _illus.data[_illus.data.length - 1].cv : 0 });
+        }
+        // Anchor points from history
+        var _anchorPoints = (a.history || []).filter(function(_h){return _h && _h.cashValue >= 0;}).map(function(_h){
+          return { m: _h.monthOffset || 0, cv: parseFloat(_h.cashValue) || 0 };
+        }).sort(function(x, y){return x.m - y.m;});
+        // Forward projection: from latest anchor (or month 0) using realized rate (if available) or illustrated
+        var _fwdRate = (_realized != null) ? _realized : _illustrated;
+        var _fwdStart = _anchorPoints.length > 0 ? _anchorPoints[_anchorPoints.length - 1] : { m: 0, cv: 0 };
+        var _fwdPoints = [];
+        if(_anchorPoints.length > 0 || a.amount > 0){
+          var _fwdParams = Object.assign({}, _illusParams, {
+            startingCV: _fwdStart.cv
+          });
+          for(var _mt2 = _fwdStart.m; _mt2 <= _chartHorizonMo; _mt2 += 12){
+            // Project from the anchor month forward to _mt2 (or use raw startCV at the anchor itself)
+            var _projCV;
+            if(_mt2 === _fwdStart.m){
+              _projCV = _fwdStart.cv;
+            } else {
+              var _fwdProj = (typeof _ibcProjectPolicy === 'function') ? _ibcProjectPolicy(_fwdParams, _fwdStart.m, _mt2) : null;
+              _projCV = (_fwdProj && _fwdProj.data && _fwdProj.data.length) ? _fwdProj.data[_fwdProj.data.length - 1].cv : (_fwdStart.cv + (_mt2 - _fwdStart.m) * (a.amount || 0) * _fwdRate / 12);
+            }
+            _fwdPoints.push({ m: _mt2, cv: _projCV });
+          }
+        }
+        // Compute scale
+        var _allCVs = _illusPoints.map(function(p){return p.cv;}).concat(_anchorPoints.map(function(p){return p.cv;})).concat(_fwdPoints.map(function(p){return p.cv;}));
+        var _maxCV = Math.max.apply(null, _allCVs.length > 0 ? _allCVs : [0, 1]);
+        if(_maxCV <= 0) _maxCV = 1;
+        var _xScale = function(m){return _chartPadL + (m / _chartHorizonMo) * (_chartW - _chartPadL - _chartPadR);};
+        var _yScale = function(cv){return _chartH - _chartPadB - (cv / _maxCV) * (_chartH - _chartPadT - _chartPadB);};
+        // Build SVG
+        var _svgH = '<svg width="100%" viewBox="0 0 '+_chartW+' '+_chartH+'" style="display:block;margin-top:8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px" preserveAspectRatio="none">';
+        // Illustrated curve (faded dashed)
+        if(_illusPoints.length > 1){
+          var _illusPath = _illusPoints.map(function(p, i){return (i === 0 ? 'M' : 'L') + _xScale(p.m).toFixed(1) + ',' + _yScale(p.cv).toFixed(1);}).join(' ');
+          _svgH += '<path d="' + _illusPath + '" fill="none" stroke="rgba(226,232,240,.35)" stroke-width="1.2" stroke-dasharray="3,3"></path>';
+        }
+        // Forward projection (solid bright line) — only if we have anchors or premium
+        if(_fwdPoints.length > 1){
+          var _fwdPath = _fwdPoints.map(function(p, i){return (i === 0 ? 'M' : 'L') + _xScale(p.m).toFixed(1) + ',' + _yScale(p.cv).toFixed(1);}).join(' ');
+          var _fwdColor = (_realized != null) ? '#EAB308' : '#A855F7';
+          _svgH += '<path d="' + _fwdPath + '" fill="none" stroke="' + _fwdColor + '" stroke-width="1.8"></path>';
+        }
+        // Anchor points (solid dots)
+        _anchorPoints.forEach(function(p){
+          _svgH += '<circle cx="' + _xScale(p.m).toFixed(1) + '" cy="' + _yScale(p.cv).toFixed(1) + '" r="3.5" fill="#22C55E" stroke="#0F172A" stroke-width="1"></circle>';
+        });
+        // Y-axis ticks (just the max value)
+        _svgH += '<text x="' + (_chartW - 2) + '" y="' + (_chartPadT + 2) + '" font-family="var(--fh)" font-size="8" fill="rgba(226,232,240,.6)" text-anchor="end">$' + (_maxCV >= 1000 ? Math.round(_maxCV/1000) + 'K' : Math.round(_maxCV)) + '</text>';
+        // X-axis labels (Y0, Y10, Y20)
+        _svgH += '<text x="' + _xScale(0).toFixed(1) + '" y="' + (_chartH - 4) + '" font-family="var(--fh)" font-size="8" fill="var(--mu)" text-anchor="start">Y0</text>';
+        _svgH += '<text x="' + _xScale(120).toFixed(1) + '" y="' + (_chartH - 4) + '" font-family="var(--fh)" font-size="8" fill="var(--mu)" text-anchor="middle">Y10</text>';
+        _svgH += '<text x="' + _xScale(240).toFixed(1) + '" y="' + (_chartH - 4) + '" font-family="var(--fh)" font-size="8" fill="var(--mu)" text-anchor="end">Y20</text>';
+        _svgH += '</svg>';
+        // Legend below mini-chart
+        _svgH += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px;font-size:9px;color:var(--mu)">';
+        _svgH += '<span style="display:inline-flex;align-items:center;gap:4px"><span style="display:inline-block;width:14px;height:1px;border-top:1px dashed rgba(226,232,240,.6)"></span>illustrated</span>';
+        if(_anchorPoints.length > 0) _svgH += '<span style="display:inline-flex;align-items:center;gap:4px"><span style="display:inline-block;width:6px;height:6px;background:#22C55E;border-radius:50%"></span>anchors ('+_anchorPoints.length+')</span>';
+        _svgH += '<span style="display:inline-flex;align-items:center;gap:4px"><span style="display:inline-block;width:14px;height:2px;background:'+((_realized != null) ? '#EAB308' : '#A855F7')+'"></span>'+((_realized != null) ? 'realized fwd' : 'illustrated fwd')+'</span>';
+        _svgH += '</div>';
+        h += _svgH;
+      } catch(_chartErr){ /* fail silently — chart is enhancement, not core */ }
+      
+      // ── Active loan tracking + repayment slider + Add Loan button ──
+      var _ibcLoans = a.loans || [];
+      var _ibcLoanBalance = a.loanBalance || 0;
+      if(_ibcLoanBalance > 0 || _ibcLoans.length > 0){
+        h += '<div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(234,179,8,.15)">';
+        h += '<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Active policy loans</div>';
+        if(_ibcLoans.length > 0){
+          _ibcLoans.forEach(function(loan, li){
+            var _lAmt = parseFloat(loan.amount) || 0;
+            var _lRate = ((loan.rate || 0.05) * 100).toFixed(1);
+            h += '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:3px;margin-bottom:4px">';
+            h += '<div style="flex:1;min-width:0"><div style="font-size:11px;color:var(--wh);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(loan.purpose||'Loan')+'</div>';
+            h += '<div style="font-size:10px;color:var(--mu)">'+fmt(_lAmt)+' @ '+_lRate+'%</div></div>';
+            h += '</div>';
+          });
+        } else {
+          h += '<div style="font-size:11px;color:var(--mu);padding:4px 0">Total loan balance: <strong style="color:var(--wh);font-family:var(--fd,monospace)">'+fmt(_ibcLoanBalance)+'</strong></div>';
+        }
+        // Repayment slider — sets a.monthlyLoanRepay directly. Slider cap is the
+        // smaller of (current loan balance) and (current available surplus + already-allocated
+        // amount on this card). Updates the "paid off in X mo" label live as user drags.
+        var _ibcRepay = a.monthlyLoanRepay || 0;
+        var _ibcLoanRateAnnual = a.loanRate || 0.05;
+        var _ibcLoanRate = _ibcLoanRateAnnual / 12;
+        // Slider cap: don't let repayment exceed loan balance or available surplus.
+        // _cpAvailableBudget(idx) excludes this card's premium from "deployed" already,
+        // so it's the max we could legally allocate to repayment on this card without
+        // changing other allocations.
+        var _availSurplus = (typeof _cpAvailableBudget === 'function') ? _cpAvailableBudget(idx) : (CPLAN.surplus || 5000);
+        var _ibcRepayCap = Math.max(0, Math.min(_ibcLoanBalance, Math.round(_availSurplus + _ibcRepay)));
+        var _ibcRepayCapStep = _ibcRepayCap > 1000 ? 25 : 5;
+        h += '<div style="margin-top:8px;padding:7px 9px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:3px">';
+        h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px;gap:6px">';
+        h += '<div style="font-size:10px;color:rgba(226,232,240,.85);font-family:var(--fh);font-weight:700;letter-spacing:.04em">Loan repayment</div>';
+        h += '<div style="font-size:10px;color:#A855F7;font-family:var(--fd,monospace);font-weight:700"><span id="ibcRepayVal'+idx+'">'+fmt(_ibcRepay)+'</span>/mo</div>';
+        h += '</div>';
+        h += '<input type="range" id="ibcRepaySlider'+idx+'" min="0" max="'+_ibcRepayCap+'" step="'+_ibcRepayCapStep+'" value="'+_ibcRepay+'" oninput="_cpIBCRepaySlide('+idx+',this.value)" onchange="_cpIBCRepayCommit('+idx+')" style="width:100%;accent-color:#A855F7;height:5px">';
+        // Projected paid-off month label
+        var _ibcMonthlyInt = _ibcLoanBalance * _ibcLoanRate;
+        var _ibcPrincipal = Math.max(0, _ibcRepay - _ibcMonthlyInt);
+        var _ibcMonthsLeft = 0;
+        if(_ibcRepay > 0 && _ibcLoanBalance > 0){
+          if(_ibcPrincipal <= 0){
+            // Repayment doesn't cover monthly interest — loan grows
+            _ibcMonthsLeft = -1;
+          } else {
+            _ibcMonthsLeft = Math.ceil(Math.log(1 + (_ibcLoanBalance * _ibcLoanRate / _ibcPrincipal)) / Math.log(1 + _ibcLoanRate));
+          }
+        }
+        var _ibcPaidOffLabel = '';
+        if(_ibcRepay <= 0) _ibcPaidOffLabel = 'No active repayment';
+        else if(_ibcMonthsLeft < 0) _ibcPaidOffLabel = '⚠ Repayment below interest — loan growing';
+        else if(_ibcMonthsLeft === 0) _ibcPaidOffLabel = 'Paid off';
+        else _ibcPaidOffLabel = 'Paid off in ~' + _ibcMonthsLeft + ' months';
+        h += '<div style="font-size:10px;color:var(--mu);margin-top:4px" id="ibcRepayLabel'+idx+'">'+_ibcPaidOffLabel+'</div>';
+        h += '</div>';
+        h += '<button onclick="event.stopPropagation();_cpAddIBCLoanModal('+idx+')" style="margin-top:6px;padding:5px 10px;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.25);color:#A855F7;font-family:var(--fh);font-size:10px;font-weight:700;cursor:pointer;border-radius:3px">+ Add policy loan</button>';
+        h += '</div>';
+      } else {
+        // No loans yet — just show the Add Loan button
+        h += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(234,179,8,.15)">';
+        h += '<button onclick="event.stopPropagation();_cpAddIBCLoanModal('+idx+')" style="padding:5px 10px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);color:#A855F7;font-family:var(--fh);font-size:10px;font-weight:700;cursor:pointer;border-radius:3px">+ Add policy loan</button>';
+        h += '</div>';
+      }
+      
+      // Drift indicator — only shows when realized rate is available (≥2 anchors)
+      if(_drift && _realized != null){
+        var _driftColor, _driftLabel, _driftIcon;
+        if(_drift === 'on_track'){_driftColor = 'var(--gr,#22C55E)'; _driftLabel = 'On track'; _driftIcon = '🟢';}
+        else if(_drift === 'slight_drift'){_driftColor = 'var(--yl,#EAB308)'; _driftLabel = 'Slight drift'; _driftIcon = '🟡';}
+        else {_driftColor = '#FCA5A5'; _driftLabel = 'Significant drift — review with agent'; _driftIcon = '🔴';}
+        h += '<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(234,179,8,.15);display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap">';
+        h += '<div style="display:flex;align-items:center;gap:6px">';
+        h += '<span style="font-size:14px">'+_driftIcon+'</span>';
+        h += '<div><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+_driftColor+';letter-spacing:.04em">'+_driftLabel+'</div>';
+        h += '<div style="font-size:10px;color:var(--mu)">Realized: <strong style="color:var(--wh)">'+(_realized*100).toFixed(2)+'%</strong> vs Illustrated: <strong style="color:var(--wh)">'+(_illustrated*100).toFixed(2)+'%</strong></div></div>';
+        h += '</div>';
+        h += '</div>';
+      }
+      h += '</div>';
+    }
+    // ── end IBC-specific UI ──
   }
   // Education vehicle selector
   if(a.type==='edu'){
@@ -25488,6 +25793,322 @@ function _cpCalcConsolidation(debts){
   return{eligible:true,months:months,interest:Math.round(totalInt),rate:conRate,payment:Math.round(pmt),totalBal:totalBal,creditScore:creditScore};
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// ── IBC POLICY MATH MODULE ──────────────────────────────────────────────────
+// Replaces the old monthly-compounding CV math with anniversary-anchored
+// crediting that matches how real WL and IUL policies actually credit interest.
+//
+// Core principle: CV does NOT compound monthly. Premium and loan repayment
+// flow continuously (real cash flows). CV updates ONCE per anniversary (WL
+// dividend + guaranteed) or once per segment maturity (IUL annual P2P).
+//
+// All defaults are research-backed industry typicals — see in-line citations.
+// Every parameter is overridable per policy via _ibcPolicyDefaults() merge.
+// Yearly review entries (policy.history[]) anchor the projection to actuals.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// Default policy parameters — used when not overridden by user. Each tagged
+// with provenance: 🟢 cited research / 🟡 inferred / ⚠ estimated.
+function _ibcPolicyDefaults(type){
+  if(type==='wl'){
+    return {
+      type:'wl',
+      design:'high_cv',           // 'high_cv' (PUA-heavy IBC) or 'traditional'
+      guaranteedRate:0.04,         // 🟢 industry 2-4% range, 4% common
+      dividendRate:0.02,           // 🟡 ~2% above guaranteed (carriers 5-6.5% gross)
+      dividendOption:'pua',        // PUA most common for IBC strategy
+      netEffectiveRate:0.04,       // 🟢 3.5-4% industry consensus net of all costs
+      loanRate:0.05,               // 🟢 typical fixed loan rate
+      // CV efficiency by year — what % of premium becomes CV that year.
+      // Research: high-CV PUA design can produce 60-80% CV in year 1.
+      cvEfficiencyYr:[null, 0.55, 0.75, 0.75, 0.90, 0.90, 1.00, 1.00, 1.00, 1.00, 1.00]
+    };
+  }
+  // IUL defaults
+  return {
+    type:'iul',
+    premiumLoadYr:[null, 0.06, 0.06, 0.06, 0.06, 0.06, 0.04, 0.04, 0.04, 0.04, 0.04, 0.02], // 🟢 5-9% yr1, 2-5% later
+    policyFeeMonthly:10,           // 🟢 $5-15/mo cited
+    per1000ChargeMonthly:0.50,     // 🟢 $0.50/$1000 DB cited
+    per1000DropoffYear:11,         // 🟢 first 10 years cited
+    capRate:0.10,                  // 🟢 9-12% range cited (2025-26)
+    parRate:1.0,                   // 🟢 100% standard for capped
+    floorRate:0.0,                 // 🟢 industry standard
+    spreadRate:0.0,                // 0 unless uncapped strategy
+    assumedIndexReturn:0.07,       // 🟢 aligned with AG-49B 6-7% ceiling
+    netEffectiveRate:0.055,        // 🟢 5-5.5% industry consensus
+    loanRate:0.05,                 // 🟢 typical
+    healthClass:'preferred',       // preferred_plus | preferred | standard | substandard
+    coiBaseRate:0.0005,            // ⚠ 2017 CSO-aligned baseline at age 30, per $1000 NAR/mo
+    coiSlope:1.085                 // 🟢 ~8.5% annual mortality compounding (standard curve)
+  };
+}
+
+// Health class multiplier on COI — research: 25-200% variance from preferred.
+function _ibcHealthMultiplier(healthClass){
+  if(healthClass==='preferred_plus')return 0.7;
+  if(healthClass==='standard')return 1.5;
+  if(healthClass==='substandard')return 2.5;
+  return 1.0; // 'preferred' default
+}
+
+// Monthly COI rate per $1000 NAR — exponential mortality curve based on 2017 CSO.
+// Returns rate to multiply by net amount at risk (DB - CV) per month.
+function _ibcCOIRatePerMonth(age, params){
+  var base = (params && params.coiBaseRate) || 0.0005;
+  var slope = (params && params.coiSlope) || 1.085;
+  var hm = _ibcHealthMultiplier(params && params.healthClass);
+  return base * hm * Math.pow(slope, Math.max(0, age - 30));
+}
+
+// Year-indexed lookup: returns the right factor for the given policy year.
+// Handles year >= length by returning the last value (reasonable for far-future).
+function _ibcYearFactor(arr, yearNum, fallback){
+  if(!arr||!arr.length)return fallback;
+  var i = Math.min(yearNum, arr.length - 1);
+  if(i < 1) return fallback;
+  return (arr[i] != null) ? arr[i] : fallback;
+}
+
+// ── WL Annual Crediting ──
+// Called ONCE per policy anniversary (every 12 months). Returns CV delta.
+// Models: guaranteed-rate growth + dividend (per dividend option) + premium-to-CV
+// per year-N efficiency curve (handles front-loaded acquisition costs).
+function _ibcWLAnnualCredit(policy, yearNum, currentCV, currentPUA){
+  var p = Object.assign({}, _ibcPolicyDefaults('wl'), policy || {});
+  var yearlyPremium = (p.monthlyPremium || 0) * 12;
+  
+  // 1. Year-N CV efficiency — front-loaded acquisition costs in early years.
+  var efficiency = _ibcYearFactor(p.cvEfficiencyYr, yearNum, 1.0);
+  var premiumToCV = yearlyPremium * efficiency;
+  
+  // 2. Guaranteed rate growth on existing CV (locked in policy contract).
+  var guaranteedGrowth = currentCV * (p.guaranteedRate || 0.04);
+  
+  // 3. Dividend on prior year-end accumulated value (CV + PUA).
+  //    Dividend rate = how much above guaranteed the carrier is paying.
+  var dividendBase = currentCV + (currentPUA || 0);
+  var dividend = dividendBase * (p.dividendRate || 0.02);
+  
+  // 4. PUA option: dividend buys paid-up additions which themselves have CV.
+  //    Approximation: ~95% of dividend translates to CV (small COI on PUAs).
+  var puaCVAdded = (p.dividendOption === 'pua') ? dividend * 0.95 : 0;
+  var nonPUADividend = (p.dividendOption !== 'pua') ? dividend : 0;
+  
+  return {
+    cvDelta: premiumToCV + guaranteedGrowth + puaCVAdded,
+    puaDelta: puaCVAdded,
+    dividend: dividend,
+    nonPUADividend: nonPUADividend,
+    breakdown: {
+      premiumToCV: premiumToCV,
+      guaranteedGrowth: guaranteedGrowth,
+      dividend: dividend,
+      puaCVAdded: puaCVAdded,
+      efficiency: efficiency
+    }
+  };
+}
+
+// ── IUL Annual Crediting ──
+// Called ONCE per policy anniversary. Models: premium load → admin/per-1000/COI
+// out → index credit on segment-starting value. Returns AV delta.
+// Simplified single-annual-segment model (real policies may have 12 staggered
+// monthly segments; the long-term net is similar).
+function _ibcIULAnnualCredit(policy, yearNum, currentAV, overrideCreditRate){
+  var p = Object.assign({}, _ibcPolicyDefaults('iul'), policy || {});
+  var yearlyPremium = (p.monthlyPremium || 0) * 12;
+  var ageThisYear = (p.issueAge || 35) + yearNum - 1;
+  var deathBenefit = p.deathBenefit || (yearlyPremium * 15);
+  
+  // 1. Premium load (front-loaded, drops over time).
+  var loadRate = _ibcYearFactor(p.premiumLoadYr, yearNum, 0.02);
+  var netPremium = yearlyPremium * (1 - loadRate);
+  
+  // 2. Annual policy fee.
+  var policyFee = (p.policyFeeMonthly || 10) * 12;
+  
+  // 3. Per-$1000 charge — first 10 years only (acquisition cost recovery).
+  var per1000 = 0;
+  if(yearNum < (p.per1000DropoffYear || 11)){
+    per1000 = (deathBenefit / 1000) * (p.per1000ChargeMonthly || 0.50) * 12;
+  }
+  
+  // 4. Cost of insurance — net amount at risk × age-based mortality rate.
+  var nar = Math.max(0, deathBenefit - currentAV);
+  var monthlyCOIRate = _ibcCOIRatePerMonth(ageThisYear, p);
+  var coi = (nar / 1000) * monthlyCOIRate * 12;
+  
+  // 5. Net contribution to account value before credit.
+  var netToAV = netPremium - policyFee - per1000 - coi;
+  
+  // 6. Index credit on segment-starting value (NAM-1617 confirms credit
+  //    is calculated on starting value, not current, per insurer guides).
+  //    For mid-year-funded simplification, use AV + half-year-net-premium.
+  var creditRate = (overrideCreditRate != null) ? overrideCreditRate : _ibcIULCreditRate(p);
+  var segmentStartValue = currentAV + (netPremium / 2);
+  var indexCredit = segmentStartValue * creditRate;
+  
+  return {
+    avDelta: netToAV + indexCredit,
+    indexCredit: indexCredit,
+    creditRate: creditRate,
+    breakdown: {
+      yearlyPremium: yearlyPremium,
+      loadRate: loadRate,
+      netPremium: netPremium,
+      policyFee: policyFee,
+      per1000: per1000,
+      coi: coi,
+      coiRate: monthlyCOIRate,
+      indexCredit: indexCredit,
+      creditRate: creditRate
+    }
+  };
+}
+
+// IUL credit rate computation: applies par/cap/spread/floor to assumed index return.
+function _ibcIULCreditRate(policy){
+  var p = policy || {};
+  var indexReturn = p.assumedIndexReturn || 0.07;
+  var par = p.parRate || 1.0;
+  var cap = p.capRate || 0.10;
+  var floor = p.floorRate || 0.0;
+  var spread = p.spreadRate || 0.0;
+  var grossCredit = indexReturn * par;
+  var afterSpread = Math.max(0, grossCredit - spread);
+  var capped = Math.min(cap, afterSpread);
+  return Math.max(floor, capped);
+}
+
+// ── Realized rate computation from yearly review anchors ──
+// Given two consecutive anchors (or the prior anchor and current actuals),
+// back-compute what rate the policy actually delivered. Used for drift indicator.
+function _ibcComputeRealizedRate(policy, prevAnchor, currentAnchor){
+  if(!prevAnchor || !currentAnchor)return null;
+  var prevCV = prevAnchor.cashValue || 0;
+  var currCV = currentAnchor.cashValue || 0;
+  var yearlyPremium = (policy.monthlyPremium || 0) * 12;
+  if(prevCV <= 0 && yearlyPremium <= 0)return null;
+  // Solve: currCV ≈ prevCV*(1+r) + yearlyPremium*efficiency
+  // This is a rough back-fit. For policy year > 5, efficiency ≈ 1 so:
+  //   r ≈ (currCV - prevCV - yearlyPremium) / prevCV  (when prevCV > 0)
+  if(prevCV > 0){
+    var r = (currCV - prevCV - yearlyPremium) / prevCV;
+    return Math.max(-0.50, Math.min(0.50, r)); // clamp to sane range
+  }
+  return null;
+}
+
+// Drift category for indicator: 🟢 on track / 🟡 slight / 🔴 significant.
+function _ibcDriftCategory(realizedRate, illustratedRate){
+  if(realizedRate == null || illustratedRate == null)return null;
+  var diff = Math.abs(realizedRate - illustratedRate);
+  if(diff <= 0.005)return 'on_track';
+  if(diff <= 0.015)return 'slight_drift';
+  return 'significant_drift';
+}
+
+// Effective credit rate for forward projection: honors user mode (illustrated/realized/weighted).
+function _ibcEffectiveCreditRate(policy){
+  var mode = (policy.recalibMode) || 'realized'; // default: use realized when available
+  var illustrated = (policy.type === 'wl')
+    ? (policy.netEffectiveRate || 0.04)
+    : _ibcIULCreditRate(policy);
+  if(mode === 'illustrated' || !policy._realizedRate)return illustrated;
+  if(mode === 'realized')return policy._realizedRate;
+  // Weighted: 60% most recent realized, 40% illustrated
+  return 0.6 * policy._realizedRate + 0.4 * illustrated;
+}
+
+// Find a yearly review anchor at or near a given month offset.
+function _ibcFindAnchor(history, monthOffset){
+  if(!history || !history.length)return null;
+  for(var i = 0; i < history.length; i++){
+    var h = history[i];
+    if(h.monthOffset === monthOffset)return h;
+  }
+  return null;
+}
+
+// ── Main projection function ──
+// Projects a policy month-by-month from fromMonth to toMonth, with anchors
+// from history[] overriding projection at their respective months.
+// Returns array of {month, cv, loanBalance, availableCV, totalPremiumsPaid,
+// isAnchor, isAnniversary, drift}.
+function _ibcProjectPolicy(policy, fromMonth, toMonth){
+  var p = Object.assign({}, _ibcPolicyDefaults(policy.type || 'wl'), policy || {});
+  var cv = p.startingCV || 0;
+  var pua = p.startingPUA || 0;
+  var loanBalance = p.startingLoanBalance || 0;
+  var totalPremiumsPaid = p.startingPremiumsPaid || 0;
+  var data = [];
+  var lastAnchor = null;
+  
+  // Compute realized rate from most recent two anchors if available.
+  var hist = (p.history || []).slice().sort(function(a,b){return a.monthOffset - b.monthOffset;});
+  if(hist.length >= 2){
+    p._realizedRate = _ibcComputeRealizedRate(p, hist[hist.length-2], hist[hist.length-1]);
+  }
+  
+  for(var m = fromMonth; m <= toMonth; m++){
+    // ── Anchor: yearly review overrides projection ──
+    var anchor = _ibcFindAnchor(hist, m);
+    if(anchor){
+      cv = (anchor.cashValue != null) ? anchor.cashValue : cv;
+      loanBalance = (anchor.loanBalance != null) ? anchor.loanBalance : loanBalance;
+      if(anchor.premiumPaidYTD != null)totalPremiumsPaid = anchor.premiumPaidYTD;
+      lastAnchor = anchor;
+    }
+    
+    // ── Continuous monthly: premium in ──
+    if(m > fromMonth){ // first month is the starting state
+      totalPremiumsPaid += (p.monthlyPremium || 0);
+    }
+    
+    // ── Continuous monthly: loan repayment (real, factual amortization) ──
+    if(loanBalance > 0 && (p.monthlyLoanRepay || 0) > 0){
+      var monthlyLoanInterest = loanBalance * ((p.loanRate || 0.05) / 12);
+      var principalPaydown = Math.max(0, p.monthlyLoanRepay - monthlyLoanInterest);
+      loanBalance = Math.max(0, loanBalance - principalPaydown);
+    }
+    
+    // ── Annual crediting on policy anniversaries ──
+    if(m > fromMonth && m % 12 === 0){
+      var policyYear = Math.floor(m / 12);
+      var rate = _ibcEffectiveCreditRate(p);
+      if(p.type === 'wl'){
+        var wlc = _ibcWLAnnualCredit(p, policyYear, cv, pua);
+        cv += wlc.cvDelta;
+        pua += wlc.puaDelta;
+      } else {
+        var ic = _ibcIULAnnualCredit(p, policyYear, cv, rate);
+        cv += ic.avDelta;
+      }
+    }
+    
+    data.push({
+      month: m,
+      cv: Math.round(cv),
+      pua: Math.round(pua),
+      loanBalance: Math.round(loanBalance),
+      availableCV: Math.max(0, Math.round(cv - loanBalance)),
+      totalPremiumsPaid: Math.round(totalPremiumsPaid),
+      isAnchor: !!anchor,
+      isAnniversary: m > 0 && m % 12 === 0
+    });
+  }
+  
+  return {
+    data: data,
+    realizedRate: p._realizedRate || null,
+    illustratedRate: (p.type === 'wl') ? (p.netEffectiveRate || 0.04) : _ibcIULCreditRate(p),
+    drift: _ibcDriftCategory(p._realizedRate, (p.type === 'wl') ? (p.netEffectiveRate || 0.04) : _ibcIULCreditRate(p))
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+
 function _cpCalcIBCDebt(debts,budget){
   if(!debts||!debts.length||budget<=0)return null;
   var surplus=CPLAN.surplus||0;
@@ -25503,7 +26124,13 @@ function _cpCalcIBCDebt(debts,budget){
   //    month (no compounding of unpaid interest into principal).
   // 4. Continue until all debts are loaned out + all loans are repaid.
   // ────────────────────────────────────────────────────────────────────────
-  var growthRate=0.05,loanAnnRate=0.05,monthlyGrow=growthRate/12;
+  // Use anniversary-anchored crediting via _ibcWLAnnualCredit. CV does NOT
+  // compound monthly — it grows linearly with premium during the year, then
+  // gets a credit injection on each policy anniversary.
+  // For debt-elimination IBC, WL is the most common underlying product, so we
+  // use WL defaults. (IUL-based IBC could be added with a similar branch.)
+  var ibcParams = Object.assign({}, _ibcPolicyDefaults('wl'), {monthlyPremium: budget});
+  var growthRate=0.05,loanAnnRate=0.05;  // legacy vars kept for clarity in chart code below
   var ds=debts.map(function(d,i){return{name:d.name||('Debt '+(i+1)),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,annualRate:(parseFloat(d.rate)||0),min:parseFloat(d.min)||0,paid:false};});
   // Avalanche order: pay off highest-INTEREST debt first when CV is sufficient.
   // (IBC's economic rationale is to attack the most expensive debt — which is also
@@ -25511,15 +26138,19 @@ function _cpCalcIBCDebt(debts,budget){
   // primary strategy, since they explicitly opted into IBC for this debt allocation.)
   ds.sort(function(a,b){return b.rate-a.rate;});
   var vehicle=0,totalDebtInt=0,totalLoanInt=0,payoffLog=[],origFreeMonth=null,month=0;
-  // Combined-loan tracking — all freed debt minimums pool together to repay all
-  // policy loans together. Matches how cash actually flows: minimums hit a single
-  // policy account, attribution to specific "loans" is a math abstraction.
   var totalLoanBalance=0;
   var totalLoanFreedMins=0;
+  // Track CV at last anniversary (stable until next anniversary) and premium-since-last-anniv.
+  // Inter-anniversary "effective CV" for loan availability = lastAnnivCV + premiumSinceAnniv.
+  // This approximates what's available — premium is in the policy's general account
+  // immediately, even though the dividend/index credit only applies on anniversary.
+  var lastAnnivCV = 0;
+  var premiumSinceAnniv = 0;
   while(month<720){
     month++;
-    // Step 1: extras flow into policy. Cash value compounds.
-    vehicle=vehicle*(1+monthlyGrow)+budget;
+    // Step 1: premium flows in monthly (continuous, real cash flow).
+    premiumSinceAnniv += budget;
+    vehicle = lastAnnivCV + premiumSinceAnniv;
     // Step 2: each unpaid debt accrues its own interest and gets its minimum payment.
     ds.forEach(function(d){
       if(d.bal<0.01||d.paid)return;
@@ -25546,10 +26177,7 @@ function _cpCalcIBCDebt(debts,budget){
       }
     });
     // Step 4: combined freed-minimums pool repays the combined loan balance.
-    // SIMPLE interest: each month's interest charge = current_balance × rate / 12,
-    // charged against whatever's still outstanding (NOT against original principal).
-    // This matches standard amortization simple interest — as the balance pays down,
-    // the monthly interest shrinks proportionally.
+    // SIMPLE interest on outstanding balance — standard amortization, no compounding.
     if(totalLoanBalance>0){
       var loanInterest=totalLoanBalance*loanAnnRate/12;
       totalLoanInt+=loanInterest;
@@ -25558,8 +26186,23 @@ function _cpCalcIBCDebt(debts,budget){
       totalLoanBalance-=loanPayment;
       if(totalLoanBalance<0.01)totalLoanBalance=0;
     }
-    // Step 5: track milestones. origFreeMonth = original debts gone.
-    // Loop terminates when both original debts and policy loans are fully cleared.
+    // Step 5: ANNIVERSARY CREDITING — every 12 months, apply WL annual credit.
+    // This is when guaranteed growth + dividend hit the policy. Reset the
+    // premium-since-anniversary tracker.
+    if(month % 12 === 0){
+      var policyYear = month / 12;
+      var annualCredit = _ibcWLAnnualCredit(ibcParams, policyYear, lastAnnivCV, 0);
+      // The premium-to-CV portion is already accumulated into vehicle via premiumSinceAnniv,
+      // but with year-N efficiency, only some of that premium "stuck" as CV — adjust.
+      var efficiency = _ibcYearFactor(ibcParams.cvEfficiencyYr, policyYear, 1.0);
+      var stuckPremiumCV = premiumSinceAnniv * efficiency;
+      var growthOnExistingCV = annualCredit.breakdown.guaranteedGrowth + annualCredit.breakdown.dividend;
+      // New anniversary CV = old anniversary CV + stuck premium + growth on existing
+      lastAnnivCV = lastAnnivCV + stuckPremiumCV + growthOnExistingCV;
+      premiumSinceAnniv = 0;
+      vehicle = lastAnnivCV;
+    }
+    // Step 6: track milestones. origFreeMonth = original debts gone.
     var origLeft=ds.some(function(d2){return d2.bal>0.01;});
     if(!origLeft&&origFreeMonth===null)origFreeMonth=month;
     if(!origLeft&&totalLoanBalance<=0)break;
@@ -25635,7 +26278,7 @@ function _cpRenderDebtEngine(debtAlloc,idx){
       h+='<div style="padding:8px 10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.1);border-radius:2px;margin-bottom:6px;display:flex;align-items:center;gap:8px">';
       h+='<span style="font-size:14px">🏛️</span><div style="flex:1"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#A855F7">IBC (Whole Life): Accumulate & Loan</div>';
       h+='<div style="font-size:10px;color:var(--mu)">Build cash value, pay debts via policy loans → debts gone month '+ibc.months+', keep '+fmtK(ibc.vehicle)+' cash value</div></div>';
-      h+='<button onclick="CPLAN.debtStrategy=\'ibc\';_cpRender()" style="padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;background:'+(CPLAN.debtStrategy==='ibc'?'rgba(168,85,247,.15)':'transparent')+';border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:2px;min-height:28px">Select</button></div>';
+      h+='<button onclick="_cpSelectIBCStrategy()" style="padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;background:'+(CPLAN.debtStrategy==='ibc'?'rgba(168,85,247,.15)':'transparent')+';border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:2px;min-height:28px">Select</button></div>';
     } else if(ibc&&!ibc.eligible){
       h+='<div style="font-size:10px;color:var(--mu);padding:4px 0">🏛️ IBC: '+ibc.reason+'</div>';
     }
@@ -25754,18 +26397,510 @@ function _cpRenderDebtEngine(debtAlloc,idx){
 // (surrender for cash with tax hit). Stored on the debt allocation as
 // _ibcEndChoice; _cpRunSimulation branches on this when emitting the
 // ibc_recovery cascade event.
+//
+// When the user picks 'cancel', we ALSO need them to choose a destination
+// for the surrendered CV lump sum — that's a different decision than the
+// recurring cascade choice. Opens _cpShowIBCSurrenderChooser for that.
 function _cpSetIbcEndChoice(idx,choice){
   var a=CPLAN.allocations[idx];
   if(!a||a.type!=='debt')return;
   a._ibcEndChoice=(choice==='cancel')?'cancel':'continue';
   _cpMarkModified();
+  // If the user just picked 'cancel', open the surrender destination chooser
+  // so they pick where the lump sum goes. They can dismiss and we'll default
+  // to proportional, but pinging them on the choice is the right UX.
+  if(choice==='cancel'){
+    setTimeout(function(){_cpShowIBCSurrenderChooser(idx);}, 100);
+    return; // re-render happens after they pick
+  }
   // Re-run sim so the cascade reflects the new choice immediately, then re-render
   // the debt-engine block + chart so the selected card visually updates.
   try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
   _cpRender();
 }
 
-// ── _cpShowIBCExplainer ────────────────────────────────────────────────────
+// ── Option B surrender destination chooser ────────────────────────────────
+// Opens when the user picks Option B (cancel policy + take CV lump sum).
+// Lets them choose where the after-tax lump sum gets deposited:
+//   1. Proportional across all current growth allocations (default)
+//   2. Boost a specific existing allocation (Roth, IUL, brokerage, savings)
+//   3. Open a new allocation as the destination
+// Stores choice on debtA._ibcOptionBDestination = '<allocation type>' | 'proportional' | '__new__'.
+function _cpShowIBCSurrenderChooser(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var ibcSim = _cpCalcIBCDebt((CPLAN.debts||[]).filter(function(d){return parseFloat(d.rate)>10;}), a.amount);
+  var lumpSumGross = (ibcSim && ibcSim.vehicle) || 0;
+  // Quick after-tax estimate — assume 22% marginal rate on gain (premium recovered tax-free).
+  // Real number depends on user's bracket and total premium paid; surface as estimate.
+  var totalPremiumsPaid = (ibcSim && ibcSim._totalPremiumsPaid) || a.amount * 12 * (((ibcSim&&ibcSim.fullFreeMonth)||60)/12);
+  var taxableGain = Math.max(0, lumpSumGross - totalPremiumsPaid);
+  var estimatedTax = Math.round(taxableGain * 0.22);
+  var afterTaxLumpSum = Math.max(0, lumpSumGross - estimatedTax);
+  
+  // Find existing growth-type allocations as boost candidates.
+  var growthCandidates = (CPLAN.allocations || []).filter(function(other,i){
+    if(i === idx) return false;
+    if(other._completed) return false;
+    if(typeof _cpIsActionOnly === 'function' && _cpIsActionOnly(other)) return false;
+    if(other.type === 'debt' || other.type === 'ef') return false;
+    return true;
+  });
+  
+  var ov = document.getElementById('ibcSurrenderChooserOverlay');
+  if(ov)ov.remove();
+  ov = document.createElement('div');
+  ov.id = 'ibcSurrenderChooserOverlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10001;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)';
+  
+  var current = a._ibcOptionBDestination || 'proportional';
+  
+  var h = '<div style="background:var(--bg-card,#0F172A);border:1px solid var(--bd);border-radius:8px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;color:var(--wh)">';
+  h += '<div style="padding:16px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between">';
+  h += '<div style="font-family:var(--fh);font-size:14px;font-weight:700">Where should the surrendered cash go?</div>';
+  h += '<button onclick="document.getElementById(\'ibcSurrenderChooserOverlay\').remove()" style="background:transparent;border:none;color:var(--mu);font-size:18px;cursor:pointer">✕</button></div>';
+  h += '<div style="padding:18px">';
+  
+  // Speculation banner — this is critical, surfaces honestly that all numbers are estimates
+  h += '<div style="margin-bottom:14px;padding:12px;background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.25);border-left:3px solid var(--yl,#EAB308);border-radius:4px">';
+  h += '<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--yl,#EAB308);letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">⚠ All numbers are estimates</div>';
+  h += '<div style="font-size:12px;color:rgba(226,232,240,.85);line-height:1.6">The lump sum, tax estimate, and timeline shown here are computed from formulas — not from your actual policy statement. Before surrendering any policy, <strong style="color:var(--wh)">request an in-force illustration from your carrier</strong> and review the actual cash surrender value, taxable gain calculation, and any surrender charges with a licensed insurance professional.</div></div>';
+  
+  // Estimated numbers
+  h += '<div style="margin-bottom:16px;padding:12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-radius:4px">';
+  h += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">';
+  h += '<div><div style="color:var(--mu);font-size:10px;font-family:var(--fh);text-transform:uppercase;letter-spacing:.06em">Estimated CV at surrender</div><div style="font-family:var(--fd,monospace);font-size:18px;color:var(--wh)">'+fmt(lumpSumGross)+'</div></div>';
+  h += '<div><div style="color:var(--mu);font-size:10px;font-family:var(--fh);text-transform:uppercase;letter-spacing:.06em">Est. tax on gain</div><div style="font-family:var(--fd,monospace);font-size:18px;color:#FCA5A5">−'+fmt(estimatedTax)+'</div></div>';
+  h += '<div style="grid-column:1/3;padding-top:8px;border-top:1px solid rgba(91,155,255,.18)"><div style="color:var(--mu);font-size:10px;font-family:var(--fh);text-transform:uppercase;letter-spacing:.06em">Net after tax (estimated)</div><div style="font-family:var(--fd,monospace);font-size:22px;color:var(--gr,#22C55E)">'+fmt(afterTaxLumpSum)+'</div></div>';
+  h += '</div></div>';
+  
+  // Three choice options
+  h += '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">';
+  
+  // Option 1: Proportional
+  h += '<label style="display:flex;gap:10px;padding:10px 12px;background:'+(current==='proportional'?'rgba(34,197,94,.08)':'transparent')+';border:1px solid '+(current==='proportional'?'rgba(34,197,94,.3)':'var(--bd)')+';border-radius:4px;cursor:pointer">';
+  h += '<input type="radio" name="ibcOptBDest" value="proportional" '+(current==='proportional'?'checked':'')+' style="accent-color:var(--gr);margin-top:2px;flex-shrink:0">';
+  h += '<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--gr,#22C55E);margin-bottom:2px">Distribute proportionally <span style="font-size:9px;color:var(--mu);font-weight:600">(default)</span></div>';
+  h += '<div style="font-size:11px;color:rgba(226,232,240,.7);line-height:1.5">Spreads <strong style="color:var(--wh)">'+fmt(afterTaxLumpSum)+'</strong> across all your existing growth allocations weighted by their current monthly amount.</div></div></label>';
+  
+  // Option 2: Boost existing
+  if(growthCandidates.length > 0){
+    var boostSelected = current !== 'proportional' && current !== '__new__';
+    h += '<label style="display:flex;gap:10px;padding:10px 12px;background:'+(boostSelected?'rgba(91,155,255,.08)':'transparent')+';border:1px solid '+(boostSelected?'rgba(91,155,255,.3)':'var(--bd)')+';border-radius:4px;cursor:pointer">';
+    h += '<input type="radio" name="ibcOptBDest" value="boost" '+(boostSelected?'checked':'')+' style="accent-color:#5B9BFF;margin-top:2px;flex-shrink:0" onchange="document.getElementById(\'ibcOptBBoostSel\').focus()">';
+    h += '<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;margin-bottom:6px">Send all of it to one allocation</div>';
+    h += '<select id="ibcOptBBoostSel" style="width:100%;padding:8px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:3px;box-sizing:border-box" onfocus="document.querySelector(\'input[name=ibcOptBDest][value=boost]\').checked=true">';
+    growthCandidates.forEach(function(c){
+      var cnm = c.customName || (typeof CP_NM !== 'undefined' && CP_NM[c.type]) || c.type;
+      var ic = (typeof CP_IC !== 'undefined' && CP_IC[c.type]) || '⭐';
+      var sel = current === c.type ? ' selected' : '';
+      h += '<option value="'+c.type+'"'+sel+'>'+ic+' '+esc(cnm)+'</option>';
+    });
+    h += '</select>';
+    h += '<div style="font-size:10px;color:var(--mu);margin-top:4px">All <strong style="color:var(--wh)">'+fmt(afterTaxLumpSum)+'</strong> deposited into the chosen item at surrender month.</div></div></label>';
+  }
+  
+  // Option 3: Add new
+  h += '<label style="display:flex;gap:10px;padding:10px 12px;background:'+(current==='__new__'?'rgba(168,85,247,.08)':'transparent')+';border:1px solid '+(current==='__new__'?'rgba(168,85,247,.3)':'var(--bd)')+';border-radius:4px;cursor:pointer">';
+  h += '<input type="radio" name="ibcOptBDest" value="new" '+(current==='__new__'?'checked':'')+' style="accent-color:#A855F7;margin-top:2px;flex-shrink:0">';
+  h += '<div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#A855F7;margin-bottom:2px">Open a new allocation as the destination</div>';
+  h += '<div style="font-size:11px;color:rgba(226,232,240,.7);line-height:1.5">Pick a new vehicle (Roth, brokerage, IUL, etc.) and the lump sum lands there. We\'ll prompt you to add it next.</div></div></label>';
+  h += '</div>';
+  
+  // Footer
+  h += '<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--bd)">';
+  h += '<button onclick="_cpIBCSurrenderChooserDismiss('+idx+')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Use default (proportional)</button>';
+  h += '<button onclick="_cpIBCSurrenderChooserApply('+idx+')" style="padding:9px 18px;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.4);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Save destination</button>';
+  h += '</div>';
+  
+  h += '</div></div>';
+  ov.innerHTML = h;
+  document.body.appendChild(ov);
+}
+
+function _cpIBCSurrenderChooserApply(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var radios = document.getElementsByName('ibcOptBDest');
+  var choice = 'proportional';
+  for(var i=0;i<radios.length;i++){
+    if(radios[i].checked){choice = radios[i].value; break;}
+  }
+  if(choice === 'proportional'){
+    a._ibcOptionBDestination = 'proportional';
+  } else if(choice === 'boost'){
+    var sel = document.getElementById('ibcOptBBoostSel');
+    a._ibcOptionBDestination = (sel && sel.value) || 'proportional';
+  } else if(choice === 'new'){
+    a._ibcOptionBDestination = '__new__';
+  }
+  var ov = document.getElementById('ibcSurrenderChooserOverlay');
+  if(ov)ov.remove();
+  _cpMarkModified();
+  try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
+  _cpRender();
+}
+
+function _cpIBCSurrenderChooserDismiss(idx){
+  var a = CPLAN.allocations[idx];
+  if(a)a._ibcOptionBDestination = 'proportional';
+  var ov = document.getElementById('ibcSurrenderChooserOverlay');
+  if(ov)ov.remove();
+  _cpMarkModified();
+  try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
+  _cpRender();
+}
+
+// ── Yearly review entry ────────────────────────────────────────────────────
+// Modal lets the user enter actual values from their annual policy statement.
+// On save, appends to allocation.history[] so the projection re-anchors at this
+// month going forward. After 2+ entries, drift indicator becomes meaningful.
+//
+// Anchor entries override projection at their month_offset. The math module
+// (_ibcProjectPolicy + _ibcComputeRealizedRate) handles the recalibration.
+function _cpShowIBCYearlyReview(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var ov = document.getElementById('ibcYearlyReviewOverlay');
+  if(ov)ov.remove();
+  ov = document.createElement('div');
+  ov.id = 'ibcYearlyReviewOverlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10001;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)';
+  
+  var policyType = a._ibcUnderlyingType || 'wl';
+  var existingHistory = a.history || [];
+  var existingCount = existingHistory.length;
+  
+  // Estimate the next anchor's expected month — typically 12 months past last anchor,
+  // or 12 months past plan start if no prior anchors.
+  var nextExpectedMonth = existingCount > 0 
+    ? (existingHistory[existingHistory.length-1].monthOffset + 12)
+    : 12;
+  
+  var h = '<div style="background:var(--bg-card,#0F172A);border:1px solid var(--bd);border-radius:8px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;color:var(--wh)">';
+  h += '<div style="padding:16px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between">';
+  h += '<div><div style="font-family:var(--fh);font-size:14px;font-weight:700">📋 Yearly Review — Recalibrate Projection</div>';
+  h += '<div style="font-size:11px;color:var(--mu);margin-top:2px">Enter values from your annual policy statement to anchor the projection to reality.</div></div>';
+  h += '<button onclick="document.getElementById(\'ibcYearlyReviewOverlay\').remove()" style="background:transparent;border:none;color:var(--mu);font-size:18px;cursor:pointer">✕</button></div>';
+  h += '<div style="padding:18px">';
+  
+  // Speculation banner
+  h += '<div style="margin-bottom:14px;padding:12px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.2);border-left:3px solid #5B9BFF;border-radius:4px">';
+  h += '<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Why this matters</div>';
+  h += '<div style="font-size:12px;color:rgba(226,232,240,.85);line-height:1.6">When you enter actual values from your statement, the projection from this point forward uses your <strong style="color:var(--wh)">real</strong> performance — not estimates. After 2+ entries the system computes your realized rate and shows drift vs. illustrated.</div></div>';
+  
+  // Existing history list
+  if(existingCount > 0){
+    h += '<div style="margin-bottom:14px;padding:10px 12px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:4px">';
+    h += '<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--mu);letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Prior anchors</div>';
+    existingHistory.forEach(function(e,i){
+      var moDate = new Date();
+      moDate.setMonth(moDate.getMonth() + e.monthOffset);
+      h += '<div style="display:flex;justify-content:space-between;font-size:11px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.04)">';
+      h += '<span style="color:rgba(226,232,240,.85)">Year '+(Math.round(e.monthOffset/12))+'</span>';
+      h += '<span style="font-family:var(--fd,monospace);color:var(--wh)">CV: '+fmt(e.cashValue||0)+(e.loanBalance?' · Loan: '+fmt(e.loanBalance):'')+'</span>';
+      h += '</div>';
+    });
+    h += '</div>';
+  }
+  
+  // New entry form
+  h += '<div style="display:flex;flex-direction:column;gap:12px">';
+  
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Policy year of this statement</label>';
+  h += '<input type="number" id="ibcReviewYear" value="'+Math.round(nextExpectedMonth/12)+'" min="1" max="50" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Cash value 📌 <span style="color:var(--mu);font-weight:600">(from your statement)</span></label>';
+  h += '<input type="number" id="ibcReviewCV" placeholder="e.g., 45000" min="0" step="100" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Outstanding policy loan balance <span style="color:var(--mu);font-weight:600">(if any)</span></label>';
+  h += '<input type="number" id="ibcReviewLoanBal" placeholder="0" min="0" step="100" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Death benefit <span style="color:var(--mu);font-weight:600">(optional)</span></label>';
+  h += '<input type="number" id="ibcReviewDB" placeholder="e.g., 500000" min="0" step="1000" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  
+  if(policyType === 'wl'){
+    h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Dividend received this year <span style="color:var(--mu);font-weight:600">(optional)</span></label>';
+    h += '<input type="number" id="ibcReviewDividend" placeholder="e.g., 800" min="0" step="10" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  } else {
+    h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Index credit this year <span style="color:var(--mu);font-weight:600">(optional, $)</span></label>';
+    h += '<input type="number" id="ibcReviewIndexCredit" placeholder="e.g., 1200" min="0" step="10" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  }
+  
+  h += '</div>';
+  
+  // Footer
+  h += '<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:14px;margin-top:14px;border-top:1px solid var(--bd)">';
+  h += '<button onclick="document.getElementById(\'ibcYearlyReviewOverlay\').remove()" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Cancel</button>';
+  h += '<button onclick="_cpIBCYearlyReviewSave('+idx+')" style="padding:9px 18px;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr,#22C55E);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Save anchor</button>';
+  h += '</div>';
+  
+  h += '</div></div>';
+  ov.innerHTML = h;
+  document.body.appendChild(ov);
+  setTimeout(function(){var inp=document.getElementById('ibcReviewCV');if(inp)inp.focus();},50);
+}
+
+function _cpIBCYearlyReviewSave(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var year = parseFloat(document.getElementById('ibcReviewYear').value) || 1;
+  var cv = parseFloat(document.getElementById('ibcReviewCV').value);
+  var loanBal = parseFloat(document.getElementById('ibcReviewLoanBal').value) || 0;
+  var db = parseFloat(document.getElementById('ibcReviewDB').value) || null;
+  var divEl = document.getElementById('ibcReviewDividend');
+  var dividend = divEl ? (parseFloat(divEl.value) || 0) : 0;
+  var icEl = document.getElementById('ibcReviewIndexCredit');
+  var indexCredit = icEl ? (parseFloat(icEl.value) || 0) : 0;
+  
+  if(!cv || cv <= 0){
+    alert('Please enter a valid cash value from your statement.');
+    return;
+  }
+  
+  // Append to history — _ibcProjectPolicy reads this to override projection at this month.
+  if(!a.history)a.history = [];
+  a.history.push({
+    monthOffset: year * 12,
+    policyYear: year,
+    cashValue: cv,
+    loanBalance: loanBal,
+    deathBenefit: db,
+    dividend: dividend,
+    indexCredit: indexCredit,
+    enteredAt: Date.now()
+  });
+  // Sort chronologically
+  a.history.sort(function(x,y){return x.monthOffset - y.monthOffset;});
+  
+  var ov = document.getElementById('ibcYearlyReviewOverlay');
+  if(ov)ov.remove();
+  
+  _cpMarkModified();
+  try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
+  _cpRender();
+}
+
+
+// ── _cpSelectIBCStrategy ────────────────────────────────────────────────────
+// Wraps the simple "set IBC strategy" with awareness: if user has no IBC growth
+// allocation yet, prompts them to either auto-create one or use an existing
+// WL/IUL allocation as the policy. Either way ensures the projection chart
+// can show the policy's CV growth alongside the debt elimination.
+function _cpSelectIBCStrategy(){
+  CPLAN.debtStrategy = 'ibc';
+  // Check if user has any IBC/WL/IUL growth allocation already.
+  var hasIBC = (CPLAN.allocations || []).some(function(a){
+    return a.type === 'ibc' || a.type === 'wl' || a.type === 'iul';
+  });
+  if(hasIBC){
+    _cpRender();
+    return;
+  }
+  // No insurance-based growth allocation yet — prompt them.
+  _cpShowAddIBCAllocPrompt();
+}
+
+function _cpShowAddIBCAllocPrompt(){
+  var ov = document.getElementById('addIBCAllocOverlay');
+  if(ov)ov.remove();
+  ov = document.createElement('div');
+  ov.id = 'addIBCAllocOverlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10001;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)';
+  
+  var h = '<div style="background:var(--bg-card,#0F172A);border:1px solid var(--bd);border-radius:8px;max-width:520px;width:100%;color:var(--wh)">';
+  h += '<div style="padding:16px 18px;border-bottom:1px solid var(--bd)">';
+  h += '<div style="font-family:var(--fh);font-size:14px;font-weight:700">🏛️ IBC strategy needs a policy</div>';
+  h += '<div style="font-size:11px;color:var(--mu);margin-top:2px">IBC works through a participating WL or IUL policy. To track the policy\'s cash value alongside your debt elimination, you need an allocation for it.</div>';
+  h += '</div>';
+  h += '<div style="padding:18px">';
+  
+  // Speculation banner
+  h += '<div style="margin-bottom:14px;padding:10px 12px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.2);border-left:3px solid var(--yl);border-radius:3px;font-size:11px;color:rgba(226,232,240,.8);line-height:1.5">';
+  h += '<strong style="color:var(--yl)">Heads up:</strong> The IBC growth card uses industry-typical defaults to project CV. Once you have a real illustration or annual statement, use the Yearly Review feature to anchor it to actuals.';
+  h += '</div>';
+  
+  h += '<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">';
+  
+  // Option 1: Auto-create
+  h += '<button onclick="_cpAddIBCAllocLink(\'create\')" style="text-align:left;padding:12px 14px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.25);border-radius:4px;cursor:pointer;color:var(--wh)">';
+  h += '<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#A855F7;margin-bottom:4px">✓ Yes — create an IBC growth card</div>';
+  h += '<div style="font-size:11px;color:rgba(226,232,240,.7);line-height:1.4">Adds a linked IBC card so you can track CV growth, take additional policy loans for other purchases, and see the full picture in your projection chart.</div>';
+  h += '</button>';
+  
+  // Option 2: Use existing
+  var existingPolicies = (CPLAN.allocations || []).filter(function(a){
+    return a.type === 'wl' || a.type === 'iul';
+  });
+  if(existingPolicies.length > 0){
+    h += '<button onclick="_cpAddIBCAllocLink(\'existing\')" style="text-align:left;padding:12px 14px;background:rgba(91,155,255,.05);border:1px solid rgba(91,155,255,.25);border-radius:4px;cursor:pointer;color:var(--wh)">';
+    h += '<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;margin-bottom:4px">→ Use my existing '+(existingPolicies[0].type||'').toUpperCase()+' allocation</div>';
+    h += '<div style="font-size:11px;color:rgba(226,232,240,.7);line-height:1.4">Marks your existing policy allocation as the IBC vehicle. No new card created.</div>';
+    h += '</button>';
+  }
+  
+  // Option 3: Skip
+  h += '<button onclick="_cpAddIBCAllocLink(\'skip\')" style="text-align:left;padding:12px 14px;background:transparent;border:1px solid var(--bd);border-radius:4px;cursor:pointer;color:var(--mu)">';
+  h += '<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--mu);margin-bottom:4px">Skip — just track the debt</div>';
+  h += '<div style="font-size:11px;color:var(--mu);line-height:1.4">The IBC math still runs internally for the debt timeline, but no separate growth card appears. You can add one later.</div>';
+  h += '</button>';
+  
+  h += '</div>';
+  h += '<div style="padding-top:12px;border-top:1px solid var(--bd);text-align:right">';
+  h += '<button onclick="document.getElementById(\'addIBCAllocOverlay\').remove();_cpRender()" style="padding:8px 14px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:11px;font-weight:700;border-radius:3px;cursor:pointer">Dismiss</button>';
+  h += '</div>';
+  h += '</div></div>';
+  ov.innerHTML = h;
+  document.body.appendChild(ov);
+}
+
+function _cpAddIBCAllocLink(choice){
+  var ov = document.getElementById('addIBCAllocOverlay');
+  if(ov)ov.remove();
+  if(choice === 'create'){
+    // Create a new IBC growth allocation. Default to WL underlying type and put
+    // in the same phase as the IBC debt allocation (or phase 1 if none).
+    var debtIdx = (CPLAN.allocations || []).findIndex(function(a){return a.type === 'debt';});
+    var phase = (debtIdx >= 0 && CPLAN.allocations[debtIdx].phase) ? CPLAN.allocations[debtIdx].phase : 1;
+    var newAlloc = {
+      id: 'ibc_' + Date.now(),
+      type: 'ibc',
+      _ibcUnderlyingType: 'wl',
+      amount: 0,
+      cascade: 'savings',
+      phase: phase,
+      customName: 'IBC Policy (linked to debt strategy)',
+      _linkedToDebt: debtIdx >= 0 ? true : false,
+      history: [],
+      loans: []
+    };
+    CPLAN.allocations.push(newAlloc);
+  } else if(choice === 'existing'){
+    // Mark existing WL/IUL as the IBC vehicle. We don't change its type, just flag it.
+    var existing = (CPLAN.allocations || []).find(function(a){
+      return a.type === 'wl' || a.type === 'iul';
+    });
+    if(existing){
+      existing._isIBCVehicle = true;
+    }
+  }
+  // 'skip' → just leave debtStrategy='ibc' set, no card change
+  _cpMarkModified();
+  try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
+  _cpRender();
+}
+
+// ── _cpAddIBCLoanModal ─────────────────────────────────────────────────────
+// Lets the user manually add a policy loan to an existing IBC allocation.
+// Accepts amount, purpose, optional rate. On save: increments loanBalance,
+// appends to loans[]. Same shape as the loan tracking from Add Expense.
+function _cpAddIBCLoanModal(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var ov = document.getElementById('cpAddIBCLoanOverlay');
+  if(ov)ov.remove();
+  ov = document.createElement('div');
+  ov.id = 'cpAddIBCLoanOverlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10001;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)';
+  
+  var h = '<div style="background:var(--bg-card,#0F172A);border:1px solid var(--bd);border-radius:8px;max-width:480px;width:100%;color:var(--wh)">';
+  h += '<div style="padding:16px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between">';
+  h += '<div><div style="font-family:var(--fh);font-size:14px;font-weight:700">+ Add policy loan</div>';
+  h += '<div style="font-size:11px;color:var(--mu);margin-top:2px">Track a new loan against this IBC policy</div></div>';
+  h += '<button onclick="document.getElementById(\'cpAddIBCLoanOverlay\').remove()" style="background:transparent;border:none;color:var(--mu);font-size:18px;cursor:pointer">✕</button></div>';
+  h += '<div style="padding:18px;display:flex;flex-direction:column;gap:12px">';
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Loan amount</label>';
+  h += '<input type="number" id="cpIBCLoanAmt" placeholder="0" min="0" step="100" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Purpose</label>';
+  h += '<input type="text" id="cpIBCLoanPurpose" placeholder="e.g. Auto purchase, Home reno, Pay off CC" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:3px;box-sizing:border-box"></div>';
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Loan rate <span style="color:var(--mu);font-weight:600">(% annual)</span></label>';
+  h += '<input type="number" id="cpIBCLoanRate" value="5" step="0.1" min="0" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd,monospace);font-size:14px;border-radius:3px;box-sizing:border-box"></div>';
+  h += '<div style="font-size:10px;color:var(--mu);line-height:1.4;margin-top:4px">Adds to your policy\'s loan balance and creates a repayment line on this card. Loan accrues simple interest on outstanding balance until repaid.</div>';
+  h += '</div>';
+  h += '<div style="padding:14px 18px;border-top:1px solid var(--bd);display:flex;gap:8px;justify-content:flex-end">';
+  h += '<button onclick="document.getElementById(\'cpAddIBCLoanOverlay\').remove()" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Cancel</button>';
+  h += '<button onclick="_cpAddIBCLoanSave('+idx+')" style="padding:9px 18px;background:rgba(168,85,247,.18);border:1px solid rgba(168,85,247,.4);color:#A855F7;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Add loan</button>';
+  h += '</div>';
+  h += '</div>';
+  ov.innerHTML = h;
+  document.body.appendChild(ov);
+  setTimeout(function(){var inp=document.getElementById('cpIBCLoanAmt');if(inp)inp.focus();},50);
+}
+
+function _cpAddIBCLoanSave(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var amt = parseFloat(document.getElementById('cpIBCLoanAmt').value);
+  var purpose = document.getElementById('cpIBCLoanPurpose').value || 'Policy loan';
+  var rate = (parseFloat(document.getElementById('cpIBCLoanRate').value) || 5) / 100;
+  if(!amt || amt <= 0){
+    alert('Please enter a valid loan amount.');
+    return;
+  }
+  if(!a.loans) a.loans = [];
+  a.loans.push({
+    id: Date.now(),
+    amount: amt,
+    purpose: purpose,
+    originationDate: new Date().toISOString().split('T')[0],
+    rate: rate,
+    repayMonthly: 0  // user can set via slider
+  });
+  a.loanBalance = (a.loanBalance || 0) + amt;
+  var ov = document.getElementById('cpAddIBCLoanOverlay');
+  if(ov)ov.remove();
+  _cpMarkModified();
+  try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
+  _cpRender();
+}
+
+// ── IBC repayment slider handlers ──
+// Live update during drag (no full re-render — just label + value text), then
+// commit on release (writes the new amount, re-runs simulation, full re-render).
+function _cpIBCRepaySlide(idx, val){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var amt = parseFloat(val) || 0;
+  // Live label updates only — full re-render happens on commit
+  var valEl = document.getElementById('ibcRepayVal' + idx);
+  if(valEl) valEl.textContent = (typeof fmt === 'function' ? fmt(amt) : '$' + amt);
+  var labelEl = document.getElementById('ibcRepayLabel' + idx);
+  if(labelEl){
+    var loanBal = a.loanBalance || 0;
+    var rateAnnual = a.loanRate || 0.05;
+    var rateMo = rateAnnual / 12;
+    var monthlyInt = loanBal * rateMo;
+    var principal = Math.max(0, amt - monthlyInt);
+    var monthsLeft = 0;
+    if(amt > 0 && loanBal > 0){
+      if(principal <= 0){
+        monthsLeft = -1;
+      } else {
+        monthsLeft = Math.ceil(Math.log(1 + (loanBal * rateMo / principal)) / Math.log(1 + rateMo));
+      }
+    }
+    var label = '';
+    if(amt <= 0) label = 'No active repayment';
+    else if(monthsLeft < 0) label = '⚠ Repayment below interest — loan growing';
+    else if(monthsLeft === 0) label = 'Paid off';
+    else label = 'Paid off in ~' + monthsLeft + ' months';
+    labelEl.textContent = label;
+  }
+  // Stash the value on the allocation in real-time too so the simulation has the
+  // latest if anything else triggers a render.
+  a.monthlyLoanRepay = amt;
+}
+
+function _cpIBCRepayCommit(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  // Amount already persisted by the slide handler; just persist + recompute now.
+  _cpMarkModified();
+  try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
+  _cpRender();
+}
+
+
 // Modal walkthrough of how IBC actually works mechanically, written in plain
 // language so a user without insurance background can follow it. Built from
 // Efrain's domain spec — keep this aligned if the simulator's mechanics change.
@@ -27367,15 +28502,27 @@ function _cpRunSimulation(){
         var endChoice=debtA._ibcEndChoice||'continue';
         if(ibcFullFreeMonth>ibcDebtFreeMonth){
           if(endChoice==='cancel'){
+            // Option B: surrender. The lump sum (estimated) plus the recurring extra
+            // and freed minimums all redirect. Route per user's destination choice
+            // stored on debtA._ibcOptionBDestination — values:
+            //   'proportional' (default): cascade across all growth allocations
+            //   '<allocation type>'      : direct all to that specific allocation
+            //   '__new__'                : cascade to default (user will add new alloc separately)
+            // The lump sum is conceptually a one-time inflow; the cascade routes the recurring portion.
+            var optBDest = debtA._ibcOptionBDestination || 'proportional';
+            var surrenderCascade = (optBDest === 'proportional' || optBDest === '__new__')
+              ? (debtA.cascade || 'savings')  // proportional → use existing cascade plumbing
+              : optBDest;                      // specific allocation type
             events.push({
               month:ibcFullFreeMonth,
               type:'ibc_recovery',
               freed:hiRateMin+debtA.amount,
-              cascade:debtA.cascade,
+              cascade:surrenderCascade,
               label:'IBC policy surrendered — extra + freed minimums redistributing',
               _ibcRecovery:true,
               _ibcChoice:'cancel',
-              _ibcVehicleAtSurrender:ibcSim.vehicle
+              _ibcVehicleAtSurrender:ibcSim.vehicle,
+              _ibcOptBDestination:optBDest
             });
           } else {
             events.push({
@@ -28167,6 +29314,13 @@ function _cpShowCompletionModal(idx){
     _cpShowActionOnlyCompletionModal(idx);
     return;
   }
+  // ── Debt-specific completion: method picker (how was this debt paid off?) ──
+  // Route through a dedicated modal that asks payoff date, method (plan/lump-sum/refinance/
+  // policy-loan/other), captures milestone note, and runs the right side effects per method.
+  if(a.type === 'debt'){
+    _cpShowDebtPaidOffModal(idx);
+    return;
+  }
   document.getElementById('cmplAllocIdx').value=idx;
   var name=a.customName||CP_NM[a.type]||a.type;
   document.getElementById('cmplTitle').textContent='Complete: '+name;
@@ -28386,6 +29540,205 @@ function _cpStartActionExpense(idx){
     }
   });
 }
+
+// ── Mark-debt-paid-off completion modal ────────────────────────────────────
+// Method-agnostic: works regardless of which strategy got you here. Asks:
+//   1. When did you pay it off? (defaults today)
+//   2. How? (plan / EF lump / windfall / refinance / policy loan / other)
+//   3. Optional milestone note
+// On submit, runs the right side effects and triggers cascade prompt for the
+// freed minimum payment.
+function _cpShowDebtPaidOffModal(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var name = a.customName || CP_NM[a.type] || 'Debt';
+  var debt = (CPLAN.debts || []).find(function(d){return d.name === a.customName || d.id === a._debtId;});
+  var debtBalance = debt ? (parseFloat(debt.balance) || 0) : 0;
+  var debtMin = debt ? (parseFloat(debt.min) || 0) : (parseFloat(a.amount) || 0);
+  
+  var ov = document.getElementById('cpDebtPaidOffOverlay');
+  if(ov)ov.remove();
+  ov = document.createElement('div');
+  ov.id = 'cpDebtPaidOffOverlay';
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10001;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)';
+  
+  var ibcPolicies = (CPLAN.allocations || []).filter(function(other){return other.type === 'ibc' || other.type === 'wl' || other.type === 'iul';});
+  var hasPolicies = ibcPolicies.length > 0;
+  
+  var todayStr = new Date().toISOString().split('T')[0];
+  
+  var h = '<div style="background:var(--bg-card,#0F172A);border:1px solid var(--bd);border-radius:8px;max-width:560px;width:100%;max-height:90vh;overflow-y:auto;color:var(--wh)">';
+  h += '<div style="padding:16px 18px;border-bottom:1px solid var(--bd);display:flex;align-items:center;justify-content:space-between">';
+  h += '<div><div style="font-family:var(--fh);font-size:14px;font-weight:700">🎉 Mark debt paid off: '+esc(name)+'</div>';
+  h += '<div style="font-size:11px;color:var(--mu);margin-top:2px">Tell us how this debt got eliminated</div></div>';
+  h += '<button onclick="document.getElementById(\'cpDebtPaidOffOverlay\').remove()" style="background:transparent;border:none;color:var(--mu);font-size:18px;cursor:pointer">✕</button></div>';
+  h += '<div style="padding:18px;display:flex;flex-direction:column;gap:14px">';
+  
+  // Date
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Payoff date</label>';
+  h += '<input type="date" id="cpDebtPaidOffDate" value="'+todayStr+'" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:3px;box-sizing:border-box"></div>';
+  
+  // Method
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">How was it paid off?</label>';
+  h += '<select id="cpDebtPaidOffMethod" onchange="_cpDebtPaidOffMethodChanged()" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:3px;box-sizing:border-box">';
+  h += '<option value="plan" selected>Through this plan\'s monthly contributions (default)</option>';
+  h += '<option value="ef_lump">Lump sum from emergency fund / savings</option>';
+  h += '<option value="windfall">Lump sum from windfall (bonus, tax refund, gift, inheritance)</option>';
+  h += '<option value="refinance">Refinanced into another loan</option>';
+  if(hasPolicies){
+    h += '<option value="policy_loan">Policy loan (IBC)</option>';
+  }
+  h += '<option value="other">Other / I\'d rather not say</option>';
+  h += '</select></div>';
+  
+  // Method-specific detail container
+  h += '<div id="cpDebtPaidOffDetail" style="display:none"></div>';
+  
+  // Milestone note
+  h += '<div><label style="font-family:var(--fh);font-size:11px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.04em;display:block;margin-bottom:4px">Milestone note <span style="color:var(--mu);font-weight:600">(optional)</span></label>';
+  h += '<input type="text" id="cpDebtPaidOffNote" placeholder="e.g. Took 18 months — felt amazing" style="width:100%;padding:9px 11px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:3px;box-sizing:border-box"></div>';
+  
+  // Cascade question — what happens to the freed min payment?
+  h += '<div style="padding:10px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:3px">';
+  h += '<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;margin-bottom:6px">Where should the '+fmt(debtMin)+'/mo freed payment go?</div>';
+  h += '<select id="cpDebtPaidOffCascade" style="width:100%;padding:8px 10px;background:rgba(0,0,0,.25);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:3px;box-sizing:border-box">';
+  h += '<option value="proportional">Distribute proportionally across growth allocations (default)</option>';
+  // Allow specific allocations as cascade target
+  (CPLAN.allocations || []).forEach(function(other, oi){
+    if(oi === idx) return;
+    if(other._completed) return;
+    if(other.type === 'debt' || other.type === 'ef') return;
+    var oName = other.customName || CP_NM[other.type] || other.type;
+    h += '<option value="'+oi+'">→ Boost: '+esc(oName)+'</option>';
+  });
+  h += '<option value="reallocate">Reallocate (open prompt to decide later)</option>';
+  h += '</select></div>';
+  
+  h += '</div>';
+  
+  // Footer
+  h += '<div style="padding:14px 18px;border-top:1px solid var(--bd);display:flex;gap:8px;justify-content:flex-end">';
+  h += '<button onclick="document.getElementById(\'cpDebtPaidOffOverlay\').remove()" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Cancel</button>';
+  h += '<button onclick="_cpDebtPaidOffSave('+idx+')" style="padding:9px 22px;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">🎉 Mark paid off</button>';
+  h += '</div>';
+  h += '</div>';
+  ov.innerHTML = h;
+  document.body.appendChild(ov);
+}
+
+// Reactive: show extra fields based on payoff method
+function _cpDebtPaidOffMethodChanged(){
+  var m = (document.getElementById('cpDebtPaidOffMethod') || {}).value;
+  var detail = document.getElementById('cpDebtPaidOffDetail');
+  if(!detail) return;
+  if(m === 'policy_loan'){
+    var ibcAllocs = (CPLAN.allocations || []).filter(function(a){return a.type === 'ibc' || a.type === 'wl' || a.type === 'iul';});
+    if(ibcAllocs.length === 0){
+      detail.innerHTML = '<div style="padding:8px 10px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.18);border-radius:3px;font-size:11px;color:var(--mu)">No IBC allocation found. Add one first via the Plan, or pick a different method.</div>';
+      detail.style.display = '';
+      return;
+    }
+    var h = '<div style="padding:10px 12px;background:rgba(168,85,247,.05);border:1px solid rgba(168,85,247,.2);border-radius:3px">';
+    h += '<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#A855F7;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Policy loan details</div>';
+    if(ibcAllocs.length > 1){
+      h += '<div style="margin-bottom:8px"><label style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;text-transform:uppercase;letter-spacing:.04em">Which policy?</label>';
+      h += '<select id="cpDebtPaidOffPolicyIdx" style="width:100%;padding:7px 10px;background:rgba(0,0,0,.3);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:3px;box-sizing:border-box;margin-top:4px">';
+      ibcAllocs.forEach(function(p, i){
+        var idx2 = (CPLAN.allocations || []).indexOf(p);
+        h += '<option value="'+idx2+'">'+esc(p.customName || CP_NM[p.type] || 'Policy')+'</option>';
+      });
+      h += '</select></div>';
+    } else {
+      var idx2 = (CPLAN.allocations || []).indexOf(ibcAllocs[0]);
+      h += '<input type="hidden" id="cpDebtPaidOffPolicyIdx" value="'+idx2+'">';
+      h += '<div style="font-size:11px;color:rgba(226,232,240,.85);margin-bottom:6px">Loan against: <strong style="color:var(--wh)">'+esc(ibcAllocs[0].customName || CP_NM[ibcAllocs[0].type] || 'Policy')+'</strong></div>';
+    }
+    h += '<div style="font-size:10px;color:var(--mu);margin-top:4px">This will increment the policy\'s loan balance and create a repayment line on its IBC card.</div>';
+    h += '</div>';
+    detail.innerHTML = h;
+    detail.style.display = '';
+  } else {
+    detail.innerHTML = '';
+    detail.style.display = 'none';
+  }
+}
+
+function _cpDebtPaidOffSave(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a)return;
+  var dateEl = document.getElementById('cpDebtPaidOffDate');
+  var methodEl = document.getElementById('cpDebtPaidOffMethod');
+  var noteEl = document.getElementById('cpDebtPaidOffNote');
+  var cascadeEl = document.getElementById('cpDebtPaidOffCascade');
+  if(!dateEl || !methodEl) return;
+  
+  var payoffDate = dateEl.value || new Date().toISOString().split('T')[0];
+  var method = methodEl.value || 'plan';
+  var note = noteEl ? noteEl.value : '';
+  var cascade = cascadeEl ? cascadeEl.value : 'proportional';
+  
+  // 1. Mark allocation complete with debt-paid-off metadata
+  a._completed = true;
+  a._completedDate = payoffDate + 'T00:00:00.000Z';
+  a._debtPaidOffMethod = method;
+  if(note) a._milestoneNote = note;
+  
+  // 2. Zero out the debt balance in S.debts (via postMessage to pfos-main)
+  var debtName = a.customName || a._debtName;
+  if(debtName){
+    try{
+      var frame = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+      if(frame && frame.contentWindow){
+        frame.contentWindow.postMessage({type:'PFOS_DEBT_PAID_OFF', debtName: debtName, payoffDate: payoffDate, method: method}, 'https://pfos.esjfinancial.com');
+      }
+    }catch(e){console.warn('PFOS_DEBT_PAID_OFF postMessage:', e);}
+  }
+  
+  // 3. Method-specific side effects
+  if(method === 'policy_loan'){
+    var pliEl = document.getElementById('cpDebtPaidOffPolicyIdx');
+    var pli = pliEl ? parseInt(pliEl.value) : -1;
+    var policy = (pli >= 0) ? CPLAN.allocations[pli] : null;
+    var debt = (CPLAN.debts || []).find(function(d){return d.name === debtName;});
+    var debtBal = debt ? (parseFloat(debt.balance) || 0) : 0;
+    if(policy && debtBal > 0){
+      if(!policy.loans) policy.loans = [];
+      policy.loans.push({
+        id: Date.now(),
+        amount: debtBal,
+        purpose: 'Pay off ' + debtName,
+        originationDate: payoffDate,
+        rate: policy.loanRate || 0.05,
+        repayMonthly: 0
+      });
+      policy.loanBalance = (policy.loanBalance || 0) + debtBal;
+    }
+  }
+  // Other methods (ef_lump, windfall, refinance, plan, other) handled by simulator —
+  // the _completedDate anchor + _debtPaidOffMethod tag let downstream renderers tell
+  // the user what happened without changing simulation logic.
+  
+  // 4. Set cascade preference on this allocation
+  if(cascade && cascade !== 'reallocate'){
+    if(!isNaN(parseInt(cascade))){
+      // User picked a specific allocation as cascade target
+      a._cascadeOverride = parseInt(cascade);
+    } else {
+      a.cascade = cascade;
+    }
+  }
+  
+  var ov = document.getElementById('cpDebtPaidOffOverlay');
+  if(ov)ov.remove();
+  
+  _cpMarkModified();
+  try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
+  _cpRender();
+  
+  // Confetti effect — purely visual, optional
+  if(typeof _cpConfetti === 'function'){try{_cpConfetti();}catch(e){}}
+}
+
 
 // Mark an action-only allocation complete. If `entry` is provided, link the saved
 // expense's id to the allocation so the user can trace it. Triggers a full plan
