@@ -7092,14 +7092,42 @@ function calcIBC(){
   var repayYrs=parseInt(document.getElementById('ibcRepayYrs').value)||5;
   var el=document.getElementById('ibcResults');if(!el||prem<=0)return;
 
-  // Phase 1: Build cash value
-  var cvRate=growth/12;
-  var cvPctOfPrem=type==='wl'?0.30:0.25; // simplified COI allocation
-  var cv=0;
-  for(var m=0;m<buildYrs*12;m++){
-    cv=cv*(1+cvRate)+prem*cvPctOfPrem;
-    if(m>60) cvPctOfPrem=type==='wl'?0.45:0.40;
-    else if(m>24) cvPctOfPrem=type==='wl'?0.38:0.33;
+  // Phase 1: Build cash value with anniversary-anchored crediting (no monthly compounding).
+  // Real WL/IUL policies credit interest annually on policy anniversary, not continuously.
+  // Year-N efficiency curve handles front-loaded acquisition costs.
+  // For high-CV WL (typical IBC design): 55% yr1, 75% yr2-3, 90% yr4-5, 100% after.
+  // For IUL: similar curve but slightly different cost structure.
+  var cv = 0;
+  var premiumSinceAnniv = 0;
+  var lastAnnivCV = 0;
+  function _dashIBCEfficiency(yearNum, type){
+    if(type === 'wl'){
+      // High-CV WL with PUA design — typical IBC use case
+      if(yearNum <= 1) return 0.55;
+      if(yearNum <= 3) return 0.75;
+      if(yearNum <= 5) return 0.90;
+      return 1.00;
+    } else {
+      // IUL — premium load 6%/4%/2% by year, slightly different curve
+      if(yearNum <= 5) return 0.94;  // 6% premium load
+      if(yearNum <= 10) return 0.96; // 4% premium load
+      return 0.98;                    // 2% premium load
+    }
+  }
+  for(var m = 1; m <= buildYrs * 12; m++){
+    premiumSinceAnniv += prem;
+    cv = lastAnnivCV + premiumSinceAnniv;
+    // Annual crediting on each policy anniversary
+    if(m % 12 === 0){
+      var policyYear = m / 12;
+      var efficiency = _dashIBCEfficiency(policyYear, type);
+      var stuckPremiumCV = premiumSinceAnniv * efficiency;
+      // Growth on existing CV at the illustrated net rate
+      var growthOnExistingCV = lastAnnivCV * growth;
+      lastAnnivCV = lastAnnivCV + stuckPremiumCV + growthOnExistingCV;
+      premiumSinceAnniv = 0;
+      cv = lastAnnivCV;
+    }
   }
   var totalPremPaid=prem*12*buildYrs;
 
@@ -7112,13 +7140,28 @@ function calcIBC(){
   var tradTotalPaid=tradMonthly*repayYrs*12;
   var ibcTotalRepaid=monthlyRepay*repayYrs*12;
 
-  // CV continues growing during repayment
-  var cvAfterLoan=cv-loanAmt; // net CV after loan
-  var cvEndOfRepay=cvAfterLoan;
-  for(var m2=0;m2<repayYrs*12;m2++){
-    cvEndOfRepay=cvEndOfRepay*(1+cvRate)+prem*0.45; // continuing premiums
+  // CV continues growing during repayment — anniversary-anchored continuation
+  // using the same year-N efficiency curve from Phase 1.
+  var cvAfterLoan = cv - loanAmt;
+  var cvEndOfRepay = cvAfterLoan;
+  if(repayYrs > 0){
+    var p2_lastAnniv = cvAfterLoan;
+    var p2_premiumSince = 0;
+    for(var m2 = 1; m2 <= repayYrs * 12; m2++){
+      p2_premiumSince += prem;
+      cvEndOfRepay = p2_lastAnniv + p2_premiumSince;
+      if(m2 % 12 === 0){
+        var p2_policyYear = buildYrs + (m2 / 12);
+        var p2_efficiency = _dashIBCEfficiency(p2_policyYear, type);
+        var p2_stuck = p2_premiumSince * p2_efficiency;
+        var p2_growth = p2_lastAnniv * growth;
+        p2_lastAnniv = p2_lastAnniv + p2_stuck + p2_growth;
+        p2_premiumSince = 0;
+        cvEndOfRepay = p2_lastAnniv;
+      }
+    }
   }
-  cvEndOfRepay+=ibcTotalRepaid; // loan repaid back to policy
+  cvEndOfRepay += ibcTotalRepaid; // loan repaid back to policy
 
   // Interest savings
   var tradInterest=tradTotalPaid-debt;
@@ -8350,11 +8393,26 @@ function calcGenWealth(){
     if(i>0) cv+=prevDB;// inherit death benefit
     var startCV=cv;
     var yearMilestones=[];
-    for(var m=0;m<g.yrs*12;m++){
-      var cvFactor=m>120?0.45:m>60?0.35:0.25;
-      cv=cv*(1+mr)+genPrem*cvFactor;
-      totalPrem+=genPrem;
-      if((m+1)%120===0) yearMilestones.push({yr:(m+1)/12,cv:Math.round(cv)});
+    // Anniversary-anchored crediting (no monthly compounding) — matches how WL
+    // policies actually credit dividends: once per anniversary on year-end value.
+    var annualGrowthRate = mr * 12;
+    var lastAnnivCV = cv;
+    var premiumSinceAnniv = 0;
+    for(var m=1; m<=g.yrs*12; m++){
+      premiumSinceAnniv += genPrem;
+      cv = lastAnnivCV + premiumSinceAnniv;
+      totalPrem += genPrem;
+      if(m % 12 === 0){
+        // Year-N efficiency: high-CV WL design, 55% yr1 → 100% yr5+
+        var policyYear = m / 12;
+        var efficiency = policyYear <= 1 ? 0.55 : policyYear <= 3 ? 0.75 : policyYear <= 5 ? 0.90 : 1.00;
+        var stuckPremiumCV = premiumSinceAnniv * efficiency;
+        var growthOnExisting = lastAnnivCV * annualGrowthRate;
+        lastAnnivCV = lastAnnivCV + stuckPremiumCV + growthOnExisting;
+        premiumSinceAnniv = 0;
+        cv = lastAnnivCV;
+      }
+      if(m % 120 === 0) yearMilestones.push({yr:m/12,cv:Math.round(cv)});
     }
     var db=Math.max(cv*2,cv+500000);prevDB=db;
     genData.push({name:g.name,icon:g.icon,col:g.col,prem:genPrem,startCV:Math.round(startCV),cv:Math.round(cv),db:Math.round(db),totalPrem:Math.round(totalPrem),milestones:yearMilestones,inherited:i>0?Math.round(startCV):0});
