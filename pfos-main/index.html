@@ -4303,6 +4303,38 @@ function qaPayMethodChange(){
     h2+='<div style="font-size:10px;color:var(--mu);margin-top:4px">This will be added to your debts and tracked across your financial plan.</div>';
     h2+='</div>';
     detail.innerHTML=h2;detail.style.display='';return;}
+  // ── policy_loan branch — gates on having an IBC policy, shows which-policy picker if multiple ──
+  if(pay.value==='policy_loan'){
+    var ibcPolicies = S.ibcPolicies || [];
+    var allPolicies = ibcPolicies.length > 0 ? ibcPolicies : (S.policies || []).filter(function(p){
+      var t = (p.type || '').toLowerCase();
+      return t.indexOf('whole') >= 0 || t.indexOf('wl') >= 0 || t.indexOf('iul') >= 0;
+    });
+    if(allPolicies.length === 0){
+      detail.innerHTML = '<div style="padding:10px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.15);border-radius:2px;margin-top:8px;font-size:11px;color:var(--mu)">'
+        + '<strong style="color:var(--yl)">No IBC policy on file.</strong> '
+        + 'Add a participating whole life or IUL policy in My Financial Data first to use policy loans.</div>';
+      detail.style.display = ''; return;
+    }
+    var hPL = '<div style="padding:10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.18);border-radius:2px;margin-top:8px">';
+    hPL += '<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:8px">Policy Loan Details</div>';
+    if(allPolicies.length > 1){
+      hPL += '<div class="fi"><label class="lb">Which Policy?</label><select class="sel" id="qaPolicyIdx" style="min-height:36px">';
+      allPolicies.forEach(function(p, i){
+        var label = (p.company || p.carrier || 'Policy') + ' — ' + (p.type || 'WL/IUL');
+        if(p.faceAmount) label += ' · ' + fmt(p.faceAmount);
+        hPL += '<option value="' + i + '">' + escH(label) + '</option>';
+      });
+      hPL += '</select></div>';
+    } else {
+      hPL += '<input type="hidden" id="qaPolicyIdx" value="0">';
+      hPL += '<div style="font-size:11px;color:rgba(226,232,240,.85);margin-bottom:8px">Loan against: <strong style="color:var(--wh)">' + escH((allPolicies[0].company || allPolicies[0].carrier || 'Policy') + ' — ' + (allPolicies[0].type || 'WL/IUL')) + '</strong></div>';
+    }
+    hPL += '<div class="fi"><label class="lb">Purpose <span style="color:var(--mu);font-weight:400">(optional)</span></label><input class="inp" type="text" id="qaPolicyLoanPurpose" placeholder="e.g. Pay off credit card, Auto purchase" style="min-height:36px"></div>';
+    hPL += '<div style="font-size:10px;color:var(--mu);margin-top:4px">This will increment your policy\'s outstanding loan balance and track the purpose for future reference. Loan accrues interest at your policy\'s loan rate.</div>';
+    hPL += '</div>';
+    detail.innerHTML = hPL; detail.style.display = ''; return;
+  }
   detail.innerHTML='';detail.style.display='none';
 }
 function simplifyCategory(cat){var map={housing:'housing',utilities:'housing',food:'food',transportation:'transportation',insurance:'housing',subscriptions:'entertainment',discretionary:'entertainment',activeSavings:'other',misc:'other'};return map[cat]||'other';}
@@ -4320,6 +4352,32 @@ function saveSpendingEntry(){
     var newDebt={id:Date.now(),name:finName,type:finType,balance:amt,rate:finRate,min:finMin,actual:finMin};
     S.debts.push(newDebt);
     entry.payment_detail={debt_id:newDebt.id,debt_name:finName,rate:finRate,type:finType};
+  }
+  // ── Policy loan: increment chosen IBC policy's loan balance + track purpose ──
+  if(entry.payment_method==='policy_loan'){
+    var pliRaw = (document.getElementById('qaPolicyIdx') || {}).value;
+    var pli = (pliRaw != null && pliRaw !== '') ? parseInt(pliRaw) : 0;
+    var pPurpose = (document.getElementById('qaPolicyLoanPurpose') || {}).value || entry.description || 'Policy loan';
+    if(!S.ibcPolicies) S.ibcPolicies = [];
+    var allPolicies = S.ibcPolicies.length > 0 ? S.ibcPolicies : (S.policies || []).filter(function(p){
+      var t = (p.type || '').toLowerCase();
+      return t.indexOf('whole') >= 0 || t.indexOf('wl') >= 0 || t.indexOf('iul') >= 0;
+    });
+    if(allPolicies[pli]){
+      var pol = allPolicies[pli];
+      pol.loanBalance = (parseFloat(pol.loanBalance) || 0) + amt;
+      // Track loans array so each loan has its own purpose/origination date
+      if(!pol.loans) pol.loans = [];
+      pol.loans.push({
+        id: Date.now(),
+        amount: amt,
+        purpose: pPurpose,
+        originationDate: entry.date || new Date().toISOString().split('T')[0],
+        rate: pol.loanRate || 0.05,
+        spendingEntryId: entry.id
+      });
+      entry.payment_detail = {policy_idx: pli, purpose: pPurpose, policy_name: (pol.company || pol.carrier || 'Policy')};
+    }
   }
   if(entry.payment_method==='emergency_fund'){var sv=parseFloat(gv('aSavings'))||0;var se=document.getElementById('aSavings');if(se)se.value=Math.max(0,sv-amt);}
   if(!S.spendingEntries)S.spendingEntries=[];
@@ -9903,6 +9961,30 @@ function submitAdvisorRequestFromModal(){
           var se=document.getElementById('aSavings');
           if(se)se.value=Math.max(0,sv-normalized.amount);
         }
+        // 4) policy_loan → increment chosen IBC policy's loanBalance + push to loans[] for tracking
+        if(normalized.payment_method==='policy_loan' && normalized.payment_detail && normalized.payment_detail._incrementLoanBalance){
+          if(!S.ibcPolicies) S.ibcPolicies = [];
+          var pli2 = parseInt(normalized.payment_detail.policy_idx) || 0;
+          var allPolicies2 = S.ibcPolicies.length > 0 ? S.ibcPolicies : (S.policies || []).filter(function(p){
+            var t = (p.type || '').toLowerCase();
+            return t.indexOf('whole') >= 0 || t.indexOf('wl') >= 0 || t.indexOf('iul') >= 0;
+          });
+          if(allPolicies2[pli2]){
+            var pol2 = allPolicies2[pli2];
+            pol2.loanBalance = (parseFloat(pol2.loanBalance) || 0) + normalized.amount;
+            if(!pol2.loans) pol2.loans = [];
+            pol2.loans.push({
+              id: Date.now(),
+              amount: normalized.amount,
+              purpose: normalized.payment_detail.purpose || normalized.description || 'Policy loan',
+              originationDate: normalized.date,
+              rate: pol2.loanRate || 0.05,
+              spendingEntryId: normalized.id
+            });
+            // Replace flag with canonical reference
+            normalized.payment_detail = {policy_idx: pli2, purpose: normalized.payment_detail.purpose, policy_name: (pol2.company || pol2.carrier || 'Policy')};
+          }
+        }
         S.spendingEntries.push(normalized);
         // Recalc + persist (debounced to coalesce with any other changes)
         try{if(typeof calc==='function')calc();}catch(e){}
@@ -9911,6 +9993,30 @@ function submitAdvisorRequestFromModal(){
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
         else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
       }catch(e){console.warn('PFOS_QUICK_ADD:',e);}
+      return;
+    }
+    // ── PFOS_DEBT_PAID_OFF ──
+    // Sent from pfos-client when user marks a debt complete via the new debt
+    // completion modal. Zeroes the matching debt balance, tags it with the
+    // payoff date and method. Persists.
+    if(msg.type==='PFOS_DEBT_PAID_OFF'){
+      try{
+        var debtName = msg.debtName;
+        var payoffDate = msg.payoffDate || new Date().toISOString().split('T')[0];
+        var method = msg.method || 'plan';
+        if(!debtName || !S.debts)return;
+        var matched = S.debts.find(function(d){return d.name === debtName;});
+        if(matched){
+          matched.balance = 0;
+          matched._paidOff = true;
+          matched._paidOffDate = payoffDate;
+          matched._paidOffMethod = method;
+          if(typeof calc==='function'){try{calc();}catch(e){}}
+          clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+          if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+          else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+        }
+      }catch(e){console.warn('PFOS_DEBT_PAID_OFF:',e);}
       return;
     }
     // Receive new savings goal from portal overlay. Same pattern as PFOS_QUICK_ADD —
@@ -11243,14 +11349,38 @@ function calcIBC(){
   var repayYrs=parseInt(document.getElementById('ibcRepayYrs').value)||5;
   var el=document.getElementById('ibcResults');if(!el||prem<=0)return;
 
-  // Phase 1: Build cash value
-  var cvRate=growth/12;
-  var cvPctOfPrem=type==='wl'?0.30:0.25; // simplified COI allocation
-  var cv=0;
-  for(var m=0;m<buildYrs*12;m++){
-    cv=cv*(1+cvRate)+prem*cvPctOfPrem;
-    if(m>60) cvPctOfPrem=type==='wl'?0.45:0.40;
-    else if(m>24) cvPctOfPrem=type==='wl'?0.38:0.33;
+  // Phase 1: Build cash value with anniversary-anchored crediting (no monthly compounding).
+  // Real WL/IUL policies credit interest annually on policy anniversary, not continuously.
+  // Year-N efficiency curve handles front-loaded acquisition costs (for high-CV WL/IUL designs).
+  var cv = 0;
+  var premiumSinceAnniv = 0;
+  var lastAnnivCV = 0;
+  function _mainIBCEfficiency(yearNum, type){
+    if(type === 'wl'){
+      // High-CV WL with PUA design — typical IBC use case
+      if(yearNum <= 1) return 0.55;
+      if(yearNum <= 3) return 0.75;
+      if(yearNum <= 5) return 0.90;
+      return 1.00;
+    } else {
+      // IUL — premium load 6%/4%/2% by year
+      if(yearNum <= 5) return 0.94;
+      if(yearNum <= 10) return 0.96;
+      return 0.98;
+    }
+  }
+  for(var m = 1; m <= buildYrs * 12; m++){
+    premiumSinceAnniv += prem;
+    cv = lastAnnivCV + premiumSinceAnniv;
+    if(m % 12 === 0){
+      var policyYear = m / 12;
+      var efficiency = _mainIBCEfficiency(policyYear, type);
+      var stuckPremiumCV = premiumSinceAnniv * efficiency;
+      var growthOnExistingCV = lastAnnivCV * growth;
+      lastAnnivCV = lastAnnivCV + stuckPremiumCV + growthOnExistingCV;
+      premiumSinceAnniv = 0;
+      cv = lastAnnivCV;
+    }
   }
   var totalPremPaid=prem*12*buildYrs;
 
@@ -11263,13 +11393,30 @@ function calcIBC(){
   var tradTotalPaid=tradMonthly*repayYrs*12;
   var ibcTotalRepaid=monthlyRepay*repayYrs*12;
 
-  // CV continues growing during repayment
-  var cvAfterLoan=cv-loanAmt; // net CV after loan
-  var cvEndOfRepay=cvAfterLoan;
-  for(var m2=0;m2<repayYrs*12;m2++){
-    cvEndOfRepay=cvEndOfRepay*(1+cvRate)+prem*0.45; // continuing premiums
+  // CV continues growing during repayment — anniversary-anchored continuation
+  // using the same year-N efficiency curve as Phase 1. The loan principal is
+  // added back at the end since it gets repaid into the policy.
+  var cvAfterLoan = cv - loanAmt;
+  var cvEndOfRepay = cvAfterLoan;
+  if(repayYrs > 0){
+    var p2_lastAnniv = cvAfterLoan;
+    var p2_premiumSince = 0;
+    for(var m2 = 1; m2 <= repayYrs * 12; m2++){
+      p2_premiumSince += prem;
+      cvEndOfRepay = p2_lastAnniv + p2_premiumSince;
+      if(m2 % 12 === 0){
+        // Year continues from policy's overall year — buildYrs already elapsed
+        var p2_policyYear = buildYrs + (m2 / 12);
+        var p2_efficiency = _mainIBCEfficiency(p2_policyYear, type);
+        var p2_stuck = p2_premiumSince * p2_efficiency;
+        var p2_growth = p2_lastAnniv * growth;
+        p2_lastAnniv = p2_lastAnniv + p2_stuck + p2_growth;
+        p2_premiumSince = 0;
+        cvEndOfRepay = p2_lastAnniv;
+      }
+    }
   }
-  cvEndOfRepay+=ibcTotalRepaid; // loan repaid back to policy
+  cvEndOfRepay += ibcTotalRepaid; // loan repaid back to policy
 
   // Interest savings
   var tradInterest=tradTotalPaid-debt;
@@ -12500,11 +12647,27 @@ function calcGenWealth(){
     if(i>0) cv+=prevDB;// inherit death benefit
     var startCV=cv;
     var yearMilestones=[];
-    for(var m=0;m<g.yrs*12;m++){
-      var cvFactor=m>120?0.45:m>60?0.35:0.25;
-      cv=cv*(1+mr)+genPrem*cvFactor;
-      totalPrem+=genPrem;
-      if((m+1)%120===0) yearMilestones.push({yr:(m+1)/12,cv:Math.round(cv)});
+    // Anniversary-anchored crediting (no monthly compounding) — matches how WL
+    // policies actually credit dividends: once per anniversary, applied to year-end
+    // accumulated value. The annualized rate is mr*12 since mr was the monthly rate.
+    var annualGrowthRate = mr * 12;
+    var lastAnnivCV = cv;
+    var premiumSinceAnniv = 0;
+    for(var m=1; m<=g.yrs*12; m++){
+      premiumSinceAnniv += genPrem;
+      cv = lastAnnivCV + premiumSinceAnniv;
+      totalPrem += genPrem;
+      if(m % 12 === 0){
+        // Year-N efficiency: high-CV WL design, 55% yr1 → 100% yr5+
+        var policyYear = m / 12;
+        var efficiency = policyYear <= 1 ? 0.55 : policyYear <= 3 ? 0.75 : policyYear <= 5 ? 0.90 : 1.00;
+        var stuckPremiumCV = premiumSinceAnniv * efficiency;
+        var growthOnExisting = lastAnnivCV * annualGrowthRate;
+        lastAnnivCV = lastAnnivCV + stuckPremiumCV + growthOnExisting;
+        premiumSinceAnniv = 0;
+        cv = lastAnnivCV;
+      }
+      if(m % 120 === 0) yearMilestones.push({yr:m/12,cv:Math.round(cv)});
     }
     var db=Math.max(cv*2,cv+500000);prevDB=db;
     genData.push({name:g.name,icon:g.icon,col:g.col,prem:genPrem,startCV:Math.round(startCV),cv:Math.round(cv),db:Math.round(db),totalPrem:Math.round(totalPrem),milestones:yearMilestones,inherited:i>0?Math.round(startCV):0});
