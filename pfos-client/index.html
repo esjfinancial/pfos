@@ -21864,7 +21864,20 @@ function _cpConvertAIRecs(aiData){
     if(r.tax_impact&&r.tax_impact!=='None')reason+='\n🏛️ Tax: '+r.tax_impact;
     // Phase D: preserve owner tag from AI; default to 'self' if missing or invalid
     var _ownerTag=(r.owner&&['self','spouse','joint'].indexOf(r.owner)>=0)?r.owner:'self';
-    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag});
+    // B1: Derive _ibcUnderlyingType from AI strategy so IBC-IUL allocations get
+    // the correct 5.5% rate (instead of 4% WL fallback in _cpGetGrossRate). For
+    // standalone IUL/WL allocations this field is unused but harmless to set.
+    var _strat=(r.strategy||'').toLowerCase();
+    var _underlying=null;
+    if(map.type==='ibc'){
+      // ibc_iul → IUL underlying; ibc_wl, ibc, or anything else → WL (conservative default)
+      _underlying=_strat==='ibc_iul'?'iul':'wl';
+    } else if(map.type==='iul'){
+      _underlying='iul';
+    } else if(map.type==='wl'){
+      _underlying='wl';
+    }
+    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying});
     usedPool+=amt;
   });
 
@@ -22038,6 +22051,59 @@ function _cpConvertAIRecs(aiData){
     CPLAN.allocations.push({type:'protection',amount:0,target:0,phase:1,cascade:'',customName:'Life Insurance Review',reason:'Auto-added: protection review required for plan health.'});
   }
 
+  // Fix PP11 (B2 enforcement): Insurance uniqueness — at most ONE permanent
+  // product per purpose lane. Lanes: banking (any 'ibc'), retirement (standalone
+  // 'iul' or 'wl' not associated with edu), education (any 'edu' with eduVehicle
+  // 'iul' or 'wl'). If AI returns multiple in the same lane, keep the first and
+  // drop the rest. The AI rule ALSO forbids this, but defensive code in case the
+  // AI violates it.
+  (function _enforceInsuranceUniqueness(){
+    var seenLanes={banking:false,retirement:false,education:false};
+    var keep=[];
+    var droppedFor=null;
+    CPLAN.allocations.forEach(function(a){
+      var lane=null;
+      if(a.type==='ibc'&&a.amount>0)lane='banking';
+      else if((a.type==='iul'||a.type==='wl')&&a.amount>0)lane='retirement';
+      else if(a.type==='edu'&&(a.eduVehicle==='iul'||a.eduVehicle==='wl')&&a.amount>0)lane='education';
+      if(lane){
+        if(seenLanes[lane]){
+          // Already have a product in this lane — drop this one. Capture the
+          // dropped premium so we can redistribute (next defensive pass).
+          droppedFor=lane;
+          return;
+        }
+        seenLanes[lane]=true;
+      }
+      keep.push(a);
+    });
+    CPLAN.allocations=keep;
+    if(droppedFor){
+      // Optional: surface a console note for debugging. We don't surface to user
+      // because the AI was supposed to follow the rule.
+      try{console.warn('[PFOS] Dropped duplicate insurance allocation in lane:',droppedFor);}catch(e){}
+    }
+  })();
+
+  // Fix PP12 (E5 phantom $0 dropper): Any non-action allocation with amount=0
+  // shouldn't have been created — it's the result of pool exhaustion in the
+  // initial conversion loop. Drop them so the user doesn't see empty cards.
+  // Action-only types (protection, custom estate, umbrella, etc.) are KEPT
+  // because they're intentionally amount=0 and represent things the user must
+  // act on, not fund.
+  var _actionOnlyForDrop={protection:1,umbrella:1,annuity_research:1,ibc_audit:1,diversify:1};
+  CPLAN.allocations=CPLAN.allocations.filter(function(a){
+    if(a.amount>0)return true;
+    if(_actionOnlyForDrop[a.type])return true;
+    // type 'custom' with $0 might be an estate item (legitimate action) —
+    // keep if customName looks like an estate/legal action.
+    if(a.type==='custom'&&a.customName){
+      var n=a.customName.toLowerCase();
+      if(n.indexOf('estate')>=0||n.indexOf('will')>=0||n.indexOf('trust')>=0||n.indexOf('poa')>=0||n.indexOf('beneficiary')>=0||n.indexOf('guardian')>=0)return true;
+    }
+    return false; // drop other $0 allocations (phantom over-budget items)
+  });
+
   if(aiData.summary)CPLAN._aiSummary=aiData.summary;
   if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
   if(aiData.debtStrategy)CPLAN.debtStrategy=aiData.debtStrategy;
@@ -22078,7 +22144,7 @@ function _cpShowApproachFork(){
   var cards=[
     {key:'traditional',label:'Traditional',icon:'📊',desc:'401k, Roth IRA, index funds, 529 plans, term life. Proven, widely-accepted vehicles.',color:'#5B9BFF',taxRatio:1},
     {key:'tax_free',label:'Tax-Free Income',icon:'🛡️',desc:'Roth IRA, HSA, IUL, Whole Life, IBC. Tax-free access via policy loans and Roth withdrawals.',color:'#22C55E',taxRatio:0},
-    {key:'hybrid',label:'Hybrid',icon:'⚡',desc:'Best vehicle for each purpose regardless of category. AI recommended based on your specific numbers.',color:'#A855F7',taxRatio:0.5}
+    {key:'hybrid',label:'Hybrid',icon:'⚡',desc:'Best vehicle for each purpose regardless of category. Mathematically optimized based on your specific numbers.',color:'#A855F7',taxRatio:0.5}
   ];
   var h='<div style="padding:20px">';
   h+='<div style="text-align:center;margin-bottom:24px">';
@@ -22092,7 +22158,8 @@ function _cpShowApproachFork(){
     var failed=ap.hasOwnProperty(cd.key)&&!data;
     var isHybrid=cd.key==='hybrid';
     h+='<div style="background:'+(isHybrid?'linear-gradient(145deg,rgba(168,85,247,.08),rgba(91,155,255,.04))':'rgba(0,68,191,.04)')+';border:2px solid '+(isHybrid?'rgba(168,85,247,.3)':'rgba(0,68,191,.1)')+';border-radius:8px;padding:24px 20px;text-align:center;position:relative;transition:border-color .2s" onmouseover="this.style.borderColor=\''+cd.color+'\'" onmouseout="this.style.borderColor=\''+(isHybrid?'rgba(168,85,247,.3)':'rgba(0,68,191,.1)')+'\'">';
-    if(isHybrid)h+='<div style="position:absolute;top:-10px;left:50%;transform:translateX(-50%);background:var(--pu);color:#fff;font-family:var(--fh);font-size:8px;font-weight:800;padding:3px 10px;border-radius:10px;letter-spacing:.1em">AI RECOMMENDED</div>';
+    // F7 fix: removed AI RECOMMENDED badge to maintain neutrality. Platform should
+    // not editorialize between approaches.
     h+='<div style="font-size:32px;margin-bottom:8px">'+cd.icon+'</div>';
     h+='<div style="font-family:var(--fh);font-size:16px;font-weight:800;color:var(--wh);margin-bottom:4px">'+cd.label+'</div>';
     h+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin-bottom:16px;min-height:36px">'+cd.desc+'</div>';
@@ -22109,8 +22176,17 @@ function _cpShowApproachFork(){
       // Success — show data with tax breakdown
       var hl=data.headline||{};
       var retVal=hl.projected_retirement_value||0;
-      var monthlyCost=hl.total_monthly_cost||0;
-      // Calculate retirement income using SAME formula as bottom bar (retirement-only vehicles, 4% rule)
+      // F1 fix: recompute monthlyCost from actual allocations rather than trusting
+      // the AI's headline.total_monthly_cost (which sometimes disagrees with the
+      // sum, producing the "Hybrid $2,300 vs plan $2,550" mismatch).
+      var monthlyCost=0;
+      if(data.allocations&&data.allocations.length>0){
+        monthlyCost=data.allocations.reduce(function(t,al){return t+(al.monthly_cost||al.amount||0);},0);
+      }
+      if(monthlyCost===0)monthlyCost=hl.total_monthly_cost||0;
+      // A3 fix: per-strategy rate must distinguish IBC-IUL (5.5%) from IBC-WL (4%).
+      // Previously both `ibc_wl` and `ibc_iul` mapped to type='ibc' and got 4%
+      // regardless of underlying. Now we read strategy directly to set the rate.
       var _retVehiclesAppr=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
       var _apprStratMap={'roth_ira':'roth','roth_401k':'roth401k','401k':'401k','traditional_ira':'trad_ira','solo_401k':'solo401k','sep_ira':'sep_ira','iul':'iul','whole_life':'wl','ibc_wl':'ibc','ibc_iul':'ibc','ibc':'ibc','hsa':'hsa'};
       var _apprYrs=Math.max(1,65-(CPLAN.age||35));
@@ -22118,12 +22194,14 @@ function _cpShowApproachFork(){
       if(data.allocations&&data.allocations.length>0){
         data.allocations.forEach(function(al){
           var amt=al.monthly_cost||al.amount||0;if(amt<=0)return;
-          var rawStrat=al.strategy||al.type||'';
+          var rawStrat=(al.strategy||al.type||'').toLowerCase();
           var aType=_apprStratMap[rawStrat]||rawStrat;
           if(_retVehiclesAppr.indexOf(aType)<0)return;
-          var rate=0.065;// Default net return assumption
-          if(aType==='wl'||aType==='ibc')rate=0.04;
+          var rate=0.065;// Default net return assumption (matches _cpGetGrossRate non-insurance default after fees)
+          if(aType==='wl')rate=0.04;
           else if(aType==='iul')rate=0.055;
+          else if(aType==='ibc')rate=(rawStrat==='ibc_iul')?0.055:0.04; // honor underlying
+          else if(aType==='hsa')rate=0.055; // 6% gross - 0.5% fees
           var bal=0;for(var _ay=1;_ay<=_apprYrs;_ay++){bal=(bal+amt*12)*(1+rate);}
           _apprRetVal+=bal;
         });
@@ -22137,7 +22215,7 @@ function _cpShowApproachFork(){
       h+='<div style="margin-bottom:14px">';
       h+='<div style="font-family:var(--fd);font-size:28px;color:'+cd.color+'">'+fmtK(retVal)+'</div>';
       h+='<div style="font-size:10px;color:var(--mu)">projected at retirement</div>';
-      h+='<div style="font-size:8px;color:var(--mu);opacity:.6">Phase 1 estimate — full projection with cascade boosts shown in plan view</div>';
+      h+='<div style="font-size:8px;color:var(--mu);opacity:.6">Estimated end-state — see plan view for the full year-by-year trajectory</div>';
       h+='</div>';
       // Retirement income with tax breakdown
       h+='<div style="margin-bottom:14px;padding:10px;background:rgba(0,0,0,.15);border-radius:4px">';
@@ -23048,10 +23126,28 @@ function _cpBuildCard(a,idx,isUnassigned){
   // Slider + manual input — hide for action-only items
   if(!_isActionOnly){
   var _slMax=_cpSliderMax(a.type,idx);
+  // P4: Insurance premium lock. Once a permanent-insurance allocation is marked
+  // Done (the user opened the policy), the premium becomes LOCKED — it cannot
+  // be increased. The user can only decrease it (effectively surrendering the
+  // policy or reducing coverage). Adding more money requires opening a NEW
+  // policy with a distinct identity. Reason: insurance must be max-funded from
+  // day 1 to minimize fees and stay within MEC limits.
+  var _isPermInsForLock=(a.type==='iul'||a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&(a.eduVehicle==='wl'||a.eduVehicle==='iul')));
+  var _premiumLocked=_isPermInsForLock&&!!a._completed;
+  if(_premiumLocked){
+    // Cap slider max at the current amount — the user cannot go above this.
+    _slMax=a.amount;
+  }
   h+='<div style="display:flex;align-items:center;gap:8px;margin:4px 0">';
-  h+='<input type="range" data-cpidx="'+idx+'" min="0" max="'+_slMax+'" step="5" value="'+Math.min(a.amount,_slMax)+'" oninput="_cpSlide('+idx+',this.value);var _mi=document.getElementById(\'cpManual'+idx+'\');if(_mi){var _rv=String(this.value).replace(/\\B(?=(\\d{3})+(?!\\d))/g,\',\');_mi.value=_rv}" onchange="_cpSlideEnd()" style="flex:1;accent-color:'+color+';height:6px">';
+  h+='<input type="range" data-cpidx="'+idx+'" min="0" max="'+_slMax+'" step="5" value="'+Math.min(a.amount,_slMax)+'" oninput="_cpSlide('+idx+',this.value);var _mi=document.getElementById(\'cpManual'+idx+'\');if(_mi){var _rv=String(this.value).replace(/\\B(?=(\\d{3})+(?!\\d))/g,\',\');_mi.value=_rv}" onchange="_cpSlideEnd()" style="flex:1;accent-color:'+color+';height:6px"'+(_premiumLocked?' title="Premium locked at $'+a.amount+'/mo — see lock icon"':'')+'>';
   h+='<div class="inp-prefix" style="width:100px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" data-cpidx="'+idx+'" id="cpManual'+idx+'" value="'+a.amount+'" min="0" max="'+_slMax+'" step="5" oninput="var _raw=this.value.replace(/[^0-9]/g,\'\');_cpSlide('+idx+',_raw);var _sl=this.parentElement.previousElementSibling;if(_sl)_sl.value=_raw" style="padding-left:22px;min-height:32px;font-size:12px;width:100%"></div>';
   h+='</div>';
+  if(_premiumLocked){
+    h+='<div style="display:flex;align-items:center;gap:6px;margin-top:2px;padding:6px 8px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.18);border-radius:3px">';
+    h+='<span style="font-size:11px">🔒</span>';
+    h+='<span style="font-size:9px;color:rgba(226,232,240,.85);line-height:1.4">Premium locked at $'+fmt(a.amount)+'/mo. Insurance must be max-funded from day one to minimize fees and stay within MEC limits. To add more, open a <strong>new policy</strong>. To reduce, lower the slider — that represents surrendering or partial reduction.</span>';
+    h+='</div>';
+  }
   }
   // IRS note — skip for insurance products (no IRS contribution limit)
   var _isInsType=a.type==='iul'||a.type==='wl'||a.type==='ibc';
@@ -23066,7 +23162,30 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _gRate=Math.round((typeof _cpGetGrossRate==='function'?_cpGetGrossRate(a):0.07)*10000)/100;
     var _fRate=_isInsurance?0:Math.round((typeof _cpGetFeeRate==='function'?_cpGetFeeRate(a):0)*10000)/100;
     var _nRate=_isInsurance?_gRate:Math.round((_gRate-_fRate)*100)/100;
-    var _yr5=0,_yr10=0,_yr20=0;var _mr=_nRate/100;var _cf2=_cpGetCF(a);for(var _yp=1;_yp<=20;_yp++){var _c=a.amount*12*_cf2;_yr5=_yp<=5?(_yr5+_c)*(1+_mr):_yr5;_yr10=_yp<=10?(_yr10+_c)*(1+_mr):_yr10;_yr20=(_yr20+_c)*(1+_mr);}
+    // A4 fix: insurance vehicles use _ibcProjectPolicy (same engine as the mini-chart)
+    // so 5/10/20yr tiles match the chart endpoint. Non-insurance keeps simple compounding.
+    var _yr5=0,_yr10=0,_yr20=0;
+    if(_isInsurance&&typeof _ibcProjectPolicy==='function'){
+      var _tileType;
+      if(a.type==='iul'||(a.type==='edu'&&a.eduVehicle==='iul'))_tileType='iul';
+      else if(a.type==='wl'||(a.type==='edu'&&a.eduVehicle==='wl'))_tileType='wl';
+      else _tileType=a._ibcUnderlyingType||'wl';
+      var _tileParams=Object.assign({},_ibcPolicyDefaults(_tileType),{monthlyPremium:a.amount||0});
+      var _r5=_ibcProjectPolicy(_tileParams,0,60);
+      var _r10=_ibcProjectPolicy(_tileParams,0,120);
+      var _r20=_ibcProjectPolicy(_tileParams,0,240);
+      _yr5=(_r5&&_r5.data&&_r5.data.length)?_r5.data[_r5.data.length-1].cv:0;
+      _yr10=(_r10&&_r10.data&&_r10.data.length)?_r10.data[_r10.data.length-1].cv:0;
+      _yr20=(_r20&&_r20.data&&_r20.data.length)?_r20.data[_r20.data.length-1].cv:0;
+    } else {
+      var _mr=_nRate/100;var _cf2=_cpGetCF(a);
+      for(var _yp=1;_yp<=20;_yp++){
+        var _c=a.amount*12*_cf2;
+        _yr5=_yp<=5?(_yr5+_c)*(1+_mr):_yr5;
+        _yr10=_yp<=10?(_yr10+_c)*(1+_mr):_yr10;
+        _yr20=(_yr20+_c)*(1+_mr);
+      }
+    }
     h+='<div style="margin-top:6px;padding:8px 10px;background:rgba(91,155,255,.03);border:1px solid rgba(91,155,255,.08);border-radius:2px">';
     if(_isInsurance){
       h+='<div style="margin-bottom:6px"><span style="font-size:11px;color:var(--mu)">Illustrated net rate: <strong style="color:var(--gr)">'+_nRate.toFixed(1)+'%</strong></span><div style="font-size:8px;color:var(--mu);margin-top:2px">Policy charges vary by carrier, age, and structure. Not an AG49-A compliant illustration.</div></div>';
@@ -24818,16 +24937,19 @@ function _cpIRSMax(type){
   var age=CPLAN.age||30;var is50=age>=50;
   var annualInc=CPLAN.income*12;
   var filing=CPLAN.marital;var isMFJ=filing==='Married'||filing==='Domestic Partnership';
+  // 2026 IRS contribution limits (projected from SECURE 2.0 inflation adjustments).
+  // Update these annually as IRS publishes official numbers each November.
   if(type==='roth'){
-    var limit=is50?8000:7000;
-    if(isMFJ){if(annualInc>254000)limit=0;else if(annualInc>244000)limit=Math.round(limit*(254000-annualInc)/10000);}
-    else{if(annualInc>170000)limit=0;else if(annualInc>155000)limit=Math.round(limit*(170000-annualInc)/15000);}
+    var limit=is50?8500:7500;
+    // 2026 Roth phase-out (projected): MFJ $246K-$256K, single $156K-$171K
+    if(isMFJ){if(annualInc>256000)limit=0;else if(annualInc>246000)limit=Math.round(limit*(256000-annualInc)/10000);}
+    else{if(annualInc>171000)limit=0;else if(annualInc>156000)limit=Math.round(limit*(171000-annualInc)/15000);}
     return Math.round(limit/12);
   }
-  if(type==='401k'||type==='roth401k')return Math.round((is50?31500:24000)/12);
-  if(type==='trad_ira'||type==='ira')return Math.round((is50?8000:7000)/12);
-  if(type==='solo401k')return Math.round((is50?77500:70000)/12);
-  if(type==='sep_ira'){var sepMax=Math.min(70000,annualInc*0.25);return Math.round(sepMax/12);}
+  if(type==='401k'||type==='roth401k')return Math.round((is50?32000:24500)/12);
+  if(type==='trad_ira'||type==='ira')return Math.round((is50?8500:7500)/12);
+  if(type==='solo401k')return Math.round((is50?78500:71000)/12);
+  if(type==='sep_ira'){var sepMax=Math.min(71000,annualInc*0.25);return Math.round(sepMax/12);}
   if(type==='hsa'){var fam=(CPLAN.children&&CPLAN.children.length>0)||isMFJ;return Math.round((fam?8750:4400)/12);}
   if(type==='coverdell')return Math.round(2000/12);
   return Math.max(Math.min(CPLAN.surplus||1,15000),100);
@@ -24873,16 +24995,17 @@ function _cpSliderMax(type,idx){
 function _cpIRSNote(type){
   var age=CPLAN.age||30;var is50=age>=50;
   var annualInc=CPLAN.income*12;var isMFJ=CPLAN.marital==='Married'||CPLAN.marital==='Domestic Partnership';
+  // 2026 IRS limits — keep in sync with _cpIRSMax above.
   if(type==='roth'){
-    var limit=is50?'$8,000':'$7,000';
+    var limit=is50?'$8,500':'$7,500';
     var maxMo=_cpIRSMax('roth');
     if(maxMo===0)return'<span style="color:var(--yl)">⚠ Income above Roth IRA direct contribution limit — ask about a <strong>backdoor Roth</strong> strategy.</span>';
     return'IRS limit: '+limit+'/yr ('+fmt(maxMo)+'/mo)'+(is50?' — includes $1,000 catch-up':'');
   }
-  if(type==='401k'||type==='roth401k'){var limit=is50?'$31,500':'$24,000';return'IRS limit: '+limit+'/yr ('+fmt(_cpIRSMax(type))+'/mo)'+(is50?' — includes $7,500 catch-up':'');}
-  if(type==='trad_ira'){var limit=is50?'$8,000':'$7,000';return'IRS limit: '+limit+'/yr ('+fmt(_cpIRSMax('trad_ira'))+'/mo)';}
-  if(type==='solo401k'){return'IRS limit: '+(is50?'$77,500':'$70,000')+'/yr ('+fmt(_cpIRSMax('solo401k'))+'/mo) — employee + employer contributions';}
-  if(type==='sep_ira'){return'IRS limit: 25% of net income, max $70,000/yr ('+fmt(_cpIRSMax('sep_ira'))+'/mo)';}
+  if(type==='401k'||type==='roth401k'){var limit=is50?'$32,000':'$24,500';return'IRS limit: '+limit+'/yr ('+fmt(_cpIRSMax(type))+'/mo)'+(is50?' — includes $7,500 catch-up':'');}
+  if(type==='trad_ira'){var limit=is50?'$8,500':'$7,500';return'IRS limit: '+limit+'/yr ('+fmt(_cpIRSMax('trad_ira'))+'/mo)';}
+  if(type==='solo401k'){return'IRS limit: '+(is50?'$78,500':'$71,000')+'/yr ('+fmt(_cpIRSMax('solo401k'))+'/mo) — employee + employer contributions';}
+  if(type==='sep_ira'){return'IRS limit: 25% of net income, max $71,000/yr ('+fmt(_cpIRSMax('sep_ira'))+'/mo)';}
   if(type==='hsa'){var fam=(CPLAN.children&&CPLAN.children.length>0)||isMFJ;return'IRS limit: '+(fam?'$8,750':'$4,400')+'/yr ('+fmt(_cpIRSMax('hsa'))+'/mo)'+(is50?' — includes $1,000 catch-up':'');}
   return'';
 }
@@ -24905,6 +25028,19 @@ function _cpEffectiveCapNote(type,idx){
 }
 
 // ── PLAN HEALTH SCORE (0–100) — Evaluates trajectory, not snapshot ──
+// Scores against the PLAN's intended end-state, not just the user's current
+// balance sheet. A freshly-recommended plan that addresses every gap should
+// score in the 80s/90s before any account is opened, because the score is
+// asking "is this plan good?" not "have you executed it yet?".
+//
+// The two components most prone to under-scoring AI plans were:
+//   • Emergency coverage — used efBal/efTarget which is $0 for new users.
+//     Now: an active EF allocation gets near-full credit because the plan
+//     has a path to the target. Once funded, full credit.
+//   • Protection — required pre-existing policies on file. Now: an active
+//     protection action item (term life, DI, health) in the plan counts
+//     as "addressed by plan" and scores partial credit. Full credit only
+//     when the user marks the item Done (i.e., they actually got coverage).
 function _cpCalcHealthScore(){
   var score=0;
   var sim=CPLAN._sim;
@@ -24916,9 +25052,14 @@ function _cpCalcHealthScore(){
     return false;
   }
   // Emergency coverage (0-15)
+  // If EF is already funded → 15. If plan has an EF allocation → 12 (path exists,
+  // not yet there). If neither → score against current efBal/efTarget ratio.
   var efPct=CPLAN.efTarget>0?Math.min(1,CPLAN.efBal/CPLAN.efTarget):0;
   var efAlloc=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
-  score+=Math.round(efPct*12)+(efAlloc||efPct>=1?3:0);
+  if(efPct>=1)score+=15;
+  else if(efAlloc&&efAlloc._completed)score+=Math.max(12,Math.round(efPct*12)+3);
+  else if(efAlloc)score+=12; // plan addresses the gap — partial credit pre-completion
+  else score+=Math.round(efPct*15);
   // Debt trajectory (0-15)
   if(CPLAN.totalDebt<=0)score+=15;
   else{
@@ -24937,19 +25078,39 @@ function _cpCalcHealthScore(){
   var sr=CPLAN.income>0?(CPLAN.income-CPLAN.expenses)/CPLAN.income*100:0;
   if(sr>=20)score+=15;else if(sr>=15)score+=12;else if(sr>=10)score+=8;else if(sr>=5)score+=4;
   // Protection coverage (0-15)
-  var protTypes={};(CPLAN.policies||[]).forEach(function(p){var t=(p.type||'').toLowerCase();if(t.indexOf('life')>=0||t.indexOf('term')>=0)protTypes.life=true;if(t.indexOf('disab')>=0)protTypes.disability=true;if(t.indexOf('health')>=0)protTypes.health=true;});
-  if(protTypes.life)score+=5;if(protTypes.disability)score+=5;if(protTypes.health)score+=5;
+  // Each of life / disability / health is worth 5 points.
+  // Full credit (5): user has a real policy on file.
+  // Partial credit (3): plan has an active protection action item — addressing the gap
+  // No credit (0): no policy AND no plan item.
+  var protTypes={};
+  (CPLAN.policies||[]).forEach(function(p){var t=(p.type||'').toLowerCase();if(t.indexOf('life')>=0||t.indexOf('term')>=0)protTypes.life=true;if(t.indexOf('disab')>=0)protTypes.disability=true;if(t.indexOf('health')>=0)protTypes.health=true;});
+  // Plan-level addressing: action items in the plan with title/customName matching
+  // life/disability/health intent
+  var planAddresses={life:false,disability:false,health:false};
+  CPLAN.allocations.forEach(function(a){
+    if(a.type!=='protection'&&a.type!=='custom')return;
+    var n=(a.customName||'').toLowerCase();
+    if(n.indexOf('term life')>=0||n.indexOf('life insur')>=0)planAddresses.life=true;
+    if(n.indexOf('disab')>=0)planAddresses.disability=true;
+    if(n.indexOf('health')>=0||n.indexOf('medical')>=0)planAddresses.health=true;
+  });
+  score+=protTypes.life?5:(planAddresses.life?3:0);
+  score+=protTypes.disability?5:(planAddresses.disability?3:0);
+  score+=protTypes.health?5:(planAddresses.health?3:0);
   // Tax efficiency (0-10) — uses trajectory: will these be funded eventually?
   if(willBeFunded('roth'))score+=3;
   if(willBeFunded('401k'))score+=3;
   if(willBeFunded('iul')||willBeFunded('wl'))score+=4;
-  // Retirement readiness (0-15) — uses trajectory projected value
+  // Retirement readiness (0-15) — uses trajectory projected value.
+  // sim.projRetValue now reflects the gate-disabled trajectory when no items are
+  // completed yet, so a freshly-recommended plan can score full points if it
+  // has a credible path to FI.
   if(sim&&sim.projRetValue>0){
     var fiNum=(CPLAN.income||0)*12*25;// Simple 25x annual income
     var fiPct=fiNum>0?sim.projRetValue/fiNum:0;
     if(fiPct>=1)score+=15;else if(fiPct>=0.75)score+=12;else if(fiPct>=0.5)score+=8;else if(fiPct>=0.25)score+=4;else if(fiPct>0)score+=2;
   } else {
-    var retAllocs=CPLAN.allocations.filter(function(a){return(a.type==='roth'||a.type==='401k'||a.type==='iul'||a.type==='wl'||a.type==='invest')&&a.amount>0;});
+    var retAllocs=CPLAN.allocations.filter(function(a){return(a.type==='roth'||a.type==='401k'||a.type==='iul'||a.type==='wl'||a.type==='ibc'||a.type==='hsa'||a.type==='trad_ira'||a.type==='solo401k'||a.type==='roth401k'||a.type==='invest')&&a.amount>0;});
     var retTotal=retAllocs.reduce(function(t,a){return t+a.amount;},0);
     var retPct=CPLAN.income>0?retTotal/CPLAN.income*100:0;
     if(retPct>=20)score+=15;else if(retPct>=15)score+=12;else if(retPct>=10)score+=8;else if(retPct>=5)score+=4;else if(retPct>0)score+=2;
@@ -28424,24 +28585,48 @@ function _cpRunSimulation(){
   var maxMonths=years*12;
 
   // ── Tracking gate (per-allocation) ─────────────────────────────────────
-  // Contributions to the future projection only count once the user has marked
-  // the card complete. Until _completed=true, we treat the allocation as $0/mo
-  // for projection purposes — even though it still appears in the deployment bar
-  // and counts against "available to allocate" (because the PLAN designates it).
-  // This avoids the false-positive where a user has a Roth IRA planned in Phase 1
-  // but hasn't opened the account yet — without this gate, the chart would show
-  // contributions and growth that aren't actually happening.
+  // The gate's job is to keep the projection HONEST: contributions only count
+  // once the user has actually opened the account and started funding it.
+  //
+  // BUT — if we apply the gate to a freshly-converted AI plan where NOTHING
+  // has been marked Done yet, the chart shows $1.1M of idle-cash math that
+  // looks identical for every plan and badly misrepresents what the plan
+  // would actually achieve. Users seeing the plan for the first time need
+  // to see the TRAJECTORY the plan promises so they can choose intelligently.
+  //
+  // Resolution: auto-detect mode based on plan state.
+  //   - If ANY growth allocation has _completed=true, we're in "tracked" mode
+  //     and the gate enforces real-world honesty (only completed items grow).
+  //   - If NO growth allocation is completed, we're in "trajectory" mode and
+  //     the gate is bypassed — the simulator shows what would happen if the
+  //     user started funding everything today.
+  // CPLAN._projectionMode='preview' or 'tracked' can override the auto behavior.
   //
   // Action-only types (protection, umbrella, estate, ibc_audit, annuity_research,
   // diversify) are exempt: they have amount=0 anyway, so gating them changes nothing.
   // Their _staticPremium (e.g. monthly life-insurance premium after completion) is
   // already factored into _cpAvailableBudget and the deployment bar overlay; it's
   // not a growth contribution.
+  var _anyCompleted=CPLAN.allocations.some(function(a){
+    if(!a||a.amount<=0)return false;
+    // Action-only types don't count — they're tracked via _staticPremium not _completed
+    if(typeof _cpActionOnlyTypes!=='undefined'&&_cpActionOnlyTypes[a.type])return false;
+    return !!a._completed;
+  });
+  var _projMode=CPLAN._projectionMode||'auto';
+  var _gateActive;
+  if(_projMode==='preview')_gateActive=false;
+  else if(_projMode==='tracked')_gateActive=true;
+  else _gateActive=_anyCompleted; // auto: gate engages once user starts marking items Done
+
   function _cpIsTrackable(a){
     if(!a)return false;
     if(typeof _cpActionOnlyTypes!=='undefined'&&_cpActionOnlyTypes[a.type])return true;
+    if(!_gateActive)return true; // trajectory mode — count all planned contributions
     return !!a._completed;
   }
+  // Expose for downstream consumers (chart annotations, score tooltips, etc.)
+  CPLAN._sim_gateActive=_gateActive;
 
   // ── 1. Calculate cascade events ──
   var events=[];
@@ -29159,6 +29344,11 @@ function _cpUpdateSliderCaps(skipIdx){
     if(a.type==='protection')return;                        // action-only, no slider
     if(a.phase!=null&&a.phase!==1&&a.phase!==0)return;      // only Phase 0/1 have live sliders
     var newMax=_cpSliderMax(a.type,i);
+    // P4: Insurance premium lock — never let the cap go above the locked amount.
+    var _isPermInsCap=(a.type==='iul'||a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&(a.eduVehicle==='wl'||a.eduVehicle==='iul')));
+    if(_isPermInsCap&&a._completed){
+      newMax=Math.min(newMax,a.amount);
+    }
     var sliderEl=document.querySelector('input[type="range"][data-cpidx="'+i+'"]');
     var manualEl=document.getElementById('cpManual'+i);
     // ONLY update the cap (max attribute) — do NOT clamp .value. Clamping would cause
@@ -29197,7 +29387,17 @@ function _cpUpdateOverBudgetBanner(){
   }
 }
 function _cpSlide(i,v){
-  CPLAN.allocations[i].amount=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;_cpEnforce();
+  var _newAmt=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
+  var _a=CPLAN.allocations[i];
+  // P4: if this is a Done insurance allocation, cap the new amount at the current
+  // amount (no increases). Decreases are allowed (user can effectively surrender).
+  if(_a){
+    var _isPermIns=(_a.type==='iul'||_a.type==='wl'||_a.type==='ibc'||(_a.type==='edu'&&(_a.eduVehicle==='wl'||_a.eduVehicle==='iul')));
+    if(_isPermIns&&_a._completed){
+      _newAmt=Math.min(_newAmt,_a.amount);
+    }
+  }
+  CPLAN.allocations[i].amount=_newAmt;_cpEnforce();
   _cpUpdateSliderCaps(i);                                   // ← NEW: push new caps to all other sliders
   _cpUpdateOverBudgetBanner();                              // ← NEW: refresh over-budget banner
   _cpMarkModified();
