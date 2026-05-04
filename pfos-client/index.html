@@ -21877,11 +21877,47 @@ function _cpConvertAIRecs(aiData){
     } else if(map.type==='wl'){
       _underlying='wl';
     }
-    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying});
+    // Wave 4 state machine: new allocations start in PROPOSED state. Insurance
+    // products get a stable _policyId at creation so audits and snapshots can
+    // distinguish Policy #1 vs Policy #2 vs Policy #N within the same purpose lane.
+    var _isInsurance=(map.type==='iul'||map.type==='wl'||map.type==='ibc'||(map.type==='edu'&&(r._eduVeh==='wl'||r._eduVeh==='iul')));
+    var _policyId=_isInsurance?('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)):null;
+    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null});
     usedPool+=amt;
   });
 
   // ── POST-PROCESSING ──
+
+  // Fix PP-C5 (HSA HDHP gate): HSA contributions require enrollment in a High Deductible
+  // Health Plan. We don't yet collect an explicit HDHP flag in profile, so we use the
+  // presence of an existing HSA in retAccounts as the proxy: if the user has an HSA on
+  // file, they're presumably HDHP-enrolled and the recommendation can carry dollars; if
+  // not, force the HSA allocation to action-only ($0) so the user must confirm HDHP and
+  // open an HSA before contributing. The edge function rule already pushes this, but
+  // belt-and-suspenders here in case the AI returns dollars for an HSA without an
+  // existing account.
+  (function _gateHSAByHDHP(){
+    // S is the canonical client state (line ~4637); retAccounts lives there.
+    // Fall back through APP._portalFd then empty array.
+    var ret=(typeof S!=='undefined'&&S&&S.retAccounts)||(APP&&APP._portalFd&&APP._portalFd.retAccounts)||[];
+    var hasExistingHSA=ret.some(function(r){
+      var t=((r&&r.type)||'').toLowerCase();
+      return t.indexOf('hsa')>=0&&(parseFloat(r.balance)||0)>0;
+    });
+    if(hasExistingHSA)return;// HDHP confirmed by existence of HSA balance
+    CPLAN.allocations.forEach(function(a){
+      if(a.type==='hsa'&&a.amount>0){
+        var dropped=a.amount;
+        a.amount=0;
+        a._hdhpGated=true;// Flag so PP12 keeps this as an action-only item
+        a.reason=(a.reason?a.reason+'\n':'')+'⚠️ HSA contributions require HDHP enrollment. Confirm you are enrolled in a High Deductible Health Plan, then return here to set a contribution amount up to the IRS limit.';
+        // Note the freed dollars so the cascade redistribution can pick them up.
+        // We keep this as a $0 action item rather than dropping it entirely so the
+        // user sees the recommendation and the HDHP requirement.
+        try{console.warn('[PFOS] HSA dollars dropped (no existing HSA / HDHP unconfirmed):',dropped);}catch(e){}
+      }
+    });
+  })();
 
   // Fix PP1: Debt type force — any allocation with debt-related title MUST be type:'debt'
   CPLAN.allocations.forEach(function(a){
@@ -22095,6 +22131,8 @@ function _cpConvertAIRecs(aiData){
   CPLAN.allocations=CPLAN.allocations.filter(function(a){
     if(a.amount>0)return true;
     if(_actionOnlyForDrop[a.type])return true;
+    // C5 frontend: keep HSA action-only items that were gated by missing HDHP confirmation
+    if(a.type==='hsa'&&a._hdhpGated)return true;
     // type 'custom' with $0 might be an estate item (legitimate action) —
     // keep if customName looks like an estate/legal action.
     if(a.type==='custom'&&a.customName){
@@ -22103,6 +22141,127 @@ function _cpConvertAIRecs(aiData){
     }
     return false; // drop other $0 allocations (phantom over-budget items)
   });
+
+  // Fix PP-W4M (Wave 4 insurance minimums): Enforce hard product minimums
+  //   IUL / IBC-IUL: $500/mo
+  //   WL  / IBC-WL:  $300/mo
+  //   Education WL or IUL: $100/mo
+  // The edge function rule cluster M1-M6 already tells the AI not to violate these,
+  // but defense-in-depth: drop any allocation that comes in below minimum.
+  // For IUL ($500 floor) where amount is in the WL-viable zone ($300-499), down-
+  // convert to WL rather than dropping entirely — preserves the planning intent
+  // while keeping the product appropriate for the funding level.
+  (function _enforceInsuranceMinimums(){
+    var INS_MIN_IUL=500,INS_MIN_WL=300,INS_MIN_EDU=100;
+    var dropped=0,downconverted=0;
+    CPLAN.allocations=CPLAN.allocations.filter(function(a){
+      var amt=parseFloat(a.amount)||0;
+      // Education-purpose insurance vehicle (type='edu' with WL/IUL eduVehicle)
+      if(a.type==='edu'&&(a.eduVehicle==='iul'||a.eduVehicle==='wl')){
+        if(amt>0&&amt<INS_MIN_EDU){
+          dropped++;
+          try{console.warn('[PFOS W4M] Dropped education-insurance below $100/mo:',a.customName,amt);}catch(e){}
+          return false;
+        }
+        return true;
+      }
+      // Standalone IUL or IBC-IUL (type='ibc' with _ibcUnderlyingType='iul')
+      var isIUL=a.type==='iul'||(a.type==='ibc'&&a._ibcUnderlyingType==='iul');
+      if(isIUL&&amt>0&&amt<INS_MIN_IUL){
+        if(amt>=INS_MIN_WL){
+          // Down-convert to WL: amount is in the WL-viable zone
+          if(a.type==='iul'){a.type='wl';}
+          else if(a.type==='ibc'){a._ibcUnderlyingType='wl';}
+          a.reason=(a.reason?a.reason+'\n':'')+'⚠️ Down-converted from IUL to WL: $'+amt+'/mo is below the $500/mo IUL minimum but meets the $300/mo WL minimum. WL fits this funding level better; revisit IUL when surplus increases.';
+          downconverted++;
+          try{console.warn('[PFOS W4M] Down-converted IUL→WL:',a.customName,amt);}catch(e){}
+          return true;
+        } else {
+          // Below WL minimum too — drop entirely
+          dropped++;
+          try{console.warn('[PFOS W4M] Dropped IUL below $300/mo:',a.customName,amt);}catch(e){}
+          return false;
+        }
+      }
+      // Standalone WL or IBC-WL
+      var isWL=a.type==='wl'||(a.type==='ibc'&&a._ibcUnderlyingType==='wl');
+      if(isWL&&amt>0&&amt<INS_MIN_WL){
+        dropped++;
+        try{console.warn('[PFOS W4M] Dropped WL below $300/mo:',a.customName,amt);}catch(e){}
+        return false;
+      }
+      // IBC with no underlying set (shouldn't happen post-Wave-1 B1 fix, but guard anyway)
+      if(a.type==='ibc'&&!a._ibcUnderlyingType&&amt>0&&amt<INS_MIN_WL){
+        dropped++;
+        try{console.warn('[PFOS W4M] Dropped IBC (no underlying) below $300/mo:',a.customName,amt);}catch(e){}
+        return false;
+      }
+      return true;
+    });
+    if(dropped||downconverted)try{console.warn('[PFOS W4M] Insurance minimums enforced — dropped:',dropped,'down-converted:',downconverted);}catch(e){}
+  })();
+
+  // Fix PP-E1 (Cascade math validator): Phase N+1 NEW funded items cannot exceed
+  // the sum of monthly_costs of items in Phase N that complete before Phase N+1
+  // starts (debt payoffs, EF target reached, custom goal funded).
+  // We can only validate this approximately at conversion time because the
+  // simulation engine runs later — but we can catch the obvious case where a Phase 2
+  // item is bigger than the sum of all Phase 1 completable items combined.
+  // When we detect a violation, we cap the Phase N+1 item at the available freed
+  // pool and surface a warning in the reason field.
+  (function _validateCascadeMath(){
+    // Group allocations by phase
+    var byPhase={};
+    CPLAN.allocations.forEach(function(a,idx){
+      var p=a.phase||1;
+      (byPhase[p]=byPhase[p]||[]).push({a:a,idx:idx});
+    });
+    var phaseNums=Object.keys(byPhase).map(function(k){return parseInt(k,10);}).filter(function(n){return n>=1&&n<99;}).sort(function(x,y){return x-y;});
+    // Items that "complete" in a phase: debt (rate>0, payable), ef (with target),
+    // custom (with target). Insurance/retirement/invest items do NOT complete —
+    // they keep getting funded indefinitely.
+    function _completableMonthly(items){
+      var sum=0;
+      items.forEach(function(it){
+        var a=it.a;
+        if(a.amount<=0)return;
+        if(a.type==='debt'||a.type==='ef')sum+=a.amount;
+        else if(a.type==='custom'&&(a.target||0)>0)sum+=a.amount;
+        else if(a.type==='house'&&(a.target||0)>0)sum+=a.amount;
+      });
+      return sum;
+    }
+    for(var i=0;i<phaseNums.length-1;i++){
+      var pN=phaseNums[i],pNext=phaseNums[i+1];
+      var freedPool=_completableMonthly(byPhase[pN]||[]);
+      // Sum NEW funded items in pNext that aren't already in pN
+      // (rule 3 says Phase 2+ should only be NEW vehicles, not amount increases —
+      // so for our purposes here, every Phase N+1 funded item counts as new).
+      var nextItems=(byPhase[pNext]||[]).filter(function(it){
+        var a=it.a;
+        // Skip action-only items (they don't consume freed cascade)
+        if(a.type==='protection')return false;
+        if(a.type==='custom'&&!a.target&&a.amount===0)return false;
+        if(a._hdhpGated)return false;// HSA gated by HDHP — no dollars consumed
+        return a.amount>0;
+      });
+      var nextDemand=nextItems.reduce(function(t,it){return t+(it.a.amount||0);},0);
+      if(nextDemand>freedPool&&nextDemand>0){
+        // Violation: Phase N+1 demands more than Phase N can free up.
+        // Scale down each Phase N+1 funded item proportionally.
+        var scale=freedPool/nextDemand;
+        nextItems.forEach(function(it){
+          var orig=it.a.amount||0;
+          var capped=Math.floor(orig*scale);
+          if(capped<orig){
+            it.a.amount=capped;
+            it.a.reason=(it.a.reason?it.a.reason+'\n':'')+'⚠️ Cascade math: Phase '+pNext+' funding capped at $'+capped+'/mo (was $'+orig+'/mo). Phase '+pN+' freed pool: $'+freedPool+'/mo.';
+          }
+        });
+        try{console.warn('[PFOS] Cascade violation P'+pN+'→P'+pNext+': demand $'+nextDemand+' vs freed $'+freedPool+', scaled to '+scale.toFixed(2));}catch(e){}
+      }
+    }
+  })();
 
   if(aiData.summary)CPLAN._aiSummary=aiData.summary;
   if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
@@ -22116,6 +22275,11 @@ function _cpSelectApproach(key){
   CPLAN._selectedApproach=key;
   CPLAN._viewingApproach=null;
   _cpConvertAIRecs(aiData);
+  // Wave 4 state transition: PROPOSED → SELECTED for all allocations.
+  // The user has committed to this approach; allocations are now editable but
+  // tracked as a chosen plan rather than a preview. Insurance products won't
+  // lock until Done is clicked individually.
+  CPLAN.allocations.forEach(function(a){if(a._state==='proposed')a._state='selected';});
   // Record generation
   var plan=APP._portalFd&&APP._portalFd.allocation_plan;
   if(!plan)plan={};if(!plan.ai_generations)plan.ai_generations=[];
@@ -22126,6 +22290,8 @@ function _cpSelectApproach(key){
   var tierNames={core:'Core',pro:'Pro',pro_plus:'Pro+',comp:'Comp',trial:'Trial'};
   CPLAN._aiTierMsg=(tierNames[tier2]||'Core')+' tier: '+remain+' AI generation'+(remain!==1?'s':'')+' remaining';
   CPLAN._originalAIPlan=JSON.parse(JSON.stringify(CPLAN.allocations));
+  // Wave 4 snapshot: capture initial plan state for history/audit context.
+  if(typeof _cpCaptureSnapshot==='function')_cpCaptureSnapshot('approach_selected','user','Initial plan: '+key+' approach selected');
   _cpRenderPlanV2();
   cplanSave();
 }
@@ -22138,8 +22304,9 @@ function _cpShowApproachFork(){
   var _annInc=(CPLAN.income||0)*12;
   var _mfj=CPLAN.marital==='Married'||CPLAN.marital==='Domestic Partnership';
   var _taxPct=10;
-  if(_mfj){if(_annInc>731200)_taxPct=37;else if(_annInc>487450)_taxPct=35;else if(_annInc>383900)_taxPct=32;else if(_annInc>201050)_taxPct=24;else if(_annInc>94300)_taxPct=22;else if(_annInc>23200)_taxPct=12;}
-  else{if(_annInc>609350)_taxPct=37;else if(_annInc>243725)_taxPct=35;else if(_annInc>191950)_taxPct=32;else if(_annInc>100525)_taxPct=24;else if(_annInc>47150)_taxPct=22;else if(_annInc>11600)_taxPct=12;}
+  // F6: 2026 federal brackets (matching edge function line 133-134). 2024 brackets removed.
+  if(_mfj){if(_annInc>751600)_taxPct=37;else if(_annInc>501050)_taxPct=35;else if(_annInc>394600)_taxPct=32;else if(_annInc>206700)_taxPct=24;else if(_annInc>96950)_taxPct=22;else if(_annInc>23850)_taxPct=12;}
+  else{if(_annInc>626350)_taxPct=37;else if(_annInc>250525)_taxPct=35;else if(_annInc>197300)_taxPct=32;else if(_annInc>103350)_taxPct=24;else if(_annInc>48475)_taxPct=22;else if(_annInc>11925)_taxPct=12;}
   var _pool=Math.round(CPLAN.surplus*(1-(CPLAN._breathingPct||15)/100));
   var cards=[
     {key:'traditional',label:'Traditional',icon:'📊',desc:'401k, Roth IRA, index funds, 529 plans, term life. Proven, widely-accepted vehicles.',color:'#5B9BFF',taxRatio:1},
@@ -22209,8 +22376,16 @@ function _cpShowApproachFork(){
       var retInc=_apprRetVal>0?Math.round(_apprRetVal*0.04/12):(hl.projected_monthly_income||0);
       // Also recalculate retVal from our formula if we have allocation data
       if(_apprRetVal>0)retVal=Math.round(_apprRetVal);
-      // Tax breakdown
-      var taxAmt=Math.round(retInc*cd.taxRatio*_taxPct/100);
+      // F5: Compute the tax bracket from RETIREMENT income, not current income.
+      // The label "X% bracket" appears next to taxable retirement income, so it
+      // must reflect the bracket the client will be IN at retirement, not now.
+      // Uses 2026 brackets matching the rest of this function.
+      var _retAnnInc=retInc*12;
+      var _retTaxPct=10;
+      if(_mfj){if(_retAnnInc>751600)_retTaxPct=37;else if(_retAnnInc>501050)_retTaxPct=35;else if(_retAnnInc>394600)_retTaxPct=32;else if(_retAnnInc>206700)_retTaxPct=24;else if(_retAnnInc>96950)_retTaxPct=22;else if(_retAnnInc>23850)_retTaxPct=12;}
+      else{if(_retAnnInc>626350)_retTaxPct=37;else if(_retAnnInc>250525)_retTaxPct=35;else if(_retAnnInc>197300)_retTaxPct=32;else if(_retAnnInc>103350)_retTaxPct=24;else if(_retAnnInc>48475)_retTaxPct=22;else if(_retAnnInc>11925)_retTaxPct=12;}
+      // Tax breakdown — use retirement bracket
+      var taxAmt=Math.round(retInc*cd.taxRatio*_retTaxPct/100);
       var netInc=retInc-taxAmt;
       h+='<div style="margin-bottom:14px">';
       h+='<div style="font-family:var(--fd);font-size:28px;color:'+cd.color+'">'+fmtK(retVal)+'</div>';
@@ -22222,7 +22397,7 @@ function _cpShowApproachFork(){
       h+='<div style="font-size:9px;color:var(--mu);letter-spacing:.06em;margin-bottom:6px">RETIREMENT INCOME</div>';
       h+='<div style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(retInc)+'/mo <span style="font-size:10px;color:var(--mu)">gross</span></div>';
       if(taxAmt>0){
-        h+='<div style="font-size:11px;color:var(--rd);margin:3px 0">− '+fmt(taxAmt)+' tax ('+_taxPct+'% bracket)</div>';
+        h+='<div style="font-size:11px;color:var(--rd);margin:3px 0">− '+fmt(taxAmt)+' tax ('+_retTaxPct+'% retirement bracket)</div>';
       } else {
         h+='<div style="font-size:11px;color:var(--gr);margin:3px 0">$0 tax — accessed tax-free</div>';
       }
@@ -22600,6 +22775,18 @@ function _cpRenderPlanV2(){
   h+='<button onclick="'+(CPLAN._approaches?'_cpShowApproachFork()':'CPLAN.allocations=[];_cpStartAIRec()')+'" style="padding:4px 10px;font-family:var(--fh);font-size:9px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:26px">'+(CPLAN._approaches?'Switch':'Compare Approaches')+'</button>';
   h+='</div>';
   h+='<button onclick="CPLAN.allocations=[];_cpStartAIRec()" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);color:var(--pu);cursor:pointer;border-radius:2px;min-height:32px">⚡ Regenerate</button>';
+  // Wave 4: Plan Audit button. Pro+ tier (and Comp), with 90-day (Pro+) /
+  // 180-day (Pro) cooldown. Disabled state surfaces the reason inline.
+  if(CPLAN._selectedApproach){
+    var _auditAvail=(typeof _cpAuditAvailability==='function')?_cpAuditAvailability():{ok:false,reason:'tier'};
+    if(_auditAvail.ok){
+      h+='<button onclick="_cpRunPlanAudit().then(function(r){if(r)_cpRenderPlanV2();})" title="Review your existing plan and surface non-destructive suggestions. Cooldown applies." style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">📋 Plan Audit</button>';
+    } else if(_auditAvail.reason==='cooldown'){
+      h+='<button disabled title="'+(_auditAvail.message||'')+'" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(100,116,139,.05);border:1px solid rgba(100,116,139,.15);color:var(--mu);cursor:not-allowed;border-radius:2px;min-height:32px;opacity:0.6">📋 Audit (in '+_auditAvail.daysRemaining+'d)</button>';
+    } else if(_auditAvail.reason==='tier'){
+      h+='<button disabled title="Plan Audit is available on Pro and above" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(100,116,139,.05);border:1px solid rgba(100,116,139,.15);color:var(--mu);cursor:not-allowed;border-radius:2px;min-height:32px;opacity:0.6">📋 Audit 🔒</button>';
+    }
+  }
   h+='<button onclick="cplanSave()" id="cplanSaveBtn" style="padding:6px 14px;font-family:var(--fh);font-size:10px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:32px">💾 Save</button>';
   h+='</div></div>';
 
@@ -22832,7 +23019,20 @@ function _cpRenderPlanV2(){
   }
 
   // ── Two-layer deployment bar (Phase 2+) ──
+  // E4: pre-compute future total for THIS active phase. If zero, hide the entire
+  // deployment bar (it would render an empty/misleading "0/mo" line).
+  var _e4FutureTotal=0;
   if(_activeTab>1&&_sim.allocFuture){
+    _sim.allocFuture.forEach(function(af){
+      var a=CPLAN.allocations[af.idx];
+      if(!a)return;
+      if(a.type==='debt'||a.type==='ef')return;
+      if(a.type==='protection'&&a.amount===0)return;
+      var fa=af.futureAmount||af.currentAmount||0;
+      if(fa>0)_e4FutureTotal+=fa;
+    });
+  }
+  if(_activeTab>1&&_sim.allocFuture&&_e4FutureTotal>0){
     h+='<div style="margin-bottom:14px">';
     h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">DEPLOYMENT COMPARISON</div>';
     // Phase 1 layer (grayed)
@@ -22971,7 +23171,11 @@ function _cpRenderPlanV2(){
         h+=_cpBuildCard(a,idx,false);
       });
     }
-    h+='<div style="text-align:center;margin-top:8px"><button onclick="_cpShowAddMenu('+_activeTab+')" style="padding:6px 16px;font-family:var(--fh);font-size:10px;font-weight:700;background:transparent;border:1px dashed '+_pCur2.border+';color:'+_pCur2.color+';cursor:pointer;border-radius:2px;min-height:32px">+ Add to Phase '+_activeTab+'</button></div>';
+    // H5: subtler "+ add new" link instead of a heavy dashed button on Phase 2+.
+    // The Phase 2+ view is primarily for boost visualization (amount increases on
+    // Phase 1 items via cascade); adding genuinely new vehicles is the secondary
+    // path and shouldn't visually compete with the per-card sliders.
+    h+='<div style="text-align:center;margin-top:10px"><a onclick="_cpShowAddMenu('+_activeTab+')" style="font-family:var(--fh);font-size:9px;font-weight:700;color:'+_pCur2.color+';opacity:0.7;cursor:pointer;letter-spacing:.04em;text-decoration:none;border-bottom:1px dotted '+_pCur2.color+'88" onmouseover="this.style.opacity=\'1\'" onmouseout="this.style.opacity=\'0.7\'">+ add new vehicle to Phase '+_activeTab+'</a></div>';
     h+='</div>';
   }
 
@@ -23051,7 +23255,14 @@ function _cpBuildCard(a,idx,isUnassigned){
     ph+='</div></div></div>';
     return ph;
   }
-  var icon=CP_IC[a.type]||'⭐';var color=CP_COL[a.type]||'#94A3B8';var name=a.customName||CP_NM[a.type]||a.type;
+  var icon=CP_IC[a.type]||'⭐';
+  // H1: Action-only items (term life, DI, LTC, umbrella, estate-planning custom)
+  // share a single muted slate so they're visually consistent. Funded items keep
+  // their distinct type colors. _isActionOnly is computed below — but we need it
+  // here for the color decision, so call _cpIsActionOnly directly.
+  var _isActionOnlyForColor=(typeof _cpIsActionOnly==='function')?_cpIsActionOnly(a):(a.type==='protection'||(a.type==='custom'&&!a.target&&!a.amount));
+  var color=_isActionOnlyForColor?'#94A3B8':(CP_COL[a.type]||'#94A3B8');
+  var name=a.customName||CP_NM[a.type]||a.type;
   var isD=CPLAN.mode==='detailed';
   // Completed items get a soft opacity so users can scan a phase and immediately see what's done.
   // Card is still interactive (Remove still works) but the wrapper communicates "this is checked off".
@@ -23216,7 +23427,16 @@ function _cpBuildCard(a,idx,isUnassigned){
       h += '<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--yl,#EAB308);letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">⚠ Estimates only</div>';
       h += '<div style="font-size:11px;color:rgba(226,232,240,.78);line-height:1.5">All projection numbers are computed from industry-typical defaults. For accurate values, request an in-force illustration from your carrier and update via Yearly Review.</div>';
       h += '</div>';
-      h += '<button onclick="event.stopPropagation();_cpShowIBCYearlyReview('+idx+')" style="padding:7px 12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr,#22C55E);font-family:var(--fh);font-size:10px;font-weight:700;cursor:pointer;border-radius:3px;flex-shrink:0">📋 Yearly Review'+(_historyCount?' ('+_historyCount+')':'')+'</button>';
+      // B7: Audit Policy ↔ Yearly Review toggle. Before the user marks the
+      // policy as Done (no real policy in force yet), the action is "Audit Policy"
+      // — they upload an existing illustration to audit it. After Done, it
+      // switches to "Yearly Review" — they recalibrate the projection against
+      // an actual annual statement or in-force illustration.
+      if(a._completed){
+        h += '<button onclick="event.stopPropagation();_cpShowIBCYearlyReview('+idx+')" style="padding:7px 12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr,#22C55E);font-family:var(--fh);font-size:10px;font-weight:700;cursor:pointer;border-radius:3px;flex-shrink:0">📋 Yearly Review'+(_historyCount?' ('+_historyCount+')':'')+'</button>';
+      } else {
+        h += '<button onclick="event.stopPropagation();if(typeof openToolCalc===\'function\')openToolCalc(\'renderPolicyAuditCalc\');" title="Upload an existing illustration to audit it" style="padding:7px 12px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;font-family:var(--fh);font-size:10px;font-weight:700;cursor:pointer;border-radius:3px;flex-shrink:0">🔍 Audit Policy</button>';
+      }
       h += '</div>';
       
       // ── Provenance markers — per-parameter origin indicators ──
@@ -23257,12 +23477,9 @@ function _cpBuildCard(a,idx,isUnassigned){
       h += '<div style="font-family:var(--fd,monospace);font-size:13px;color:var(--wh);font-weight:700">'+_ibcLoanRateDisp+'%</div>';
       h += '<div style="font-size:9px;color:rgba(226,232,240,.6)">contract</div>';
       h += '</div>';
-      // Death benefit (anchored if user provided in yearly review)
-      h += '<div style="padding:6px 8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px">';
-      h += '<div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"><span title="'+_anchorLabel+'">'+_anchorIcon+'</span> Death benefit</div>';
-      h += '<div style="font-family:var(--fd,monospace);font-size:13px;color:var(--wh);font-weight:700">'+(_ibcDB > 0 ? (typeof fmtK==='function'?fmtK(_ibcDB):'$'+_ibcDB) : '—')+'</div>';
-      h += '<div style="font-size:9px;color:'+_anchorColor+'">'+(_ibcDB > 0 ? _anchorLabel : 'not set')+'</div>';
-      h += '</div>';
+      // B8: Death Benefit tile removed — was almost always "—" because users rarely
+      // provide DB during yearly review, and DB isn't a meaningful per-anniversary
+      // tracking signal for cash-value-focused policies. Grid auto-fits to 3 tiles.
       h += '</div>';
       // Provenance legend (small footer below the markers)
       h += '<div style="margin-top:6px;font-size:9px;color:var(--mu);display:flex;gap:10px;flex-wrap:wrap">';
@@ -23279,8 +23496,15 @@ function _cpBuildCard(a,idx,isUnassigned){
       //    rate (or illustrated if no realized rate yet)
       // Useful even with zero anchors — shows the pure illustrated curve.
       try {
-        var _chartW = 320, _chartH = 80, _chartPadL = 4, _chartPadR = 4, _chartPadT = 10, _chartPadB = 16;
-        var _chartHorizonMo = 240; // 20 years
+        // B5/B6 fix: larger viewBox + xMidYMid meet so text isn't stretched, and
+        // dynamic horizon based on years to retirement (capped 10-40 yrs).
+        var _chartW = 600, _chartH = 160, _chartPadL = 8, _chartPadR = 8, _chartPadT = 18, _chartPadB = 26;
+        var _retAgeForHorizon = CPLAN.retAge || (CPLAN.profile && CPLAN.profile.retAge) || 65;
+        var _curAgeForHorizon = CPLAN.age || (CPLAN.profile && CPLAN.profile.currentAge) || 30;
+        var _yrsToRet = Math.max(0, _retAgeForHorizon - _curAgeForHorizon);
+        var _chartHorizonMo = Math.min(480, Math.max(120, _yrsToRet * 12));// 10–40 yr window
+        var _chartHorizonYr = Math.round(_chartHorizonMo / 12);
+        var _chartHalfYr = Math.round(_chartHorizonYr / 2);
         // Build illustrated curve from year 0
         var _illusParams = Object.assign({}, _ibcPolicyDefaults(_ibcType), {
           monthlyPremium: a.amount || 0,
@@ -23322,7 +23546,7 @@ function _cpBuildCard(a,idx,isUnassigned){
         var _xScale = function(m){return _chartPadL + (m / _chartHorizonMo) * (_chartW - _chartPadL - _chartPadR);};
         var _yScale = function(cv){return _chartH - _chartPadB - (cv / _maxCV) * (_chartH - _chartPadT - _chartPadB);};
         // Build SVG
-        var _svgH = '<svg width="100%" viewBox="0 0 '+_chartW+' '+_chartH+'" style="display:block;margin-top:8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px" preserveAspectRatio="none">';
+        var _svgH = '<svg width="100%" viewBox="0 0 '+_chartW+' '+_chartH+'" style="display:block;margin-top:8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px" preserveAspectRatio="xMidYMid meet">';
         // Illustrated curve (faded dashed)
         if(_illusPoints.length > 1){
           var _illusPath = _illusPoints.map(function(p, i){return (i === 0 ? 'M' : 'L') + _xScale(p.m).toFixed(1) + ',' + _yScale(p.cv).toFixed(1);}).join(' ');
@@ -23338,12 +23562,15 @@ function _cpBuildCard(a,idx,isUnassigned){
         _anchorPoints.forEach(function(p){
           _svgH += '<circle cx="' + _xScale(p.m).toFixed(1) + '" cy="' + _yScale(p.cv).toFixed(1) + '" r="3.5" fill="#22C55E" stroke="#0F172A" stroke-width="1"></circle>';
         });
-        // Y-axis ticks (just the max value)
-        _svgH += '<text x="' + (_chartW - 2) + '" y="' + (_chartPadT + 2) + '" font-family="var(--fh)" font-size="8" fill="rgba(226,232,240,.6)" text-anchor="end">$' + (_maxCV >= 1000 ? Math.round(_maxCV/1000) + 'K' : Math.round(_maxCV)) + '</text>';
-        // X-axis labels (Y0, Y10, Y20)
-        _svgH += '<text x="' + _xScale(0).toFixed(1) + '" y="' + (_chartH - 4) + '" font-family="var(--fh)" font-size="8" fill="var(--mu)" text-anchor="start">Y0</text>';
-        _svgH += '<text x="' + _xScale(120).toFixed(1) + '" y="' + (_chartH - 4) + '" font-family="var(--fh)" font-size="8" fill="var(--mu)" text-anchor="middle">Y10</text>';
-        _svgH += '<text x="' + _xScale(240).toFixed(1) + '" y="' + (_chartH - 4) + '" font-family="var(--fh)" font-size="8" fill="var(--mu)" text-anchor="end">Y20</text>';
+        // Y-axis ticks (just the max value) — adjusted for larger viewBox
+        _svgH += '<text x="' + (_chartW - 4) + '" y="' + (_chartPadT + 4) + '" font-family="var(--fh)" font-size="11" fill="rgba(226,232,240,.6)" text-anchor="end">$' + (_maxCV >= 1000 ? Math.round(_maxCV/1000) + 'K' : Math.round(_maxCV)) + '</text>';
+        // B6: X-axis labels — Y0 / Y[half] / Y[full] with age in parens
+        var _ageStart = _curAgeForHorizon;
+        var _ageHalf = _curAgeForHorizon + _chartHalfYr;
+        var _ageEnd = _curAgeForHorizon + _chartHorizonYr;
+        _svgH += '<text x="' + _xScale(0).toFixed(1) + '" y="' + (_chartH - 6) + '" font-family="var(--fh)" font-size="10" fill="var(--mu)" text-anchor="start">Y0 (age '+_ageStart+')</text>';
+        _svgH += '<text x="' + _xScale(_chartHalfYr * 12).toFixed(1) + '" y="' + (_chartH - 6) + '" font-family="var(--fh)" font-size="10" fill="var(--mu)" text-anchor="middle">Y'+_chartHalfYr+' (age '+_ageHalf+')</text>';
+        _svgH += '<text x="' + _xScale(_chartHorizonMo).toFixed(1) + '" y="' + (_chartH - 6) + '" font-family="var(--fh)" font-size="10" fill="var(--mu)" text-anchor="end">Y'+_chartHorizonYr+' (age '+_ageEnd+')</text>';
         _svgH += '</svg>';
         // Legend below mini-chart
         _svgH += '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:4px;font-size:9px;color:var(--mu)">';
@@ -23736,12 +23963,19 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _newPhaseNum=_phaseRange[_phaseRange.length-1]+1;
   h+='<option value="'+_newPhaseNum+'">+ New phase '+_newPhaseNum+'</option>';
   h+='</select></div>';
-  // Mark complete — action-only items get the button at amount 0; everything else needs a funded amount.
-  // The button is prominent (not the small ghost-style button it was) because the user needs to know
-  // that allocations don't track in the projection until they click Done — so this is the primary CTA
-  // on every uncompleted card.
-  if(((a.amount>0)||_isActionOnly)&&!a._completed){h+='<button onclick="_cpMarkComplete('+idx+');_cpRenderPlanV2()" title="Click after you actually open this account / start contributing" style="padding:6px 14px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(34,197,94,.28)\'" onmouseout="this.style.background=\'rgba(34,197,94,.18)\'">✓ Done</button>';}
-  else if(a._completed){h+='<span style="padding:6px 12px;font-size:10px;color:var(--gr);font-family:var(--fh);font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:3px">✓ Completed</span>';}
+  // Mark complete — action-only items get the button at amount 0; funded items need an amount;
+  // E6: $0 non-action allocations also get a Done button (with a different tooltip) so the
+  // user can mark "acknowledged" instead of being stuck with only the X. The button is
+  // prominent (not the small ghost-style button it was) because the user needs to know
+  // that allocations don't track in the projection until they click Done — so this is
+  // the primary CTA on every uncompleted card.
+  if(!a._completed){
+    var _doneTooltip=(a.amount>0||_isActionOnly)
+      ?'Click after you actually open this account / start contributing'
+      :'No funding amount yet — click Done to acknowledge this recommendation, or use the slider to set an amount first';
+    h+='<button onclick="_cpMarkComplete('+idx+');_cpRenderPlanV2()" title="'+_doneTooltip+'" style="padding:6px 14px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(34,197,94,.28)\'" onmouseout="this.style.background=\'rgba(34,197,94,.18)\'">✓ Done</button>';
+  }
+  else{h+='<span style="padding:6px 12px;font-size:10px;color:var(--gr);font-family:var(--fh);font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:3px">✓ Completed</span>';}
   // Remove
   h+='<button onclick="_cpRemove('+idx+');_cpRenderPlanV2()" style="padding:2px 8px;font-family:var(--fh);font-size:8px;font-weight:700;background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.1);color:var(--rd);cursor:pointer;border-radius:2px;min-height:24px">✕</button>';
   h+='</div></div>';
@@ -23777,12 +24011,22 @@ function _cpBuildTimeline(){
   var origProj=CPLAN._originalProjection||null;
 
   // ── Collect all phase numbers in use, in order ──
+  // E3 fix: use the same "meaningful content" filter as the phase tab bar
+  // (_cpRenderPlanV2:_phaseHasContent) so the timeline doesn't show a separate
+  // bar for a phase whose only items are $0 protection action items. Single
+  // source of truth: a phase is real when it has at least one funded item OR
+  // a non-protection item.
+  function _tlPhaseHasContent(pn){
+    var items=CPLAN.allocations.filter(function(a){return ((a.phase!=null)?a.phase:1)===pn;});
+    if(!items.length)return false;
+    return items.some(function(a){return a.amount>0||a.type!=='protection';});
+  }
   var phases=[];
   var phaseSet={};
   CPLAN.allocations.forEach(function(a){
     var p=(a.phase!=null)?a.phase:1;
     if(p===0)return;// unassigned items don't contribute to a phase track
-    if(!phaseSet[p]){phaseSet[p]=true;phases.push(p);}
+    if(!phaseSet[p]&&_tlPhaseHasContent(p)){phaseSet[p]=true;phases.push(p);}
   });
   phases.sort(function(a,b){return a-b;});
   // Always show Phase 1 even if empty so the user has context
@@ -23815,6 +24059,8 @@ function _cpBuildTimeline(){
       }
     });
   }
+  // E2 fallback: see "E2 fallback (deferred)" block below — must wait until
+  // phaseMilestonesByPhase is populated.
 
   // Phase end month = max completion month among items in the phase, OR the next phase's
   // start month if known, OR (open-ended) the projection horizon.
@@ -23902,7 +24148,30 @@ function _cpBuildTimeline(){
   }
 
   // ── Determine each phase's display window: [startMo, endMo] ──
+  // E2 fallback (deferred): for any non-Phase-1 phase whose start the simulation
+  // didn't produce, derive it from the prior phase's last completion milestone
+  // (debt payoff, EF target, custom goal). Without this fallback, Phase 2/3 starts
+  // default to 0 and the bars collapse to the full window. Runs here (after
+  // phaseMilestonesByPhase is populated) so we can read milestone months.
+  for(var _psi=0;_psi<phases.length;_psi++){
+    var _ps=phases[_psi];
+    if(phaseStartByPhase[_ps]!=null)continue;
+    var _prevPhase=phases[_psi-1];
+    if(_prevPhase==null){phaseStartByPhase[_ps]=0;continue;}
+    var _prevLast=phaseStartByPhase[_prevPhase]||0;
+    (phaseMilestonesByPhase[_prevPhase]||[]).forEach(function(mil){
+      if(mil.month>_prevLast)_prevLast=mil.month;
+    });
+    // If the previous phase had no milestones either, push start forward by 12 mo
+    // so the current phase has visible width.
+    phaseStartByPhase[_ps]=_prevLast||((phaseStartByPhase[_prevPhase]||0)+12);
+  }
+
   // endMo = next phase's start, or last milestone in this phase + buffer, or projection horizon
+  // E2 fix: distinguish between "last phase" (use horizon) and "non-last phase whose
+  // next-phase start is unknown" (use this phase's own last milestone). Previously
+  // both cases fell back to horizon, which made Phase 2 and Phase 3 share the same
+  // end date when sim hadn't produced a Phase 3 startsMonth.
   var phaseEndByPhase={};
   var horizon=Math.max(60,monthsElapsed+24);// at least 5 years out, or 2 yr past "now"
   // Find the latest milestone across all phases as a candidate horizon
@@ -23915,10 +24184,23 @@ function _cpBuildTimeline(){
   for(var pi=0;pi<phases.length;pi++){
     var p=phases[pi];
     var nextP=phases[pi+1];
-    if(nextP!=null&&phaseStartByPhase[nextP]!=null){
+    var isLastPhase=(nextP==null);
+    if(!isLastPhase&&phaseStartByPhase[nextP]!=null){
+      // Most reliable: end = next phase's start
       phaseEndByPhase[p]=phaseStartByPhase[nextP];
+    } else if(!isLastPhase){
+      // Non-last phase but next-phase start unknown — use this phase's own last
+      // milestone + buffer rather than the global horizon. This prevents Phase 2
+      // and Phase 3 from showing the same end date when sim hasn't produced a
+      // Phase 3 startsMonth yet.
+      var lastMilMid=0;
+      (phaseMilestonesByPhase[p]||[]).forEach(function(mil){if(mil.month>lastMilMid)lastMilMid=mil.month;});
+      // If this phase has no milestones at all, project a modest 24-month window
+      // beyond its start so it doesn't collapse to zero width.
+      var pStartForEnd=phaseStartByPhase[p]||0;
+      phaseEndByPhase[p]=Math.max(lastMilMid+6,pStartForEnd+24);
     } else {
-      // Last phase or no next-phase trigger known — extend to horizon (or past last milestone)
+      // Last phase only: extend to horizon (or past last milestone)
       var lastMil=0;
       (phaseMilestonesByPhase[p]||[]).forEach(function(mil){if(mil.month>lastMil)lastMil=mil.month;});
       phaseEndByPhase[p]=Math.max(lastMil+6,horizon);
@@ -29221,7 +29503,14 @@ function _cpRenderChart(targetId){
   },100);
   svg+='<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;font-size:10px;color:var(--mu);margin-top:6px">';
   svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:rgba(100,116,139,.4);margin-right:4px;vertical-align:middle;border-top:1px dashed rgba(100,116,139,.5)"></span>Do nothing ('+fmtK(baselineData[years])+')</span>';
-  active.forEach(function(a){svg+='<span><span style="display:inline-block;width:12px;height:8px;border-radius:1px;background:'+CP_COL[a.type]+';opacity:0.4;margin-right:4px;vertical-align:middle"></span>'+(a.customName||CP_NM[a.type])+'</span>';});
+  // H2: Per-vehicle legend only when displacement bands are rendered (Pro+).
+  // Without the bands, the legend wouldn't match the chart (which shows a single
+  // combined gradient), so lower tiers get a single combined entry instead.
+  if(_cpTierHas('displacement_bands')){
+    active.forEach(function(a){svg+='<span><span style="display:inline-block;width:12px;height:8px;border-radius:1px;background:'+CP_COL[a.type]+';opacity:0.4;margin-right:4px;vertical-align:middle"></span>'+(a.customName||CP_NM[a.type])+'</span>';});
+  } else if(active.length>0){
+    svg+='<span><span style="display:inline-block;width:12px;height:8px;border-radius:1px;background:rgba(91,155,255,.2);margin-right:4px;vertical-align:middle"></span>Plan growth (all vehicles combined)</span>';
+  }
   svg+='<span><span style="display:inline-block;width:12px;height:3px;border-radius:1px;background:#5B9BFF;margin-right:4px;vertical-align:middle"></span>'+(_isRetView?'Retirement':'This plan')+' ('+fmtK(totalData[years])+')</span>';
   if(simData&&simData.length>0){var simLegCol=simData[years]>=totalData[years]?'#22C55E':'#EF4444';svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:'+simLegCol+';margin-right:4px;vertical-align:middle;border-top:1px dashed '+simLegCol+'"></span>Simulated ('+fmtK(simData[years])+')</span>';}
   svg+='</div>';
@@ -29494,6 +29783,185 @@ function _cpRemove(i){
 // Collects real details when marking plan items complete,
 // then syncs bidirectionally with pfos-main.
 // ══════════════════════════════════════════════════════
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4: Plan snapshot capture
+//
+// Snapshots are append-only records of the plan state at durable change points
+// (initial plan selection, allocation marked Done, audit suggestion accepted,
+// manual save). They're stored in the `plan_snapshots` Supabase table for
+// later retrieval by future timeline UI / advisor review / compliance audit.
+//
+// We do NOT snapshot on every slider drag — those are noise. Only on durable
+// state changes that the user explicitly triggered.
+//
+// Storage cost is trivial: a few KB per snapshot, append-only, 10-20 per
+// active user per year. Retrieval is by user_id + created_at DESC.
+//
+// If the Supabase write fails (offline, RLS, schema mismatch), we log to
+// console and proceed — snapshots are best-effort, not blocking. The plan
+// itself still saves via cplanSave's normal path.
+// ─────────────────────────────────────────────────────────────────────────────
+async function _cpCaptureSnapshot(trigger,triggeredBy,notes){
+  if(!db)return;
+  try{
+    var session=(await db.auth.getSession()).data.session;
+    if(!session)return;
+    var userId=session.user.id;
+    // Snapshot the plan state — full allocations array + headline plan-level fields
+    var planState={
+      allocations:JSON.parse(JSON.stringify(CPLAN.allocations||[])),
+      surplus:CPLAN.surplus,
+      breathingPct:CPLAN._breathingPct||15,
+      debtStrategy:CPLAN.debtStrategy||'',
+      selectedApproach:CPLAN._selectedApproach||'',
+      riskProfile:CPLAN.riskProfile||'',
+      tier:CPLAN.tier||'',
+      planStartDate:CPLAN._planStartDate||null
+    };
+    // Snapshot the relevant client_data state at this moment (not the full S object —
+    // just the fields that would change AI recommendations if rerun: income, debts,
+    // retAccounts, profile basics).
+    var S2=(typeof S!=='undefined')?S:{};
+    var clientDataState={
+      currentAge:S2.currentAge||0,
+      income:CPLAN.income||0,
+      expenses:CPLAN.expenses||0,
+      debts:S2.debts||[],
+      retAccounts:S2.retAccounts||[],
+      children:S2.children||[],
+      goals:S2.goals||[],
+      buckets:S2.buckets||[],
+      profileSnapshot:{
+        marital:(S2.profile&&S2.profile.marital)||'',
+        retAge:(S2.profile&&S2.profile.retAge)||0,
+        retIncome:(S2.profile&&S2.profile.retIncome)||0,
+        healthStatus:(S2.profile&&S2.profile.healthStatus)||''
+      }
+    };
+    var row={
+      user_id:userId,
+      trigger:trigger,
+      triggered_by:triggeredBy||'user',
+      plan_state:planState,
+      client_data_state:clientDataState,
+      notes:notes||null
+    };
+    // Best-effort insert — don't block plan save on snapshot failure
+    var res=await db.from('plan_snapshots').insert(row);
+    if(res.error){
+      try{console.warn('[PFOS W4 snapshot] Insert failed (non-blocking):',res.error.message);}catch(e){}
+    }
+  }catch(err){
+    try{console.warn('[PFOS W4 snapshot] Capture error (non-blocking):',err&&err.message);}catch(e){}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Wave 4: Audit-mode plan regeneration
+//
+// Calls the audit-plan edge function (separate from generate-recommendations
+// to keep token costs low — audit reviews an existing plan, doesn't design a
+// fresh one). The edge function enforces tier (Pro+ only) and cooldown
+// (Pro 180d, Pro+/Comp 90d) server-side; the frontend also enforces these
+// for UX (button state, friendly messaging) before making the request.
+//
+// Returns the audit result object on success (CPLAN._latestAudit), or surfaces
+// the error to the user. Audit results are NON-DESTRUCTIVE — they are NOT
+// applied automatically. The audit result UI (next session) renders halos /
+// dashed-border cards and per-suggestion Accept/Dismiss controls.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Tier & cooldown gate — used both by the button-state renderer and the runner.
+function _cpAuditAvailability(){
+  var tier=(CPLAN.tier||'core').toLowerCase();
+  var allowed=['pro','pro_plus','comp'].indexOf(tier)>=0;
+  if(!allowed){
+    return {ok:false,reason:'tier',message:'Plan audit is available on Pro and above. Upgrade to access this feature.',tier:tier};
+  }
+  var cooldownDays=tier==='pro'?180:90;
+  var lastAuditAt=null;
+  try{
+    var plan=APP._portalFd&&APP._portalFd.allocation_plan;
+    lastAuditAt=plan&&plan.last_audit_at?plan.last_audit_at:null;
+  }catch(e){}
+  if(lastAuditAt){
+    var lastDate=new Date(lastAuditAt);
+    if(!isNaN(lastDate.getTime())){
+      var msSince=Date.now()-lastDate.getTime();
+      var daysSince=Math.floor(msSince/86400000);
+      if(daysSince<cooldownDays){
+        var daysRemaining=cooldownDays-daysSince;
+        var nextDate=new Date(lastDate.getTime()+cooldownDays*86400000);
+        return {ok:false,reason:'cooldown',daysRemaining:daysRemaining,nextAvailableAt:nextDate.toISOString(),
+          message:'Next audit available in '+daysRemaining+' day'+(daysRemaining===1?'':'s')+' ('+nextDate.toLocaleDateString()+').',tier:tier};
+      }
+    }
+  }
+  return {ok:true,tier:tier,cooldownDays:cooldownDays};
+}
+
+async function _cpRunPlanAudit(){
+  var avail=_cpAuditAvailability();
+  if(!avail.ok){
+    try{alert(avail.message);}catch(e){}
+    return null;
+  }
+  if(!CPLAN._selectedApproach){
+    try{alert('Run an initial plan first — there is nothing to audit yet.');}catch(e){}
+    return null;
+  }
+  // Split allocations into active vs proposed/selected for the edge function
+  var activeAllocations=[],proposedAllocations=[];
+  CPLAN.allocations.forEach(function(a){
+    var rec={
+      type:a.type,amount:a.amount,customName:a.customName||'',phase:a.phase||1,
+      eduVehicle:a.eduVehicle||'',_state:a._state||'proposed',
+      _ibcUnderlyingType:a._ibcUnderlyingType||null,
+      _policyId:a._policyId||null,_policyNumber:a._policyNumber||null,
+      _lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,
+      _hdhpGated:a._hdhpGated||false
+    };
+    if(a._state==='active')activeAllocations.push(rec);
+    else proposedAllocations.push(rec);
+  });
+  // Build request payload mirroring generate-recommendations but slimmer
+  var payload={
+    clientData:(typeof S!=='undefined'?S:{}),
+    calcs:(APP._portalCalcs||{}),
+    riskProfile:CPLAN.riskProfile||'moderate',
+    activeAllocations:activeAllocations,
+    proposedAllocations:proposedAllocations,
+    approach:CPLAN._selectedApproach,
+    tier:avail.tier,
+    lastAuditAt:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.last_audit_at)||null
+  };
+  try{
+    var token='';
+    try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(e){}
+    var res=await fetch(SUPABASE_URL+'/functions/v1/audit-plan',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify(payload)
+    });
+    var data=await res.json();
+    if(data.error){
+      try{alert('Audit error: '+(data.message||data.error));}catch(e){}
+      return null;
+    }
+    // Persist audit result + last_audit_at on the plan
+    CPLAN._latestAudit=data;
+    var plan=(APP._portalFd&&APP._portalFd.allocation_plan)||{};
+    plan.last_audit_at=data.auditDate||new Date().toISOString();
+    plan.latest_audit=data;
+    if(APP._portalFd)APP._portalFd.allocation_plan=plan;
+    cplanSave();
+    return data;
+  }catch(err){
+    try{alert('Audit request failed: '+(err&&err.message));}catch(e){}
+    return null;
+  }
+}
+
 var _cmplPendingIdx=-1;
 var _planLinkPending=null;
 var _prevMainState=null;// Track previous pfos-main state for new-item detection
@@ -30234,6 +30702,47 @@ function cplanSave(){
   // backwards-compat fallback (legacy plan.created) and only sets if not already set.
   _cpGetPlanStartDate();
 
+  // Wave 4 state machine migration: lazily transition allocations whose _completed
+  // flag is true but _state hasn't been advanced. Centralizing here means we don't
+  // have to touch every completion code path (action-only, debt, IBC, regular).
+  // For insurance products at the moment of activation: lock premium (_lockedPremium),
+  // record opened date, assign sequential _policyNumber within the purpose lane.
+  (function _cpMigrateAllocationStates(){
+    var migrated=[];
+    CPLAN.allocations.forEach(function(a){
+      if(!a._completed)return;
+      if(a._state==='active'||a._state==='closed')return;
+      // Compute purpose lane for policy numbering (insurance only)
+      var lane=null;
+      if(a.type==='ibc')lane='banking';
+      else if(a.type==='iul'||a.type==='wl')lane='retirement';
+      else if(a.type==='edu'&&(a.eduVehicle==='iul'||a.eduVehicle==='wl'))lane='education';
+      // Assign next _policyNumber in this lane (counting existing active policies)
+      if(lane&&!a._policyNumber){
+        var existingInLane=CPLAN.allocations.filter(function(x){
+          if(x===a)return false;
+          if(!x._policyNumber)return false;
+          if(lane==='banking')return x.type==='ibc';
+          if(lane==='retirement')return x.type==='iul'||x.type==='wl';
+          if(lane==='education')return x.type==='edu'&&(x.eduVehicle==='iul'||x.eduVehicle==='wl');
+          return false;
+        });
+        a._policyNumber=existingInLane.length+1;
+      }
+      // Lock the premium for insurance products (P4 rule)
+      var isInsurance=lane!=null;
+      if(isInsurance&&!a._lockedPremium){
+        a._lockedPremium=a.amount;
+      }
+      a._state='active';
+      a._openedDate=a._completedDate||new Date().toISOString();
+      migrated.push(a.customName||a.type);
+    });
+    if(migrated.length&&typeof _cpCaptureSnapshot==='function'){
+      _cpCaptureSnapshot('allocation_completed','user','Activated: '+migrated.join(', '));
+    }
+  })();
+
   // Phase A: capture original projection snapshot on first save. This is the baseline
   // we'll compare against in Phase B's accountability message ("you've drifted from
   // your original retirement age by N months"). Idempotent — only set once.
@@ -30256,7 +30765,10 @@ function cplanSave(){
   }
 
   // Clean allocations for serialization (strip timers/functions)
-  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0};});
+  // Wave 4: preserve state machine fields. Also fix latent Wave 1 bug —
+  // _ibcUnderlyingType was missing from this map and was being lost on reload,
+  // which made IUL allocations fall back to the WL 4% rate after any save/reload.
+  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false};});
   var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,selectedApproach:CPLAN._selectedApproach||'',approaches:CPLAN._approaches||null,planSource:CPLAN.hasAdvisor?'advisor':'self',planMode:CPLAN.planMode||'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString(),phaseNames:{1:CPLAN._phase1Name||'',2:CPLAN._phase2Name||'',3:CPLAN._phase3Name||'',4:CPLAN._phase4Name||''},ai_generations:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.ai_generations)||[],checkIns:CPLAN._checkIns||{},
     // Phase A: persist time anchor + original-projection baseline. Both are immutable
     // after first save — they're only re-captured if missing (legacy plan migration).
