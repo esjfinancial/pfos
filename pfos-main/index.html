@@ -1125,6 +1125,8 @@ html[data-theme="light"] .pwa-bar{background:linear-gradient(0deg,#FFFFFF,#F8FAF
     <div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Spouse / Partner</div>
     <div class="row"><div class="fi"><label class="lb">First Name</label><input class="inp" type="text" id="spFirstName" placeholder="First name" oninput="syncSpouseToProfile()"></div><div class="fi"><label class="lb">Last Name</label><input class="inp" type="text" id="spLastName" placeholder="Last name" oninput="syncSpouseToProfile()"></div></div>
     <div class="row"><div class="fi"><label class="lb">Email</label><input class="inp" type="email" id="spEmail" placeholder="spouse@email.com"></div><div class="fi"><label class="lb">Occupation</label><input class="inp" type="text" id="spOccupation" placeholder="e.g. Teacher"></div></div>
+    <div class="row"><div class="fi"><label class="lb">Date of Birth</label><input class="inp" type="date" id="spDOB" oninput="syncSpouseToProfile();syncSpouseAgeFromDOB();calc()"></div><div class="fi"><label class="lb">Current Age</label><input class="inp" type="number" id="spCurrentAge" placeholder="35" min="18" max="100" oninput="syncSpouseToProfile();calc()"></div></div>
+    <div class="row"><div class="fi"><label class="lb">Target Retirement Age</label><input class="inp" type="number" id="spRetAge" placeholder="65" min="50" max="80" value="65" oninput="syncSpouseToProfile();calc()"></div><div class="fi"><label class="lb">Expected SS at FRA <span style="color:var(--mu);font-weight:400">(optional)</span></label><input class="inp" type="number" id="spSsBenefit" placeholder="$/mo" min="0" oninput="syncSpouseToProfile();calc()"></div></div>
   </div>
   <div class="row"><div class="fi"><label class="lb">Current Age</label><input class="inp" type="number" id="currentAge" placeholder="35" min="18" max="80" oninput="calc()"></div><div class="fi"><label class="lb">Household Size</label><input class="inp" type="number" id="hhSize" placeholder="1" min="1" max="20" value="1" oninput="calc()"></div></div>
   <div class="row"><div class="fi"><label class="lb">Credit Score</label><input class="inp" type="number" id="creditScore" placeholder="720" min="300" max="850" oninput="calc()"></div><div class="fi"><label class="lb">Filing Status</label><select class="sel" id="taxFilingStatus" onchange="markManual(this);calc()"><option value="single">Single</option><option value="married_joint">Married Filing Jointly</option><option value="married_separate">Married Filing Separately</option><option value="hoh">Head of Household</option></select></div></div>
@@ -2432,6 +2434,16 @@ function syncAgeFromDOB(){
   var m=new Date().getMonth()-new Date(dob).getMonth();
   if(m<0||(m===0&&new Date().getDate()<new Date(dob).getDate())) age--;
   if(age>=18&&age<=100){ var a=document.getElementById('currentAge'); if(a&&!a.value){a.value=age;} calc(); }
+}
+
+// Phase 1A: Spouse DOB → spouse current age derivation
+// Mirrors syncAgeFromDOB. Respects manual entry (only writes if spCurrentAge is empty).
+function syncSpouseAgeFromDOB(){
+  var dob=gv('spDOB'); if(!dob) return;
+  var age=new Date().getFullYear()-new Date(dob).getFullYear();
+  var m=new Date().getMonth()-new Date(dob).getMonth();
+  if(m<0||(m===0&&new Date().getDate()<new Date(dob).getDate())) age--;
+  if(age>=18&&age<=100){ var a=document.getElementById('spCurrentAge'); if(a&&!a.value){a.value=age;} calc(); }
 }
 
 // ═══════════════════════════════════════════════════
@@ -5707,6 +5719,7 @@ function _doSync(){
     currentAge:gv('currentAge'),hhSize:gv('hhSize'),creditScore:gv('creditScore'),
     taxFilingStatus:gv('taxFilingStatus'),
     spFirstName:gv('spFirstName'),spLastName:gv('spLastName'),spEmail:gv('spEmail'),spOccupation:gv('spOccupation'),
+    spDOB:gv('spDOB'),spCurrentAge:gv('spCurrentAge'),spRetAge:gv('spRetAge'),spSsBenefit:gv('spSsBenefit'),
     retAge:gv('retAge'),retIncome:gv('retIncome'),retLifeExp:gv('retLifeExp'),ssBenefit:gv('ssBenefit'),retInflation:gv('retInflation'),
     retTaxBracket:gv('retTaxBracket'),retCapGainsBracket:gv('retCapGainsBracket'),
     liAnnualIncome:gv('liAnnualIncome'),liYearsReplace:gv('liYearsReplace'),liSpouseYears:gv('liSpouseYears'),
@@ -5742,6 +5755,11 @@ function _doSync(){
       buckets:S.buckets,
       // Phase 1A: share employment type + selected income data so partner's view reflects spouse info
       employmentType:S.profile&&(S.profile.employment_type||S.profile.employmentType),
+      // Phase 1B: share retirement-relevant fields so partner B's spouse view sees partner A's data
+      retAge:S.profile&&S.profile.retAge,
+      dob:S.profile&&S.profile.dob,
+      currentAge:S.profile&&(S.profile.currentAge||S.currentAge),
+      ssBenefit:S.profile&&S.profile.ssBenefit,
       incomeSourcesShare:(S.incomeSources||[]).map(function(s){return{
         name:s.name,owner:s.owner,mode:s.mode||'simple',amount:s.amount,
         pay_frequency:s.pay_frequency,take_home_per_check:s.take_home_per_check,
@@ -8270,15 +8288,42 @@ function renderProjections(){
     retH+='</div></div>';
   }
 
-  // Spousal Retirement Coordination
+  // Spousal Retirement Coordination — uses actual spouse retirement age data
   if(S.householdType!=='individual'&&S.currentAge>0){
-    var spouseAge=S.currentAge; // default to same age if not specified
+    var prof=S.profile||{};
+    var spAge=parseInt(prof.spCurrentAge)||parseInt(gv('spCurrentAge'))||0;
+    var spRetAge=parseInt(prof.spRetAge)||parseInt(gv('spRetAge'))||65;
+    var hasSpData=spAge>0;
+    var yrsToYourRet=Math.max(0,retAge-S.currentAge);
+    var yrsToSpRet=hasSpData?Math.max(0,spRetAge-spAge):null;
     retH+='<div style="margin-top:14px;padding:10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:2px">';
     retH+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:4px">👫 Spousal Coordination</div>';
     retH+='<div style="font-size:12px;color:rgba(226,232,240,.8);line-height:1.7">';
-    if(retAge<65) retH+='If you retire at '+retAge+' while your spouse continues working, plan for single-income bridge period. ';
-    retH+='Consider: staggered retirement dates, survivor Social Security benefits, and separate vs joint account strategies. ';
-    retH+='Each spouse should have adequate life insurance to cover the retirement shortfall of the surviving partner.';
+    if(!hasSpData){
+      retH+='<span style="color:var(--yl)">⚠ Spouse age not yet entered.</span> Add spouse DOB or current age + target retirement age in the profile section above for accurate household retirement coordination. ';
+      if(retAge<65) retH+='If you retire at '+retAge+' while your spouse continues working, plan for single-income bridge period. ';
+    } else {
+      // Compute actual retirement timeline for both partners
+      var youRetireYr=new Date().getFullYear()+yrsToYourRet;
+      var spRetireYr=new Date().getFullYear()+yrsToSpRet;
+      var bridgeYears=Math.abs(yrsToYourRet-yrsToSpRet);
+      var youFirst=yrsToYourRet<yrsToSpRet;
+      var bothSame=yrsToYourRet===yrsToSpRet;
+      retH+='<strong style="color:var(--wh)">Your retirement:</strong> age '+retAge+' (~'+youRetireYr+', '+yrsToYourRet+' yrs away). ';
+      retH+='<strong style="color:var(--wh)">Spouse retirement:</strong> age '+spRetAge+' (~'+spRetireYr+', '+yrsToSpRet+' yrs away). ';
+      if(bothSame){
+        retH+='Same retirement year — combined household income drops in one event. Plan for a single-event income transition.';
+      } else {
+        retH+='<strong style="color:var(--or)">'+bridgeYears+'-year bridge period</strong> where '+(youFirst?'your spouse continues earning':'you continue earning')+' after '+(youFirst?'your':'their')+' retirement. ';
+        retH+='This is a real planning window — '+(youFirst?'spouse':'your')+' income covers household expenses, opening room for Roth conversions, HSA timing, and tax-bracket optimization.';
+      }
+      retH+=' Consider: staggered retirement dates, survivor Social Security benefits, separate vs joint account strategies, and adequate life insurance for whichever partner retires first.';
+      // Pre-Medicare gap warning for spouse
+      if(spRetAge<65){
+        var spGap=65-spRetAge;
+        retH+=' <span style="color:var(--or)">Spouse pre-Medicare gap: '+spGap+' yr'+(spGap>1?'s':'')+' before Medicare at 65 — factor private health insurance into household budget.</span>';
+      }
+    }
     retH+='</div></div>';
   }
 
@@ -10216,6 +10261,31 @@ function submitAdvisorRequestFromModal(){
             S.profile.spouseEmploymentType=jfd.employmentType;
             S.profile._spouseEmploymentAutofilled=true;
           }
+          // Phase 1B: Spouse retirement-age autofill from linked partner's profile
+          // Partner B's profile has THEIR retAge/dob/currentAge/ssBenefit. From partner A's
+          // view those are "spouse" fields — autofill so both partners see consistent data.
+          if(!S.profile)S.profile={};
+          if(jfd.retAge){
+            S.profile.spRetAge=jfd.retAge;
+            S.profile._spouseRetAgeAutofilled=true;
+            var spRetEl=document.getElementById('spRetAge');
+            if(spRetEl&&!spRetEl.dataset.manualEdit)spRetEl.value=jfd.retAge;
+          }
+          if(jfd.dob){
+            S.profile.spDOB=jfd.dob;
+            var spDobEl=document.getElementById('spDOB');
+            if(spDobEl&&!spDobEl.dataset.manualEdit){spDobEl.value=jfd.dob;syncSpouseAgeFromDOB();}
+          }
+          if(jfd.currentAge){
+            S.profile.spCurrentAge=jfd.currentAge;
+            var spAgeEl=document.getElementById('spCurrentAge');
+            if(spAgeEl&&!spAgeEl.dataset.manualEdit&&!spAgeEl.value)spAgeEl.value=jfd.currentAge;
+          }
+          if(jfd.ssBenefit){
+            S.profile.spSsBenefit=jfd.ssBenefit;
+            var spSsEl=document.getElementById('spSsBenefit');
+            if(spSsEl&&!spSsEl.dataset.manualEdit&&!spSsEl.value)spSsEl.value=jfd.ssBenefit;
+          }
         }
       }
       // ── Restore household UI ──
@@ -10232,7 +10302,7 @@ function submitAdvisorRequestFromModal(){
       // ── Restore all panel DOM fields from S.profile ──
       if(S.profile){
         var _prof=S.profile;
-        var pfMap={cpFirstName:'firstName',cpLastName:'lastName',cpEmail:'email',cpPhone:'phone',cpDOB:'dob',cpMarital:'marital',cpSpouse:'spouse',cpOccupation:'occupation',cpEmployer:'employer',cpEmploymentType:'employmentType',cpState:'state',cpHealthStatus:'healthStatus',currentAge:'currentAge',hhSize:'hhSize',creditScore:'creditScore',taxFilingStatus:'taxFilingStatus',spFirstName:'spFirstName',spLastName:'spLastName',spEmail:'spEmail',spOccupation:'spOccupation',retAge:'retAge',retIncome:'retIncome',ssBenefit:'ssBenefit',retInflation:'retInflation',retTaxBracket:'retTaxBracket',retCapGainsBracket:'retCapGainsBracket',liAnnualIncome:'liAnnualIncome',liYearsReplace:'liYearsReplace',liSpouseYears:'liSpouseYears',liCoverage:'liCoverage',liMortgage:'liMortgage',liOtherDebt:'liOtherDebt',liDependents:'liDependents',liChildcare:'liChildcare',liEduPerChild:'liEduPerChild',liCollegeSavings:'liCollegeSavings',liFinal:'liFinal',spAnnualIncome:'spAnnualIncome',spYearsReplace:'spYearsReplace',spCoverage:'spCoverage',spDiCoverage:'spDiCoverage',diHasCoverage:'diHasCoverage',diBenefit:'diBenefit',diWaitDays:'diWaitDays',diDuration:'diDuration',diPremium:'diPremium',diCarrier:'diCarrier',ltcHasCoverage:'ltcHasCoverage',ltcBenefit:'ltcBenefit',ltcYears:'ltcYears',ltcPremium:'ltcPremium',umbHas:'umbHas',umbAmount:'umbAmount',umbPremium:'umbPremium',umbCarrier:'umbCarrier',pcType:'pcType',pcHomePremium:'pcHomePremium',pcAutoHas:'pcAutoHas',pcAutoPremium:'pcAutoPremium',estWill:'estWill',estTrust:'estTrust',estPOA:'estPOA',estHealthcare:'estHealthcare',estBeneficiary:'estBeneficiary',estGuardian:'estGuardian',estWillNotes:'estWillNotes',estTrustNotes:'estTrustNotes',estPOANotes:'estPOANotes',estHealthcareNotes:'estHealthcareNotes',estBeneficiaryNotes:'estBeneficiaryNotes',estGuardianNotes:'estGuardianNotes',eduNumChildren:'eduNumChildren'};
+        var pfMap={cpFirstName:'firstName',cpLastName:'lastName',cpEmail:'email',cpPhone:'phone',cpDOB:'dob',cpMarital:'marital',cpSpouse:'spouse',cpOccupation:'occupation',cpEmployer:'employer',cpEmploymentType:'employmentType',cpState:'state',cpHealthStatus:'healthStatus',currentAge:'currentAge',hhSize:'hhSize',creditScore:'creditScore',taxFilingStatus:'taxFilingStatus',spFirstName:'spFirstName',spLastName:'spLastName',spEmail:'spEmail',spOccupation:'spOccupation',spDOB:'spDOB',spCurrentAge:'spCurrentAge',spRetAge:'spRetAge',spSsBenefit:'spSsBenefit',retAge:'retAge',retIncome:'retIncome',ssBenefit:'ssBenefit',retInflation:'retInflation',retTaxBracket:'retTaxBracket',retCapGainsBracket:'retCapGainsBracket',liAnnualIncome:'liAnnualIncome',liYearsReplace:'liYearsReplace',liSpouseYears:'liSpouseYears',liCoverage:'liCoverage',liMortgage:'liMortgage',liOtherDebt:'liOtherDebt',liDependents:'liDependents',liChildcare:'liChildcare',liEduPerChild:'liEduPerChild',liCollegeSavings:'liCollegeSavings',liFinal:'liFinal',spAnnualIncome:'spAnnualIncome',spYearsReplace:'spYearsReplace',spCoverage:'spCoverage',spDiCoverage:'spDiCoverage',diHasCoverage:'diHasCoverage',diBenefit:'diBenefit',diWaitDays:'diWaitDays',diDuration:'diDuration',diPremium:'diPremium',diCarrier:'diCarrier',ltcHasCoverage:'ltcHasCoverage',ltcBenefit:'ltcBenefit',ltcYears:'ltcYears',ltcPremium:'ltcPremium',umbHas:'umbHas',umbAmount:'umbAmount',umbPremium:'umbPremium',umbCarrier:'umbCarrier',pcType:'pcType',pcHomePremium:'pcHomePremium',pcAutoHas:'pcAutoHas',pcAutoPremium:'pcAutoPremium',estWill:'estWill',estTrust:'estTrust',estPOA:'estPOA',estHealthcare:'estHealthcare',estBeneficiary:'estBeneficiary',estGuardian:'estGuardian',estWillNotes:'estWillNotes',estTrustNotes:'estTrustNotes',estPOANotes:'estPOANotes',estHealthcareNotes:'estHealthcareNotes',estBeneficiaryNotes:'estBeneficiaryNotes',estGuardianNotes:'estGuardianNotes',eduNumChildren:'eduNumChildren'};
         Object.keys(pfMap).forEach(function(domId){var el=document.getElementById(domId);var val=_prof[pfMap[domId]];if(el&&val!==undefined&&val!=='')el.value=val;});
         // Restore children dropdown + goals from profile
         if(S.children&&S.children.length>0){var cpSel=document.getElementById('cpChildren');if(cpSel)cpSel.value=String(S.children.length);renderProfileChildInputs();}
