@@ -22596,12 +22596,23 @@ function _cpConvertAIRecs(aiData){
     // distinguish Policy #1 vs Policy #2 vs Policy #N within the same purpose lane.
     var _isInsurance=(map.type==='iul'||map.type==='wl'||map.type==='ibc'||(map.type==='edu'&&(r._eduVeh==='wl'||r._eduVeh==='iul')));
     var _policyId=_isInsurance?('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)):null;
-    CPLAN.allocations.push({type:map.type,amount:amt,target:0,phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null});
+    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null});
     usedPool+=amt;
   });
 
   // ── POST-PROCESSING ──
 
+  // P1 (Fix #1): Backstop — ensure every EF allocation has target populated.
+  // The AI may omit target_amount on its EF recommendation; without target the
+  // date-range renderer (line ~24105) falls back to "ongoing" instead of showing
+  // a projected fully-funded date. CPLAN.efTarget was computed earlier from
+  // monthly expenses × 3 (line ~23335) and is always available.
+  (function _backstopEFTarget(){
+    var efTgt=Math.round(Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0)));
+    CPLAN.allocations.forEach(function(a){
+      if(a.type==='ef'&&(!a.target||a.target<=0)&&efTgt>0){a.target=efTgt;}
+    });
+  })();
   // Fix PP-C5 (HSA HDHP gate): HSA contributions require enrollment in a High Deductible
   // Health Plan. We don't yet collect an explicit HDHP flag in profile, so we use the
   // presence of an existing HSA in retAccounts as the proxy: if the user has an HSA on
@@ -22925,6 +22936,16 @@ function _cpConvertAIRecs(aiData){
           // Down-convert to WL: amount is in the WL-viable zone
           if(a.type==='iul'){a.type='wl';}
           else if(a.type==='ibc'){a._ibcUnderlyingType='wl';}
+          // Fix #6: also normalize customName so the card title reflects what the
+          // policy actually is now. Without this, the user sees "Indexed Universal
+          // Life Policy" with a 4.0% rate (correct for WL) and assumes the rate
+          // calc is broken — when really the title is just stale.
+          if(a.customName){
+            a.customName=a.customName
+              .replace(/Indexed Universal Life( Policy)?/gi,'Whole Life Policy')
+              .replace(/\bIUL Policy\b/gi,'Whole Life Policy')
+              .replace(/\bIUL\b/gi,'WL');
+          }
           a.reason=(a.reason?a.reason+'\n':'')+'⚠️ Down-converted from IUL to WL: $'+amt+'/mo is below the $500/mo IUL minimum but meets the $300/mo WL minimum. WL fits this funding level better; revisit IUL when surplus increases.';
           downconverted++;
           try{console.warn('[PFOS W4M] Down-converted IUL→WL:',a.customName,amt);}catch(e){}
@@ -23019,6 +23040,11 @@ function _cpConvertAIRecs(aiData){
   if(aiData.summary)CPLAN._aiSummary=aiData.summary;
   if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
   if(aiData.debtStrategy)CPLAN.debtStrategy=aiData.debtStrategy;
+  // Fix #2: run the enforce safety net once now (allowScale=true) so over-budget
+  // AI plans get scaled down at load time. Subsequent interactive _cpEnforce()
+  // calls from sliders use default opts (allowScale=false) so individual edits
+  // don't shift other sliders proportionally.
+  try{_cpEnforce({allowScale:true});}catch(e){console.warn('Load-time enforce:',e);}
 }
 
 // ── Select an approach from the 3 generated options ──
@@ -23920,10 +23946,14 @@ function _cpRenderPlanV2(){
         }
 
         // Completing items get grayed wrapper. Two paths:
-        //   1) Item is debt/EF/custom-with-target AND simulation has computed any completion event
-        //      (debt paid off OR EF funded OR custom goal reached)
-        //   2) Item is already directly marked _completed (user-confirmed completion)
-        if((isCompleting&&_sim&&((_sim.debtFreeMonth||0)>0||(_sim.fullFundingMonth||0)>0))||a._completed){
+        //   1) Phase N>1 view + item is debt/EF/custom-with-target → grayed by definition
+        //      (Phase 2+ exists *because* Phase 1 things complete; their entries should
+        //      visually reflect that.) Fix #3: previously gated on _sim.fullFundingMonth>0
+        //      which meant "all phases started" — wrong field — so EFs in Phase 2 view
+        //      stayed live. Now we gray them in any non-Phase-1 tab.
+        //   2) Item is already directly marked _completed (user-confirmed completion) —
+        //      grayed in any tab including Phase 1.
+        if((_activeTab>1&&isCompleting)||a._completed){
           h+='<div style="opacity:0.45;filter:grayscale(0.5)">';
           h+=_cpBuildCard(a,idx,false);
           h+='</div>';
@@ -23942,7 +23972,16 @@ function _cpRenderPlanV2(){
     if(_phaseOnlyItems.length>0){
       h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:'+_pCur2.color+';margin:12px 0 6px">NEW IN PHASE '+_activeTab+'</div>';
       _phaseOnlyItems.forEach(function(a){var idx=CPLAN.allocations.indexOf(a);
+        // Fix #7: NEW-in-phase items render with a.amount=0 by default since
+        // cascade hasn't fired yet at plan-edit time. Substitute the simulator's
+        // projected futureAmount (what cascade will deliver when this phase
+        // starts) so users see e.g. HSA $26/mo instead of HSA $0/mo. Original
+        // amount restored after the card render so persisted state is unchanged.
+        var _origAmt=a.amount;
+        var _af=(_sim&&_sim.allocFuture)?_sim.allocFuture[idx]:null;
+        if(_af&&_af.futureAmount>_origAmt){a.amount=_af.futureAmount;}
         h+=_cpBuildCard(a,idx,false);
+        a.amount=_origAmt;
       });
     }
     // H5: subtler "+ add new" link instead of a heavy dashed button on Phase 2+.
@@ -24234,8 +24273,12 @@ function _cpBuildCard(a,idx,isUnassigned){
       var _ibcGrowthRate = ((_illustrated || 0) * 100).toFixed(1);
       h += '<div style="margin-top:8px;display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px">';
       // Cash value (anchored if any history; else illustrated)
+      // Fix #5: label was "Cash value" with no time context — confusing because
+      // _ibcProj runs only 12 months so the value shown is year-1 illustrated CV
+      // (intentionally low for max-funded WL due to commission load). The chart
+      // above shows the long-term trajectory; this tile is the year-1 anchor.
       h += '<div style="padding:6px 8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px">';
-      h += '<div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"><span title="'+_anchorLabel+'">'+_anchorIcon+'</span> Cash value</div>';
+      h += '<div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.04em;text-transform:uppercase;margin-bottom:2px"><span title="'+_anchorLabel+'">'+_anchorIcon+'</span> '+(_hasAnchor?'Cash value':'Year 1 CV')+'</div>';
       h += '<div style="font-family:var(--fd,monospace);font-size:14px;color:var(--wh);font-weight:700">'+(typeof fmtK==='function'?fmtK(_ibcCV):'$'+_ibcCV)+'</div>';
       h += '<div style="font-size:11px;color:'+_anchorColor+'">'+_anchorLabel+'</div>';
       h += '</div>';
@@ -24320,7 +24363,10 @@ function _cpBuildCard(a,idx,isUnassigned){
         var _xScale = function(m){return _chartPadL + (m / _chartHorizonMo) * (_chartW - _chartPadL - _chartPadR);};
         var _yScale = function(cv){return _chartH - _chartPadB - (cv / _maxCV) * (_chartH - _chartPadT - _chartPadB);};
         // Build SVG
-        var _svgH = '<svg width="100%" viewBox="0 0 '+_chartW+' '+_chartH+'" style="display:block;margin-top:8px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px" preserveAspectRatio="xMidYMid meet">';
+        // Fix #4: caption clarifying what the chart shows — without this, the
+        // top-right Y-axis tick reads as e.g. "$1338K" with no context.
+        h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding:0 2px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu)">📈 Cash Value Projection</div><div style="font-size:10px;color:var(--mu)">Projected at age '+(_curAgeForHorizon + _chartHorizonYr)+': <strong style="color:var(--gr)">$'+(_maxCV >= 1000 ? Math.round(_maxCV/1000) + 'K' : Math.round(_maxCV))+'</strong></div></div>';
+        var _svgH = '<svg width="100%" viewBox="0 0 '+_chartW+' '+_chartH+'" style="display:block;margin-top:4px;background:rgba(0,0,0,.18);border:1px solid var(--bd);border-radius:3px" preserveAspectRatio="xMidYMid meet">';
         // Illustrated curve (faded dashed)
         if(_illusPoints.length > 1){
           var _illusPath = _illusPoints.map(function(p, i){return (i === 0 ? 'M' : 'L') + _xScale(p.m).toFixed(1) + ',' + _yScale(p.cv).toFixed(1);}).join(' ');
@@ -30016,8 +30062,14 @@ function _cpRunSimulation(){
     if(freed>0){
       // Priority: INCREASE existing growth allocations (they're already compounding)
       // Phase D: hybrid restricts to owner-matching growth
+      // Fix #8: insurance premiums (iul/wl/ibc) are FIXED at policy inception and
+      // cannot be increased mid-policy without a new contract. Excluded from the
+      // BOOST pass so cascade redirects to non-insurance growth (Roth/401k/invest/
+      // HSA) instead. The UNFUNDED pass below (line ~30130) still allows initial
+      // funding of currently-$0 insurance allocations (Phase 2 starter pattern),
+      // which doesn't violate the lock since the policy hasn't been issued yet.
       var growth=CPLAN.allocations.map(function(a5,i5){return{a:a5,i:i5};})
-        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
+        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','invest','edu','trad_ira','solo401k','sep_ira','hsa'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
         .sort(function(a6,b6){return(a6.a.phase||99)-(b6.a.phase||99);});
       if(growth.length>0){
         // BUG FIX: proportions must be computed against INITIAL freed, not the
@@ -31663,7 +31715,13 @@ function _cpConfetti(label){
   document.body.appendChild(overlay);
   setTimeout(function(){overlay.remove();},3000);
 }
-function _cpEnforce(){
+function _cpEnforce(opts){
+  // Fix #2: opts.allowScale=true only when called from plan-load paths (AI/advisor
+  // plan parsing). Interactive paths (_cpSlide → _cpEnforce) leave opts undefined
+  // so the proportional rescale stays dormant and only the active slider moves.
+  // The slider's `max` attribute already prevents users from exceeding budget;
+  // this safety net is for plans that arrive over-budget from external sources.
+  var _allowScale=!!(opts&&opts.allowScale);
   // 1. Cap individual allocations at IRS maximums (preserved)
   CPLAN.allocations.forEach(function(a){
     if(a.amount<=0)return;
@@ -31676,7 +31734,10 @@ function _cpEnforce(){
   // 2. Cap total at available budget (surplus − breathing room).
   // Live editing can't exceed budget thanks to slider caps; this safety net catches
   // over-budget plans loaded from AI/advisor sources and silently scales them, then
-  // sets _scaledOnLoad so _cpRenderPlanV2 can surface a notice.
+  // sets _scaledOnLoad so _cpRenderPlanV2 can surface a notice. Gated on _allowScale
+  // so it does NOT run during interactive slider drags (which would shift other
+  // sliders proportionally — visible bug from before fix).
+  if(!_allowScale)return;
   var surplus=CPLAN.surplus||0;
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
   var budgetCap=surplus*(1-brPct);
