@@ -22066,27 +22066,66 @@ function _cpConvertAIRecs(aiData){
     }
   });
 
-  // Fix PP10: Tax-Free approach should not include taxable investment accounts
+  // Fix PP10: Tax-Free approach should not include taxable investment accounts.
+  // Bug fix: also cap traditional 401k at the employer match level (match capture is
+  // valid even in tax-free; anything beyond match defeats the tax-free purpose).
+  // Also filter trad_ira entirely (purely tax-deferred, not tax-free).
   if(CPLAN._selectedApproach==='tax_free'||CPLAN._viewingApproach==='tax_free'){
     var _taxableRemoved=0;
+    // Compute employer match dollar amount once — used to cap traditional 401k below.
+    var _matchPctTF=0;
+    var _retAcctsTF=(APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.retAccounts)||[];
+    var _matchAcctTF=_retAcctsTF.find(function(r){return(parseFloat(r.matchPct)||0)>0;});
+    if(_matchAcctTF)_matchPctTF=parseFloat(_matchAcctTF.matchPct)||0;
+    var _matchDollarsTF=Math.round((CPLAN.income||0)*(_matchPctTF/100));
     CPLAN.allocations=CPLAN.allocations.filter(function(a){
+      // Taxable brokerage — drop and redistribute
       if(a.type==='invest'){_taxableRemoved+=a.amount;return false;}
+      // Traditional IRA — purely tax-deferred, drop and redistribute (Roth IRA replaces it)
+      if(a.type==='trad_ira'){_taxableRemoved+=a.amount;return false;}
+      // Traditional 401k — cap at employer match level. Excess goes to redistribution pool.
+      // If no employer match, drop the 401k allocation entirely.
+      if(a.type==='401k'){
+        if(_matchDollarsTF<=0){_taxableRemoved+=a.amount;return false;}
+        if(a.amount>_matchDollarsTF){
+          var _excess=a.amount-_matchDollarsTF;
+          a.amount=_matchDollarsTF;
+          _taxableRemoved+=_excess;
+          a.reason=(a.reason?a.reason+'\n':'')+'⚠️ Tax-Free: Traditional 401(k) capped at employer match ('+fmt(_matchDollarsTF)+'/mo). Excess redirected to tax-free buckets.';
+        }
+        return true;
+      }
       return true;
     });
-    // Redistribute removed amount to Roth IRA if it exists, capped at IRS limit
+    // Redistribute removed amount in priority order: Roth 401k → Roth IRA → HSA → IUL/WL/IBC
+    if(_taxableRemoved>0){
+      var _r401=CPLAN.allocations.find(function(a){return a.type==='roth401k';});
+      if(_r401){
+        var _r401Max=_cpIRSMax('roth401k',_r401);
+        var _add1=Math.min(_taxableRemoved,Math.max(0,_r401Max-_r401.amount));
+        _r401.amount+=_add1;_taxableRemoved-=_add1;
+      }
+    }
     if(_taxableRemoved>0){
       var _rothA=CPLAN.allocations.find(function(a){return a.type==='roth';});
       if(_rothA){
-        var _rothMax=_cpIRSMax('roth');
-        var _addToRoth=Math.min(_taxableRemoved,Math.max(0,_rothMax-_rothA.amount));
-        _rothA.amount+=_addToRoth;
-        _taxableRemoved-=_addToRoth;
+        var _rothMax=_cpIRSMax('roth',_rothA);
+        var _add2=Math.min(_taxableRemoved,Math.max(0,_rothMax-_rothA.amount));
+        _rothA.amount+=_add2;_taxableRemoved-=_add2;
       }
-      // Any remaining goes to existing IUL/WL/IBC (no IRS cap)
-      if(_taxableRemoved>0){
-        var _tfGrowth=CPLAN.allocations.find(function(a){return a.type==='iul'||a.type==='wl'||a.type==='ibc';});
-        if(_tfGrowth)_tfGrowth.amount+=_taxableRemoved;
+    }
+    if(_taxableRemoved>0){
+      var _hsaA=CPLAN.allocations.find(function(a){return a.type==='hsa';});
+      if(_hsaA&&!_hsaA._hdhpGated){
+        var _hsaMax=_cpIRSMax('hsa',_hsaA);
+        var _add3=Math.min(_taxableRemoved,Math.max(0,_hsaMax-_hsaA.amount));
+        _hsaA.amount+=_add3;_taxableRemoved-=_add3;
       }
+    }
+    // Any remaining goes to existing IUL/WL/IBC (no IRS cap)
+    if(_taxableRemoved>0){
+      var _tfGrowth=CPLAN.allocations.find(function(a){return a.type==='iul'||a.type==='wl'||a.type==='ibc';});
+      if(_tfGrowth)_tfGrowth.amount+=_taxableRemoved;
     }
   }
 
@@ -23036,8 +23075,8 @@ function _cpRenderPlanV2(){
     var phaseItems=CPLAN.allocations.filter(function(a){return a.phase===pn;});
     var doneCnt=phaseItems.filter(function(a){return a._completed;}).length;
     var pPct=phaseItems.length>0?Math.round(doneCnt/phaseItems.length*100):0;
-    // Phase 1 all completed = grayed
-    var isCompleted=pn===1&&phaseItems.length>0&&phaseItems.every(function(a){return a._completed;});
+    // Any phase with all items completed = grayed (was: only Phase 1)
+    var isCompleted=phaseItems.length>0&&phaseItems.every(function(a){return a._completed;});
     h+='<button onclick="CPLAN._activePhaseTab='+pn+';_cpRenderPlanV2()" style="display:flex;align-items:center;gap:6px;padding:10px 16px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:40px;background:'+(isActive?p.color+'15':'transparent')+';color:'+(isActive?p.color:isCompleted?'var(--mu)':'rgba(226,232,240,.5)')+';border-bottom:2px solid '+(isActive?p.color:'transparent')+';margin-bottom:-2px;transition:all .15s;letter-spacing:.04em'+(isCompleted?';opacity:0.5':'')+'">';
     h+=p.icon+' Phase '+pn;
     if(pPct>0&&pPct<100)h+=' <span style="font-size:8px;opacity:0.7">'+pPct+'%</span>';
@@ -23191,8 +23230,10 @@ function _cpRenderPlanV2(){
           h+='</div>';
         }
 
-        // Completing items get grayed wrapper
-        if(isCompleting&&_sim&&_sim.debtFreeMonth>0){
+        // Completing items get grayed wrapper. Two paths:
+        //   1) Item is debt/EF/custom-with-target AND simulation has computed it'll complete
+        //   2) Item is already directly marked _completed (user-confirmed completion)
+        if((isCompleting&&_sim&&_sim.debtFreeMonth>0)||a._completed){
           h+='<div style="opacity:0.45;filter:grayscale(0.5)">';
           h+=_cpBuildCard(a,idx,false);
           h+='</div>';
