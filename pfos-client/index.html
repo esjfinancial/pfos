@@ -22503,6 +22503,10 @@ function _cpViewApproach(key){
   CPLAN._viewingApproach=key;
   _cpConvertAIRecs(aiData);
   CPLAN._originalAIPlan=JSON.parse(JSON.stringify(CPLAN.allocations));
+  // CRITICAL: rebuild simulation so allocFuture indexes match the post-conversion
+  // allocations array. Without this, insurance uniqueness drops or other PP
+  // post-processors create stale idx → undefined references in the render path.
+  if(typeof _cpRunSimulation==='function')try{_cpRunSimulation();}catch(e){console.warn('Sim rebuild failed:',e);}
   _cpRenderPlanV2();
 }
 // ── Retry a single failed approach ──
@@ -23127,6 +23131,7 @@ function _cpRenderPlanV2(){
     h+='<div style="position:relative;height:14px;background:rgba(100,116,139,.06);border-radius:3px;overflow:hidden"><div style="display:flex;height:100%">';
     _sim.allocFuture.forEach(function(af){
       var a=CPLAN.allocations[af.idx];
+      if(!a)return;// Defense: stale idx pointing to dropped allocation
       if(a.type==='debt'||a.type==='ef')return;// Exclude completed items from Phase 2 bar
       if(a.type==='protection'&&a.amount===0)return;// Exclude action-only items
       var fa=af.futureAmount||af.currentAmount||0;
@@ -23138,6 +23143,7 @@ function _cpRenderPlanV2(){
     h+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:4px;margin-bottom:4px">';
     _sim.allocFuture.forEach(function(af){
       var a=CPLAN.allocations[af.idx];
+      if(!a)return;// Defense: stale idx pointing to dropped allocation
       if(a.type==='debt'||a.type==='ef')return;
       if(a.type==='protection'&&a.amount===0)return;
       var fa=af.futureAmount||af.currentAmount||0;
@@ -23231,9 +23237,10 @@ function _cpRenderPlanV2(){
         }
 
         // Completing items get grayed wrapper. Two paths:
-        //   1) Item is debt/EF/custom-with-target AND simulation has computed it'll complete
+        //   1) Item is debt/EF/custom-with-target AND simulation has computed any completion event
+        //      (debt paid off OR EF funded OR custom goal reached)
         //   2) Item is already directly marked _completed (user-confirmed completion)
-        if((isCompleting&&_sim&&_sim.debtFreeMonth>0)||a._completed){
+        if((isCompleting&&_sim&&((_sim.debtFreeMonth||0)>0||(_sim.fullFundingMonth||0)>0))||a._completed){
           h+='<div style="opacity:0.45;filter:grayscale(0.5)">';
           h+=_cpBuildCard(a,idx,false);
           h+='</div>';
@@ -29330,12 +29337,18 @@ function _cpRunSimulation(){
         .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
         .sort(function(a6,b6){return(a6.a.phase||99)-(b6.a.phase||99);});
       if(growth.length>0){
-        // Distribute proportionally to current allocation amounts (not equal split)
+        // BUG FIX: proportions must be computed against INITIAL freed, not the
+        // running freed value. Otherwise each iteration takes its proportional
+        // share of a shrinking pool, leaving an unallocated remainder that should
+        // have cascaded but doesn't (visible as Phase2 < Phase1 in deployment bar).
+        // First pass: distribute proportionally based on initial freed, applying IRS caps.
         var _growthTotal=growth.reduce(function(t,g){return t+allocAmounts[g.i];},0);
+        var _initialFreed=freed;
         growth.forEach(function(g){
           if(freed<=0)return;
           var proportion=_growthTotal>0?allocAmounts[g.i]/_growthTotal:(1/growth.length);
-          var per=Math.round(freed*proportion);
+          // Use INITIAL freed for proportional share, capped by what's actually still available
+          var per=Math.min(Math.round(_initialFreed*proportion),freed);
           var irsMax3=_cpIRSMax(g.a.type,g.a);
           var add3=Math.min(per,Math.max(0,irsMax3-allocAmounts[g.i]));
           if(add3>0){
@@ -29346,6 +29359,35 @@ function _cpRunSimulation(){
             freed-=add3;
           }
         });
+        // Second pass: any leftover (from IRS-capped items or rounding) gets
+        // pushed to growth items that still have IRS headroom. Iterate until
+        // fully consumed or no more headroom.
+        var _safetyIter=0;
+        while(freed>0&&_safetyIter<3){
+          _safetyIter++;
+          var distributedThisPass=0;
+          growth.forEach(function(g){
+            if(freed<=0)return;
+            var irsMax4=_cpIRSMax(g.a.type,g.a);
+            var headroom=Math.max(0,irsMax4-allocAmounts[g.i]);
+            if(headroom<=0)return;
+            // Each pass distributes proportionally to remaining headroom across
+            // items that still have room, ensuring fairness without re-shrinking.
+            var add4=Math.min(headroom,freed);
+            if(add4>0){
+              allocAmounts[g.i]+=add4;
+              allocFuture[g.i].futureAmount=allocAmounts[g.i];
+              allocFuture[g.i].boosts.push({month:ev.month,amount:add4,from:ev.label});
+              // Find existing destination entry to merge, or push new
+              var _existing=destinations.find(function(d){return d.type===g.a.type&&d.name===(g.a.customName||CP_NM[g.a.type]);});
+              if(_existing)_existing.amount+=add4;
+              else destinations.push({type:g.a.type,name:g.a.customName||CP_NM[g.a.type],amount:add4});
+              freed-=add4;
+              distributedThisPass+=add4;
+            }
+          });
+          if(distributedThisPass===0)break;// All items at IRS cap
+        }
       }
     }
     // Then: fund any remaining unfunded growth items (skip action-only items)
