@@ -1127,6 +1127,7 @@ html[data-theme="light"] .pwa-bar{background:linear-gradient(0deg,#FFFFFF,#F8FAF
     <div class="row"><div class="fi"><label class="lb">Email</label><input class="inp" type="email" id="spEmail" placeholder="spouse@email.com"></div><div class="fi"><label class="lb">Occupation</label><input class="inp" type="text" id="spOccupation" placeholder="e.g. Teacher"></div></div>
     <div class="row"><div class="fi"><label class="lb">Date of Birth</label><input class="inp" type="date" id="spDOB" oninput="syncSpouseToProfile();syncSpouseAgeFromDOB();calc()"></div><div class="fi"><label class="lb">Current Age</label><input class="inp" type="number" id="spCurrentAge" placeholder="35" min="18" max="100" oninput="syncSpouseToProfile();calc()"></div></div>
     <div class="row"><div class="fi"><label class="lb">Target Retirement Age</label><input class="inp" type="number" id="spRetAge" placeholder="65" min="50" max="80" value="65" oninput="syncSpouseToProfile();calc()"></div><div class="fi"><label class="lb">Expected SS at FRA <span style="color:var(--mu);font-weight:400">(optional)</span></label><input class="inp" type="number" id="spSsBenefit" placeholder="$/mo" min="0" oninput="syncSpouseToProfile();calc()"></div></div>
+    <div class="row"><div class="fi"><label class="lb">Spouse's Desired Monthly Retirement Income (Today's $)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="spRetIncome" placeholder="5000" min="0" oninput="syncSpouseToProfile();calc()" style="padding-left:22px"></div></div><div class="fi"></div></div>
   </div>
   <div class="row"><div class="fi"><label class="lb">Current Age</label><input class="inp" type="number" id="currentAge" placeholder="35" min="18" max="80" oninput="calc()"></div><div class="fi"><label class="lb">Household Size</label><input class="inp" type="number" id="hhSize" placeholder="1" min="1" max="20" value="1" oninput="calc()"></div></div>
   <div class="row"><div class="fi"><label class="lb">Credit Score</label><input class="inp" type="number" id="creditScore" placeholder="720" min="300" max="850" oninput="calc()"></div><div class="fi"><label class="lb">Filing Status</label><select class="sel" id="taxFilingStatus" onchange="markManual(this);calc()"><option value="single">Single</option><option value="married_joint">Married Filing Jointly</option><option value="married_separate">Married Filing Separately</option><option value="hoh">Head of Household</option></select></div></div>
@@ -2246,10 +2247,11 @@ function estTermPremium(age,health,termYrs,coverage){
   return Math.round(coverage/100000*baseRate*mult*100)/100;
 }
 
-// Capital gains tax rate estimator
+// Capital gains tax rate estimator (2026 LTCG thresholds — IRS Rev. Proc. 2025-32)
 function estCapGainsTax(income,filingStatus){
-  if(filingStatus==='mfj') return income>583750?0.20:income>89250?0.15:0;
-  return income>518900?0.20:income>44625?0.15:0;
+  if(filingStatus==='mfj') return income>613700?0.20:income>98900?0.15:0;
+  if(filingStatus==='hoh') return income>579600?0.20:income>66200?0.15:0;
+  return income>545500?0.20:income>49450?0.15:0;
 }
 function pi(v){ return parseInt(v)||0; }
 function set(id,h){ var el=document.getElementById(id); if(el) el.innerHTML=h; }
@@ -2428,6 +2430,59 @@ function getProfile(){
   };
 }
 function getFullName(){ var p=getProfile(); return (p.firstName+' '+p.lastName).trim()||'Client'; }
+// Phase 4: Full Retirement Age table (SSA rules).
+// Born 1943-1954: 66.0
+// Born 1955: 66 + 2 mo (66.167)
+// Born 1956: 66 + 4 mo (66.333)
+// Born 1957: 66 + 6 mo (66.5)
+// Born 1958: 66 + 8 mo (66.667)
+// Born 1959: 66 + 10 mo (66.833)
+// Born 1960+: 67.0
+// Returns FRA in years (decimal). Integer year → integer/decimal age.
+// Source: ssa.gov/oact/quickcalc/early_late.html
+function _ssFRA(birthYearOrDob){
+  var by;
+  if(typeof birthYearOrDob==='number')by=birthYearOrDob;
+  else if(typeof birthYearOrDob==='string'&&birthYearOrDob){
+    var d=new Date(birthYearOrDob);
+    by=isNaN(d.getTime())?null:d.getFullYear();
+  }
+  if(!by||by<1900||by>new Date().getFullYear())return 67;// safe default
+  if(by<=1954)return 66;
+  if(by===1955)return 66+2/12;
+  if(by===1956)return 66+4/12;
+  if(by===1957)return 66+6/12;
+  if(by===1958)return 66+8/12;
+  if(by===1959)return 66+10/12;
+  return 67;
+}
+// Returns a formatted FRA string like "66" or "66 yr 8 mo" or "67"
+function _ssFRAStr(by){
+  var fra=_ssFRA(by);
+  if(fra===Math.floor(fra))return String(Math.round(fra));
+  var yr=Math.floor(fra);var mo=Math.round((fra-yr)*12);
+  return yr+' yr '+mo+' mo';
+}
+// Adjustment factor for claiming at a given age vs FRA.
+// Early: -5/9 of 1% per month for first 36 months before FRA, then -5/12 of 1% per additional month.
+// Delayed: +8% per year (2/3% per month) after FRA up to age 70. After 70, no further increase.
+function _ssClaimAdjustment(claimAge,fra){
+  if(claimAge>=70)claimAge=70;
+  if(claimAge<62)claimAge=62;
+  var monthsDiff=Math.round((claimAge-fra)*12);
+  if(monthsDiff===0)return 1;
+  if(monthsDiff>0){
+    // Delayed: +2/3% per month, capped at age 70
+    return 1+monthsDiff*(2/3)/100;
+  }
+  // Early: months before FRA
+  var monthsEarly=-monthsDiff;
+  var firstWindow=Math.min(36,monthsEarly);
+  var beyond=Math.max(0,monthsEarly-36);
+  var reduction=firstWindow*(5/9)/100+beyond*(5/12)/100;
+  return Math.max(0.6,1-reduction);// floor at 60% (extreme early)
+}
+
 function syncAgeFromDOB(){
   var dob=gv('cpDOB'); if(!dob) return;
   var age=new Date().getFullYear()-new Date(dob).getFullYear();
@@ -2805,8 +2860,11 @@ function renderPlanSection(){
       _ptH+='<div style="font-size:11px;color:var(--mu)">'+fmt(a.amount)+'/mo planned'+(isDone&&d2.actual!==a.amount?' · Actual: <strong style="color:var(--gr)">'+fmt(d2.actual)+'</strong>':'')+'</div>';
       if(calE)_ptH+='<div style="font-size:9px;color:var(--mu)">📅 Withdraws on the '+calE.day+(_pfosOrdSuffix(calE.day))+'</div>';
       if(isDone&&d2.note)_ptH+='<div style="font-size:9px;color:var(--mu);font-style:italic">📝 '+escH(d2.note)+'</div>';
-      // Growth projection
-      if(['roth','401k','invest','iul','wl','edu','ibc'].indexOf(a.type)>=0){var rt=0.065;var yr2=Math.max(1,65-(_pd.age||35));var bl=0;for(var y=1;y<=yr2;y++)bl=(bl+a.amount*12)*(1+rt);_ptH+='<div style="font-size:9px;color:var(--gr)">→ '+fmtK(Math.round(bl))+' at retirement</div>';}
+      // Growth projection — Phase D multi-partner: prefer plan-supplied retirement age,
+      // fall back to user's profile retAge, then 65. Owner-aware projection requires the
+      // partner data the postMessage doesn't currently carry per-allocation; until that
+      // lands, project against the user's own retirement age.
+      if(['roth','401k','invest','iul','wl','edu','ibc'].indexOf(a.type)>=0){var rt=0.065;var _projRetAge=parseInt((_pd&&_pd.retirementAge)||(S.profile&&S.profile.retAge)||gv('retAge'))||65;var yr2=Math.max(1,_projRetAge-(_pd.age||35));var bl=0;for(var y=1;y<=yr2;y++)bl=(bl+a.amount*12)*(1+rt);_ptH+='<div style="font-size:9px;color:var(--gr)">→ '+fmtK(Math.round(bl))+' at retirement</div>';}
       _ptH+='</div><div style="text-align:right;flex-shrink:0;margin-right:8px"><div style="font-family:var(--fd);font-size:22px;color:'+c2+'">'+fmt(a.amount)+'</div><div style="font-size:8px;color:var(--mu)">/mo</div></div>';
       if(isDone)_ptH+='<div style="padding:8px 16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr)">✓ Done</div>';
       else if(isMiss)_ptH+='<div style="padding:8px 16px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--rd)">✗ Missed</div>';
@@ -3866,11 +3924,12 @@ function _acctComputePlanImpact(monthlyShortfall){
   }
 
   // Compute compounded impact at retirement.
-  // Use planned retirement age 65 if not stored. Use a 6.5% blended growth rate as the
+  // Phase D multi-partner: prefer the retirement age from the synced plan, fall back to
+  // the user's own profile retAge, then 65. Use a 6.5% blended growth rate as the
   // baseline approximation — actual portal sim would do better, but this is a quick
   // illustration meant to motivate behavior, not produce AG49-A precision.
   var age=plan.age||30;
-  var retAge=65;
+  var retAge=parseInt(plan.retirementAge||(S.profile&&S.profile.retAge)||gv('retAge'))||65;
   var yrs=Math.max(1,retAge-age);
   var rate=0.065;
   // Annuity-due future value of $shortfall/mo at given rate over yrs
@@ -5719,7 +5778,7 @@ function _doSync(){
     currentAge:gv('currentAge'),hhSize:gv('hhSize'),creditScore:gv('creditScore'),
     taxFilingStatus:gv('taxFilingStatus'),
     spFirstName:gv('spFirstName'),spLastName:gv('spLastName'),spEmail:gv('spEmail'),spOccupation:gv('spOccupation'),
-    spDOB:gv('spDOB'),spCurrentAge:gv('spCurrentAge'),spRetAge:gv('spRetAge'),spSsBenefit:gv('spSsBenefit'),
+    spDOB:gv('spDOB'),spCurrentAge:gv('spCurrentAge'),spRetAge:gv('spRetAge'),spSsBenefit:gv('spSsBenefit'),spRetIncome:gv('spRetIncome'),
     retAge:gv('retAge'),retIncome:gv('retIncome'),retLifeExp:gv('retLifeExp'),ssBenefit:gv('ssBenefit'),retInflation:gv('retInflation'),
     retTaxBracket:gv('retTaxBracket'),retCapGainsBracket:gv('retCapGainsBracket'),
     liAnnualIncome:gv('liAnnualIncome'),liYearsReplace:gv('liYearsReplace'),liSpouseYears:gv('liSpouseYears'),
@@ -7650,8 +7709,8 @@ function renderTaxEstimation(){
   var isMFS=filing==='married_separate';
   var isHOH=filing==='hoh';
 
-  // 2026 standard deductions (IRS Rev. Proc. 2025-32)
-  var stdDeduction=isMFJ?29200:isHOH?21900:14600;
+  // 2026 standard deductions (IRS Rev. Proc. 2025-32 + OBBBA)
+  var stdDeduction=isMFJ?32200:isHOH?24150:16100;
   var taxableIncome=Math.max(0,annualInc-stdDeduction);
 
   // 2026 Federal income tax brackets
@@ -7694,8 +7753,8 @@ function renderTaxEstimation(){
     remaining-=width;
   }
 
-  // Social Security tax (2026: 6.2% on first $168,600)
-  var ssWageBase=168600;
+  // Social Security tax (2026: 6.2% on first $184,500)
+  var ssWageBase=184500;
   var ssRate=0.062;
   var ssTaxableWages=Math.min(annualInc,ssWageBase);
   var ssTax=ssTaxableWages*ssRate;
@@ -7829,9 +7888,9 @@ function renderTaxEstimation(){
   // Year-End Tax Checklist
   var month=new Date().getMonth(); // 0-indexed
   var checklistItems=[];
-  checklistItems.push({icon:'💰',text:'Max 401(k) contributions ($23,500 limit, $31,000 if 50+)',done:false});
-  checklistItems.push({icon:'🏥',text:'Max HSA contributions ($4,300 individual, $8,550 family)',done:false});
-  if(annualInc<161000||isMFJ&&annualInc<240000) checklistItems.push({icon:'🔄',text:'Fund Roth IRA ($7,000 limit, $8,000 if 50+)',done:false});
+  checklistItems.push({icon:'💰',text:'Max 401(k) contributions ($24,500 limit, $32,500 if 50+, $35,750 if age 60-63)',done:false});
+  checklistItems.push({icon:'🏥',text:'Max HSA contributions ($4,400 self-only, $8,750 family)',done:false});
+  if(annualInc<168000||isMFJ&&annualInc<252000) checklistItems.push({icon:'🔄',text:'Fund Roth IRA ($7,500 limit, $8,600 if 50+)',done:false});
   checklistItems.push({icon:'📊',text:'Review investment gains/losses for tax-loss harvesting',done:false});
   checklistItems.push({icon:'🎁',text:'Make charitable contributions before Dec 31',done:false});
   if(isMFJ&&annualInc<150000||!isMFJ&&annualInc<75000) checklistItems.push({icon:'🔄',text:'Evaluate Roth conversion at current low bracket',done:false});
@@ -8228,18 +8287,24 @@ function renderProjections(){
     retH+='</div>';
   }
 
-  // Social Security Optimization (62 vs 67 vs 70)
+  // Social Security Optimization (62 vs FRA vs 70) — Phase 4: FRA-aware
   var ssBenefit=pf(gv('ssBenefit'))||0;
   if(ssBenefit>0){
-    var ss62=Math.round(ssBenefit*0.70); // ~30% reduction at 62
-    var ss67=Math.round(ssBenefit);       // FRA benefit
-    var ss70=Math.round(ssBenefit*1.24); // ~24% increase at 70
+    // Use profile DOB to derive birth year and FRA. Defaults to 67 if unknown.
+    var _ssBYear=null;
+    if(prof.dob){var _dDob=new Date(prof.dob);if(!isNaN(_dDob.getTime()))_ssBYear=_dDob.getFullYear();}
+    var _ssFRAyrs=_ssFRA(_ssBYear);
+    var _ssFRAlbl=_ssFRAStr(_ssBYear);
+    var _ssFRAfloor=Math.floor(_ssFRAyrs);
+    var ss62=Math.round(ssBenefit*_ssClaimAdjustment(62,_ssFRAyrs));
+    var ssFRA=Math.round(ssBenefit*_ssClaimAdjustment(_ssFRAyrs,_ssFRAyrs));// = ssBenefit
+    var ss70=Math.round(ssBenefit*_ssClaimAdjustment(70,_ssFRAyrs));
     // Lifetime comparison assuming life to 85
-    var life62=(85-62)*12*ss62, life67=(85-67)*12*ss67, life70=(85-70)*12*ss70;
-    retH+='<div style="margin-top:14px"><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Social Security Optimization</div>';
+    var life62=(85-62)*12*ss62, lifeFRA=(85-_ssFRAfloor)*12*ssFRA, life70=(85-70)*12*ss70;
+    retH+='<div style="margin-top:14px"><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Social Security Optimization &middot; FRA '+_ssFRAlbl+'</div>';
     retH+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px">';
     retH+='<div style="padding:8px;background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.12);border-radius:2px;text-align:center"><div style="font-size:10px;color:var(--mu)">Claim at 62</div><div style="font-family:var(--fd);font-size:18px;color:var(--rd)">'+fmt(ss62)+'</div><div style="font-size:9px;color:var(--mu)">/mo · '+fmtK(life62)+' lifetime</div></div>';
-    retH+='<div style="padding:8px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.12);border-radius:2px;text-align:center"><div style="font-size:10px;color:var(--mu)">Claim at 67 (FRA)</div><div style="font-family:var(--fd);font-size:18px;color:var(--yl)">'+fmt(ss67)+'</div><div style="font-size:9px;color:var(--mu)">/mo · '+fmtK(life67)+' lifetime</div></div>';
+    retH+='<div style="padding:8px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.12);border-radius:2px;text-align:center"><div style="font-size:10px;color:var(--mu)">Claim at FRA ('+_ssFRAlbl+')</div><div style="font-family:var(--fd);font-size:18px;color:var(--yl)">'+fmt(ssFRA)+'</div><div style="font-size:9px;color:var(--mu)">/mo · '+fmtK(lifeFRA)+' lifetime</div></div>';
     retH+='<div style="padding:8px;background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.12);border-radius:2px;text-align:center"><div style="font-size:10px;color:var(--mu)">Claim at 70</div><div style="font-family:var(--fd);font-size:18px;color:var(--gr)">'+fmt(ss70)+'</div><div style="font-size:9px;color:var(--mu)">/mo · '+fmtK(life70)+' lifetime</div></div>';
     retH+='</div>';
     var diff70vs62=life70-life62;
@@ -8251,8 +8316,12 @@ function renderProjections(){
   var retContrib=c.totalMonthlyRetContrib||0;
   if(inc>0&&(ssBenefit>0||retContrib>0)){
     var ssMonthly=ssBenefit||0;
-    var withdrawalRate=0.04; // 4% rule
-    var portfolioIncome=Math.round(projRetBal*withdrawalRate/12);
+    // Phase 2: portfolio income = monthly amount the projected balance can sustain over 25-yr
+    // retirement at ~1% real return (PMT formula). The user's stated retIncome is the planning
+    // standard — this number says what the balance can actually deliver per month.
+    var _portfolioYrsRet=25;var _portfolioRealRate=0.01/12;
+    var _portN=_portfolioYrsRet*12;
+    var portfolioIncome=projRetBal>0?Math.round(projRetBal*(_portfolioRealRate/(1-Math.pow(1+_portfolioRealRate,-_portN)))):0;
     var pensionIncome=0;
     if(S.retAccounts){S.retAccounts.forEach(function(a){if(a.type==='pension')pensionIncome+=(a.contrib||0);});}
     var totalRetIncome=ssMonthly+portfolioIncome+pensionIncome;
@@ -8260,7 +8329,7 @@ function renderProjections(){
       retH+='<div style="margin-top:14px"><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--or);margin-bottom:8px">Retirement Income Sources</div>';
       var sources=[
         {label:'Social Security',amt:ssMonthly,col:'#5B9BFF'},
-        {label:'Portfolio Withdrawals (4%)',amt:portfolioIncome,col:'var(--gr)'},
+        {label:'Portfolio Withdrawals',amt:portfolioIncome,col:'var(--gr)'},
         {label:'Pension',amt:pensionIncome,col:'var(--pu)'}
       ].filter(function(s){return s.amt>0;});
       sources.forEach(function(s){
@@ -8327,8 +8396,13 @@ function renderProjections(){
     retH+='</div></div>';
   }
 
-  // RMD Tracker (age 73+)
-  if(S.currentAge>=73){
+  // RMD Tracker — SECURE 2.0 set RMD age to 73 for those born 1951-1959, 75 for those born 1960+.
+  // Use birth year (derived from current age) to apply the correct trigger so younger clients
+  // who get RMD at 75 don't see a premature warning at 73.
+  var _curYear=new Date().getFullYear();
+  var _userBirthYr=S.currentAge>0?(_curYear-S.currentAge):0;
+  var _userRmdAge=_userBirthYr>=1960?75:_userBirthYr>=1951?73:72;
+  if(S.currentAge>=_userRmdAge){
     var retBal3=(S.ret?S.ret.balance:0)||0;
     var rmdFactor=S.currentAge<=75?26.5:S.currentAge<=80?22.9:S.currentAge<=85?18.7:14.8;
     var rmdAmount=Math.round(retBal3/rmdFactor);
@@ -8336,9 +8410,31 @@ function renderProjections(){
     retH+='<div style="margin-top:14px;padding:10px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.18);border-radius:2px">';
     retH+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--rd);margin-bottom:4px">⚠️ Required Minimum Distribution</div>';
     retH+='<div style="font-size:12px;color:rgba(226,232,240,.8);line-height:1.7">';
-    retH+='Your RMD this year: <strong style="color:var(--rd)">'+fmtK(rmdAmount)+'</strong> (balance '+fmtK(retBal3)+' ÷ '+rmdFactor+' factor). ';
+    retH+='Your RMD this year (age '+S.currentAge+', RMD age '+_userRmdAge+'): <strong style="color:var(--rd)">'+fmtK(rmdAmount)+'</strong> (balance '+fmtK(retBal3)+' ÷ '+rmdFactor+' factor). ';
     retH+='Deadline: December 31. Penalty for missing: <strong style="color:var(--rd)">25%</strong> ('+fmtK(rmdPenalty)+').';
     retH+='</div></div>';
+  }
+  // Phase D multi-partner: spouse RMD coordination — each partner has their own RMD trigger
+  // based on their birth year. When the spouse is past their RMD age, surface it separately
+  // so the household sees both partners' RMD obligations and deadlines.
+  if(S.householdType!=='individual'){
+    var _spProf=S.profile||{};
+    var _spAge2=parseInt(_spProf.spCurrentAge)||parseInt(gv('spCurrentAge'))||0;
+    if(_spAge2>0){
+      var _spBirthYr=_curYear-_spAge2;
+      var _spRmdAge=_spBirthYr>=1960?75:_spBirthYr>=1951?73:72;
+      if(_spAge2>=_spRmdAge){
+        // Spouse balance not stored separately in this file — flag the obligation without a dollar amount.
+        // Once spouse retirement balance is wired through (Phase 2), add the dollar calculation here.
+        retH+='<div style="margin-top:10px;padding:10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.14);border-radius:2px">';
+        retH+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--rd);margin-bottom:4px">⚠️ Spouse RMD — separate obligation</div>';
+        retH+='<div style="font-size:12px;color:rgba(226,232,240,.8);line-height:1.7">';
+        retH+='Your spouse (age '+_spAge2+', RMD age '+_spRmdAge+') is also subject to RMDs on their own retirement accounts. ';
+        retH+='Each partner&apos;s RMD is calculated and reported separately. ';
+        retH+='Deadline: December 31. Penalty for missing: <strong style="color:var(--rd)">25%</strong>.';
+        retH+='</div></div>';
+      }
+    }
   }
 
   set('retSection',retH);
@@ -8369,7 +8465,7 @@ function renderProjections(){
   var retBalance=(S.ret?S.ret.balance:0)||0;
   var totalAssets2=c.totalAssets||0;
   var totalDebt2=c.totalDebt||0;
-  var estateExempt=13610000;
+  var estateExempt=15000000;
   var grossEstate=deathBenefit+retBalance+totalAssets2;
   var estTaxExposure=Math.max(0,grossEstate-estateExempt);
   var estTax2=Math.round(estTaxExposure*0.40);
@@ -8728,11 +8824,12 @@ function deDetectFlags(c){
   // Backdoor Roth for high-income earners
   var annualInc=c.inc*12;
   var isMarried=gv('taxFilingStatus')==='married_joint';
-  var rothIncomeLimit=isMarried?240000:161000;
+  // 2026 Roth phase-out upper bounds: MFJ $252,000, single/HoH $168,000
+  var rothIncomeLimit=isMarried?252000:168000;
   if(annualInc>rothIncomeLimit&&hasRetAccts){
     var hasRothAcct=(S.retAccounts||[]).some(function(a){return a.type&&a.type.indexOf('roth')!==-1;});
     if(!hasRothAcct){
-      DE.systemFlags.push({id:'backdoor_roth',level:3,levelName:'Efficiency',icon:'🚪',severity:'medium',urgency:'near_term',title:'Backdoor Roth IRA Opportunity',desc:'Income of '+fmtK(annualInc)+'/yr exceeds direct Roth IRA limits ('+fmtK(rothIncomeLimit)+'). A backdoor Roth conversion lets you contribute to Roth tax-free growth anyway.',impact:'Up to $7,000/yr ($8,000 if 50+) in tax-free growth',costOfNothing:'Missing decades of tax-free compounding. $7K/yr at 7% = $680K in 30 years.',strategies:['backdoor_roth','mega_backdoor_roth'],service:'Tax Strategy / Roth',confidence:'medium',status:'detected'});
+      DE.systemFlags.push({id:'backdoor_roth',level:3,levelName:'Efficiency',icon:'🚪',severity:'medium',urgency:'near_term',title:'Backdoor Roth IRA Opportunity',desc:'Income of '+fmtK(annualInc)+'/yr exceeds direct Roth IRA limits ('+fmtK(rothIncomeLimit)+'). A backdoor Roth conversion lets you contribute to Roth tax-free growth anyway.',impact:'Up to $7,500/yr ($8,600 if 50+) in tax-free growth',costOfNothing:'Missing decades of tax-free compounding. $7.5K/yr at 7% = $730K in 30 years.',strategies:['backdoor_roth','mega_backdoor_roth'],service:'Tax Strategy / Roth',confidence:'medium',status:'detected'});
     }
   }
   // Tax withholding optimizer (large refund indicator)
@@ -8752,8 +8849,8 @@ function deDetectFlags(c){
       DE.systemFlags.push({id:'no_will',level:2,levelName:'Risk Protection',icon:'📜',severity:c.netWorth>100000?'high':'medium',urgency:'near_term',title:'No Will or Estate Plan',desc:'Without a will, state law determines asset distribution. This may not align with your wishes.',impact:'Family faces probate delays and unintended distribution',costOfNothing:'Probate costs 3-7% of estate value. Court decides guardianship for minors.',strategies:['estate_will','estate_trust'],service:'Estate Planning',confidence:'high',status:'detected'});
     }
   }
-  // Estate tax exposure (federal exemption ~$13.61M for 2026)
-  var estateExemption=13610000;
+  // Estate tax exposure (federal exemption $15M for 2026, OBBBA permanent)
+  var estateExemption=15000000;
   var estateValue=c.totalAssets+(S.protCalcs?S.protCalcs.coverage:0);
   if(estateValue>estateExemption*0.7){
     var exposure=Math.max(0,estateValue-estateExemption);
@@ -8895,7 +8992,7 @@ function deGenRecText(f,c){
   if(f.id==='beneficiary_audit')return'Review beneficiary designations on all retirement accounts (401k, IRA, Roth), life insurance policies, and transfer-on-death accounts. Outdated beneficiaries override will provisions — this is one of the most common estate planning mistakes.';
   if(f.id==='no_will')return'Create a will, healthcare proxy, and power of attorney. Without these documents, state law determines how assets are distributed and who makes medical decisions on your behalf. Cost: $500-2,000 through an estate attorney.';
   if(f.id==='estate_tax')return'Projected estate may exceed federal tax exemption. Consider trust structures, annual gifting strategy ($19K/person/year exclusion), and charitable planning to reduce taxable estate.';
-  if(f.id==='hsa_not_maxed')return'Maximize HSA contributions immediately. The HSA is the only account with triple tax advantage: tax-deductible contributions, tax-free growth, and tax-free withdrawals for medical expenses. 2026 limits: $4,300 individual, $8,550 family.';
+  if(f.id==='hsa_not_maxed')return'Maximize HSA contributions immediately. The HSA is the only account with triple tax advantage: tax-deductible contributions, tax-free growth, and tax-free withdrawals for medical expenses. 2026 limits: $4,400 self-only, $8,750 family.';
   if(f.id==='roth_opportunity')return'You are in the '+Math.round((pf(gv('retTaxBracket'))||0.22)*100)+'% bracket. Consider converting traditional IRA funds to Roth now. Pay taxes at your current low rate to enjoy tax-free growth and withdrawals in retirement.';
   if(f.id==='backdoor_roth')return'Your income exceeds direct Roth IRA contribution limits. Open a traditional IRA, make a non-deductible contribution, then convert to Roth. This "backdoor" method gives you tax-free growth. If your employer offers a mega backdoor Roth via after-tax 401k contributions, you could shelter significantly more.';
   if(f.id==='overwithholding')return'Your last refund of $'+(S.lastTaxRefund||0).toLocaleString()+' means ~$'+Math.round((S.lastTaxRefund||0)/12)+'/mo is being overwitheld. Adjust your W-4 to increase take-home pay and redirect the difference to savings or debt payoff.';
@@ -8907,7 +9004,7 @@ function deGenRecText(f,c){
 function deGenOutcome(f,c){
   if(f.id==='cashflow_neg')return'Positive cash flow. Stops debt accumulation.';if(f.id==='ef_none')return'3-month reserve in ~'+Math.ceil((c.efT3||1)/Math.max(1,c.netCF))+' months.';if(f.id==='ef_low')return'Full 3-month reserve. Removes financial vulnerability.';if(f.id==='protection_gap')return'Full family coverage. Mortgage and income protected.';if(f.id==='high_debt')return'Faster payoff, reduced interest, improved DTI.';if(f.id==='dti_high')return'DTI below 36% — restores credit access.';if(f.id==='idle_cash')return'Cash generating returns vs losing to inflation.';if(f.id==='retirement_gap')return'Gap closes progressively toward FI number.';if(f.id==='edu_gap')return'Tax-advantaged savings avoids future student debt.';if(f.id==='leaks')return'Recovered surplus redirected to priority goals.';if(f.id==='employer_match')return'Full employer match captured — guaranteed return.';if(f.id==='no_retirement')return'Retirement savings begin compounding immediately.';if(f.id==='high_cash')return'Excess cash deployed for growth vs inflation loss.';if(f.id==='low_savings')return'Savings rate increases toward 15% wealth-building target.';if(f.id==='nw_declining')return'Net worth stabilizes and resumes growth.';if(f.id==='beneficiary_audit')return'All accounts have current, verified beneficiary designations.';if(f.id==='no_will')return'Estate plan in place — assets distributed per your wishes.';if(f.id==='estate_tax')return'Tax exposure reduced through strategic planning.';if(f.id==='hsa_not_maxed')return'Triple tax advantage fully utilized — maximum tax savings.';if(f.id==='roth_opportunity')return'Low-bracket Roth conversion locks in tax savings for decades.';if(f.id==='backdoor_roth')return'Tax-free growth vehicle established despite high income — compounding for decades.';if(f.id==='overwithholding')return'Monthly take-home increases — redirected to financial goals.';if(f.id==='no_disability')return'Income protected against disability — family financial stability preserved.';if(f.id==='no_ltc')return'Assets protected from long-term care costs — retirement savings preserved.';if(f.id==='no_umbrella')return'Personal assets protected by umbrella coverage above standard limits.';return'Improved financial position.';
 }
-function deGetAssumptions(flagId,c){var map={cashflow_neg:'Assumes current income/expenses constant.',cashflow_thin:'Assumes no major income or expense changes.',ef_none:'3× monthly expenses = '+fmt(c.efT3||0)+'. Actual target may vary.',ef_low:'3-month reserve minimum. 6-month preferred for variable income.',protection_gap:'Income replacement only. Does not include long-term care or disability.',high_debt:'Assumes minimum payments continue on all other accounts.',dti_high:'DTI from entered income and minimum payments only.',idle_cash:'Idle = liquid assets above 3-month EF target.',leaks:'Spending leaks self-reported via expense tagging.',retirement_gap:(c.yearsToRetire||30)+' yrs to retirement, '+(c.blendedRetReturn||7)+'% nominal return, income needed to age 90.',edu_gap:'Constant college cost inflation and investment return assumed.',employer_match:'Based on entered match percentage and current contribution levels.',no_retirement:'Assumes no existing retirement savings or employer plans.',high_cash:'Cash above 6-month EF target classified as excess. Inflation at 3.5%.',low_savings:'Target savings rate of 15% per financial planning best practices.',nw_declining:'Compares current net worth to previous snapshot value.',beneficiary_audit:'Assumes beneficiary designations have not been reviewed recently.',no_will:'Assumes no current will or estate documents on file.',estate_tax:'2026 federal estate exemption of $13.61M. State exemptions may be lower.',hsa_not_maxed:'Assumes client has HDHP and HSA eligibility. 2026 limits used.',roth_opportunity:'Based on current vs projected retirement tax bracket comparison.',backdoor_roth:'Assumes no existing traditional IRA balance (pro-rata rule). Consult tax advisor for execution.',overwithholding:'Based on self-reported last tax refund amount.',no_disability:'Assumes no current disability coverage. 1-in-4 statistic from SSA.',no_ltc:'Average nursing home costs from Genworth Cost of Care Survey. 2.5-year average stay.',no_umbrella:'Net worth exceeds typical auto/home liability limits of $300-500K.'};return map[flagId]||'Based on data entered. Results are illustrative.';}
+function deGetAssumptions(flagId,c){var map={cashflow_neg:'Assumes current income/expenses constant.',cashflow_thin:'Assumes no major income or expense changes.',ef_none:'3× monthly expenses = '+fmt(c.efT3||0)+'. Actual target may vary.',ef_low:'3-month reserve minimum. 6-month preferred for variable income.',protection_gap:'Income replacement only. Does not include long-term care or disability.',high_debt:'Assumes minimum payments continue on all other accounts.',dti_high:'DTI from entered income and minimum payments only.',idle_cash:'Idle = liquid assets above 3-month EF target.',leaks:'Spending leaks self-reported via expense tagging.',retirement_gap:(c.yearsToRetire||30)+' yrs to retirement, '+(c.blendedRetReturn||7)+'% nominal return, income needed to age 90.',edu_gap:'Constant college cost inflation and investment return assumed.',employer_match:'Based on entered match percentage and current contribution levels.',no_retirement:'Assumes no existing retirement savings or employer plans.',high_cash:'Cash above 6-month EF target classified as excess. Inflation at 3.5%.',low_savings:'Target savings rate of 15% per financial planning best practices.',nw_declining:'Compares current net worth to previous snapshot value.',beneficiary_audit:'Assumes beneficiary designations have not been reviewed recently.',no_will:'Assumes no current will or estate documents on file.',estate_tax:'2026 federal estate exemption of $15M. State exemptions may be lower.',hsa_not_maxed:'Assumes client has HDHP and HSA eligibility. 2026 limits used.',roth_opportunity:'Based on current vs projected retirement tax bracket comparison.',backdoor_roth:'Assumes no existing traditional IRA balance (pro-rata rule). Consult tax advisor for execution.',overwithholding:'Based on self-reported last tax refund amount.',no_disability:'Assumes no current disability coverage. 1-in-4 statistic from SSA.',no_ltc:'Average nursing home costs from Genworth Cost of Care Survey. 2.5-year average stay.',no_umbrella:'Net worth exceeds typical auto/home liability limits of $300-500K.'};return map[flagId]||'Based on data entered. Results are illustrative.';}
 function deCalcCostOfDelay(flagId,c){
   var costs={yr1:0,yr3:0,yr5:0,desc:''};
   if(flagId==='retirement_gap'||flagId==='no_retirement'){
@@ -8940,7 +9037,7 @@ function deCalcCostOfDelay(flagId,c){
     costs.yr1=Math.round(estate2*0.05);costs.yr3=costs.yr1;costs.yr5=costs.yr1;
     costs.desc='Probate costs 3-7% of estate. Unintended distribution risk of '+fmtK(estate2);
   } else if(flagId==='estate_tax'){
-    var exempt2=13610000;var ev2=c.totalAssets+(S.protCalcs?S.protCalcs.coverage:0);
+    var exempt2=15000000;var ev2=c.totalAssets+(S.protCalcs?S.protCalcs.coverage:0);
     var exp2=Math.max(0,ev2-exempt2);
     costs.yr1=Math.round(exp2*0.40);costs.yr3=costs.yr1;costs.yr5=costs.yr1;
     costs.desc='Estate tax at 40% on '+fmtK(exp2)+' above exemption';
@@ -10186,7 +10283,7 @@ function submitAdvisorRequestFromModal(){
       ['cpFirstName','cpLastName','cpEmail','cpPhone','cpDOB','cpSpouse','cpChildren',
        'cpOccupation','cpEmployer','cpEmploymentType','cpState','cpHealthStatus',
        'cpMarital','currentAge','hhSize','creditScore','taxFilingStatus',
-       'spFirstName','spLastName','spEmail','spOccupation',
+       'spFirstName','spLastName','spEmail','spOccupation','spRetIncome',
        'aChecking','aSavings','aSavAPY','aInvest','aRE','aOther','aTotalDisp',
        'retAge','retIncome','ssBenefit','retInflation','retTaxBracket','retCapGainsBracket',
        'liAnnualIncome','liYearsReplace','liSpouseYears','liCoverage','liMortgage',
@@ -10302,7 +10399,7 @@ function submitAdvisorRequestFromModal(){
       // ── Restore all panel DOM fields from S.profile ──
       if(S.profile){
         var _prof=S.profile;
-        var pfMap={cpFirstName:'firstName',cpLastName:'lastName',cpEmail:'email',cpPhone:'phone',cpDOB:'dob',cpMarital:'marital',cpSpouse:'spouse',cpOccupation:'occupation',cpEmployer:'employer',cpEmploymentType:'employmentType',cpState:'state',cpHealthStatus:'healthStatus',currentAge:'currentAge',hhSize:'hhSize',creditScore:'creditScore',taxFilingStatus:'taxFilingStatus',spFirstName:'spFirstName',spLastName:'spLastName',spEmail:'spEmail',spOccupation:'spOccupation',spDOB:'spDOB',spCurrentAge:'spCurrentAge',spRetAge:'spRetAge',spSsBenefit:'spSsBenefit',retAge:'retAge',retIncome:'retIncome',ssBenefit:'ssBenefit',retInflation:'retInflation',retTaxBracket:'retTaxBracket',retCapGainsBracket:'retCapGainsBracket',liAnnualIncome:'liAnnualIncome',liYearsReplace:'liYearsReplace',liSpouseYears:'liSpouseYears',liCoverage:'liCoverage',liMortgage:'liMortgage',liOtherDebt:'liOtherDebt',liDependents:'liDependents',liChildcare:'liChildcare',liEduPerChild:'liEduPerChild',liCollegeSavings:'liCollegeSavings',liFinal:'liFinal',spAnnualIncome:'spAnnualIncome',spYearsReplace:'spYearsReplace',spCoverage:'spCoverage',spDiCoverage:'spDiCoverage',diHasCoverage:'diHasCoverage',diBenefit:'diBenefit',diWaitDays:'diWaitDays',diDuration:'diDuration',diPremium:'diPremium',diCarrier:'diCarrier',ltcHasCoverage:'ltcHasCoverage',ltcBenefit:'ltcBenefit',ltcYears:'ltcYears',ltcPremium:'ltcPremium',umbHas:'umbHas',umbAmount:'umbAmount',umbPremium:'umbPremium',umbCarrier:'umbCarrier',pcType:'pcType',pcHomePremium:'pcHomePremium',pcAutoHas:'pcAutoHas',pcAutoPremium:'pcAutoPremium',estWill:'estWill',estTrust:'estTrust',estPOA:'estPOA',estHealthcare:'estHealthcare',estBeneficiary:'estBeneficiary',estGuardian:'estGuardian',estWillNotes:'estWillNotes',estTrustNotes:'estTrustNotes',estPOANotes:'estPOANotes',estHealthcareNotes:'estHealthcareNotes',estBeneficiaryNotes:'estBeneficiaryNotes',estGuardianNotes:'estGuardianNotes',eduNumChildren:'eduNumChildren'};
+        var pfMap={cpFirstName:'firstName',cpLastName:'lastName',cpEmail:'email',cpPhone:'phone',cpDOB:'dob',cpMarital:'marital',cpSpouse:'spouse',cpOccupation:'occupation',cpEmployer:'employer',cpEmploymentType:'employmentType',cpState:'state',cpHealthStatus:'healthStatus',currentAge:'currentAge',hhSize:'hhSize',creditScore:'creditScore',taxFilingStatus:'taxFilingStatus',spFirstName:'spFirstName',spLastName:'spLastName',spEmail:'spEmail',spOccupation:'spOccupation',spDOB:'spDOB',spCurrentAge:'spCurrentAge',spRetAge:'spRetAge',spSsBenefit:'spSsBenefit',spRetIncome:'spRetIncome',retAge:'retAge',retIncome:'retIncome',ssBenefit:'ssBenefit',retInflation:'retInflation',retTaxBracket:'retTaxBracket',retCapGainsBracket:'retCapGainsBracket',liAnnualIncome:'liAnnualIncome',liYearsReplace:'liYearsReplace',liSpouseYears:'liSpouseYears',liCoverage:'liCoverage',liMortgage:'liMortgage',liOtherDebt:'liOtherDebt',liDependents:'liDependents',liChildcare:'liChildcare',liEduPerChild:'liEduPerChild',liCollegeSavings:'liCollegeSavings',liFinal:'liFinal',spAnnualIncome:'spAnnualIncome',spYearsReplace:'spYearsReplace',spCoverage:'spCoverage',spDiCoverage:'spDiCoverage',diHasCoverage:'diHasCoverage',diBenefit:'diBenefit',diWaitDays:'diWaitDays',diDuration:'diDuration',diPremium:'diPremium',diCarrier:'diCarrier',ltcHasCoverage:'ltcHasCoverage',ltcBenefit:'ltcBenefit',ltcYears:'ltcYears',ltcPremium:'ltcPremium',umbHas:'umbHas',umbAmount:'umbAmount',umbPremium:'umbPremium',umbCarrier:'umbCarrier',pcType:'pcType',pcHomePremium:'pcHomePremium',pcAutoHas:'pcAutoHas',pcAutoPremium:'pcAutoPremium',estWill:'estWill',estTrust:'estTrust',estPOA:'estPOA',estHealthcare:'estHealthcare',estBeneficiary:'estBeneficiary',estGuardian:'estGuardian',estWillNotes:'estWillNotes',estTrustNotes:'estTrustNotes',estPOANotes:'estPOANotes',estHealthcareNotes:'estHealthcareNotes',estBeneficiaryNotes:'estBeneficiaryNotes',estGuardianNotes:'estGuardianNotes',eduNumChildren:'eduNumChildren'};
         Object.keys(pfMap).forEach(function(domId){var el=document.getElementById(domId);var val=_prof[pfMap[domId]];if(el&&val!==undefined&&val!=='')el.value=val;});
         // Restore children dropdown + goals from profile
         if(S.children&&S.children.length>0){var cpSel=document.getElementById('cpChildren');if(cpSel)cpSel.value=String(S.children.length);renderProfileChildInputs();}
@@ -11956,13 +12053,16 @@ function calcRetScenarios(){
 
   // ── FI Number ──
   h+='<div style="text-align:center;padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin:14px 0 12px">';
-  h+='<div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.15em">YOUR FI NUMBER (4% RULE)</div>';
+  h+='<div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.15em">BALANCE NEEDED FOR YOUR TARGET</div>';
   h+='<div style="font-family:var(--fd);font-size:34px;color:#5B9BFF">'+fmtK(fiNumber)+'</div>';
-  h+='<div style="font-size:10px;color:var(--mu)">'+fmt(need)+'/mo desired − '+fmt(ss)+'/mo SS = '+fmt(needFromPortfolio)+'/mo from portfolio × 25 years</div>';
+  h+='<div style="font-size:10px;color:var(--mu)">'+fmt(need)+'/mo desired − '+fmt(ss)+'/mo SS = '+fmt(needFromPortfolio)+'/mo from portfolio &times; ~25 years (sustainable withdrawal horizon)</div>';
   h+='</div>';
 
   // ── Story Hook ──
-  h+=calcStoryBox('🎯','The gap between doing nothing and optimizing: <span style="color:var(--gr);font-weight:700">'+fmtK(gap)+' in retirement assets</span> and up to <span style="color:var(--gr)">'+fmt(Math.round(gap*0.04/12))+'/mo</span> extra retirement income. That is the cost of inaction.','var(--gr)');
+  // Phase 2: "extra income" from closing the gap, framed via sustainability not 4% rule.
+  // 25-yr horizon at 1% real return → roughly balance × 0.00377/mo (PMT factor).
+  var _gapMonthlyExtra=gap>0?Math.round(gap*(0.01/12)/(1-Math.pow(1+0.01/12,-300))):0;
+  h+=calcStoryBox('🎯','The gap between doing nothing and optimizing: <span style="color:var(--gr);font-weight:700">'+fmtK(gap)+' in retirement assets</span> &mdash; about <span style="color:var(--gr)">'+fmt(_gapMonthlyExtra)+'/mo</span> extra sustainable retirement income against your '+fmt(need)+'/mo target. That is the cost of inaction.','var(--gr)');
 
   // ── 3 Columns ──
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px">';
@@ -12019,7 +12119,7 @@ function calcRetScenarios(){
   }
   h+='<div style="padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:8px;font-size:10px;color:var(--yl);line-height:1.5">⚠️ <strong>Important:</strong> These projections use simplified assumptions. Real-world results vary based on market conditions, tax changes, and personal circumstances. Use as a planning guide, not a guarantee.</div>';
   h+=calcShareBtn();
-  h+=calcDisclaim('Projections use constant returns of '+(ret*100)+'% and '+Math.round(infl*100)+'% inflation. Actual returns vary. "Probability" is a simplified estimate based on goal proximity. Social Security estimates should be verified at ssa.gov. The 4% rule is a guideline, not a guarantee. Consult a financial advisor for personalized retirement planning.');
+  h+=calcDisclaim('Projections use constant returns of '+(ret*100)+'% and '+Math.round(infl*100)+'% inflation. Actual returns vary. "Probability" is a simplified estimate based on goal proximity. Social Security estimates should be verified at ssa.gov. PFOS uses your stated desired monthly retirement income as the planning standard and projects what your balance can sustain over a ~25-year retirement horizon (PMT formula). The legacy 4% rule is shown as context only, not as the planning target. Consult a financial advisor for personalized retirement planning.');
   el.innerHTML=h;
 }
 
@@ -12031,28 +12131,38 @@ function renderSocialSecurityCalc(){
   var age=cAge('ss');var c=cpf('ss');var inc=c.inc||0;
   var pia=inc>0?Math.min(3822,Math.round(inc*0.4)):2000;
   var spouseInc=0;(S.incomeSources||[]).forEach(function(s){if((s.owner||'').toLowerCase()==='spouse') spouseInc+=(s.amount||0);});
+  // Phase 4: derive FRA from birth year. Defaults to 67 if DOB unknown.
+  var _profile=S.profile||{};
+  var _userBirthYr=null;
+  if(_profile.dob){var _d=new Date(_profile.dob);if(!isNaN(_d.getTime()))_userBirthYr=_d.getFullYear();}
+  if(!_userBirthYr&&age){_userBirthYr=new Date().getFullYear()-age;}
+  var _userFRA=_ssFRA(_userBirthYr);
+  var _userFRAStr=_ssFRAStr(_userBirthYr);
+  var _spouseBirthYr=null;
+  if(_profile.spDOB){var _sd=new Date(_profile.spDOB);if(!isNaN(_sd.getTime()))_spouseBirthYr=_sd.getFullYear();}
+  var _spouseFRA=_ssFRA(_spouseBirthYr);
 
   // ── Toggle ──
   var h=calcToggleHTML('ss','calcSocialSecurity');
 
   // ── Subtitle ──
-  h+='<div style="font-size:12px;color:var(--mu);margin-bottom:12px;line-height:1.6">Claiming at 62 vs 67 vs 70 can mean a difference of <strong style="color:var(--wh)">hundreds of thousands of dollars</strong> over your lifetime. See the break-even ages, tax impact, and optimal strategy for your situation.</div>';
+  h+='<div style="font-size:12px;color:var(--mu);margin-bottom:12px;line-height:1.6">Claiming at 62 vs FRA vs 70 can mean a difference of <strong style="color:var(--wh)">hundreds of thousands of dollars</strong> over your lifetime. Your Full Retirement Age (FRA) depends on your birth year. See the break-even ages, tax impact, and optimal strategy for your situation.</div>';
 
   // ── Profile Bar ──
   h+='<div style="padding:12px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.8">';
-  h+='<strong style="color:var(--wh)">📋 Your Profile:</strong> Age: <span style="color:#5B9BFF;font-weight:600">'+age+'</span> · Est. PIA: <span style="color:var(--gr);font-weight:600">'+fmt(pia)+'/mo</span> (based on current income)';
-  if(spouseInc>0) h+='<br>👥 Spouse income detected — couple optimization available';
+  h+='<strong style="color:var(--wh)">📋 Your Profile:</strong> Age: <span style="color:#5B9BFF;font-weight:600">'+age+'</span> · Birth year: <span style="color:#5B9BFF;font-weight:600">'+(_userBirthYr||'—')+'</span> · FRA: <span style="color:var(--gr);font-weight:600">'+_userFRAStr+'</span> · Est. PIA: <span style="color:var(--gr);font-weight:600">'+fmt(pia)+'/mo</span>';
+  if(spouseInc>0) h+='<br>👥 Spouse income detected — couple optimization available'+(_spouseBirthYr?' (spouse FRA: '+_ssFRAStr(_spouseBirthYr)+')':'');
   h+='</div>';
 
   // ── Inputs ──
-  h+='<div class="row"><div class="fi"><label class="lb">Current Age</label><input class="inp" type="number" id="ss_age" value="'+age+'" oninput="calcSocialSecurity()" style="min-height:36px"></div>';
-  h+='<div class="fi"><label class="lb">Estimated Monthly PIA (at age 67)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ss_pia" value="'+pia+'" oninput="calcSocialSecurity()" style="padding-left:22px;min-height:36px"></div></div></div>';
+  h+='<div class="row"><div class="fi"><label class="lb">Birth Year (for FRA)</label><input class="inp" type="number" id="ss_birthYr" value="'+(_userBirthYr||'')+'" min="1900" max="'+new Date().getFullYear()+'" oninput="calcSocialSecurity()" style="min-height:36px"></div>';
+  h+='<div class="fi"><label class="lb">Estimated Monthly PIA (at FRA)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ss_pia" value="'+pia+'" oninput="calcSocialSecurity()" style="padding-left:22px;min-height:36px"></div></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">Life Expectancy Assumption</label><input class="inp" type="number" id="ss_lifeExp" value="90" min="70" max="100" oninput="calcSocialSecurity()" style="min-height:36px"></div>';
   h+='<div class="fi"><label class="lb">Other Retirement Income /mo</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ss_otherInc" value="0" oninput="calcSocialSecurity()" style="padding-left:22px;min-height:36px"></div></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">Estimated Tax Bracket in Retirement %</label><input class="inp" type="number" id="ss_taxBrack" value="22" step="1" oninput="calcSocialSecurity()" style="min-height:36px"></div>';
-  h+='<div class="fi"><label class="lb">Spouse PIA at 67 (0 if N/A)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ss_spousePIA" value="'+(spouseInc>0?Math.round(spouseInc*0.4):0)+'" oninput="calcSocialSecurity()" style="padding-left:22px;min-height:36px"></div></div></div>';
+  h+='<div class="fi"><label class="lb">Spouse PIA at FRA (0 if N/A)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ss_spousePIA" value="'+(spouseInc>0?Math.round(spouseInc*0.4):0)+'" oninput="calcSocialSecurity()" style="padding-left:22px;min-height:36px"></div></div></div>';
 
-    h+='<div class="row"><div class="fi"><label class="lb">COLA (Cost-of-Living Adjustment) %/yr</label><input class="inp" type="number" id="ss_cola" value="2.5" step="0.5" oninput="calcSocialSecurity()" style="min-height:36px"></div><div class="fi"><label class="lb">Start Claiming Age</label><select class="sel" id="ss_startAge" onchange="calcSocialSecurity()" style="min-height:36px"><option value="62">62 (early)</option><option value="67" selected>67 (FRA)</option><option value="70">70 (max)</option></select></div></div>';
+    h+='<div class="row"><div class="fi"><label class="lb">COLA (Cost-of-Living Adjustment) %/yr</label><input class="inp" type="number" id="ss_cola" value="2.5" step="0.5" oninput="calcSocialSecurity()" style="min-height:36px"></div><div class="fi"><label class="lb">Start Claiming Age</label><select class="sel" id="ss_startAge" onchange="calcSocialSecurity()" style="min-height:36px"><option value="62">62 (early)</option><option value="67" selected>FRA (full)</option><option value="70">70 (max)</option></select></div></div>';
   h+='<div id="ss_results"></div>';
   el.innerHTML=h;calcSocialSecurity();
 }
@@ -12064,36 +12174,36 @@ function calcSocialSecurity(){
   var taxBrack=(pf(gv('ss_taxBrack'))||22)/100;
   var spousePIA=pf(gv('ss_spousePIA'))||0;
   var cola=(pf(gv('ss_cola'))||2.5)/100;
+  var birthYr=parseInt(gv('ss_birthYr'))||null;
   var el=document.getElementById('ss_results');if(!el)return;
-
-  var at62=Math.round(pia*0.70);// 30% reduction
-  var at67=pia;// full benefit
-  var at70=Math.round(pia*1.24);// 24% increase (8%/yr delayed credits)
-
-  // Cumulative by age
-  var cum62=[],cum67=[],cum70=[];var c62=0,c67=0,c70=0;
-  var be67=0,be70=0;
+  // Phase 4: FRA-aware claim adjustment factors
+  var fra=_ssFRA(birthYr);
+  var fraStr=_ssFRAStr(birthYr);
+  var at62=Math.round(pia*_ssClaimAdjustment(62,fra));
+  var atFRA=Math.round(pia*_ssClaimAdjustment(fra,fra));// 1.0
+  var at70=Math.round(pia*_ssClaimAdjustment(70,fra));
+  // Cumulative by age — FRA-aware
+  var c62=0,cFRA=0,c70=0;
+  var beFRA=0,be70=0;
+  var fraFloor=Math.floor(fra);
   for(var a=62;a<=lifeExp;a++){
     if(a>=62) c62+=at62*12;
-    if(a>=67) c67+=at67*12;
+    if(a>=fraFloor) cFRA+=atFRA*12;
     if(a>=70) c70+=at70*12;
-    if(!be67&&c67>c62) be67=a;
+    if(!beFRA&&cFRA>c62) beFRA=a;
     if(!be70&&c70>c62) be70=a;
-    if(a===70||a===75||a===80||a===85||a===90||a===lifeExp){
-      cum62.push({age:a,val:c62});cum67.push({age:a,val:c67});cum70.push({age:a,val:c70});
-    }
   }
 
   // Tax impact on SS benefits
-  var combinedInc62=at62*12+otherInc*12;var combinedInc67=at67*12+otherInc*12;var combinedInc70=at70*12+otherInc*12;
+  var combinedInc62=at62*12+otherInc*12;var combinedIncFRA=atFRA*12+otherInc*12;var combinedInc70=at70*12+otherInc*12;
   // Simplified: up to 85% of SS may be taxable at higher incomes
   function taxPct(combined){return combined>44000?0.85:combined>34000?0.50:0;}
   var tax62=Math.round(at62*taxPct(combinedInc62)*taxBrack);
-  var tax67=Math.round(at67*taxPct(combinedInc67)*taxBrack);
+  var taxFRA=Math.round(atFRA*taxPct(combinedIncFRA)*taxBrack);
   var tax70=Math.round(at70*taxPct(combinedInc70)*taxBrack);
-  var net62=at62-tax62;var net67=at67-tax67;var net70=at70-tax70;
+  var net62=at62-tax62;var netFRA=atFRA-taxFRA;var net70=at70-tax70;
 
-  var maxM=Math.max(at62,at67,at70,1);
+  var maxM=Math.max(at62,atFRA,at70,1);
   var diff62_70=c70-c62;// at life expectancy
 
   var h='';
@@ -12102,10 +12212,13 @@ function calcSocialSecurity(){
   h+=calcStoryBox('🎯','If you live to '+lifeExp+': claiming at 62 = <span style="color:var(--or)">'+fmtK(c62)+'</span> total. Claiming at 70 = <span style="color:var(--gr)">'+fmtK(c70)+'</span>. That is a <span style="color:var(--gr);font-weight:700">'+fmtK(diff62_70)+' lifetime difference</span>.','var(--gr)');
 
   // ── 3 Scenario Cards ──
+  // Phase 4: FRA-aware reduction/bonus % displayed
+  var _redPct=Math.round((1-_ssClaimAdjustment(62,fra))*100);
+  var _bonusPct=Math.round((_ssClaimAdjustment(70,fra)-1)*100);
   var opts=[
-    {age:62,m:at62,net:net62,tax:tax62,cum:c62,label:'30% REDUCTION',col:'var(--or)',desc:'Good if you need income immediately, have health concerns, or have other income sources to bridge the gap.'},
-    {age:67,m:at67,net:net67,tax:tax67,cum:c67,label:'FULL BENEFIT (FRA)',col:'var(--gr)',desc:'Balanced approach for most people. Full benefit with no reduction or bonus.'},
-    {age:70,m:at70,net:net70,tax:tax70,cum:c70,label:'24% BONUS (MAX)',col:'#5B9BFF',desc:'Maximum benefit. Best if you have good health, other income to bridge years 67-70, and plan to live past '+be70+'.'}
+    {age:62,m:at62,net:net62,tax:tax62,cum:c62,label:_redPct+'% REDUCTION',col:'var(--or)',desc:'Good if you need income immediately, have health concerns, or have other income sources to bridge the gap.'},
+    {age:fraStr,m:atFRA,net:netFRA,tax:taxFRA,cum:cFRA,label:'FULL BENEFIT (FRA)',col:'var(--gr)',desc:'Balanced approach for most people. Full benefit with no reduction or bonus.'},
+    {age:70,m:at70,net:net70,tax:tax70,cum:c70,label:_bonusPct+'% BONUS (MAX)',col:'#5B9BFF',desc:'Maximum benefit. Best if you have good health, other income to bridge years '+fraStr+'-70, and plan to live past '+be70+'.'}
   ];
 
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:14px 0 12px">';
@@ -12127,19 +12240,29 @@ function calcSocialSecurity(){
 
   // ── Break-Even Ages ──
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">';
-  h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;text-align:center"><div style="font-size:10px;color:var(--mu)">67 beats 62 at age</div><div style="font-family:var(--fd);font-size:32px;color:var(--gr)">'+be67+'</div><div style="font-size:9px;color:var(--mu)">If you live past '+be67+', waiting to 67 pays off</div></div>';
-  h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;text-align:center"><div style="font-size:10px;color:var(--mu)">70 beats 62 at age</div><div style="font-family:var(--fd);font-size:32px;color:#5B9BFF">'+be70+'</div><div style="font-size:9px;color:var(--mu)">If you live past '+be70+', waiting to 70 pays off</div></div>';
+  h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;text-align:center"><div style="font-size:10px;color:var(--mu)">FRA ('+fraStr+') beats 62 at age</div><div style="font-family:var(--fd);font-size:32px;color:var(--gr)">'+(beFRA||'—')+'</div><div style="font-size:9px;color:var(--mu)">If you live past '+(beFRA||'?')+', waiting to FRA pays off</div></div>';
+  h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;text-align:center"><div style="font-size:10px;color:var(--mu)">70 beats 62 at age</div><div style="font-family:var(--fd);font-size:32px;color:#5B9BFF">'+(be70||'—')+'</div><div style="font-size:9px;color:var(--mu)">If you live past '+(be70||'?')+', waiting to 70 pays off</div></div>';
   h+='</div>';
 
   // ── Cumulative Lifetime Chart ──
   h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin:8px 0 6px">Cumulative Benefits by Age</div>';
-  var maxCum=Math.max.apply(null,[c62,c67,c70]);
+  // Phase 4: rebuild cum arrays at FRA-aware boundaries
+  var cum62Arr=[],cumFRAArr=[],cum70Arr=[];var _cc62=0,_ccFRA=0,_cc70=0;
+  for(var aa=62;aa<=lifeExp;aa++){
+    if(aa>=62) _cc62+=at62*12;
+    if(aa>=fraFloor) _ccFRA+=atFRA*12;
+    if(aa>=70) _cc70+=at70*12;
+    if(aa===70||aa===75||aa===80||aa===85||aa===90||aa===lifeExp){
+      cum62Arr.push({age:aa,val:_cc62});cumFRAArr.push({age:aa,val:_ccFRA});cum70Arr.push({age:aa,val:_cc70});
+    }
+  }
+  var maxCum=Math.max.apply(null,[c62,cFRA,c70]);
   h+='<div id="ss_chart" style="margin-bottom:12px">';
-  cum62.forEach(function(pt,i){
-    var v62=cum62[i].val,v67=cum67[i].val,v70=cum70[i].val;
+  cum62Arr.forEach(function(pt,i){
+    var v62=cum62Arr[i].val,vFRA=cumFRAArr[i].val,v70=cum70Arr[i].val;
     h+='<div style="margin-bottom:6px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700">AGE '+pt.age+'</div>';
-    [{v:v62,c:'var(--or)',l:'@62'},{v:v67,c:'var(--gr)',l:'@67'},{v:v70,c:'#5B9BFF',l:'@70'}].forEach(function(b){
-      h+='<div style="display:flex;align-items:center;gap:4px;margin-bottom:1px"><span style="font-size:8px;color:'+b.c+';width:24px">'+b.l+'</span>';
+    [{v:v62,c:'var(--or)',l:'@62'},{v:vFRA,c:'var(--gr)',l:'@'+fraStr.split(' ')[0]},{v:v70,c:'#5B9BFF',l:'@70'}].forEach(function(b){
+      h+='<div style="display:flex;align-items:center;gap:4px;margin-bottom:1px"><span style="font-size:8px;color:'+b.c+';width:30px">'+b.l+'</span>';
       h+='<div style="flex:1;height:7px;background:rgba(0,68,191,.06);border-radius:4px;overflow:hidden"><div data-anim-w="'+Math.round(b.v/maxCum*100)+'%" style="height:100%;width:0%;background:'+b.c+';border-radius:4px"></div></div>';
       h+='<span style="font-size:8px;color:'+b.c+';min-width:45px;text-align:right;font-family:var(--fh);font-weight:700">'+fmtK(b.v)+'</span></div>';
     });
@@ -12150,38 +12273,80 @@ function calcSocialSecurity(){
   // ── Tax Impact ──
   h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.8">';
   h+='<strong style="color:var(--wh)">📋 Tax Impact at '+Math.round(taxBrack*100)+'% Bracket:</strong><br>';
-  h+='At your projected retirement income'+(otherInc>0?' ('+fmt(otherInc)+'/mo other income)':'')+', approximately <span style="color:var(--or)">'+Math.round(taxPct(combinedInc67)*100)+'%</span> of your SS benefit is taxable.<br>';
+  h+='At your projected retirement income'+(otherInc>0?' ('+fmt(otherInc)+'/mo other income)':'')+', approximately <span style="color:var(--or)">'+Math.round(taxPct(combinedIncFRA)*100)+'%</span> of your SS benefit is taxable.<br>';
   h+='<span style="color:var(--or)">Claim @62:</span> '+fmt(at62)+' gross → <span style="color:var(--wh)">'+fmt(net62)+'/mo after tax</span> (−'+fmt(tax62)+'/mo)<br>';
-  h+='<span style="color:var(--gr)">Claim @67:</span> '+fmt(at67)+' gross → <span style="color:var(--wh)">'+fmt(net67)+'/mo after tax</span> (−'+fmt(tax67)+'/mo)<br>';
+  h+='<span style="color:var(--gr)">Claim @FRA ('+fraStr+'):</span> '+fmt(atFRA)+' gross → <span style="color:var(--wh)">'+fmt(netFRA)+'/mo after tax</span> (−'+fmt(taxFRA)+'/mo)<br>';
   h+='<span style="color:#5B9BFF">Claim @70:</span> '+fmt(at70)+' gross → <span style="color:var(--wh)">'+fmt(net70)+'/mo after tax</span> (−'+fmt(tax70)+'/mo)';
   h+='</div>';
 
-  // ── Couple Strategy ──
+  // ── Couple Strategy & Survivor Benefits ──
   if(spousePIA>0){
-    var spAt62=Math.round(spousePIA*0.70);var spAt70=Math.round(spousePIA*1.24);
-    var survivorBenefit=Math.max(at70,spAt70);
+    // Phase 4: spouse claim adjustments use spouse's FRA, not hardcoded 67
+    var _spFRA=_ssFRA(_spouseBirthYr);
+    var _spFRAStr=_ssFRAStr(_spouseBirthYr);
+    var spAt62=Math.round(spousePIA*_ssClaimAdjustment(62,_spFRA));
+    var spAtFRA=Math.round(spousePIA*_ssClaimAdjustment(_spFRA,_spFRA));
+    var spAt70=Math.round(spousePIA*_ssClaimAdjustment(70,_spFRA));
+    // Survivor benefit rules (SSA): the surviving spouse receives the larger of:
+    //   (a) their own retirement benefit (whatever they were/are claiming), or
+    //   (b) 100% of what the deceased was receiving at time of death.
+    // If deceased had delayed credits (claimed past FRA), the survivor inherits those credits.
+    // If deceased claimed early, the survivor benefit reflects that reduced amount (RIB-LIM:
+    // floor of ~82.5% of PIA applies in some cases — simplified here).
+    // A surviving spouse can claim survivor benefit as early as age 60 with ~28.5% reduction,
+    // or wait until their own FRA for full survivor amount (no further increase past FRA).
+    // We model three combined strategies for the COUPLE's outcome if the higher-PIA spouse dies first.
+    var _userIsHigher=pia>=spousePIA;
+    var _hiPIA=_userIsHigher?pia:spousePIA;
+    var _loPIA=_userIsHigher?spousePIA:pia;
+    var _hiFRA=_userIsHigher?fra:_spFRA;
+    var _loFRA=_userIsHigher?_spFRA:fra;
+    var _hiFRAStr=_userIsHigher?fraStr:_spFRAStr;
+    function _benAt(p,a,f){return Math.round(p*_ssClaimAdjustment(a,f));}
+    var strategies=[
+      {label:'Both claim at 62',hiClaim:62,loClaim:62,desc:'Earliest income; lowest lifetime; smallest survivor benefit.'},
+      {label:'Both claim at FRA',hiClaim:_hiFRA,loClaim:_loFRA,desc:'Balanced approach; no reductions or delayed credits.'},
+      {label:'Higher delays to 70, lower claims at 62',hiClaim:70,loClaim:62,desc:'Recommended if survivor protection is key. Income flows early; survivor inherits the maximum delayed-credit benefit.'},
+      {label:'Both delay to 70',hiClaim:70,loClaim:70,desc:'Maximum lifetime + max survivor benefit, if longevity is on your side and other income bridges the gap.'}
+    ];
     h+='<div style="padding:14px;background:rgba(249,115,22,.04);border:2px solid rgba(249,115,22,.12);border-radius:4px;margin-bottom:12px">';
-    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--or);margin-bottom:6px">👥 COUPLE OPTIMIZATION</div>';
-    h+='<div style="font-size:11px;color:var(--mu);line-height:1.8">';
-    h+='<strong style="color:var(--wh)">Scenario to consider:</strong> Lower-earning spouse claims at 62 ('+fmt(spAt62)+'/mo), higher-earning spouse delays to 70 ('+fmt(at70)+'/mo). This provides income early while maximizing the survivor benefit.<br>';
-    h+='<strong style="color:var(--wh)">Survivor benefit:</strong> When one spouse passes, the surviving spouse receives the higher of the two benefits: <span style="color:var(--gr);font-weight:700">'+fmt(survivorBenefit)+'/mo</span>. Delaying the higher earner maximizes this protection.';
-    h+='</div></div>';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--or);margin-bottom:8px">👥 COUPLE OPTIMIZATION &amp; SURVIVOR BENEFITS</div>';
+    h+='<div style="font-size:10px;color:var(--mu);margin-bottom:10px;line-height:1.5">When one spouse passes, the survivor receives the larger of: their own benefit, or 100% of what the deceased was receiving. Delayed retirement credits (DRCs) earned by the deceased are inherited by the survivor.</div>';
+    h+='<table style="width:100%;border-collapse:collapse;font-size:10px;color:var(--mu)">';
+    h+='<thead><tr style="border-bottom:1px solid var(--bd)"><th style="text-align:left;padding:5px 4px;font-weight:700;color:var(--wh)">Strategy</th><th style="text-align:right;padding:5px 4px;font-weight:700;color:var(--wh)">Combined while both alive</th><th style="text-align:right;padding:5px 4px;font-weight:700;color:var(--wh)">Survivor (if higher-earner dies)</th></tr></thead><tbody>';
+    var bestSurvivor=0;
+    strategies.forEach(function(s){
+      var hi=_benAt(_hiPIA,s.hiClaim,_hiFRA);
+      var lo=_benAt(_loPIA,s.loClaim,_loFRA);
+      var combined=hi+lo;
+      var survivor=Math.max(hi,lo);// survivor receives higher of two when higher-earner passes
+      bestSurvivor=Math.max(bestSurvivor,survivor);
+      var isBest=(survivor===Math.max.apply(null,strategies.map(function(t){return Math.max(_benAt(_hiPIA,t.hiClaim,_hiFRA),_benAt(_loPIA,t.loClaim,_loFRA));})));
+      h+='<tr style="border-bottom:1px solid rgba(0,68,191,.06)">';
+      h+='<td style="padding:6px 4px;line-height:1.4"><span style="color:var(--wh)">'+s.label+'</span><br><span style="font-size:9px">'+s.desc+'</span></td>';
+      h+='<td style="text-align:right;padding:6px 4px;color:var(--wh);font-family:var(--fd)">'+fmt(combined)+'/mo</td>';
+      h+='<td style="text-align:right;padding:6px 4px;color:'+(isBest?'var(--gr)':'var(--wh)')+';font-family:var(--fd);font-weight:'+(isBest?'700':'400')+'">'+fmt(survivor)+'/mo'+(isBest?' ★':'')+'</td>';
+      h+='</tr>';
+    });
+    h+='</tbody></table>';
+    h+='<div style="font-size:10px;color:var(--mu);margin-top:8px;line-height:1.5">★ marks the strategy with the highest survivor benefit. If both spouses\' longevity is uncertain, prioritize maximizing the survivor benefit by having the higher-earning spouse delay to 70 — this protects the surviving spouse for potentially decades.</div>';
+    h+='</div>';
   }
 
   // ── Verdict ──
   h+='<div style="padding:14px;background:linear-gradient(135deg,rgba(91,155,255,.04),rgba(34,197,94,.02));border:2px solid #5B9BFF33;border-radius:8px;margin-bottom:12px">';
   h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;margin-bottom:6px">VERDICT FOR YOUR SITUATION</div>';
   h+='<div style="font-size:12px;color:var(--mu);line-height:1.8">';
-  if(otherInc>2000) h+='With '+fmt(otherInc)+'/mo in other retirement income, you can afford to <strong style="color:#5B9BFF">delay to 70</strong> for maximum lifetime benefits. Every year you delay past 67 adds ~8% to your benefit permanently.';
-  else if(lifeExp>=85) h+='With a life expectancy assumption of '+lifeExp+', <strong style="color:var(--gr)">waiting to at least 67</strong> is mathematically optimal. Past age '+be67+', you come out ahead. If health allows, 70 maximizes the '+fmtK(diff62_70)+' lifetime difference.';
+  if(otherInc>2000) h+='With '+fmt(otherInc)+'/mo in other retirement income, you can afford to <strong style="color:#5B9BFF">delay to 70</strong> for maximum lifetime benefits. Every year you delay past FRA adds ~8% to your benefit permanently.';
+  else if(lifeExp>=85) h+='With a life expectancy assumption of '+lifeExp+', <strong style="color:var(--gr)">waiting to at least FRA ('+fraStr+')</strong> is mathematically optimal. Past age '+(beFRA||fraStr)+', you come out ahead. If health allows, 70 maximizes the '+fmtK(diff62_70)+' lifetime difference.';
   else h+='With a shorter life expectancy assumption of '+lifeExp+', <strong style="color:var(--or)">claiming at 62</strong> may make sense — you start receiving benefits immediately. But consider: most people underestimate their longevity.';
   h+='</div></div>';
 
   h+='<div style="padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:8px;font-size:10px;color:var(--yl);line-height:1.5">⚠️ <strong>Important:</strong> These projections use simplified assumptions. Real-world results vary based on market conditions, tax changes, and personal circumstances. Use as a planning guide, not a guarantee.</div>';
   
-  h+='<div style="padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:10px;font-size:10px;color:var(--yl);line-height:1.5">📈 <strong>COLA Adjustment:</strong> Social Security benefits increase ~'+(cola*100)+'%/yr with cost-of-living adjustments. A '+fmt(pia)+'/mo benefit at 67 becomes ~'+fmt(Math.round(pia*Math.pow(1+cola,23)))+'/mo by age 90 — but purchasing power depends on actual inflation.</div>';
+  h+='<div style="padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:10px;font-size:10px;color:var(--yl);line-height:1.5">📈 <strong>COLA Adjustment:</strong> Social Security benefits increase ~'+(cola*100)+'%/yr with cost-of-living adjustments. A '+fmt(pia)+'/mo benefit at FRA becomes ~'+fmt(Math.round(pia*Math.pow(1+cola,23)))+'/mo by age 90 — but purchasing power depends on actual inflation.</div>';
   h+=calcShareBtn();
-  h+=calcDisclaim('Benefits based on 2026 Social Security formulas. Actual PIA depends on your 35 highest-earning years — verify at ssa.gov. Tax impact simplified; actual taxation depends on combined income thresholds. Spousal and survivor benefits have additional rules not fully modeled here. Consult a financial advisor.');
+  h+=calcDisclaim('Benefits based on 2026 Social Security formulas. Your Full Retirement Age (FRA) varies by birth year (66 for 1943-54 → 67 for 1960+). Actual PIA depends on your 35 highest-earning years — verify at ssa.gov. Tax impact simplified; actual taxation depends on combined income thresholds. Spousal and survivor benefits have additional rules not fully modeled here. Consult a financial advisor.');
   el.innerHTML=h;
   animBars('ss_chart');
 }
@@ -12633,7 +12798,7 @@ function renderEstateDashboard(){
   h+=statTile(est.done+'/'+est.total,'Documents',estCol);
   h+=statTile(est.pct+'%','Score',estCol);
   h+=statTile(est.total-est.done,'Missing',est.total-est.done>0?'var(--rd)':'var(--gr)');
-  h+=statTile(c.netWorth>13610000?'YES':'NO','Estate Tax Exposed',c.netWorth>13610000?'var(--rd)':'var(--gr)');
+  h+=statTile(c.netWorth>15000000?'YES':'NO','Estate Tax Exposed',c.netWorth>15000000?'var(--rd)':'var(--gr)');
   h+='</div>';
 
   // ── Document Checklist ──
@@ -12651,10 +12816,11 @@ function renderEstateDashboard(){
 
   // ── Estate Tax Quick Check ──
   if(c.netWorth>0){
-    var above=c.netWorth>13610000;var sunsetRisk=c.netWorth>7000000;
-    h+='<div style="margin-top:12px;padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+(above?'var(--rd)':sunsetRisk?'var(--or)':'var(--gr)')+';border-radius:4px">';
+    // 2026 federal estate/gift exemption: $15M individual / $30M couple (OBBBA permanent)
+    var above=c.netWorth>15000000;var nearLimit=c.netWorth>10000000&&c.netWorth<=15000000;
+    h+='<div style="margin-top:12px;padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+(above?'var(--rd)':nearLimit?'var(--yl)':'var(--gr)')+';border-radius:4px">';
     h+='<div style="font-family:var(--fd);font-size:24px;color:'+(above?'var(--or)':'var(--gr)')+'">'+fmtK(c.netWorth)+'</div>';
-    h+='<div style="font-size:11px;color:'+(above?'var(--or)':sunsetRisk?'var(--or)':'var(--gr)')+'">'+( above?'⚠️ Above $13.61M exemption — estate tax planning critical':sunsetRisk?'⚠️ Above $7M sunset threshold — may be exposed in 2026':'✅ Below federal exemption')+'</div></div>';
+    h+='<div style="font-size:11px;color:'+(above?'var(--rd)':nearLimit?'var(--yl)':'var(--gr)')+'">'+( above?'⚠️ Above $15M federal exemption — estate tax planning critical':nearLimit?'⚠️ Approaching $15M exemption — review state estate taxes and growth assumptions':'✅ Below federal exemption ($15M individual / $30M couple, OBBBA permanent)')+'</div></div>';
   }
 
   h+='<div style="padding:8px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:8px;font-size:10px;color:var(--mu);line-height:1.5">💡 <strong style="color:var(--wh)">Next Steps:</strong> Review these numbers with your full financial picture in mind. Set a calendar reminder to revisit in 90 days. Small adjustments now compound into massive differences over time.</div>';
@@ -12896,9 +13062,9 @@ function calcBuyVsRentFull(){
     var yrHOA=Math.round(hoa*12*Math.pow(1.03,yr-1));
     var yrMaint=Math.round(homeVal*maintPct);
 
-    // Interest portion for tax deduction
+    // Interest portion for tax deduction (above 2026 single std deduction $16,100)
     var yrInterest=0;for(var m=0;m<12;m++){var ip=bal*rm;yrInterest+=ip;bal=Math.max(0,bal-(pmt-ip));}
-    var taxSaving=Math.round(Math.max(0,yrInterest-13850)*taxBrack);// only deduct above standard deduction
+    var taxSaving=Math.round(Math.max(0,yrInterest-16100)*taxBrack);// only deduct above standard deduction
     cumTaxSaving+=taxSaving;
 
     cumBuyCost+=(yrMortgage+yrPropTax+yrIns+yrHOA+yrMaint-taxSaving);
@@ -12990,8 +13156,8 @@ function calcBuyVsRentFull(){
   // ── Tax Impact ──
   h+='<div style="padding:10px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.7">';
   h+='<strong style="color:var(--wh)">📋 Tax Impact:</strong> ';
-  if(final.taxSaved>0) h+='Mortgage interest deduction saves ~<span style="color:var(--gr);font-weight:600">'+fmtK(final.taxSaved)+'</span> over '+stay+' years (in the '+Math.round(taxBrack*100)+'% bracket, only interest above the $13,850 standard deduction).';
-  else h+='At your interest level, you likely will not benefit from itemizing — the standard deduction of $13,850 is higher than your mortgage interest. <span style="color:var(--yl)">This is a hidden cost most people miss.</span>';
+  if(final.taxSaved>0) h+='Mortgage interest deduction saves ~<span style="color:var(--gr);font-weight:600">'+fmtK(final.taxSaved)+'</span> over '+stay+' years (in the '+Math.round(taxBrack*100)+'% bracket, only interest above the $16,100 standard deduction).';
+  else h+='At your interest level, you likely will not benefit from itemizing — the standard deduction of $16,100 is higher than your mortgage interest. <span style="color:var(--yl)">This is a hidden cost most people miss.</span>';
   h+='</div>';
 
   // ── Hidden Costs ──
@@ -13061,31 +13227,34 @@ function calcTaxEstimate(){
   var el=document.getElementById('te_results');if(!el)return;
 
   var gross=w2+se+stcg;// ordinary income (LTCG taxed separately)
-  var stdDed=filing==='married'?29200:filing==='hoh'?21900:14600;
+  var stdDed=filing==='married'?32200:filing==='hoh'?24150:16100;
   var deduction=Math.max(stdDed,itemized);
   var agi=gross+ltcg-k401-hsa-(se>0?Math.round(se*0.0765):0);// SE deduction
   var taxable=Math.max(0,agi-deduction);
 
-  // Federal brackets 2025
+  // Federal brackets 2026 (IRS Rev. Proc. 2025-32, OBBBA permanent)
   var brackets=filing==='married'?[[24800,0.10],[76000,0.12],[110600,0.22],[192150,0.24],[108900,0.32],[256250,0.35],[Infinity,0.37]]:filing==='hoh'?[[17600,0.10],[49850,0.12],[38250,0.22],[96075,0.24],[54450,0.32],[384375,0.35],[Infinity,0.37]]:[[12400,0.10],[38000,0.12],[55300,0.22],[96075,0.24],[54450,0.32],[384375,0.35],[Infinity,0.37]];
 
   var tax=0;var remaining=taxable-ltcg;var bracketBreakdown=[];
   brackets.forEach(function(b){if(remaining<=0)return;var amt=Math.min(remaining,b[0]);tax+=amt*b[1];bracketBreakdown.push({rate:Math.round(b[1]*100),amount:Math.round(amt),tax:Math.round(amt*b[1])});remaining-=amt;});
 
-  // LTCG tax (0/15/20% based on income)
-  var ltcgRate=taxable>518900?0.20:taxable>44625?0.15:0;
+  // LTCG tax 2026 (0/15/20% based on filing status — IRS Rev. Proc. 2025-32)
+  var ltcgRate;
+  if(filing==='married'){ltcgRate=taxable>613700?0.20:taxable>98900?0.15:0;}
+  else if(filing==='hoh'){ltcgRate=taxable>579600?0.20:taxable>66200?0.15:0;}
+  else{ltcgRate=taxable>545500?0.20:taxable>49450?0.15:0;}
   var ltcgTax=Math.round(ltcg*ltcgRate);
 
-  // FICA
-  var ficaSS=Math.min(w2,168600)*0.062;
+  // FICA (2026 SS wage base $184,500; Medicare unchanged)
+  var ficaSS=Math.min(w2,184500)*0.062;
   var ficaMed=w2*0.0145+Math.max(0,w2-200000)*0.009;// Additional Medicare
   var fica=Math.round(ficaSS+ficaMed);
 
   // Self-employment tax
   var seTax=se>0?Math.round(se*0.9235*0.153):0;
 
-  // Credits
-  var childCredit=dep*2000;// simplified
+  // Credits (2026 CTC $2,200/child — OBBBA permanent, indexed for inflation starting 2026)
+  var childCredit=dep*2200;
   var totalCredits=childCredit;
 
   var totalTax=Math.round(tax+ltcgTax+fica+seTax-totalCredits);
@@ -13136,7 +13305,7 @@ function calcTaxEstimate(){
   h+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(0,68,191,.04)"><span>FICA (SS '+fmt(Math.round(ficaSS))+' + Med '+fmt(Math.round(ficaMed))+')</span><span style="color:var(--or)">'+fmt(fica)+'</span></div>';
   if(seTax>0) h+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(0,68,191,.04)"><span>Self-Employment Tax (15.3%)</span><span style="color:var(--or)">'+fmt(seTax)+'</span></div>';
   if(ltcgTax>0) h+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(0,68,191,.04)"><span>LTCG Tax ('+Math.round(ltcgRate*100)+'%)</span><span style="color:var(--or)">'+fmt(ltcgTax)+'</span></div>';
-  if(totalCredits>0) h+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(0,68,191,.04);color:var(--gr)"><span>− Credits ('+dep+' children × $2,000)</span><span>−'+fmt(totalCredits)+'</span></div>';
+  if(totalCredits>0) h+='<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid rgba(0,68,191,.04);color:var(--gr)"><span>− Credits ('+dep+' children × $2,200)</span><span>−'+fmt(totalCredits)+'</span></div>';
   h+='</div>';
 
   // ── Effective vs Marginal ──
@@ -13206,7 +13375,7 @@ function calcTaxEstimate(){
   h+='</div></div>';
 
   h+=calcShareBtn();
-  h+=calcDisclaim('Simplified estimate using 2025 federal brackets. Does not include state/local tax, AMT, net investment income tax (3.8%), qualified business income deduction, education credits, or other credits beyond child tax credit. Capital gains rates simplified. Consult a tax professional for complete tax planning.');
+  h+=calcDisclaim('Simplified estimate using 2026 federal brackets (OBBBA). Does not include state/local tax, AMT, net investment income tax (3.8%), qualified business income deduction, education credits, or other credits beyond child tax credit. Capital gains rates simplified. Consult a tax professional for complete tax planning.');
   el.innerHTML=h;
 }
 
@@ -15854,7 +16023,6 @@ function calcParentPLUS(){
   }
   var retLost=Math.round(retGrowthWithout-retGrowthWith);
   // How many years delayed?
-  var monthlyRetNeed=retTarget*0.04/12;
   var _mcRet2=(S.calcs&&S.calcs.blendedRetReturn||7)/100;var yrsToTarget=0;var rb=retBal;while(rb<retTarget&&yrsToTarget<50){yrsToTarget++;rb=rb*(1+_mcRet2)+retContr*12;}
   var yrsIfNoPlus=0;rb=retBal;while(rb<retTarget&&yrsIfNoPlus<50){yrsIfNoPlus++;rb=rb*(1+_mcRet2)+(retContr+stdPmt)*12;}
   var delayYrs=yrsToTarget-yrsIfNoPlus;
@@ -16028,7 +16196,7 @@ function calcRMD(){
   // ── Strategies ──
   h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--gr);margin:8px 0 6px">💡 Tax-Smart Strategies</div>';
   var strategies=[
-    {icon:'🎁',title:'QCD (Qualified Charitable Distribution)',desc:'If 70½+, donate up to $105,000 of your RMD directly to charity. Satisfies RMD without increasing taxable income. Best for charitable givers.',color:'var(--gr)'},
+    {icon:'🎁',title:'QCD (Qualified Charitable Distribution)',desc:'If 70½+, donate up to $111,000 of your RMD directly to charity (2026 limit, indexed for inflation). Satisfies RMD without increasing taxable income. Best for charitable givers.',color:'var(--gr)'},
     {icon:'🔄',title:'Roth Conversion (before 73)',desc:'Convert traditional to Roth in lower-income years before RMDs begin. Roth accounts have NO RMDs and grow tax-free. Reduces future RMD burden.',color:'var(--pu)'},
     {icon:'📅',title:'Strategic Timing',desc:'Withdraw early in the year and reinvest in a taxable account. The earlier you withdraw, the more time the money has to grow outside the traditional account.',color:'#5B9BFF'},
   ];
@@ -16040,7 +16208,7 @@ function calcRMD(){
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:12px"><div style="padding:8px;background:var(--bg-card);border:1px solid var(--bd);border-top:2px solid var(--or);border-radius:4px;text-align:center"><div style="font-size:9px;color:var(--or)">REQUIRED WITHDRAWAL</div><div style="font-family:var(--fd);font-size:16px;color:var(--or)">'+fmtK(Math.round(rmd))+'/yr</div></div><div style="padding:8px;background:var(--bg-card);border:1px solid var(--bd);border-top:2px solid #5B9BFF;border-radius:4px;text-align:center"><div style="font-size:9px;color:#5B9BFF">AFTER-TAX TAKE-HOME</div><div style="font-family:var(--fd);font-size:16px;color:#5B9BFF">'+fmtK(Math.round(rmd*(1-bracket)))+'/yr</div></div></div>';
 
   h+=calcShareBtn();
-  h+=calcDisclaim('RMD calculations use IRS Uniform Lifetime Table. Actual distribution periods may differ if spouse is sole beneficiary and more than 10 years younger. RMD starting age is 73 (SECURE 2.0 Act). First RMD deadline is April 1 of the year after turning 73. QCD limit is $105,000 for 2024 (indexed for inflation). Consult a tax professional.');
+  h+=calcDisclaim('RMD calculations use IRS Uniform Lifetime Table. Actual distribution periods may differ if spouse is sole beneficiary and more than 10 years younger. RMD starting age is 73 for those born 1951-1959, 75 for those born 1960+ (SECURE 2.0 Act). First RMD deadline is April 1 of the year after you reach RMD age. QCD limit is $111,000 for 2026 (indexed for inflation). Consult a tax professional.');
   el.innerHTML=h;
   animBars('rmd_chart');
 }
@@ -16107,8 +16275,16 @@ function calcSpousalRet(){
   var el=document.getElementById('sr_results');if(!el)return;
 
   var totalSav=savA+savB;
-  var ssA62=Math.round(ssA*0.70);var ssA70=Math.round(ssA*1.24);
-  var ssB62=Math.round(ssB*0.70);var ssB70=Math.round(ssB*1.24);
+  // Phase 4: FRA-aware claim adjustments. Each spouse's FRA derived from profile DOB.
+  // Defaults to 67 if unknown. The dropdown still shows generic 62/67/70 ages,
+  // but the math respects each partner's actual FRA.
+  var _profSr=S.profile||{};
+  var _byA=null,_byB=null;
+  if(_profSr.dob){var _dA=new Date(_profSr.dob);if(!isNaN(_dA.getTime()))_byA=_dA.getFullYear();}
+  if(_profSr.spDOB){var _dB=new Date(_profSr.spDOB);if(!isNaN(_dB.getTime()))_byB=_dB.getFullYear();}
+  var _fraA=_ssFRA(_byA);var _fraB=_ssFRA(_byB);
+  var ssA62=Math.round(ssA*_ssClaimAdjustment(62,_fraA));var ssA70=Math.round(ssA*_ssClaimAdjustment(70,_fraA));
+  var ssB62=Math.round(ssB*_ssClaimAdjustment(62,_fraB));var ssB70=Math.round(ssB*_ssClaimAdjustment(70,_fraB));
 
   // Determine who retires first
   var firstRetAge=Math.min(retA,retB);var secondRetAge=Math.max(retA,retB);
@@ -16124,9 +16300,11 @@ function calcSpousalRet(){
   }
 
   var bothRetAge=Math.max(retA,retB+(ageA-ageB));// A's age when both retired
-  var ssStartAge=67;// Both at FRA
+  // Phase 4: SS start age = lower of the two FRAs (couple coordination assumes both claim at FRA by default)
+  var ssStartAge=Math.floor(Math.min(_fraA,_fraB));
+  var _ssLbl=_ssFRAStr(_byA);
   phases.push({name:'Both Retired, Pre-SS',icon:'🏖️🏖️',income:0,startAge:'Both retired (A age ~'+bothRetAge+')',dur:Math.max(0,ssStartAge-bothRetAge),color:'var(--rd)'});
-  phases.push({name:'Both Retired + SS',icon:'🏖️🏖️💰',income:ssA+ssB,startAge:'Both 67+ (SS kicks in)',dur:23,color:'var(--gr)'});
+  phases.push({name:'Both Retired + SS',icon:'🏖️🏖️💰',income:ssA+ssB,startAge:'Both at FRA (SS kicks in)',dur:23,color:'var(--gr)'});
 
   var h='';
 
@@ -16187,7 +16365,7 @@ function calcSpousalRet(){
 
   h+=cssBar(Math.min(100,75),'#5B9BFF',8);
   h+=calcShareBtn();
-  h+=calcDisclaim('SS benefits estimated at FRA (67). Early claiming reduces benefits ~6-7%/yr before FRA. Delayed credits increase benefits 8%/yr after FRA to age 70. Survivor benefits have additional rules. Healthcare estimates are approximate. Consult a financial planner for personalized retirement coordination.');
+  h+=calcDisclaim('SS benefits estimated at each spouse\'s Full Retirement Age (FRA), which varies by birth year (66 for those born 1943-54 → 67 for those born 1960+). Early claiming reduces benefits ~6-7%/yr before FRA. Delayed credits increase benefits 8%/yr after FRA to age 70. Survivor benefits have additional rules. Healthcare estimates are approximate. Consult a financial planner for personalized retirement coordination.');
   el.innerHTML=h;
 }
 
@@ -16468,7 +16646,7 @@ function calcRothConv(){
 
   h+=cssBar(Math.min(100,75),'#5B9BFF',8);
   h+=calcShareBtn();
-  h+=calcDisclaim('Tax estimates use simplified 2025 federal brackets. Actual conversion impact depends on full tax return, state taxes, ACA subsidies, Medicare IRMAA, and other factors. Conversions are irrevocable. 5-year rule applies to converted amounts before age 59½. Consult a tax professional.');
+  h+=calcDisclaim('Tax estimates use simplified 2026 federal brackets (OBBBA). Actual conversion impact depends on full tax return, state taxes, ACA subsidies, Medicare IRMAA, and other factors. Conversions are irrevocable. 5-year rule applies to converted amounts before age 59½. Consult a tax professional.');
   el.innerHTML=h;
 }
 
@@ -16625,12 +16803,13 @@ function calcHSA(){
   var el=document.getElementById('hsa_results');if(!el)return;
 
   if(!hdhp){
-    el.innerHTML='<div style="padding:16px;background:rgba(239,68,68,.05);border:2px solid rgba(239,68,68,.15);border-radius:4px;margin-top:14px;text-align:center"><div style="font-size:24px;margin-bottom:6px">❌</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--rd)">HSA REQUIRES AN HDHP</div><div style="font-size:11px;color:var(--mu);margin-top:6px;line-height:1.6">You need a High-Deductible Health Plan to contribute to an HSA. For 2025: min deductible of $1,650 (self) / $3,300 (family). Ask your employer if an HDHP option is available — the HSA tax benefits often outweigh the higher deductible.</div></div>';
+    el.innerHTML='<div style="padding:16px;background:rgba(239,68,68,.05);border:2px solid rgba(239,68,68,.15);border-radius:4px;margin-top:14px;text-align:center"><div style="font-size:24px;margin-bottom:6px">❌</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--rd)">HSA REQUIRES AN HDHP</div><div style="font-size:11px;color:var(--mu);margin-top:6px;line-height:1.6">You need a High-Deductible Health Plan to contribute to an HSA. For 2026: min deductible of $1,700 (self-only) / $3,400 (family); max OOP $8,500 (self) / $17,000 (family). Ask your employer if an HDHP option is available — the HSA tax benefits often outweigh the higher deductible.</div></div>';
     return;
   }
 
   var catchUp=age>=55?1000:0;
-  var maxContr=(type==='self'?4150:8300)+catchUp;
+  // 2026 HSA limits per IRS Rev. Proc. 2025-19: $4,400 self-only / $8,750 family + $1,000 catch-up at 55+
+  var maxContr=(type==='self'?4400:8750)+catchUp;
   var gap=Math.max(0,maxContr-contr);
   var taxSavedNow=Math.round(contr*bracket);// going in
   var maxTaxSaved=Math.round(maxContr*bracket);
@@ -16699,7 +16878,7 @@ function calcHSA(){
   
   h+='<div style="padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:10px;font-size:10px;color:var(--yl);line-height:1.5">📈 <strong>Healthcare inflation ('+(hsaInfl*100)+'%/yr):</strong> A $500/mo medical bill today costs ~'+fmt(Math.round(500*Math.pow(1+hsaInfl,20)))+'/mo in 20 years. Your HSA grows tax-free to meet these rising costs — this is why investing your HSA balance is powerful.</div>';
   h+=calcShareBtn();
-  h+=calcDisclaim('HSA requires a qualifying HDHP. 2025 limits: $4,150 individual / $8,300 family + $1,000 catch-up for 55+. Investment options and fees vary by HSA provider. Receipt reimbursement strategy requires keeping records. Consult a tax professional.');
+  h+=calcDisclaim('HSA requires a qualifying HDHP. 2026 limits: $4,400 self-only / $8,750 family + $1,000 catch-up for 55+. HDHP min deductible $1,700 self / $3,400 family; max OOP $8,500 self / $17,000 family. Investment options and fees vary by HSA provider. Receipt reimbursement strategy requires keeping records. Consult a tax professional.');
   el.innerHTML=h;
 }
 
@@ -16716,7 +16895,7 @@ function renderEstateTaxCalc(){
   var h=calcToggleHTML('et','calcEstateTax');
 
   // ── Subtitle ──
-  h+='<div style="font-size:12px;color:var(--mu);margin-bottom:12px;line-height:1.6">Determine if your estate will owe federal or state estate taxes — including the <strong style="color:var(--rd)">2026 exemption sunset</strong> that could cut the threshold from $13.61M to ~$7M. Life insurance you own counts as part of your taxable estate.</div>';
+  h+='<div style="font-size:12px;color:var(--mu);margin-bottom:12px;line-height:1.6">Determine if your estate will owe federal or state estate taxes. The federal exemption is <strong style="color:var(--gr)">$15M per person</strong> ($30M per couple) for 2026 — <strong>permanent</strong> under OBBBA (no more sunset risk). Many states have lower thresholds. Life insurance you own counts as part of your taxable estate.</div>';
 
   // ── Profile Bar ──
   h+='<div style="padding:12px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.8">';
@@ -16751,7 +16930,7 @@ function renderWealthTransfer(){
 
   // ── Profile Bar ──
   h+='<div style="padding:12px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.8">';
-  h+='<strong style="color:var(--wh)">📋 Your Profile:</strong> Net worth: <span style="color:#5B9BFF;font-weight:600">'+fmtK(nw)+'</span> · 2025 gift exclusion: <span style="color:var(--gr)">$18,000/person</span> (married: $36,000)';
+  h+='<strong style="color:var(--wh)">📋 Your Profile:</strong> Net worth: <span style="color:#5B9BFF;font-weight:600">'+fmtK(nw)+'</span> · 2026 gift exclusion: <span style="color:var(--gr)">$19,000/person</span> (married: $38,000)';
   h+='</div>';
 
   // ── Inputs ──
@@ -16842,7 +17021,7 @@ function calcWealthTransfer(){
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:10px"><div style="padding:8px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.12);border-top:2px solid var(--or);border-radius:4px;text-align:center"><div style="font-size:9px;color:var(--or);font-weight:700">CURRENT SITUATION</div><div style="font-size:10px;color:var(--mu);margin-top:3px">Where you are today</div></div><div style="padding:8px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.12);border-top:2px solid var(--gr);border-radius:4px;text-align:center"><div style="font-size:9px;color:var(--gr);font-weight:700">OPTIMIZED</div><div style="font-size:10px;color:var(--mu);margin-top:3px">After implementing changes</div></div></div>';
 
   h+=calcShareBtn();
-  h+=calcDisclaim('2026 annual gift exclusion: $19,000/person ($38,000 married). 529 superfunding uses 5-year gift tax averaging. Amounts above the annual exclusion count against the lifetime exemption ($13.61M individual). Gift/estate tax rates are 40%. Consult an estate attorney for a comprehensive gifting strategy.');
+  h+=calcDisclaim('2026 annual gift exclusion: $19,000/person ($38,000 married). 529 superfunding uses 5-year gift tax averaging. Amounts above the annual exclusion count against the lifetime exemption ($15M individual / $30M couple, made permanent by OBBBA July 2025). Gift/estate tax rates are 40%. Consult an estate attorney for a comprehensive gifting strategy.');
   el.innerHTML=h;
 }
 
@@ -16875,7 +17054,7 @@ function renderLegacyDashboard(){
 
   // ── THE WATERFALL: Assets → Debts → Taxes → Expenses → NET ──
   var assets=nw+totalDB;
-  var estateTax=assets>13610000?Math.round((assets-13610000)*0.40):0;
+  var estateTax=assets>15000000?Math.round((assets-15000000)*0.40):0;
   var finalExpenses=15000;// funeral, legal, probate
   var netToFamily=assets-totalDebt-estateTax-finalExpenses;
 
@@ -16909,19 +17088,27 @@ function renderLegacyDashboard(){
   h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--or);margin:12px 0 6px">Income Replacement for Survivors</div>';
   var monthsOfExpenses=netToFamily>0?Math.round(netToFamily/monthlyExp):0;
   var yearsOfExpenses=Math.round(monthsOfExpenses/12*10)/10;
-  var monthlyFromInsurance=totalDB>0?Math.round(totalDB*0.04/12):0;// 4% rule on insurance proceeds
-  var incomeGap=Math.max(0,monthlyExp-monthlyFromInsurance);
+  // Phase 2: insurance survivor income reframed. Gross-income replacement is the primary
+  // standard ("DB covers your gross income for X years") — that's what survivors need to
+  // maintain household standard of living. Sustainable withdrawal from invested proceeds
+  // is shown as a supplemental figure (25-yr horizon, 1% real return) instead of 4% rule.
+  var grossAnnualInc=(inc||0)*12;
+  var yearsIncomeReplaced=grossAnnualInc>0&&totalDB>0?Math.round(totalDB/grossAnnualInc*10)/10:0;
+  var _proceedsR=0.01/12,_proceedsN=300;// 25-yr horizon, 1% real
+  var sustainableMonthly=totalDB>0?Math.round(totalDB*(_proceedsR/(1-Math.pow(1+_proceedsR,-_proceedsN)))):0;
+  var incomeGap=Math.max(0,(inc||0)-sustainableMonthly);
 
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px">';
-  h+=statTile(yearsOfExpenses+' yrs','Expenses Covered','var(--gr)');
-  h+=statTile(fmt(monthlyFromInsurance)+'/mo','From Insurance (4%)','#5B9BFF');
-  h+=statTile(fmt(incomeGap)+'/mo','Monthly Gap',incomeGap>0?'var(--rd)':'var(--gr)');
+  h+=statTile(yearsIncomeReplaced+' yrs','Gross Income Replaced','var(--gr)');
+  h+=statTile(yearsOfExpenses+' yrs','Expenses Covered','#5B9BFF');
+  h+=statTile(fmt(sustainableMonthly)+'/mo','Sustainable from Proceeds',sustainableMonthly>=(inc||0)?'var(--gr)':'var(--or)');
   h+='</div>';
 
   h+='<div style="padding:10px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.7">';
-  h+='Your family\'s expenses: <span style="color:var(--or);font-weight:600">'+fmt(monthlyExp)+'/mo</span>. Insurance proceeds invested at 4%: <span style="color:#5B9BFF">'+fmt(monthlyFromInsurance)+'/mo</span>. ';
-  if(incomeGap>0) h+='<span style="color:var(--rd);font-weight:600">Gap of '+fmt(incomeGap)+'/mo</span> — they would need to supplement with other income or draw down principal.';
-  else h+='<span style="color:var(--gr)">✅ Expenses covered by insurance income alone.</span>';
+  h+='Your gross income: <span style="color:var(--or);font-weight:600">'+fmt(inc||0)+'/mo</span> ('+fmtK(grossAnnualInc)+'/yr). Death benefit of <span style="color:var(--gr);font-weight:600">'+fmtK(totalDB)+'</span> replaces your gross income for <span style="color:var(--gr);font-weight:600">'+yearsIncomeReplaced+' years</span>. ';
+  h+='If invested over 25 years at a sustainable real return, proceeds supply <span style="color:#5B9BFF">'+fmt(sustainableMonthly)+'/mo</span>. ';
+  if(incomeGap>0) h+='<span style="color:var(--rd);font-weight:600">Sustainable monthly falls '+fmt(incomeGap)+'/mo short of replacing your full gross income</span> &mdash; survivors would deplete principal faster, work, or live on less.';
+  else h+='<span style="color:var(--gr)">✅ Sustainable monthly matches or exceeds your current gross income.</span>';
   h+='</div>';
 
   // ── Warnings ──
@@ -17328,8 +17515,8 @@ function calcWindfall(){
     allocs.push({p:priority++,label:'High-Interest Debt (10%+)',amt:a2,icon:'💳',color:'var(--or)',why:'Eliminate '+fmtK(highDebt)+' debt, save ~'+fmtK(highDebtInt)+'/yr interest'});remaining-=a2;
   }
   if(remaining>1000){
-    var rothAmt=Math.min(remaining,7000);
-    allocs.push({p:priority++,label:'Roth IRA Contribution',amt:rothAmt,icon:'📈',color:'#5B9BFF',why:'Tax-free growth (2025 limit: $7,000)'});remaining-=rothAmt;
+    var rothAmt=Math.min(remaining,7500);
+    allocs.push({p:priority++,label:'Roth IRA Contribution',amt:rothAmt,icon:'📈',color:'#5B9BFF',why:'Tax-free growth (2026 limit: $7,500)'});remaining-=rothAmt;
   }
   if(otherDebt>0&&remaining>1000){
     var a3=Math.min(remaining,otherDebt);
@@ -17553,8 +17740,8 @@ function calcBabyCost(){
   var yr1Total=preBirth;for(var k in yr1) yr1Total+=yr1[k];
   var monthly=Math.round((yr1Total-preBirth)/12);// ongoing monthly
 
-  // Tax credits
-  var childTC=2000;var depCareFSA=cc==='daycare'||cc==='nanny'?5000:0;
+  // Tax credits (2026: CTC $2,200/child OBBBA permanent; DCFSA $7,500 per household OBBBA permanent)
+  var childTC=2200;var depCareFSA=cc==='daycare'||cc==='nanny'?7500:0;
   var depCareSavings=Math.round(depCareFSA*0.22);// tax savings at 22%
   var totalCredits=childTC+depCareSavings;
 
@@ -18258,7 +18445,7 @@ function calcCollegeSavings(){
      taxOnWithdraw:0,// already taxed
      stateTaxSaved:0,
      pros:['No contribution limit (gift tax applies above $18K/yr)','Any use — not restricted to education','Simple to set up','Child can invest in anything'],
-     cons:['CHILD\'S asset — devastating FAFSA impact (20%)','Irrevocable gift — child controls at 18/21','Kiddie tax on earnings above $2,500','Child may not use it for college'],
+     cons:['CHILD\'S asset — devastating FAFSA impact (20%)','Irrevocable gift — child controls at 18/21','Kiddie tax on unearned income above $2,700 (2026)','Child may not use it for college'],
      aidImpact:'HIGH — student asset (20% FAFSA hit)',aidColor:'var(--rd)',
      flexibility:'HIGH — any purpose',flexColor:'var(--gr)'},
 
@@ -18294,11 +18481,11 @@ function calcCollegeSavings(){
 
     {name:'Roth IRA (Parent)',icon:'💰',color:'var(--gr)',
      rate:0.07,taxDrag:0,
-     proj:grow(Math.min(monthly,583),years,0.07),// $7,000/yr max → $583/mo
+     proj:grow(Math.min(monthly,625),years,0.07),// $7,500/yr max → $625/mo (2026)
      taxOnWithdraw:0,// contributions come out tax-free
      stateTaxSaved:0,
-     pros:['Contributions withdraw tax/penalty-free anytime','Dual purpose: retirement + college backup','Not counted on FAFSA (retirement asset)','Tax-free growth','$7,000/yr contribution limit'],
-     cons:['$7,000/yr limit (shared with retirement savings)','Earnings withdrawal before 59½ = tax + 10% penalty','Reduces YOUR retirement savings','Income restrictions for contributions'],
+     pros:['Contributions withdraw tax/penalty-free anytime','Dual purpose: retirement + college backup','Not counted on FAFSA (retirement asset)','Tax-free growth','$7,500/yr contribution limit'],
+     cons:['$7,500/yr limit (shared with retirement savings)','Earnings withdrawal before 59½ = tax + 10% penalty','Reduces YOUR retirement savings','Income restrictions for contributions'],
      aidImpact:'NONE — retirement assets excluded from FAFSA',aidColor:'var(--gr)',
      flexibility:'HIGH — dual purpose (retirement + education)',flexColor:'var(--gr)'},
   ];
@@ -18386,7 +18573,7 @@ function calcCollegeSavings(){
 
   h+='<div style="padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:8px;font-size:10px;color:var(--yl);line-height:1.5">⚠️ <strong>Important:</strong> These projections use simplified assumptions. Real-world results vary based on market conditions, tax changes, and personal circumstances. Use as a planning guide, not a guarantee.</div>';
   h+=calcShareBtn();
-  h+=calcDisclaim('Projections are estimates based on historical average returns and simplified growth models. 529 returns depend on plan and investment selection. IUL and Whole Life projections simplified — actual cash value depends on carrier, policy design, and COI charges. FAFSA rules may change. Coverdell ESA income limits and contribution limits are 2025 values. Roth IRA contributions limited to earned income. This is educational — consult a financial advisor for personalized college savings strategy.');
+  h+=calcDisclaim('Projections are estimates based on historical average returns and simplified growth models. 529 returns depend on plan and investment selection. IUL and Whole Life projections simplified — actual cash value depends on carrier, policy design, and COI charges. FAFSA rules may change. Coverdell ESA contribution limits ($2,000/yr per beneficiary) and income phase-outs are 2026 values. Roth IRA contributions limited to earned income. This is educational — consult a financial advisor for personalized college savings strategy.');
   el.innerHTML=h;
   animBars('csc_chart');
 }
@@ -18613,7 +18800,7 @@ function calcSandwichGen(){
   h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--gr);margin:8px 0 6px">💡 Strategies to Find Breathing Room</div>';
   var strategies=[
     {icon:'🏛️',text:'<strong>Medicaid planning:</strong> If parents qualify, Medicaid can cover nursing home or home care costs. Asset protection strategies exist.',color:'var(--gr)'},
-    {icon:'💰',text:'<strong>Dependent Care FSA:</strong> Up to $5,000/yr pretax for child OR elder care. Tax savings: ~'+fmtK(Math.round(5000*0.22))+'.',color:'#5B9BFF'},
+    {icon:'💰',text:'<strong>Dependent Care FSA:</strong> Up to $7,500/yr pretax for child OR elder care (2026 OBBBA limit, up from $5,000). Tax savings: ~'+fmtK(Math.round(7500*0.22))+'.',color:'#5B9BFF'},
     {icon:'👨‍👩‍👧‍👦',text:'<strong>Family cost-sharing:</strong> If you have siblings, propose a fair split of parent care costs. Even 2-way split saves you '+fmt(Math.round(parentCost/2))+'/mo.',color:'var(--pu)'},
     {icon:'🏥',text:'<strong>Veterans benefits:</strong> Aid & Attendance can provide $1,000-$2,000/mo for qualifying veterans or surviving spouses.',color:'var(--or)'},
     {icon:'📋',text:'<strong>Long-term care insurance:</strong> If parents have a policy, activate it. If not, explore hybrid policies for yourself to prevent this burden on your children.',color:'var(--yl)'},
@@ -20312,7 +20499,7 @@ function renderGiftTaxCalc(){
   var h=calcToggleHTML('gt','calcGiftTax');
 
   // ── Story Hook ──
-  h+=calcStoryBox('🎁','The current estate tax exemption of <span style="color:var(--gr);font-weight:700">$13.99M per person</span> is scheduled to <span style="color:var(--rd);font-weight:700">drop to ~$7M on January 1, 2026</span> unless Congress acts. Gifts made under the higher exemption are <strong>grandfathered</strong> — the IRS confirmed they will NOT claw them back. If your estate exceeds $7M, this is the most important planning window of your lifetime.','var(--or)');
+  h+=calcStoryBox('🎁','The federal estate and gift tax exemption is <span style="color:var(--gr);font-weight:700">$15M per person</span> ($30M per couple) for 2026 — made <strong>permanent</strong> by the One Big Beautiful Bill Act (signed July 4, 2025). The previously-scheduled sunset to ~$7M was eliminated. The exemption is indexed for inflation going forward. Estates above the exemption are taxed at 40%. State estate taxes may still apply at lower thresholds.','var(--gr)');
 
   // ── Profile Bar ──
   h+='<div style="padding:12px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.8">';
@@ -21136,8 +21323,8 @@ function calcRelocation(){
   var newFedTax=Math.round(fedTax(totalNewIncome));
   var curStateTax=Math.round(totalIncome*cur.inc/100);
   var newStateTax=Math.round(totalNewIncome*nw.inc/100);
-  var fica=Math.round(Math.min(totalIncome,176100)*0.0765);
-  var ficaNew=Math.round(Math.min(totalNewIncome,176100)*0.0765);
+  var fica=Math.round(Math.min(totalIncome,184500)*0.0765);
+  var ficaNew=Math.round(Math.min(totalNewIncome,184500)*0.0765);
   var curTakeHome=totalIncome-curFedTax-curStateTax-fica;
   var newTakeHome=totalNewIncome-newFedTax-newStateTax-ficaNew;
   var takeHomeDiff=newTakeHome-curTakeHome;
