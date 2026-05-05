@@ -23133,10 +23133,24 @@ function _cpShowApproachFork(){
       // A3 fix: per-strategy rate must distinguish IBC-IUL (5.5%) from IBC-WL (4%).
       // Previously both `ibc_wl` and `ibc_iul` mapped to type='ibc' and got 4%
       // regardless of underlying. Now we read strategy directly to set the rate.
-      var _retVehiclesAppr=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
-      var _apprStratMap={'roth_ira':'roth','roth_401k':'roth401k','401k':'401k','traditional_ira':'trad_ira','solo_401k':'solo401k','sep_ira':'sep_ira','iul':'iul','whole_life':'wl','ibc_wl':'ibc','ibc_iul':'ibc','ibc':'ibc','hsa':'hsa'};
+      // Fix-C (math overhaul): include 'invest' (taxable brokerage) which the AI
+      // returns for Traditional/Hybrid plans but the prior strategy fork silently
+      // dropped — making Traditional's projected retirement value undercount by
+      // ~50% and showing wildly wrong gross/tax/net comparisons.
+      var _retVehiclesAppr=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'];
+      var _apprStratMap={'roth_ira':'roth','roth_401k':'roth401k','401k':'401k','traditional_401k':'401k','traditional_ira':'trad_ira','solo_401k':'solo401k','sep_ira':'sep_ira','iul':'iul','whole_life':'wl','ibc_wl':'ibc','ibc_iul':'ibc','ibc':'ibc','hsa':'hsa','invest':'invest','taxable_brokerage':'invest','brokerage':'invest','index_funds':'invest'};
+      // Per-type tax bucket for the weighted retirement-income tax calc:
+      //   ord  → ordinary income (full retirement bracket %): Trad 401k/IRA/Solo/SEP
+      //   ltcg → long-term capital gains (15% — typical retiree bracket): taxable brokerage
+      //   free → no tax: Roth, Roth 401(k), HSA (assumed medical use), IUL/WL/IBC policy loans
+      var _apprTaxBucket={
+        '401k':'ord','trad_ira':'ord','solo401k':'ord','sep_ira':'ord',
+        'roth':'free','roth401k':'free','hsa':'free','iul':'free','wl':'free','ibc':'free',
+        'invest':'ltcg'
+      };
       var _apprYrs=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
       var _apprRetVal=0;
+      var _apprBuckets={ord:0,ltcg:0,free:0};
       if(data.allocations&&data.allocations.length>0){
         data.allocations.forEach(function(al){
           var amt=al.monthly_cost||al.amount||0;if(amt<=0)return;
@@ -23148,13 +23162,19 @@ function _cpShowApproachFork(){
           else if(aType==='iul')rate=0.055;
           else if(aType==='ibc')rate=(rawStrat==='ibc_iul')?0.055:0.04; // honor underlying
           else if(aType==='hsa')rate=0.055; // 6% gross - 0.5% fees
+          else if(aType==='invest')rate=0.065; // 7.5% moderate gross - 1% expense ratio
+          else if(aType==='401k'||aType==='roth401k')rate=0.06; // 7% gross - 1% plan fees
           var bal=0;for(var _ay=1;_ay<=_apprYrs;_ay++){bal=(bal+amt*12)*(1+rate);}
           _apprRetVal+=bal;
+          // Categorize for weighted tax — prefer explicit bucket, fall back to 'ord'
+          var _bk=_apprTaxBucket[aType]||'ord';
+          _apprBuckets[_bk]+=bal;
         });
       }
       // Phase 2: sustainability (PMT, 25-yr, 1% real) — not 4% rule
       var _apprR=0.01/12,_apprN=300;
-      var retInc=_apprRetVal>0?Math.round(_apprRetVal*(_apprR/(1-Math.pow(1+_apprR,-_apprN)))):(hl.projected_monthly_income||0);
+      var _apprPMTfactor=_apprR/(1-Math.pow(1+_apprR,-_apprN));
+      var retInc=_apprRetVal>0?Math.round(_apprRetVal*_apprPMTfactor):(hl.projected_monthly_income||0);
       // Also recalculate retVal from our formula if we have allocation data
       if(_apprRetVal>0)retVal=Math.round(_apprRetVal);
       // F5: Compute the tax bracket from RETIREMENT income, not current income.
@@ -23165,9 +23185,37 @@ function _cpShowApproachFork(){
       var _retTaxPct=10;
       if(_mfj){if(_retAnnInc>751600)_retTaxPct=37;else if(_retAnnInc>501050)_retTaxPct=35;else if(_retAnnInc>394600)_retTaxPct=32;else if(_retAnnInc>206700)_retTaxPct=24;else if(_retAnnInc>96950)_retTaxPct=22;else if(_retAnnInc>23850)_retTaxPct=12;}
       else{if(_retAnnInc>626350)_retTaxPct=37;else if(_retAnnInc>250525)_retTaxPct=35;else if(_retAnnInc>197300)_retTaxPct=32;else if(_retAnnInc>103350)_retTaxPct=24;else if(_retAnnInc>48475)_retTaxPct=22;else if(_retAnnInc>11925)_retTaxPct=12;}
-      // Tax breakdown — use retirement bracket
-      var taxAmt=Math.round(retInc*cd.taxRatio*_retTaxPct/100);
+      // Fix-C: weighted tax breakdown by bucket — replaces the prior flat
+      // cd.taxRatio (Traditional=1.0, Tax-Free=0, Hybrid=0.5) which was wrong for
+      // mixed plans. Now each bucket pays its real rate:
+      //   • ord at the retirement bracket %
+      //   • ltcg at 15% (typical retiree LTCG bracket; 20% applies above $533K joint
+      //     in 2026 — handled coarsely here, the plan view shows the precise number)
+      //   • free at 0%
+      var _ltcgRate=15;
+      var _bkInc={
+        ord: _apprRetVal>0?Math.round(_apprBuckets.ord*_apprPMTfactor):0,
+        ltcg:_apprRetVal>0?Math.round(_apprBuckets.ltcg*_apprPMTfactor):0,
+        free:_apprRetVal>0?Math.round(_apprBuckets.free*_apprPMTfactor):0
+      };
+      var _bkTax={
+        ord: Math.round(_bkInc.ord*_retTaxPct/100),
+        ltcg:Math.round(_bkInc.ltcg*_ltcgRate/100),
+        free:0
+      };
+      var taxAmt=_bkTax.ord+_bkTax.ltcg+_bkTax.free;
+      // Backstop: if no per-allocation data (AI didn't return allocations, only
+      // headline) fall back to the prior cd.taxRatio for graceful degradation.
+      if(_apprRetVal<=0){taxAmt=Math.round(retInc*cd.taxRatio*_retTaxPct/100);}
       var netInc=retInc-taxAmt;
+      // Effective blended rate for the inline label
+      var _effRate=retInc>0?Math.round(taxAmt/retInc*100):0;
+      // Tooltip breakdown — shown on hover of the (i) icon
+      var _tipParts=[];
+      if(_bkInc.ord>0)_tipParts.push('Ordinary income (Trad 401k/IRA): $'+fmt(_bkInc.ord)+'/mo × '+_retTaxPct+'% = $'+fmt(_bkTax.ord)+' tax');
+      if(_bkInc.ltcg>0)_tipParts.push('Long-term capital gains (taxable brokerage): $'+fmt(_bkInc.ltcg)+'/mo × '+_ltcgRate+'% = $'+fmt(_bkTax.ltcg)+' tax');
+      if(_bkInc.free>0)_tipParts.push('Tax-free (Roth, HSA, insurance loans): $'+fmt(_bkInc.free)+'/mo × 0% = $0 tax');
+      var _tipText=_tipParts.length>0?_tipParts.join('\n'):'No allocation data — tax estimate uses approach default.';
       h+='<div style="margin-bottom:14px">';
       h+='<div style="font-family:var(--fd);font-size:28px;color:'+cd.color+'">'+fmtK(retVal)+'</div>';
       h+='<div style="font-size:12px;color:var(--mu)">projected at retirement</div>';
@@ -23177,10 +23225,14 @@ function _cpShowApproachFork(){
       h+='<div style="margin-bottom:14px;padding:10px;background:rgba(0,0,0,.15);border-radius:4px">';
       h+='<div style="font-size:11px;color:var(--mu);letter-spacing:.06em;margin-bottom:6px">RETIREMENT INCOME</div>';
       h+='<div style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(retInc)+'/mo <span style="font-size:12px;color:var(--mu)">gross</span></div>';
+      // Fix-C: show the EFFECTIVE blended rate (weighted across ord/ltcg/free buckets)
+      // rather than a flat retirement-bracket %, plus an (i) tooltip with the per-bucket
+      // breakdown so users can see how the tax was computed.
       if(taxAmt>0){
-        h+='<div style="font-size:13px;color:var(--rd);margin:3px 0">− '+fmt(taxAmt)+' tax ('+_retTaxPct+'% retirement bracket)</div>';
+        var _bracketLabel=(_bkTax.ord>0&&_bkTax.ltcg===0)?(_retTaxPct+'% retirement bracket'):(_effRate+'% blended');
+        h+='<div style="font-size:13px;color:var(--rd);margin:3px 0">− '+fmt(taxAmt)+' tax ('+_bracketLabel+') <span title="'+_tipText.replace(/"/g,'&quot;')+'" style="display:inline-block;width:14px;height:14px;line-height:14px;border-radius:50%;background:rgba(226,232,240,.1);color:var(--mu);font-size:10px;text-align:center;cursor:help;margin-left:2px;vertical-align:middle">i</span></div>';
       } else {
-        h+='<div style="font-size:13px;color:var(--gr);margin:3px 0">$0 tax — accessed tax-free</div>';
+        h+='<div style="font-size:13px;color:var(--gr);margin:3px 0">$0 tax — accessed tax-free <span title="'+_tipText.replace(/"/g,'&quot;')+'" style="display:inline-block;width:14px;height:14px;line-height:14px;border-radius:50%;background:rgba(34,197,94,.12);color:var(--gr);font-size:10px;text-align:center;cursor:help;margin-left:2px;vertical-align:middle">i</span></div>';
       }
       h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:'+(taxAmt>0?'var(--wh)':'var(--gr)')+'">'+fmt(netInc)+'/mo <span style="font-size:11px;font-weight:400;color:var(--mu)">net after tax</span></div>';
       h+='</div>';
