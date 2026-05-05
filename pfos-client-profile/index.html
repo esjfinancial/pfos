@@ -1681,7 +1681,7 @@ function _advSpendPlanImpact(monthlyShortfall){
     else mostAffectedName=mostAffected.type;
   }
   var age=CPLAN.age||30;
-  var retAge=65;
+  var retAge=CPLAN.retirementAge||65;
   var yrs=Math.max(1,retAge-age);
   var rate=0.065;
   var monthsRem=yrs*12;
@@ -2153,12 +2153,20 @@ function getPFOSFrame(){
 function _syncPlanToMain(){
   if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length)return;
   var plan={
-    allocations:CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target};}),
+    // Phase D multi-partner: include owner per allocation so pfos-main can render
+    // owner-aware projections (currently it falls back to user's retirement age, but
+    // the owner field travels through for future per-partner projection rendering).
+    allocations:CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target,owner:a.owner||'self'};}),
     sim:null,
     tracking:{},
     calendar:{},
     income:CPLAN.income,surplus:CPLAN.surplus,expenses:CPLAN.expenses,
     totalDebt:CPLAN.totalDebt,debtMin:CPLAN.debtMin,age:CPLAN.age,
+    // Phase D multi-partner: retirement age + partner snapshot. pfos-main reads
+    // plan.retirementAge for projections; partner data lets it render two-event coordination.
+    retirementAge:CPLAN.retirementAge||65,
+    partner:CPLAN._partner?{firstName:CPLAN._partner.firstName,name:CPLAN._partner.name,age:CPLAN._partner.age,retirementAge:CPLAN._partner.retirementAge||65,income:CPLAN._partner.income,ssBenefit:CPLAN._partner.ssBenefit||0,retIncome:CPLAN._partner.retIncome||0}:null,
+    householdType:CPLAN._householdType||'individual',
     debtStrategy:CPLAN.debtStrategy,debts:CPLAN.debts,
     cols:CP_COL,names:CP_NM,icons:CP_IC
   };
@@ -4504,7 +4512,7 @@ function renderProfileRedFlags(fd){
   if(c.retGap===undefined&&rawS.retAccounts){
     var _retBal=rawS.retAccounts.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
     var _retContrib=rawS.retAccounts.reduce(function(t,a){return t+(parseFloat(a.contrib)||0);},0);
-    var _age=parseInt(rawS.currentAge)||35;var _retAge=65;var _yrs=Math.max(1,_retAge-_age);
+    var _age=parseInt(rawS.currentAge)||35;var _retAge=parseInt(rawS.profile&&rawS.profile.retAge)||65;var _yrs=Math.max(1,_retAge-_age);
     var _projBal=_retBal;for(var _y=0;_y<_yrs;_y++)_projBal=(_projBal+_retContrib*12)*1.07;
     c.projRetBal=Math.round(_projBal);
     var _retIncome=parseFloat((rawS.profile&&rawS.profile.retIncome)||5000)||5000;
@@ -5990,7 +5998,7 @@ setTimeout(function(){
 // ═══════════════════════════════════════════════════════════════
 // CAPITAL PLAN ENGINE — mirrors client portal's financial plan
 // ═══════════════════════════════════════════════════════════════
-var CPLAN={allocations:[],surplus:0,income:0,expenses:0,totalDebt:0,debtMin:0,debts:[],efBal:0,efTarget:0,age:30,riskProfile:'',mode:'guided',hasAdvisor:true,modified:false,tier:'pro_plus',policies:[],employer:'',children:[],debtStrategy:'avalanche',marital:'single',_activePhaseTab:1};
+var CPLAN={allocations:[],surplus:0,income:0,expenses:0,totalDebt:0,debtMin:0,debts:[],efBal:0,efTarget:0,age:30,retirementAge:65,riskProfile:'',mode:'guided',hasAdvisor:true,modified:false,tier:'pro_plus',policies:[],employer:'',children:[],debtStrategy:'avalanche',marital:'single',_activePhaseTab:1};
 // Wave 5 advisor port: type catalogs expanded to full client-portal parity.
 // Includes term life, annuity sub-types, IBC variants, and action-only items
 // (umbrella, estate, ibc_audit, annuity_research, diversify) so the advisor
@@ -6026,6 +6034,17 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
   CPLAN.debts=rawS.debts||[];CPLAN.totalDebt=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
   CPLAN.debtMin=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
   CPLAN.age=parseInt(rawS.currentAge)||parseInt(c.age)||35;
+  // Phase D: retirement age from profile (default 65). Mirrors pfos-main S.profile.retAge convention.
+  CPLAN.retirementAge=parseInt(rawS.profile&&rawS.profile.retAge)||65;
+  // Phase 4: DOB for FRA/RMD calculations. Falls back to age-based birth year if absent.
+  CPLAN.dob=(rawS.profile&&rawS.profile.dob)||null;
+  CPLAN.spDob=(rawS.profile&&rawS.profile.spDOB)||null;
+  // Phase 2: per-partner retirement income TARGETS (today's $/mo, user-stated).
+  // These are the "what they actually want" goals — not derived from balance, not 4% rule.
+  // CPLAN.retIncome = self target. CPLAN.spRetIncome = spouse target (when spouse data lives in
+  // same profile). For linked-partner couples, CPLAN._partner.retirementIncome is also populated.
+  CPLAN.retIncome=parseFloat(rawS.profile&&rawS.profile.retIncome)||0;
+  CPLAN.spRetIncome=parseFloat(rawS.profile&&rawS.profile.spRetIncome)||0;
   CPLAN.policies=rawS.policies||rawS.insurancePolicies||[];CPLAN.children=rawS.children||[];
   CPLAN.riskProfile=(rawS.riskProfile&&rawS.riskProfile.label)||(c.riskProfile)||'moderate';
   CPLAN.marital=rawS.marital||c.marital||'single';CPLAN.employer=rawS.employer||'';
@@ -6076,6 +6095,13 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             expenses:pExp,
             surplus:Math.max(0,pInc-pExp),
             age:pAge,
+            // Phase D multi-partner retirement: pull spouse's retirement age + SS benefit
+            // from their profile. Defaults to 65 if not set so projections stay valid.
+            // Once pfos-main writes spRetAge to S.profile, this picks it up automatically.
+            // Until then, falls back to partner's own retAge or 65.
+            retirementAge:parseInt(pProfile.retAge)||65,
+            ssBenefit:parseFloat(pProfile.ssBenefit)||0,
+            retirementIncome:parseFloat(pProfile.retIncome)||0,
             allocations:pAllocs,
             debts:pRawS.debts||[],
             efBal:pRawS.assets?(parseFloat(pRawS.assets.checking)||0)+(parseFloat(pRawS.assets.savings)||0):0,
@@ -6239,8 +6265,50 @@ function _cpCalcHealthScore(){
   var hasLife=(d.policies||[]).some(function(p){return(p.type||'').toLowerCase().indexOf('life')>=0;});
   var hasDisab=(d.policies||[]).some(function(p){return(p.type||'').toLowerCase().indexOf('disab')>=0;});
   s+=(hasLife?5:0)+(hasDisab?5:0);
-  var retAllocs=CPLAN.allocations.filter(function(a){return['roth','401k','iul','wl','ibc','trad_ira'].indexOf(a.type)>=0&&a.amount>0;});
-  s+=Math.min(15,retAllocs.length*5);
+  // Phase 2: retirement readiness — replaces the old vehicle-count component (15 pts max).
+  // Single user: how much of stated monthly target the projected balance can sustain.
+  // Couple: each partner needs their own target met (using their own balance share);
+  // household score = min(self_pct, spouse_pct) × 15. The min reflects distributional risk:
+  // a household with one well-prepared partner and one underprepared partner is fragile.
+  var retScore=0;
+  if(CPLAN._sim&&CPLAN._sim.projRetValue!=null){
+    if(CPLAN._partner&&CPLAN._householdType==='joint'&&CPLAN._sim.retirementByOwner){
+      // Couple per-partner readiness against each partner's own target
+      var _myAge=CPLAN.age||35;
+      var _spAge=CPLAN._partner.age||35;
+      var _myRetAge=CPLAN.retirementAge||65;
+      var _spRetAge=CPLAN._partner.retirementAge||65;
+      var _myYr=Math.max(1,Math.min(30,_myRetAge-_myAge));
+      var _spYr=Math.max(1,Math.min(30,_spRetAge-_spAge));
+      var _jtYr=Math.max(_myYr,_spYr);
+      var _selfArr=CPLAN._sim.retirementByOwner.self||[];
+      var _spArr=CPLAN._sim.retirementByOwner.spouse||[];
+      var _jtArr=CPLAN._sim.retirementByOwner.joint||[];
+      function _atY(arr,y){return arr[y]!=null?arr[y]:(arr[arr.length-1]||0);}
+      var _myBal=_atY(_selfArr,_myYr)+_atY(_jtArr,_jtYr)*0.5;
+      var _spBal=_atY(_spArr,_spYr)+_atY(_jtArr,_jtYr)*0.5;
+      var _myInc=_cpSustainableMonthly(_myBal,25,0.01);
+      var _spInc=_cpSustainableMonthly(_spBal,25,0.01);
+      var _myTgt=_cpRetIncomeTarget('self');
+      var _spTgt=_cpRetIncomeTarget('spouse');
+      var _myPct=_myTgt>0?Math.min(1,_myInc/_myTgt):0;
+      var _spPct=_spTgt>0?Math.min(1,_spInc/_spTgt):0;
+      retScore=Math.round(Math.min(_myPct,_spPct)*15);
+    }else{
+      // Single user readiness vs stated target
+      var _proj=CPLAN._sim.projRetValue||0;
+      var _projInc=_cpSustainableMonthly(_proj,25,0.01);
+      var _tgt=_cpRetIncomeTarget('self');
+      var _pct=_tgt>0?Math.min(1,_projInc/_tgt):0;
+      retScore=Math.round(_pct*15);
+    }
+  }else{
+    // No simulation yet — fall back to vehicle-count partial credit so the score isn't 0
+    // before the user generates a plan. Half-credit per vehicle, max 7 of 15 points.
+    var retAllocs=CPLAN.allocations.filter(function(a){return['roth','401k','iul','wl','ibc','trad_ira'].indexOf(a.type)>=0&&a.amount>0;});
+    retScore=Math.min(7,retAllocs.length*2);
+  }
+  s+=retScore;
   var types=CPLAN.allocations.filter(function(a){return a.amount>0;}).map(function(a){return a.type;});
   var unique=types.filter(function(t,i){return types.indexOf(t)===i;});s+=Math.min(10,unique.length*2);
   var taxFree=CPLAN.allocations.some(function(a){return(a.type==='roth'||a.type==='hsa')&&a.amount>0;});s+=(taxFree?5:0);
@@ -6263,16 +6331,133 @@ function _cpIRSMax(type,allocOrOwner){
   else if(owner==='joint'&&CPLAN._partner&&CPLAN._partner.age)age=Math.max(CPLAN.age||35,CPLAN._partner.age);
   var o50=age>=50;
   var o55=age>=55;
-  // 2026 IRS contribution limits (annual, divided by 12 below for monthly)
-  // Roth/Trad IRA: $7,000 base, $8,000 with 50+ catch-up
-  // 401k/403b/TSP elective deferral: $23,500 base, $30,500 with 50+ catch-up
-  // HSA: $4,300 self-only / $8,550 family (2026), +$1,000 if 55+
-  // Solo 401k overall: $69,000 base, $76,500 with 50+ catch-up (employee + employer combined)
-  // SEP IRA: $69,000 base (self-employed)
+  var o60_63=age>=60&&age<=63;// SECURE 2.0 super catch-up window (replaces the standard 50+ catch-up)
+  // 2026 IRS contribution limits (IRS Notice 2025-67 + Rev. Proc. 2025-19, Nov 2025).
+  // Update annually as IRS publishes official numbers each November.
+  // Roth/Trad IRA: $7,500 base, $8,600 with 50+ catch-up ($1,100)
+  // 401k/403b/TSP elective deferral: $24,500 base, $32,500 at 50+ ($8,000), $35,750 at 60-63 ($11,250)
+  // HSA: $4,400 self-only / $8,750 family, +$1,000 if 55+
+  // Solo 401k overall (415c): $72,000 base, $80,000 at 50+, $83,250 at 60-63
+  // SEP IRA: 25% of compensation, max $72,000 (self-employed)
+  // Coverdell ESA: $2,000
   var hsaFamily=(CPLAN.hsaCoverage==='family'||CPLAN.hdhpCoverage==='family');
-  var hsaAnnual=(hsaFamily?8550:4300)+(o55?1000:0);
-  var limits={roth:o50?8000:7000,'401k':o50?30500:23500,roth401k:o50?30500:23500,trad_ira:o50?8000:7000,hsa:hsaAnnual,solo401k:o50?76500:69000,sep_ira:69000};
-  return limits[type]?Math.round(limits[type]/12):99999;
+  var hsaAnnual=(hsaFamily?8750:4400)+(o55?1000:0);
+  // Phase 4: HSA Medicare cutoff. Anyone enrolled in Medicare cannot contribute to HSA
+  // (still allowed to spend/grow). Default Medicare enrollment is age 65; some delay if
+  // they have qualifying employer coverage. We treat 65+ as a soft block with an advisory
+  // surfaced in the cap note. To allow contributions for someone 65+ still on employer
+  // coverage and not enrolled in Medicare, advisor uses the IRS override toggle.
+  if(age>=65)hsaAnnual=0;
+  var k401Catchup=o60_63?11250:(o50?8000:0);
+  var soloCatchup=o60_63?11250:(o50?8000:0);
+  var limits={roth:o50?8600:7500,'401k':24500+k401Catchup,roth401k:24500+k401Catchup,trad_ira:o50?8600:7500,hsa:hsaAnnual,solo401k:72000+soloCatchup,sep_ira:72000,coverdell:2000};
+  var monthlyMax=limits[type]?Math.round(limits[type]/12):99999;
+  // Phase D multi-partner: spousal IRA earned-income test. IRC requires the working
+  // partner's earned income to cover the SUM of both partners' IRA contributions.
+  // If the IRA owner is currently retired but the other partner is still working,
+  // cap their contribution at the working partner's remaining earned income capacity.
+  // Only applies to Roth and Traditional IRAs (not 401k/SEP/HSA — those have their
+  // own earned-income rules handled elsewhere).
+  if((type==='roth'||type==='trad_ira')&&(owner==='self'||owner==='spouse')&&CPLAN._partner){
+    var ownerRetiredNow=_cpOwnerCurrentlyRetired(owner);
+    var otherOwner=(owner==='self'?'spouse':'self');
+    var otherWorkingNow=!_cpOwnerCurrentlyRetired(otherOwner);
+    if(ownerRetiredNow&&otherWorkingNow){
+      var earnedRemaining=_cpWorkingPartnerIncomeRemaining(owner);
+      monthlyMax=Math.min(monthlyMax,earnedRemaining);
+    } else if(ownerRetiredNow&&!otherWorkingNow){
+      // Both retired — no earned income, no IRA contributions allowed
+      monthlyMax=0;
+    }
+  }
+  return monthlyMax;
+}
+// Phase 4: SECURE 2.0 §603 — mandatory Roth-only catch-up for high earners (effective 2026).
+// Workers age 50+ whose prior-year FICA wages exceeded $145,000 (indexed; $150K for 2026)
+// MUST make their 401(k)/403(b)/457(b) catch-up contributions to a designated Roth account.
+// Standard $24,500 base elective deferral can still be Traditional or Roth; only the
+// catch-up portion (additional $8K at 50+, $11.25K at 60-63) is forced Roth.
+// Returns true if the named owner is subject to the requirement based on FICA wages.
+// Note: this checks current income as a proxy for prior-year FICA wages — close enough for
+// planning purposes. Strict implementation requires actual W-2 box 5 from prior year.
+function _cpSecure2RothCatchup(owner){
+  var age=CPLAN.age||35;
+  var inc=CPLAN.income||0;
+  if(owner==='spouse'&&CPLAN._partner){
+    age=CPLAN._partner.age||35;
+    inc=CPLAN._partner.income||0;
+  }
+  // 2026 threshold: $150,000 prior-year FICA wages (annual). Compare with annual income.
+  var ROTH_CATCHUP_THRESHOLD=150000;
+  if(age<50)return false;
+  if(inc*12<ROTH_CATCHUP_THRESHOLD)return false;
+  return true;
+}
+// Phase D multi-partner: owner-aware retirement age lookup. Used everywhere a
+// per-allocation projection runs so spouse-owned allocations project against the
+// SPOUSE's retirement age and self-owned ones project against the primary's.
+// 'joint' returns the LATER of the two (household retirement = whichever happens last),
+// matching the existing _cpIRSMax joint-allocation convention.
+// Returns a number (the retirement age). Pass an allocation OR an owner string.
+function _cpRetAgeFor(allocOrOwner){
+  var owner=null;
+  if(typeof allocOrOwner==='string')owner=allocOrOwner;
+  else if(allocOrOwner&&typeof allocOrOwner==='object')owner=allocOrOwner.owner||'self';
+  var selfRet=CPLAN.retirementAge||65;
+  if(!CPLAN._partner)return selfRet;
+  var spRet=CPLAN._partner.retirementAge||65;
+  if(owner==='spouse')return spRet;
+  if(owner==='joint')return Math.max(selfRet,spRet);
+  return selfRet;
+}
+// Years remaining until the owner-relevant retirement event. Floors at 1 to avoid
+// degenerate projections when the owner is already at or past retirement age.
+function _cpYrsToRetFor(allocOrOwner){
+  var owner=null;
+  if(typeof allocOrOwner==='string')owner=allocOrOwner;
+  else if(allocOrOwner&&typeof allocOrOwner==='object')owner=allocOrOwner.owner||'self';
+  var retAge=_cpRetAgeFor(owner);
+  var curAge=(owner==='spouse'&&CPLAN._partner&&CPLAN._partner.age)?CPLAN._partner.age:(CPLAN.age||35);
+  // Joint: use the YOUNGER partner's age vs the LATER retirement, since projection
+  // horizon should run until household retirement (whichever spouse retires last).
+  if(owner==='joint'&&CPLAN._partner&&CPLAN._partner.age){
+    var selfYrs=(CPLAN.retirementAge||65)-(CPLAN.age||35);
+    var spYrs=(CPLAN._partner.retirementAge||65)-CPLAN._partner.age;
+    return Math.max(1,selfYrs,spYrs);
+  }
+  return Math.max(1,retAge-curAge);
+}
+// Phase D multi-partner: retirement month for an allocation's owner, used by the
+// projection walk to determine when contributions cease. Joint allocations cease
+// at the LATER retirement; self/spouse allocations cease at their respective owner's.
+function _cpRetMonthFor(allocOrOwner){
+  return _cpYrsToRetFor(allocOrOwner)*12;
+}
+// Phase D multi-partner: returns true if the owner is currently at or past their
+// retirement age. Used by the slider-side spousal-IRA earned-income test.
+function _cpOwnerCurrentlyRetired(owner){
+  if(owner==='spouse'){
+    if(!CPLAN._partner||!CPLAN._partner.age)return false;
+    return CPLAN._partner.age>=(CPLAN._partner.retirementAge||65);
+  }
+  return (CPLAN.age||35)>=(CPLAN.retirementAge||65);
+}
+// Phase D multi-partner: working partner's monthly earned income remaining after
+// their own IRA contributions are deducted. Used to cap a retired partner's IRA
+// contribution under the IRS earned-income test (working partner's earned income
+// must cover the sum of both partners' IRA contributions).
+function _cpWorkingPartnerIncomeRemaining(retiredOwner){
+  var workingIsSpouse=(retiredOwner==='self');
+  var workingMonthly=workingIsSpouse?(CPLAN._partner&&CPLAN._partner.income||0):(CPLAN.income||0);
+  if(workingMonthly<=0)return 0;
+  var workingOwner=workingIsSpouse?'spouse':'self';
+  // Sum working partner's own IRA contributions (Roth + Traditional)
+  var workingOwnIRAs=(CPLAN.allocations||[]).reduce(function(t,a){
+    var ao=a.owner||'self';
+    if(ao===workingOwner&&(a.type==='roth'||a.type==='trad_ira'))return t+(parseFloat(a.amount)||0);
+    return t;
+  },0);
+  return Math.max(0,workingMonthly-workingOwnIRAs);
 }
 // Phase C: Household-aware surplus. For joint households, returns combined surplus
 // from both partners. Otherwise returns this client's surplus.
@@ -6340,10 +6525,32 @@ function _cpEffectiveCapNote(type,idx){
   if(idx!=null&&irsTypes.indexOf(type)>=0&&irsMax<99999){
     overrideBtn=' <button onclick="_cpToggleIrsOverride('+idx+')" title="Override IRS cap (e.g. mega-backdoor, after-tax bucket, special situation). Requires reason." style="margin-left:6px;padding:1px 6px;font-size:8px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);color:#A855F7;cursor:pointer;border-radius:2px">Override</button>';
   }
+  // Phase 4: SECURE 2.0 §603 advisory for high-earner catch-up (Roth-only requirement).
+  // Surfaces when a 401(k)/403(b)/457(b) catch-up MUST go to Roth based on prior-year FICA wages.
+  var secureNote='';
+  if((type==='401k'||type==='roth401k')&&alloc){
+    var ownerForSecure=alloc.owner||'self';
+    if(_cpSecure2RothCatchup(ownerForSecure)){
+      if(type==='401k'){
+        secureNote='<div style="margin-top:3px;padding:4px 6px;background:rgba(168,85,247,.06);border-left:2px solid rgba(168,85,247,.5);border-radius:1px;font-size:9px;color:rgba(168,85,247,.95);line-height:1.4">⚠ <strong>SECURE 2.0:</strong> '+(ownerForSecure==='spouse'?'Spouse':'Owner')+' age 50+ with FICA wages &gt; $150K/yr &mdash; the catch-up portion must go to Roth 401(k), not Traditional. Add a Roth 401(k) allocation to capture catch-up.</div>';
+      } else {
+        secureNote='<div style="margin-top:3px;padding:4px 6px;background:rgba(34,197,94,.04);border-left:2px solid rgba(34,197,94,.5);border-radius:1px;font-size:9px;color:rgba(34,197,94,.95);line-height:1.4">✓ <strong>SECURE 2.0 compliant:</strong> Catch-up flows here as Roth, satisfying the high-earner requirement.</div>';
+      }
+    }
+  }
+  // Phase 4: HSA Medicare cutoff advisory
+  if(type==='hsa'&&alloc){
+    var ownerForHsa=alloc.owner||'self';
+    var ageForHsa=(ownerForHsa==='spouse'&&CPLAN._partner&&CPLAN._partner.age)?CPLAN._partner.age:(CPLAN.age||35);
+    if(ageForHsa>=65){
+      secureNote+='<div style="margin-top:3px;padding:4px 6px;background:rgba(239,68,68,.05);border-left:2px solid rgba(239,68,68,.5);border-radius:1px;font-size:9px;color:rgba(239,68,68,.95);line-height:1.4">⚠ <strong>Medicare cutoff:</strong> '+(ownerForHsa==='spouse'?'Spouse':'Owner')+' age '+ageForHsa+' &mdash; HSA contributions blocked. Medicare enrollment (typically age 65) ends HSA eligibility. If still on employer coverage and Medicare-deferred, advisor can use Override.</div>';
+    }
+  }
   return '<span style="color:'+color+';font-weight:700">Cap: '+fmt(effective)+'/mo</span>'
     +' <span style="color:var(--mu)">&mdash; governed by '+govBy+ownerNote+'</span>'
     +' <span style="color:var(--mu);font-size:8px">('+surplusLabel+' '+fmt(surplus)+' &minus; others = '+fmt(available)+' available)</span>'
-    +overrideBtn;
+    +overrideBtn
+    +secureNote;
 }
 function _cpEnforce(){
   CPLAN.allocations.forEach(function(a){
@@ -6596,6 +6803,36 @@ function _cpRenderEFRunway(){
   el.innerHTML=h;
 }
 
+// Phase 2: Retirement income helpers. The user's stated target is the planning standard
+// — not the 4% rule, not 80% of current income. _cpRetIncomeTarget returns the right
+// target per owner ('self' / 'spouse'), with sensible fallbacks. _cpSustainableMonthly
+// computes the monthly income a given balance can sustain over a retirement horizon
+// using a real (inflation-adjusted) return rate — used for projections and stress tests.
+function _cpRetIncomeTarget(owner){
+  // Self target: CPLAN.retIncome (user-stated). Fallback: current monthly expenses.
+  // Spouse target: CPLAN.spRetIncome (same-profile spouse) or _partner.retirementIncome
+  // (linked-partner couple). Fallback: half current expenses (rough split assumption).
+  if(owner==='spouse'){
+    var t=parseFloat(CPLAN.spRetIncome)||0;
+    if(t>0)return t;
+    if(CPLAN._partner&&CPLAN._partner.retirementIncome>0)return parseFloat(CPLAN._partner.retirementIncome);
+    return Math.round((CPLAN.expenses||0)/2);
+  }
+  var st=parseFloat(CPLAN.retIncome)||0;
+  if(st>0)return st;
+  return CPLAN.expenses||0;
+}
+// Returns the monthly income a balance can sustain over yearsInRet at a given real annual return.
+// This is the WITHDRAWAL math (PMT formula). Defaults: 25 years, 1% real return.
+// In retirement years the balance is gradually drawn down — at end of horizon, balance = 0.
+function _cpSustainableMonthly(balance,yearsInRet,realAnnualReturn){
+  if(!(balance>0))return 0;
+  var n=(yearsInRet||25)*12;
+  var r=(realAnnualReturn!=null?realAnnualReturn:0.01)/12;
+  if(Math.abs(r)<0.0001)return balance/n;
+  return balance*(r/(1-Math.pow(1+r,-n)));
+}
+
 function _cpRenderIncomeReplacement(){
   var el=document.getElementById('cplanIncomeReplace');if(!el)return;
   if(CPLAN.income<=0){el.innerHTML='';return;}
@@ -6604,81 +6841,268 @@ function _cpRenderIncomeReplacement(){
   // (each partner gets their own retirement projection at their own age 65; joint allocations
   //  are split 50/50 between them). For individual/separate/hybrid, fall through to legacy logic.
   if(CPLAN._partner&&CPLAN._householdType==='joint'&&CPLAN._sim&&CPLAN._sim.retirementByOwner){
-    var _myFirst=(APP._currentClientName||'You').split(' ')[0];
+    var _myFirst=((APP.currentClient&&APP.currentClient.name)||'You').split(' ')[0];
     var _spFirst=CPLAN._partner.firstName||'Partner';
     var _myAge=CPLAN.age||35;
     var _spAge=CPLAN._partner.age||35;
-    var _myYr=Math.max(1,Math.min(30,65-_myAge));
-    var _spYr=Math.max(1,Math.min(30,65-_spAge));
+    // Phase D multi-partner: each partner projects to their OWN retirement age,
+    // not a hardcoded 65. Joint allocations split 50/50 between partners and projected
+    // at the LATER retirement (when both are retired and drawing from joint).
+    var _myRetAge=CPLAN.retirementAge||65;
+    var _spRetAge=(CPLAN._partner.retirementAge)||65;
+    var _myYr=Math.max(1,Math.min(30,_myRetAge-_myAge));
+    var _spYr=Math.max(1,Math.min(30,_spRetAge-_spAge));
+    var _jtYr=Math.max(_myYr,_spYr);// Joint allocations look up at LATER retirement
     var _selfArr=CPLAN._sim.retirementByOwner.self||[];
     var _spArr=CPLAN._sim.retirementByOwner.spouse||[];
     var _jtArr=CPLAN._sim.retirementByOwner.joint||[];
     function _atYr(arr,yr){return arr[yr]!=null?arr[yr]:(arr[arr.length-1]||0);}
-    var _myBal=_atYr(_selfArr,_myYr)+_atYr(_jtArr,_myYr)*0.5;
-    var _spBal=_atYr(_spArr,_spYr)+_atYr(_jtArr,_spYr)*0.5;
-    var _myInc=Math.round(_myBal*0.04/12);
-    var _spInc=Math.round(_spBal*0.04/12);
-    var _myCurInc=CPLAN.income||1;var _spCurInc=CPLAN._partner.income||1;
-    var _myPct=Math.round(_myInc/_myCurInc*100);
-    var _spPct=Math.round(_spInc/_spCurInc*100);
+    // Each partner gets their own-owned bal at their retirement + 50% of joint at later retirement
+    var _myBal=_atYr(_selfArr,_myYr)+_atYr(_jtArr,_jtYr)*0.5;
+    var _spBal=_atYr(_spArr,_spYr)+_atYr(_jtArr,_jtYr)*0.5;
+    // Phase 2: monthly income each balance can sustain. Targets are user-stated, not derived.
+    // Years in retirement default to 25 (age 65 → 90); real return default 1%.
+    var _myInc=Math.round(_cpSustainableMonthly(_myBal,25,0.01));
+    var _spInc=Math.round(_cpSustainableMonthly(_spBal,25,0.01));
+    var _myTarget=Math.round(_cpRetIncomeTarget('self'));
+    var _spTarget=Math.round(_cpRetIncomeTarget('spouse'));
+    var _myPct=_myTarget>0?Math.round(_myInc/_myTarget*100):0;
+    var _spPct=_spTarget>0?Math.round(_spInc/_spTarget*100):0;
     function _col(p){return p>=80?'var(--gr)':p>=50?'var(--yl)':p>=25?'var(--or)':'var(--rd)';}
-    function _card(name,age,yr,inc,curInc,pct){
+    function _card(name,age,retAge,yr,inc,target,pct){
       var col=_col(pct);
       var disp=Math.min(100,pct);
-      var lbl=pct>=100?'Full':pct>=80?'Strong':pct>=50?'Moderate':pct>=25?'Partial':'Minimal';
+      var lbl=pct>=100?'On track':pct>=80?'Close':pct>=50?'Behind':pct>=25?'Significant gap':'Critical gap';
       var hh='<div style="padding:10px 12px;border:1px solid var(--bd);border-radius:4px;background:rgba(0,68,191,.02)">';
       hh+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">';
-      hh+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu)">'+esc(name)+' &middot; age 65 in '+yr+'y</div>';
+      hh+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu)">'+esc(name)+' &middot; age '+retAge+' in '+yr+'y</div>';
       hh+='<div style="font-family:var(--fd);font-size:16px;color:'+col+'">'+disp+'%</div></div>';
       hh+='<div style="height:6px;background:rgba(0,68,191,.06);border-radius:3px;overflow:hidden;margin-bottom:4px"><div style="height:100%;width:'+disp+'%;background:'+col+';border-radius:3px;transition:width .3s"></div></div>';
-      hh+='<div style="font-size:9px;color:var(--mu)">'+lbl+' &middot; '+fmt(inc)+'/mo of '+fmt(Math.round(curInc))+'/mo</div>';
+      hh+='<div style="font-size:9px;color:var(--mu)">'+lbl+' &middot; '+fmt(inc)+'/mo of '+fmt(target)+'/mo target</div>';
       hh+='</div>';
       return hh;
     }
     var h='<div style="padding:12px 16px">';
-    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Retirement Income Replacement &middot; per partner</div>';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Retirement Income vs Target &middot; per partner</div>';
     h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
-    h+=_card(_myFirst,_myAge,_myYr,_myInc,_myCurInc,_myPct);
-    h+=_card(_spFirst,_spAge,_spYr,_spInc,_spCurInc,_spPct);
+    h+=_card(_myFirst,_myAge,_myRetAge,_myYr,_myInc,_myTarget,_myPct);
+    h+=_card(_spFirst,_spAge,_spRetAge,_spYr,_spInc,_spTarget,_spPct);
     h+='</div>';
-    h+='<div style="font-size:9px;color:var(--mu);margin-top:6px;line-height:1.4">Joint allocations split 50/50 between partners. Each partner projected to their own age 65 using their separate IRS limits.</div>';
+    h+='<div style="font-size:9px;color:var(--mu);margin-top:6px;line-height:1.4">Each partner&apos;s projected balance shown as the monthly income it can sustain over 25 years of retirement, against their own stated target. Joint allocations split 50/50 and projected to the later retirement.</div>';
+
+    // ── Phase 2: Two-stage income replacement (staggered retirement) ──
+    // Only meaningful when partners retire at different ages. Stage 1 = the gap years
+    // when one partner is retired and the other still earns; Stage 2 = both retired.
+    // The household needs less replacement during Stage 1 because one paycheck still flows.
+    var _stageGap=Math.abs(_myYr-_spYr);
+    if(_stageGap>0){
+      var _selfFirst=_myYr<=_spYr;// true if self retires first or same time
+      var _earlyName=_selfFirst?_myFirst:_spFirst;
+      var _lateName=_selfFirst?_spFirst:_myFirst;
+      var _earlyDraw=_selfFirst?_myInc:_spInc;
+      var _lateGrossInc=_selfFirst?Math.round(CPLAN._partner.income||0):Math.round(CPLAN.income||0);
+      var _stage1Total=_earlyDraw+_lateGrossInc;
+      var _stage2Total=_myInc+_spInc;
+      var _hhTarget=_myTarget+_spTarget;
+      var _s1Pct=_hhTarget>0?Math.min(100,Math.round(_stage1Total/_hhTarget*100)):0;
+      var _s2Pct=_hhTarget>0?Math.min(100,Math.round(_stage2Total/_hhTarget*100)):0;
+      var _earlyRetAge=_selfFirst?_myRetAge:_spRetAge;
+      var _lateRetAge=_selfFirst?_spRetAge:_myRetAge;
+      function _stCol(p){return p>=100?'var(--gr)':p>=80?'var(--gr)':p>=50?'var(--yl)':p>=25?'var(--or)':'var(--rd)';}
+      h+='<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--bd)">';
+      h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Two-Stage Income Replacement &middot; staggered retirement</div>';
+      h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
+      // Stage 1
+      h+='<div style="padding:10px 12px;border:1px solid var(--bd);border-radius:4px;background:rgba(0,68,191,.02)">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">';
+      h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu)">Stage 1 &middot; '+_stageGap+' yr'+(_stageGap!==1?'s':'')+' (age '+_earlyRetAge+'&ndash;'+_lateRetAge+')</div>';
+      h+='<div style="font-family:var(--fd);font-size:16px;color:'+_stCol(_s1Pct)+'">'+_s1Pct+'%</div></div>';
+      h+='<div style="height:6px;background:rgba(0,68,191,.06);border-radius:3px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+_s1Pct+'%;background:'+_stCol(_s1Pct)+';border-radius:3px"></div></div>';
+      h+='<div style="font-size:9px;color:var(--mu);line-height:1.5">'+esc(_earlyName)+' draws <strong style="color:var(--wh)">'+fmt(_earlyDraw)+'/mo</strong> + '+esc(_lateName)+' earns <strong style="color:var(--wh)">'+fmt(_lateGrossInc)+'/mo</strong></div>';
+      h+='<div style="font-size:9px;color:var(--mu);margin-top:2px">Total <strong style="color:var(--wh)">'+fmt(_stage1Total)+'/mo</strong> of '+fmt(_hhTarget)+'/mo household target</div>';
+      h+='</div>';
+      // Stage 2
+      h+='<div style="padding:10px 12px;border:1px solid var(--bd);border-radius:4px;background:rgba(0,68,191,.02)">';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">';
+      h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu)">Stage 2 &middot; both retired (age '+_lateRetAge+'+)</div>';
+      h+='<div style="font-family:var(--fd);font-size:16px;color:'+_stCol(_s2Pct)+'">'+_s2Pct+'%</div></div>';
+      h+='<div style="height:6px;background:rgba(0,68,191,.06);border-radius:3px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+_s2Pct+'%;background:'+_stCol(_s2Pct)+';border-radius:3px"></div></div>';
+      h+='<div style="font-size:9px;color:var(--mu);line-height:1.5">'+esc(_myFirst)+' draws <strong style="color:var(--wh)">'+fmt(_myInc)+'/mo</strong> + '+esc(_spFirst)+' draws <strong style="color:var(--wh)">'+fmt(_spInc)+'/mo</strong></div>';
+      h+='<div style="font-size:9px;color:var(--mu);margin-top:2px">Total <strong style="color:var(--wh)">'+fmt(_stage2Total)+'/mo</strong> of '+fmt(_hhTarget)+'/mo household target</div>';
+      h+='</div>';
+      h+='</div>';
+      // Strategy note
+      var _stageNote='';
+      if(_s1Pct>=100&&_s2Pct<100)_stageNote='Stage 1 is well-covered &mdash; the working partner&apos;s income carries the household. The gap appears in Stage 2 once both stop earning.';
+      else if(_s1Pct<100&&_s2Pct>=100)_stageNote='Stage 1 is the squeeze period &mdash; the early retiree&apos;s drawdown plus the working partner&apos;s income falls short. Consider delaying the early retirement or building Stage 1 reserves.';
+      else if(_s1Pct<100&&_s2Pct<100)_stageNote='Both stages fall short of the household target. Increase savings, delay retirement, or reduce the target.';
+      else _stageNote='Both stages exceed the household target. Strong staggered-retirement plan.';
+      h+='<div style="font-size:10px;color:var(--mu);margin-top:8px;padding:8px 10px;background:rgba(0,68,191,.03);border-radius:3px;line-height:1.5">'+_stageNote+'</div>';
+      h+='</div>';
+    }
     h+='</div>';
     el.innerHTML=h;
     return;
   }
   // ── Legacy single-client logic (individual / hybrid / separate) ──
+  // Phase 2: target is the user's stated retirement income (today's $/mo), not 4% rule.
   // Use simulation's retirement-only data if available
   var retIncome=0;
   if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length>0){
-    var _retYrsToAge65=Math.max(1,Math.min(30,65-(CPLAN.age||35)));
+    var _retYrsToAge65=Math.max(1,Math.min(30,(CPLAN.retirementAge||65)-(CPLAN.age||35)));
     var retAtRetire=CPLAN._sim.retirement[_retYrsToAge65]||CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
-    retIncome=Math.round(retAtRetire*0.04/12);
+    retIncome=Math.round(_cpSustainableMonthly(retAtRetire,25,0.01));
   } else {
-    var yrs=Math.max(1,65-CPLAN.age);
+    var yrs=Math.max(1,(CPLAN.retirementAge||65)-CPLAN.age);
+    var _projBal=0;
     CPLAN.allocations.forEach(function(a){if(a.amount<=0)return;
       if(_retVehicles.indexOf(a.type)<0)return;// Only retirement vehicles
       var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var bal=0;
       for(var y=1;y<=Math.min(yrs,40);y++){var c2=a.amount*12*cf;bal=(bal+c2)*(1+rate);}
-      retIncome+=Math.round(bal*0.04/12);
+      _projBal+=bal;
     });
+    retIncome=Math.round(_cpSustainableMonthly(_projBal,25,0.01));
   }
-  var replacePct=CPLAN.income>0?Math.round(retIncome/CPLAN.income*100):0;
+  var target=Math.round(_cpRetIncomeTarget('self'));
+  var replacePct=target>0?Math.round(retIncome/target*100):0;
   var displayPct=Math.min(100,replacePct);
   var col=replacePct>=80?'var(--gr)':replacePct>=50?'var(--yl)':replacePct>=25?'var(--or)':'var(--rd)';
-  var label=replacePct>=100?'Full replacement':replacePct>=80?'Strong':replacePct>=50?'Moderate':replacePct>=25?'Partial':'Minimal';
+  var label=replacePct>=100?'On track':replacePct>=80?'Close':replacePct>=50?'Behind':replacePct>=25?'Significant gap':'Critical gap';
   var h='<div style="padding:12px 16px">';
   h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Retirement Income Replacement</div>';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Retirement Income vs Target</div>';
   h+='<div style="font-family:var(--fd);font-size:20px;color:'+col+'">'+displayPct+'%</div></div>';
   h+='<div style="height:8px;background:rgba(0,68,191,.06);border-radius:4px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+displayPct+'%;background:'+col+';border-radius:4px;transition:width .3s"></div></div>';
   h+='<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mu)">';
-  h+='<span>'+label+' — '+fmt(retIncome)+'/mo projected</span>';
-  h+='<span>of '+fmt(CPLAN.income)+'/mo current</span></div>';
-  if(replacePct<80)h+='<div style="font-size:10px;color:var(--yl);margin-top:4px">Gap: '+fmt(Math.round(CPLAN.income*0.8-retIncome))+'/mo to reach 80% target</div>';
-  else if(replacePct>100)h+='<div style="font-size:10px;color:var(--gr);margin-top:4px">Surplus: '+fmt(retIncome-CPLAN.income)+'/mo above current income</div>';
+  h+='<span>'+label+' &mdash; '+fmt(retIncome)+'/mo projected</span>';
+  h+='<span>of '+fmt(target)+'/mo target</span></div>';
+  if(replacePct<100&&target>0)h+='<div style="font-size:10px;color:var(--yl);margin-top:4px">Gap: '+fmt(Math.max(0,target-retIncome))+'/mo to reach stated target</div>';
+  else if(replacePct>100)h+='<div style="font-size:10px;color:var(--gr);margin-top:4px">Surplus: '+fmt(retIncome-target)+'/mo above target</div>';
+  if(!CPLAN.retIncome)h+='<div style="font-size:9px;color:var(--mu);margin-top:4px;font-style:italic">No target set &mdash; using current monthly expenses ('+fmt(CPLAN.expenses)+'/mo) as fallback. Set "Desired Monthly Income" in profile for accurate planning.</div>';
   h+='</div>';
   el.innerHTML=h;
 }
+
+// Phase 3: Plan summary — narrative readout of key dates and structure.
+// Renders retirement event timeline (single or two-event), debt-free / fully-funded dates,
+// and a hybrid-strategy allocation breakdown when the plan blends conventional + insurance.
+function _cpRenderPlanSummary(){
+  var el=document.getElementById('cplanPlanSummary');if(!el)return;
+  var active=CPLAN.allocations.filter(function(a){return a.amount>0;});
+  if(!active.length){el.innerHTML='';return;}
+  var sim=CPLAN._sim||{};
+  var now=new Date();
+  function _addMonths(d,m){var nd=new Date(d.getTime());nd.setMonth(nd.getMonth()+m);return nd;}
+  function _fmtMonYr(d){return d.toLocaleString('en-US',{month:'short',year:'numeric'});}
+  // Retirement event lines
+  var _selfFirst=((APP.currentClient&&APP.currentClient.name)||'You').split(' ')[0]||'You';
+  var _selfRetAge=CPLAN.retirementAge||65;
+  var _selfRetYr=Math.max(0,_selfRetAge-(CPLAN.age||35));
+  var _selfRetDate=_addMonths(now,_selfRetYr*12);
+  var _hasPartner=!!CPLAN._partner;
+  var _spFirst=_hasPartner?(CPLAN._partner.firstName||'Partner'):null;
+  var _spRetAge=_hasPartner?(CPLAN._partner.retirementAge||65):null;
+  var _spRetYr=_hasPartner?Math.max(0,_spRetAge-(CPLAN._partner.age||35)):null;
+  var _spRetDate=_hasPartner?_addMonths(now,_spRetYr*12):null;
+  // Hybrid detection: plan contains both conventional retirement vehicles AND insurance/IBC
+  var _convTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'];
+  var _insTypes=['iul','wl','ibc'];
+  var _hasConv=active.some(function(a){return _convTypes.indexOf(a.type)>=0;});
+  var _hasIns=active.some(function(a){return _insTypes.indexOf(a.type)>=0;});
+  var _isHybrid=_hasConv&&_hasIns;
+  // Debt-free / fully-funded months from sim
+  var _dfMonths=sim.debtFreeMonth||0;
+  var _ffMonths=sim.fullFundingMonth||0;
+  var _dfDate=_dfMonths>0?_addMonths(now,_dfMonths):null;
+  var _ffDate=_ffMonths>0?_addMonths(now,_ffMonths):null;
+
+  var h='<div class="info-card" style="padding:16px;margin-bottom:0">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:12px">Plan Summary</div>';
+
+  // Timeline narrative
+  h+='<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">';
+  // Debt free
+  if(_dfDate&&CPLAN.totalDebt>0){
+    h+='<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(249,115,22,.04);border-left:3px solid rgba(249,115,22,.5);border-radius:2px">';
+    h+='<span style="font-size:14px">🚫</span>';
+    h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--or)">DEBT FREE</div>';
+    h+='<div style="font-size:11px;color:var(--wh)">'+_fmtMonYr(_dfDate)+' &middot; <span style="color:var(--mu)">'+(_dfMonths<24?_dfMonths+' months':Math.round(_dfMonths/12*10)/10+' years')+' from now</span></div></div></div>';
+  }
+  // Fully funded EF + house
+  if(_ffDate&&_ffMonths>0&&_ffMonths!==_dfMonths){
+    h+='<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(34,197,94,.04);border-left:3px solid rgba(34,197,94,.5);border-radius:2px">';
+    h+='<span style="font-size:14px">🎯</span>';
+    h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:var(--gr)">SHORT-TERM GOALS COMPLETE</div>';
+    h+='<div style="font-size:11px;color:var(--wh)">'+_fmtMonYr(_ffDate)+' &middot; <span style="color:var(--mu)">EF, house savings, and other targeted goals all reached</span></div></div></div>';
+  }
+  // Retirement events
+  if(_hasPartner&&_selfRetYr!==_spRetYr){
+    // Two events: render in chronological order
+    var _firstRet=_selfRetYr<_spRetYr?{name:_selfFirst,age:_selfRetAge,yr:_selfRetYr,date:_selfRetDate,col:'rgba(168,85,247,1)',bg:'rgba(168,85,247,.06)'}
+      :{name:_spFirst,age:_spRetAge,yr:_spRetYr,date:_spRetDate,col:'rgba(244,114,182,1)',bg:'rgba(244,114,182,.06)'};
+    var _secondRet=_selfRetYr<_spRetYr?{name:_spFirst,age:_spRetAge,yr:_spRetYr,date:_spRetDate,col:'rgba(244,114,182,1)',bg:'rgba(244,114,182,.06)'}
+      :{name:_selfFirst,age:_selfRetAge,yr:_selfRetYr,date:_selfRetDate,col:'rgba(168,85,247,1)',bg:'rgba(168,85,247,.06)'};
+    [_firstRet,_secondRet].forEach(function(r,i){
+      h+='<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:'+r.bg+';border-left:3px solid '+r.col+';border-radius:2px">';
+      h+='<span style="font-size:14px">'+(i===0?'👋':'🎉')+'</span>';
+      h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+r.col+'">'+esc(r.name).toUpperCase()+' RETIRES (AGE '+r.age+')</div>';
+      h+='<div style="font-size:11px;color:var(--wh)">'+_fmtMonYr(r.date)+' &middot; <span style="color:var(--mu)">'+(r.yr<=1?'within 1 year':r.yr+' years from now')+'</span></div></div></div>';
+    });
+    // Stage 1 caption
+    var _stageGap=Math.abs(_selfRetYr-_spRetYr);
+    h+='<div style="font-size:10px;color:var(--mu);padding:4px 10px;line-height:1.5"><strong style="color:var(--wh)">'+_stageGap+' year'+(_stageGap!==1?'s':'')+' of staggered retirement</strong> &middot; one earner + one drawdown before both retire</div>';
+  } else {
+    // Single event (or couple retiring same year)
+    h+='<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;background:rgba(168,85,247,.06);border-left:3px solid rgba(168,85,247,.7);border-radius:2px">';
+    h+='<span style="font-size:14px">🎉</span>';
+    h+='<div style="flex:1"><div style="font-family:var(--fh);font-size:10px;font-weight:700;color:rgba(168,85,247,1)">'+(_hasPartner?'BOTH RETIRE':'RETIREMENT')+' (AGE '+_selfRetAge+')</div>';
+    h+='<div style="font-size:11px;color:var(--wh)">'+_fmtMonYr(_selfRetDate)+' &middot; <span style="color:var(--mu)">'+(_selfRetYr<=1?'within 1 year':_selfRetYr+' years from now')+'</span></div></div></div>';
+  }
+  h+='</div>';
+
+  // Hybrid allocation summary (conditional)
+  if(_isHybrid){
+    var _convTotal=0,_insTotal=0;
+    active.forEach(function(a){
+      if(_convTypes.indexOf(a.type)>=0)_convTotal+=a.amount;
+      else if(_insTypes.indexOf(a.type)>=0)_insTotal+=a.amount;
+    });
+    var _retTotal=_convTotal+_insTotal;
+    var _convPct=_retTotal>0?Math.round(_convTotal/_retTotal*100):0;
+    var _insPct=_retTotal>0?Math.round(_insTotal/_retTotal*100):0;
+    h+='<div style="margin-top:4px;padding:10px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:3px">';
+    h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:6px">Hybrid Strategy Allocation</div>';
+    h+='<div style="height:10px;display:flex;border-radius:2px;overflow:hidden;background:rgba(0,68,191,.04);margin-bottom:6px">';
+    if(_convPct>0)h+='<div style="height:100%;width:'+_convPct+'%;background:#5B9BFF;opacity:0.6" title="Conventional: '+fmt(_convTotal)+'"></div>';
+    if(_insPct>0)h+='<div style="height:100%;width:'+_insPct+'%;background:rgba(168,85,247,.7)" title="Insurance/IBC: '+fmt(_insTotal)+'"></div>';
+    h+='</div>';
+    h+='<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--mu)">';
+    h+='<span><span style="display:inline-block;width:8px;height:8px;border-radius:1px;background:#5B9BFF;opacity:0.6;margin-right:4px;vertical-align:middle"></span>Conventional <strong style="color:var(--wh)">'+fmt(_convTotal)+'/mo</strong> ('+_convPct+'%)</span>';
+    h+='<span><span style="display:inline-block;width:8px;height:8px;border-radius:1px;background:rgba(168,85,247,.7);margin-right:4px;vertical-align:middle"></span>Insurance/IBC <strong style="color:var(--wh)">'+fmt(_insTotal)+'/mo</strong> ('+_insPct+'%)</span>';
+    h+='</div>';
+    h+='<div style="font-size:10px;color:var(--mu);margin-top:6px;line-height:1.5">Tax-deferred + market growth (conventional) paired with tax-free access + permanent death benefit (insurance/IBC). Each leg fills a different role: retirement income, legacy, liquidity, tax diversification.</div>';
+    h+='</div>';
+  }
+
+  // Progress note when key sim numbers are present
+  if(sim.projRetValue>0){
+    var _projInc=sim.projRetIncome||0;
+    var _myTgt=Math.round(_cpRetIncomeTarget('self'));
+    var _spTgt=_hasPartner?Math.round(_cpRetIncomeTarget('spouse')):0;
+    var _hhTgt=_myTgt+_spTgt;
+    if(_hhTgt>0){
+      var _coveragePct=Math.round(_projInc/_hhTgt*100);
+      var _coverCol=_coveragePct>=100?'var(--gr)':_coveragePct>=80?'var(--gr)':_coveragePct>=50?'var(--yl)':_coveragePct>=25?'var(--or)':'var(--rd)';
+      h+='<div style="margin-top:10px;padding:10px 12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:3px;font-size:11px;color:var(--mu);line-height:1.6">';
+      h+='At retirement, this plan projects <strong style="color:var(--wh)">'+fmtK(sim.projRetValue)+'</strong> in retirement assets, sustaining <strong style="color:var(--wh)">'+fmt(_projInc)+'/mo</strong> &mdash; ';
+      h+='<strong style="color:'+_coverCol+'">'+_coveragePct+'%</strong> of '+(_hasPartner?'household':'')+' target ('+fmt(_hhTgt)+'/mo).';
+      h+='</div>';
+    }
+  }
+  h+='</div>';
+  el.innerHTML=h;
+}
+
 
 function _cpRenderStressTests(){
   var el=document.getElementById('cplanStressTests');if(!el)return;
@@ -6709,7 +7133,7 @@ function _cpRenderStressTests(){
     {icon:'📊',label:'Reduced income (−20%)',desc:'Permanent 20% income reduction',val:projectPlan(0.8,1,0,0),color:'var(--or)'}
   ];
   var h='<div style="padding:14px 16px">';
-  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">What happens to this plan if...</div>';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Economic shocks &mdash; what happens if...</div>';
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
   scenarios.forEach(function(s){
     var diff=s.val-basePlan;var pctDiff=basePlan>0?Math.round(diff/basePlan*100):0;
@@ -6722,6 +7146,181 @@ function _cpRenderStressTests(){
   });
   h+='</div>';
   h+='<div style="font-size:10px;color:var(--mu);margin-top:8px;text-align:center">Base plan projection (20yr): <strong style="color:#5B9BFF">'+fmtK(basePlan)+'</strong></div>';
+
+  // ── Phase 2: Retirement-timing stress tests ──
+  // Uses the full _cpRunSimulation engine (per-owner contribution cessation, hybrid cascade
+  // gates, spousal IRA rules), not the simpler projectPlan kernel. Each scenario mutates
+  // retirement age(s), runs the sim, captures projRetValue, and restores. After all scenarios
+  // run, the base sim is re-run once so CPLAN._sim reflects the real plan again.
+  if(typeof _cpRunSimulation==='function'){
+    var _baseSim=CPLAN._sim||{};
+    var _baseRetVal=_baseSim.projRetValue||0;
+    var _baseRetInc=_baseSim.projRetIncome||0;
+    var _origSelf=CPLAN.retirementAge;
+    var _origSpouse=CPLAN._partner?CPLAN._partner.retirementAge:null;
+    var _hasPartner=!!CPLAN._partner;
+    function _runRetScenario(selfDelta,spouseDelta){
+      // Mutate
+      if(selfDelta!==0)CPLAN.retirementAge=Math.max(50,(_origSelf||65)+selfDelta);
+      if(spouseDelta!==0&&_hasPartner)CPLAN._partner.retirementAge=Math.max(50,(_origSpouse||65)+spouseDelta);
+      var sim=null;try{sim=_cpRunSimulation();}catch(e){}
+      var result={projRetValue:(sim&&sim.projRetValue)||0,projRetIncome:(sim&&sim.projRetIncome)||0};
+      // Restore (immediate, before next scenario)
+      CPLAN.retirementAge=_origSelf;
+      if(_hasPartner)CPLAN._partner.retirementAge=_origSpouse;
+      return result;
+    }
+    var retScenarios=[];
+    retScenarios.push({icon:'⏪',label:(_hasPartner?'You retire':'Retire')+' 5 years early',desc:'Self stops contributing 5 yrs sooner',res:_runRetScenario(-5,0),color:'var(--or)'});
+    if(_hasPartner){
+      retScenarios.push({icon:'⏪',label:'Spouse retires 5 years early',desc:'Spouse stops contributing 5 yrs sooner',res:_runRetScenario(0,-5),color:'var(--or)'});
+      retScenarios.push({icon:'⏪⏪',label:'Both retire 5 years early',desc:'Both stop contributing 5 yrs sooner',res:_runRetScenario(-5,-5),color:'var(--rd)'});
+    }
+    // After all scenarios: re-run base sim so CPLAN._sim reflects actual plan again
+    try{_cpRunSimulation();}catch(e){}
+    // User's stated retirement income target — coverage frame
+    var _retTargetSelf=Math.round(_cpRetIncomeTarget('self'));
+    var _retTargetSp=_hasPartner?Math.round(_cpRetIncomeTarget('spouse')):0;
+    var _retTargetHH=_retTargetSelf+_retTargetSp;
+    h+='<div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--bd)">';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Retirement-timing shocks</div>';
+    h+='<div style="display:grid;grid-template-columns:'+(_hasPartner?'repeat(3,1fr)':'1fr')+';gap:8px">';
+    retScenarios.forEach(function(s){
+      var balDiff=s.res.projRetValue-_baseRetVal;
+      var incDiff=s.res.projRetIncome-_baseRetInc;
+      var coverPct=_retTargetHH>0?Math.round(s.res.projRetIncome/_retTargetHH*100):0;
+      var coverCol=coverPct>=100?'var(--gr)':coverPct>=80?'var(--gr)':coverPct>=50?'var(--yl)':coverPct>=25?'var(--or)':'var(--rd)';
+      h+='<div style="padding:12px;background:rgba(0,68,191,.03);border:1px solid rgba(0,68,191,.08);border-radius:2px">';
+      h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:14px">'+s.icon+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">'+s.label+'</span></div>';
+      h+='<div style="font-family:var(--fd);font-size:20px;color:'+s.color+'">'+fmtK(s.res.projRetValue)+'</div>';
+      h+='<div style="font-size:10px;color:var(--mu)">'+s.desc+'</div>';
+      h+='<div style="font-size:10px;color:'+(balDiff<0?'var(--rd)':'var(--gr)')+';margin-top:3px">'+fmtK(balDiff)+' vs base balance</div>';
+      h+='<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,68,191,.08);font-size:10px;color:var(--mu)">Sustainable: <span style="color:var(--wh);font-weight:600">'+fmt(s.res.projRetIncome)+'/mo</span>';
+      if(_retTargetHH>0)h+=' &middot; <span style="color:'+coverCol+';font-weight:600">'+coverPct+'%</span> of '+fmt(_retTargetHH)+'/mo target';
+      h+='</div></div>';
+    });
+    h+='</div>';
+    h+='<div style="font-size:9px;color:var(--mu);margin-top:8px;line-height:1.4">Each scenario uses the full simulation engine: per-owner contribution cessation, hybrid cross-partner cascade, spousal IRA rules. Sustainable monthly = balance the retirement account can deliver over a 25-year retirement at 1% real return.</div>';
+    h+='</div>';
+  }
+  h+='</div>';
+  el.innerHTML=h;
+}
+
+// Phase 4: Drawdown sequencing and RMD modeling.
+// Returns the IRS Uniform Lifetime Table divisor for a given age (RMD calculation).
+// Source: IRS Pub 590-B, Appendix B, Table III (most current).
+function _cpRMDDivisor(age){
+  // Uniform Lifetime Table III (post-2022 SECURE 2.0)
+  var T={73:26.5,74:25.5,75:24.6,76:23.7,77:22.9,78:22.0,79:21.1,80:20.2,
+    81:19.4,82:18.5,83:17.7,84:16.8,85:16.0,86:15.2,87:14.4,88:13.7,
+    89:12.9,90:12.2,91:11.5,92:10.8,93:10.1,94:9.5,95:8.9,96:8.4,
+    97:7.8,98:7.3,99:6.8,100:6.4};
+  if(age<73)return null;
+  if(age>100)return 6.4;
+  return T[age]||null;
+}
+// Returns the SECURE 2.0 RMD start age based on birth year.
+function _cpRMDStartAge(birthYear){
+  if(!birthYear)return 73;// safe default
+  if(birthYear>=1960)return 75;
+  if(birthYear>=1951)return 73;
+  return 72;// pre-SECURE 2.0
+}
+// Drawdown sequence: returns the recommended order of accounts to draw from in retirement.
+// Pre-RMD: taxable → tax-deferred (small amount for tax bracket fill) → tax-free last
+// At RMD: RMDs forced first → taxable → tax-deferred (beyond RMD) → tax-free
+// Tax-free (Roth, IUL/WL loans, HSA after 65) saved for end to maximize tax-free compound growth.
+var _cpDrawdownTiers={
+  taxable:['invest','rental','custom'],
+  taxDeferred:['401k','trad_ira','solo401k','sep_ira','ibc'],
+  taxFree:['roth','roth401k','iul','wl','hsa']
+};
+function _cpClassifyAccount(type){
+  if(_cpDrawdownTiers.taxable.indexOf(type)>=0)return 'taxable';
+  if(_cpDrawdownTiers.taxDeferred.indexOf(type)>=0)return 'taxDeferred';
+  if(_cpDrawdownTiers.taxFree.indexOf(type)>=0)return 'taxFree';
+  return null;
+}
+
+function _cpRenderDrawdownPlan(){
+  var el=document.getElementById('cplanDrawdown');if(!el)return;
+  if(!_cpTierHas('drawdown_plan')){el.innerHTML=_cpUpgradeHint('Drawdown Plan','pro_plus');return;}
+  var sim=CPLAN._sim;
+  if(!sim||!sim.allocFuture){el.innerHTML='';return;}
+  // Bucket projected retirement balances by tax tier
+  var buckets={taxable:0,taxDeferred:0,taxFree:0,unknown:0};
+  CPLAN.allocations.forEach(function(a,idx){
+    var future=sim.allocFuture[idx];
+    if(!future)return;
+    var bal=future.futureAmount||0;
+    if(bal<=0)return;
+    var tier=_cpClassifyAccount(a.type);
+    if(tier)buckets[tier]+=bal;
+    else buckets.unknown+=bal;
+  });
+  var totalRet=buckets.taxable+buckets.taxDeferred+buckets.taxFree+buckets.unknown;
+  if(totalRet<=0){el.innerHTML='';return;}
+  // Birth year for RMD age (CPLAN.dob populated during client load; falls back to age-based)
+  var _bY=null;
+  if(CPLAN.dob){
+    var _d=new Date(CPLAN.dob);
+    if(!isNaN(_d.getTime()))_bY=_d.getFullYear();
+  }
+  if(!_bY&&CPLAN.age)_bY=new Date().getFullYear()-CPLAN.age;
+  var _rmdAge=_cpRMDStartAge(_bY);
+  var _retAge=CPLAN.retirementAge||65;
+  var _rmdGap=Math.max(0,_rmdAge-_retAge);
+  // First-year RMD estimate at start age
+  var _firstRMDdiv=_cpRMDDivisor(_rmdAge);
+  var _est1stRMD=_firstRMDdiv?Math.round(buckets.taxDeferred/_firstRMDdiv):0;
+
+  function _tierCard(label,amount,col,desc){
+    var pct=Math.round(amount/totalRet*100);
+    var h='<div style="padding:10px 12px;border:1px solid var(--bd);border-left:3px solid '+col+';border-radius:3px;background:rgba(0,68,191,.02);margin-bottom:6px">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px">';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+col+';letter-spacing:.06em">'+label+'</div>';
+    h+='<div style="font-family:var(--fd);font-size:14px;color:var(--wh)">'+fmtK(amount)+'</div></div>';
+    h+='<div style="height:5px;background:rgba(0,68,191,.05);border-radius:2px;overflow:hidden;margin-bottom:4px"><div style="height:100%;width:'+pct+'%;background:'+col+';opacity:.6"></div></div>';
+    h+='<div style="font-size:10px;color:var(--mu);line-height:1.4">'+desc+' &middot; '+pct+'% of projected retirement assets</div>';
+    h+='</div>';
+    return h;
+  }
+  var h='<div class="info-card" style="padding:16px">';
+  h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:12px">Drawdown Plan &middot; tax-efficient withdrawal order</div>';
+  // Bucket display
+  h+=_tierCard('🟢 Taxable accounts',buckets.taxable,'#5B9BFF','Brokerage, rental income, custom — drawn first to defer tax-advantaged growth');
+  h+=_tierCard('🟡 Tax-deferred accounts',buckets.taxDeferred,'rgba(234,179,8,1)','401(k), Traditional IRA, IBC — drawn second; subject to RMDs starting age '+_rmdAge);
+  h+=_tierCard('🟢 Tax-free accounts',buckets.taxFree,'var(--gr)','Roth, IUL/WL loans, HSA (after 65) — drawn last to maximize tax-free compound growth');
+  if(buckets.unknown>0)h+=_tierCard('⚪ Other / unclassified',buckets.unknown,'rgba(100,116,139,.6)','House, EF, education accounts — generally not retirement income sources');
+
+  // RMD section
+  if(buckets.taxDeferred>0){
+    h+='<div style="margin-top:12px;padding:12px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.18);border-radius:3px">';
+    h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:rgba(234,179,8,1);letter-spacing:.06em;margin-bottom:6px">REQUIRED MINIMUM DISTRIBUTIONS</div>';
+    h+='<div style="font-size:11px;color:var(--mu);line-height:1.7">';
+    h+='Born '+(_bY||'?')+' &middot; RMDs begin at age <strong style="color:var(--wh)">'+_rmdAge+'</strong> ('+(_bY&&_bY>=1960?'SECURE 2.0':'SECURE 2.0 / earlier rules')+').<br>';
+    if(_rmdGap>0)h+='Window of <strong style="color:var(--gr)">'+_rmdGap+' year'+(_rmdGap!==1?'s':'')+'</strong> between retirement (age '+_retAge+') and first RMD &mdash; ideal time for Roth conversions while in lower brackets.<br>';
+    if(_est1stRMD>0)h+='At age '+_rmdAge+', estimated first RMD: <strong style="color:var(--wh)">'+fmtK(_est1stRMD)+'</strong> from tax-deferred balance of '+fmtK(buckets.taxDeferred)+' (Uniform Lifetime divisor '+_firstRMDdiv+').<br>';
+    h+='RMDs are taxable income whether you need the cash or not. After RMDs are satisfied, additional withdrawals from tax-deferred accounts add to taxable income; consider QCD ('+fmt(111000)+'/yr 2026 limit) for charitable goals to reduce taxable RMDs.';
+    h+='</div></div>';
+  }
+
+  // Roth conversion window callout
+  if(_rmdGap>=2&&buckets.taxDeferred>buckets.taxFree*0.5){
+    h+='<div style="margin-top:8px;padding:10px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:3px;font-size:11px;color:var(--mu);line-height:1.6">';
+    h+='💡 <strong style="color:var(--gr)">Roth conversion opportunity:</strong> The '+_rmdGap+'-year window between retirement and RMDs is the best time to convert tax-deferred → Roth. You\'re likely in a lower tax bracket (no wages, no SS yet). Each dollar converted permanently leaves the RMD calculation pool.';
+    h+='</div>';
+  }
+  // Hybrid IUL/WL note
+  if(buckets.taxFree>0){
+    var _hasInsurance=CPLAN.allocations.some(function(a){return(a.type==='iul'||a.type==='wl')&&a.amount>0;});
+    if(_hasInsurance){
+      h+='<div style="margin-top:8px;padding:10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.18);border-radius:3px;font-size:11px;color:var(--mu);line-height:1.6">';
+      h+='✨ <strong style="color:rgba(168,85,247,1)">IUL/WL access:</strong> Tax-free income from your insurance policies works via FIFO basis withdrawals + policy loans &mdash; not 4% of CV. Refer to the carrier illustration for accurate annual income capacity. Policy loans don\'t count as taxable income or affect Social Security taxation thresholds.';
+      h+='</div>';
+    }
+  }
   h+='</div>';
   el.innerHTML=h;
 }
@@ -6794,12 +7393,20 @@ function _cpRenderOutcomes(){
   h+='</div></div></div>';
 
   // ── 2. Projected Outcomes ──
-  var nw5=-CPLAN.totalDebt,nw10=-CPLAN.totalDebt,nw20=-CPLAN.totalDebt,nw30=-CPLAN.totalDebt,retIncome=0;
-  active.forEach(function(a){var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var b5=0,b10=0,b20=0,b30=0;for(var y=1;y<=30;y++){var c2=a.amount*12*cf;if(y<=5)b5=(b5+c2)*(1+rate);if(y<=10)b10=(b10+c2)*(1+rate);if(y<=20)b20=(b20+c2)*(1+rate);b30=(b30+c2)*(1+rate);}nw5+=b5;nw10+=b10;nw20+=b20;nw30+=b30;if(a.type!=='ef'&&a.type!=='debt'&&a.type!=='house')retIncome+=Math.round(b30*0.04/12);});
+  var nw5=-CPLAN.totalDebt,nw10=-CPLAN.totalDebt,nw20=-CPLAN.totalDebt,nw30=-CPLAN.totalDebt,retBal30=0;
+  active.forEach(function(a){var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var b5=0,b10=0,b20=0,b30=0;for(var y=1;y<=30;y++){var c2=a.amount*12*cf;if(y<=5)b5=(b5+c2)*(1+rate);if(y<=10)b10=(b10+c2)*(1+rate);if(y<=20)b20=(b20+c2)*(1+rate);b30=(b30+c2)*(1+rate);}nw5+=b5;nw10+=b10;nw20+=b20;nw30+=b30;if(a.type!=='ef'&&a.type!=='debt'&&a.type!=='house')retBal30+=b30;});
+  // Phase 2: convert balance → sustainable monthly income (PMT, 25-yr horizon, 1% real),
+  // and frame against user's stated retirement income target (CPLAN.retIncome) instead of 4% rule.
+  var _retSustained=Math.round(_cpSustainableMonthly(retBal30,25,0.01));
+  var _retTarget=Math.round(_cpRetIncomeTarget('self'));
+  var _retPct=_retTarget>0?Math.min(100,Math.round(_retSustained/_retTarget*100)):0;
+  var _retCol=_retPct>=100?'var(--gr)':_retPct>=80?'var(--gr)':_retPct>=50?'var(--yl)':_retPct>=25?'var(--or)':'var(--rd)';
   h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">';
   [{y:'YR 5',v:nw5},{y:'YR 10',v:nw10},{y:'YR 20',v:nw20},{y:'YR 30',v:nw30}].forEach(function(p){h+='<div class="info-card" style="text-align:center;padding:10px"><div style="font-size:8px;color:var(--mu);font-family:var(--fh);font-weight:700">'+p.y+'</div><div style="font-family:var(--fd);font-size:16px;color:var(--gr)">'+fmtK(Math.round(p.v))+'</div></div>';});
   h+='</div>';
-  h+='<div class="info-card" style="text-align:center;padding:10px;margin-bottom:10px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700">EST. RETIREMENT INCOME (4% rule)</div><div style="font-family:var(--fd);font-size:20px;color:var(--wh)">'+fmt(retIncome)+'/mo</div></div>';
+  h+='<div class="info-card" style="text-align:center;padding:10px;margin-bottom:10px"><div style="font-size:9px;color:var(--mu);font-family:var(--fh);font-weight:700">SUSTAINABLE MONTHLY INCOME &middot; YR 30</div><div style="font-family:var(--fd);font-size:20px;color:'+_retCol+'">'+fmt(_retSustained)+'/mo</div>';
+  if(_retTarget>0)h+='<div style="font-size:9px;color:var(--mu);margin-top:2px">'+_retPct+'% of '+fmt(_retTarget)+'/mo target</div>';
+  h+='</div>';
 
   // ── 3. Per-Allocation Year-by-Year Table ──
   h+='<div class="info-card" style="padding:14px;margin-bottom:10px">';
@@ -6864,10 +7471,10 @@ function _cpRunSimulation(){
   var efRemaining=Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0));
   if(efA&&efRemaining>0){
     var efMo=Math.ceil(efRemaining/efA.amount);
-    events.push({month:efMo,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF funded'});
+    events.push({month:efMo,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF funded',_sourceOwner:efA.owner||'self'});
   } else if(efA&&efRemaining<=0){
     // EF already funded — immediately free
-    events.push({month:0,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF already funded'});
+    events.push({month:0,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF already funded',_sourceOwner:efA.owner||'self'});
   }
   // Debt completion — only accelerate high-rate debts (>10% APR)
   var _RATE_THRESHOLD=10;
@@ -6899,28 +7506,28 @@ function _cpRunSimulation(){
       }
       var _cvAvRecoveryMonth=debtSim.months+_cvAvMonths;
       // Event 1: At debt-free — IBC premium continues, but freed mins go to loan repayment (freed=0 for redistribution)
-      events.push({month:debtSim.months,type:'debt',freed:0,cascade:'',label:'High-rate debt free — freed minimums repaying IBC policy loans',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion,_ibcLoanRepayment:_creditCardFreed});
+      events.push({month:debtSim.months,type:'debt',freed:0,cascade:'',label:'High-rate debt free — freed minimums repaying IBC policy loans',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion,_ibcLoanRepayment:_creditCardFreed,_sourceOwner:debtA.owner||'self'});
       // Event 2: At CV=AV recovery — NOW freed minimums redistribute to growth
       if(_cvAvRecoveryMonth>debtSim.months){
-        events.push({month:_cvAvRecoveryMonth,type:'ibc_recovery',freed:_creditCardFreed,cascade:debtA.cascade,label:'IBC loans repaid (CV=AV) — freed minimums now redistributing',_ibcRecovery:true});
+        events.push({month:_cvAvRecoveryMonth,type:'ibc_recovery',freed:_creditCardFreed,cascade:debtA.cascade,label:'IBC loans repaid (CV=AV) — freed minimums now redistributing',_ibcRecovery:true,_sourceOwner:debtA.owner||'self'});
       } else {
         // Instant recovery (unlikely but handle gracefully)
-        events.push({month:debtSim.months,type:'debt',freed:_creditCardFreed,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion});
+        events.push({month:debtSim.months,type:'debt',freed:_creditCardFreed,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion,_sourceOwner:debtA.owner||'self'});
       }
     } else {
       // Non-IBC: full debt allocation + minimums freed
-      events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order});
+      events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,_sourceOwner:debtA.owner||'self'});
     }
     debtSim.order.forEach(function(o){events.push({month:o.month,type:'debt_milestone',freed:0,cascade:'',label:o.name+' paid off'});});
   } else if(debtA&&hiRateDebts.length===0&&allDebts.length>0){
     // No high-rate debt — all debt is low-rate, don't accelerate. Free the debt allocation immediately.
-    events.push({month:0,type:'debt',freed:debtA.amount,cascade:debtA.cascade,label:'No high-rate debt — extra redirected to growth'});
+    events.push({month:0,type:'debt',freed:debtA.amount,cascade:debtA.cascade,label:'No high-rate debt — extra redirected to growth',_sourceOwner:debtA.owner||'self'});
   }
   // Custom/house goal completions
   CPLAN.allocations.forEach(function(a,i){
     if((a.type==='custom'||a.type==='house')&&a.target>0&&a.amount>0){
       var mo=Math.ceil(Math.max(0,(a.target-(a.goalCurrent||0)))/a.amount);
-      events.push({month:mo,type:a.type,freed:a.amount,cascade:a.cascade,label:(a.customName||CP_NM[a.type]||'Goal')+' complete',allocIdx:i});
+      events.push({month:mo,type:a.type,freed:a.amount,cascade:a.cascade,label:(a.customName||CP_NM[a.type]||'Goal')+' complete',allocIdx:i,_sourceOwner:a.owner||'self'});
     }
   });
   events.sort(function(a,b){return a.month-b.month;});
@@ -6933,6 +7540,19 @@ function _cpRunSimulation(){
   events.forEach(function(ev){
     if(ev.freed<=0||ev.type==='debt_milestone')return;
     var freed=ev.freed;var destinations=[];
+    // Phase D multi-partner: hybrid households restrict cross-partner cascade.
+    // Partner A's freed cash flows only to partner A's growth (and joint allocations);
+    // joint-source freed cash flows everywhere. Joint and individual households
+    // redistribute without owner restriction (current behavior).
+    var _isHybridCascade=(CPLAN._householdType==='hybrid');
+    var _srcOwner=ev._sourceOwner||'self';
+    var _cascadeOwnerOK=function(destOwner){
+      if(!_isHybridCascade)return true;
+      if(_srcOwner==='joint')return true;
+      var dOwn=destOwner||'self';
+      // Self-source or spouse-source can flow to own allocations OR joint allocations
+      return dOwn===_srcOwner||dOwn==='joint';
+    };
     // IBC debt strategy: reclassify IBC premium as growth allocation when debt completes
     if(ev._ibcContinues&&ev._ibcContinues>0){
       var ibcIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='ibc'&&ibcIdx<0)ibcIdx=i2;});
@@ -6951,9 +7571,9 @@ function _cpRunSimulation(){
         destinations.push({type:'ibc',name:'IBC (continued)',amount:ev._ibcContinues});
       }
     }
-    // Specific cascade target
+    // Specific cascade target — gate by owner match in hybrid
     if(ev.cascade){
-      var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0)tIdx=i2;});
+      var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0&&_cascadeOwnerOK(a2.owner))tIdx=i2;});
       if(tIdx>=0){
         var irsMax=_cpIRSMax(CPLAN.allocations[tIdx].type,CPLAN.allocations[tIdx]);
         var maxAdd=Math.max(0,irsMax-allocAmounts[tIdx]);
@@ -6972,8 +7592,9 @@ function _cpRunSimulation(){
     // Remaining: first boost existing growth allocations, then fund unfunded items
     if(freed>0){
       // Priority: INCREASE existing growth allocations (they're already compounding)
+      // Phase D: hybrid restricts to owner-matching growth
       var growth=CPLAN.allocations.map(function(a5,i5){return{a:a5,i:i5};})
-        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;})
+        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
         .sort(function(a6,b6){return(a6.a.phase||99)-(b6.a.phase||99);});
       if(growth.length>0){
         // Distribute proportionally to current allocation amounts (not equal split)
@@ -7001,6 +7622,7 @@ function _cpRunSimulation(){
           if(allocAmounts[x.i]>0||x.a._completed)return false;
           if(x.a.type==='protection')return false;
           if(x.a.type==='custom'&&(!x.a.target||x.a.target<=0))return false;
+          if(!_cascadeOwnerOK(x.a.owner))return false;// Phase D: hybrid owner gate
           return['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;
         })
         .sort(function(a4,b4){return(a4.a.phase||99)-(b4.a.phase||99);});
@@ -7057,11 +7679,32 @@ function _cpRunSimulation(){
       if(a.type==='debt')return;// Debt handled via -remDebt
       var af=allocFuture[idx];
       var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);
+      // Phase D multi-partner: contributions cease at owner retirement.
+      // For Roth/Trad IRA owned by retired partner, spousal IRA exception allows
+      // continued contributions while OTHER partner is still working (capped at
+      // working partner's remaining earned income capacity).
+      var _ownerRetMonth=_cpRetMonthFor(a);
+      var _aOwner=a.owner||'self';
+      var _isIRA=(a.type==='roth'||a.type==='trad_ira');
+      var _spousalIRAEligible=_isIRA&&CPLAN._partner&&(_aOwner==='self'||_aOwner==='spouse');
+      var _otherOwner=_aOwner==='self'?'spouse':'self';
+      var _otherRetMonth=_spousalIRAEligible?_cpRetMonthFor(_otherOwner):0;
+      var _spousalCap=_spousalIRAEligible?_cpWorkingPartnerIncomeRemaining(_aOwner):0;
       var bal=0;
       for(var m=1;m<=yr*12;m++){
         var monthlyAmt=af.currentAmount;
         af.boosts.forEach(function(b){if(m>=b.month)monthlyAmt=af.futureAmount;});
         if((a.type==='ef'||a.type==='house'||a.type==='custom')&&a.target>0&&bal>=a.target){monthlyAmt=0;}
+        // Phase D multi-partner: cease contributions at owner retirement, with spousal IRA exception
+        if(m>_ownerRetMonth){
+          if(_spousalIRAEligible&&m<=_otherRetMonth){
+            // Spousal IRA: retired partner can keep contributing while other partner works,
+            // but capped at working partner's remaining earned income
+            monthlyAmt=Math.min(monthlyAmt,_spousalCap);
+          } else {
+            monthlyAmt=0;
+          }
+        }
         var contrib=monthlyAmt*cf;
         bal=(bal+contrib)*(1+(rate/12));
       }
@@ -7111,9 +7754,15 @@ function _cpRunSimulation(){
   }
   var debtFreeMonth=debtSim?debtSim.months:0;
   // Retirement projection — use retirement-only data at retirement age (not full NW)
-  var _retAge=65;var _yrsToRet=Math.max(1,Math.min(years,_retAge-(CPLAN.age||35)));
+  // Phase D multi-partner note: still single-event walk for now. Two-event simulation
+  // (each partner retiring at their own age, joint allocations funded by still-working
+  // partner) is gated on the joint-funding rule decision — see plan doc Phase 1 followups.
+  var _retAge=CPLAN.retirementAge||65;var _yrsToRet=Math.max(1,Math.min(years,_retAge-(CPLAN.age||35)));
   var projRetValue=retirementData[_yrsToRet]||retirementData[years]||0;
-  var projRetIncome=Math.round(projRetValue*0.04/12);// 4% safe withdrawal rule
+  // Phase 2: monthly income sustainability (PMT formula) over a 25-yr retirement at 1% real return.
+  // The user's stated retirement income target is the planning standard, used for comparison
+  // elsewhere — this number expresses what the projected balance can actually sustain.
+  var projRetIncome=Math.round(_cpSustainableMonthly(projRetValue,25,0.01));
 
   // Store result
   CPLAN._sim={
@@ -7281,6 +7930,31 @@ function _cpRenderChart(targetId){
   if(efA){var efYr=Math.ceil(Math.ceil((efA.target||CPLAN.efTarget)/efA.amount)/12);if(efYr>0&&efYr<years){svg+='<line x1="'+x(efYr)+'" y1="'+padT+'" x2="'+x(efYr)+'" y2="'+(H-padB)+'" stroke="rgba(34,197,94,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(efYr)+'" y="'+(padT-3)+'" fill="rgba(34,197,94,.6)" font-size="7" text-anchor="middle" font-family="var(--fh)">EF done</text>';}}
   var dA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
   if(dA&&CPLAN.totalDebt>0){var dYr=Math.ceil(Math.ceil(CPLAN.totalDebt/(dA.amount+CPLAN.debtMin))/12);if(dYr>0&&dYr<years){svg+='<line x1="'+x(dYr)+'" y1="'+padT+'" x2="'+x(dYr)+'" y2="'+(H-padB)+'" stroke="rgba(249,115,22,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(dYr)+'" y="'+(padT-3)+'" fill="rgba(249,115,22,.6)" font-size="7" text-anchor="middle" font-family="var(--fh)">Debt free</text>';}}
+  // ── Phase 3: Retirement event lines (self & spouse) ──
+  // Vertical color-coded markers at each retirement age. For couples with same retirement
+  // year, render a single combined line. For staggered, render two lines plus subtle
+  // shading between them to highlight the Stage 1 staggered period.
+  var _retSelfYr=Math.max(0,Math.min(years,(CPLAN.retirementAge||65)-(CPLAN.age||35)));
+  var _retSpYr=(CPLAN._partner&&CPLAN._partner.retirementAge&&CPLAN._partner.age)
+    ?Math.max(0,Math.min(years,CPLAN._partner.retirementAge-CPLAN._partner.age)):null;
+  var _retSelfFirst=((APP.currentClient&&APP.currentClient.name)||'You').split(' ')[0]||'You';
+  var _retSpFirst=CPLAN._partner?(CPLAN._partner.firstName||'Partner'):null;
+  if(_retSelfYr>0&&_retSpYr!==null&&_retSpYr>0&&_retSelfYr!==_retSpYr){
+    // Staggered — shade the gap window
+    var _gx1=x(Math.min(_retSelfYr,_retSpYr));
+    var _gx2=x(Math.max(_retSelfYr,_retSpYr));
+    svg+='<rect x="'+_gx1+'" y="'+padT+'" width="'+(_gx2-_gx1)+'" height="'+(H-padT-padB)+'" fill="rgba(168,85,247,.04)"/>';
+  }
+  if(_retSelfYr>0&&_retSelfYr<years){
+    // Self retirement line — purple/violet
+    svg+='<line x1="'+x(_retSelfYr)+'" y1="'+padT+'" x2="'+x(_retSelfYr)+'" y2="'+(H-padB)+'" stroke="rgba(168,85,247,.55)" stroke-width="1.2" stroke-dasharray="3,2"/>';
+    svg+='<text x="'+x(_retSelfYr)+'" y="'+(padT-3)+'" fill="rgba(168,85,247,.85)" font-size="7" text-anchor="middle" font-family="var(--fh)" font-weight="700">'+esc(_retSelfFirst)+' retires</text>';
+  }
+  if(_retSpYr!==null&&_retSpYr>0&&_retSpYr<years&&_retSpYr!==_retSelfYr){
+    // Spouse retirement line — pink/rose
+    svg+='<line x1="'+x(_retSpYr)+'" y1="'+padT+'" x2="'+x(_retSpYr)+'" y2="'+(H-padB)+'" stroke="rgba(244,114,182,.55)" stroke-width="1.2" stroke-dasharray="3,2"/>';
+    svg+='<text x="'+x(_retSpYr)+'" y="'+(padT-3)+'" fill="rgba(244,114,182,.9)" font-size="7" text-anchor="middle" font-family="var(--fh)" font-weight="700">'+esc(_retSpFirst)+' retires</text>';
+  }
   if(_cpTierHas('milestones_extra')){
   for(var m100=1;m100<=years;m100++){if(totalData[m100]>=100000&&(m100===1||totalData[m100-1]<100000)){svg+='<line x1="'+x(m100)+'" y1="'+padT+'" x2="'+x(m100)+'" y2="'+(H-padB)+'" stroke="rgba(91,155,255,.2)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(m100)+'" y="'+(H-padB+10)+'" fill="rgba(91,155,255,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">$100k</text>';break;}}
   var fiTarget=CPLAN.expenses*12*25;
@@ -7342,7 +8016,9 @@ function _cpRenderChart(targetId){
 
 function _cpProj(a){
   if(a.amount<=0)return'';
-  var mo=a.amount;var yrs=Math.max(1,65-CPLAN.age);
+  // Phase D multi-partner: project against the OWNER's retirement age, not a
+  // hardcoded 65. Spouse-owned allocations now correctly use spouse's horizon.
+  var mo=a.amount;var yrs=_cpYrsToRetFor(a);
   if(a.type==='ef'){var t=a.target||Math.round(CPLAN.efTarget-CPLAN.efBal);var m=mo>0?Math.ceil(Math.max(0,t)/mo):0;var _efDate=m>0?' · target <strong>'+_cpFormatCompletionLabel(m).split(' (')[0]+'</strong>':'';return'Fully funded in <strong>'+m+' month'+(m!==1?'s':'')+'</strong>'+_efDate;}
   if(a.type==='debt'){
     var sorted=CPLAN.debts.slice().filter(function(x){return(parseFloat(x.balance)||0)>0;});
@@ -7355,8 +8031,20 @@ function _cpProj(a){
     var _debtDate=mo2>0?' · debt-free <strong>'+_cpFormatCompletionLabel(mo2).split(' (')[0]+'</strong>':'';
     return'Debt free in <strong>~'+mo2+' months</strong> using '+stName+_debtDate;
   }
-  if(a.type==='iul'){var cv=0;var _iR=_cpGetNetRate(a);var _iCF=_cpGetCF(a);for(var y=1;y<=Math.min(yrs,30);y++)cv=(cv+mo*12*_iCF)*(1+_iR);var ri=Math.round(cv*0.045/12);return'Cash value: <strong>'+fmtK(Math.round(cv))+'</strong> · Tax-free income: <strong>~'+fmt(ri)+'/mo</strong> in retirement';}
-  if(a.type==='wl'){var cv2=0;var _wR=_cpGetNetRate(a);var _wCF=_cpGetCF(a);for(var y2=1;y2<=Math.min(yrs,30);y2++)cv2=(cv2+mo*12*_wCF)*(1+_wR);return'Guaranteed cash value: <strong>'+fmtK(Math.round(cv2))+'</strong> + dividends';}
+  if(a.type==='iul'){var cv=0;var _iR=_cpGetNetRate(a);var _iCF=_cpGetCF(a);for(var y=1;y<=Math.min(yrs,30);y++)cv=(cv+mo*12*_iCF)*(1+_iR);
+    // Phase 2: IUL income via A+D combined approach. If advisor entered the
+    // illustration's projected monthly retirement income on the allocation, use that.
+    // Otherwise show CV only — IUL income is illustration-driven (FIFO basis withdrawal
+    // then policy loans) and a flat % of CV is misleading without policy design context.
+    var _illIncome=parseFloat(a.illustratedRetIncome)||0;
+    if(_illIncome>0)return'Cash value: <strong>'+fmtK(Math.round(cv))+'</strong> &middot; Illustrated tax-free income: <strong>'+fmt(_illIncome)+'/mo</strong>';
+    return'Cash value: <strong>'+fmtK(Math.round(cv))+'</strong> &middot; <span style="color:var(--mu);font-size:10px">income from policy depends on illustration &mdash; enter projected monthly income on this allocation for accurate planning</span>';
+  }
+  if(a.type==='wl'){var cv2=0;var _wR=_cpGetNetRate(a);var _wCF=_cpGetCF(a);for(var y2=1;y2<=Math.min(yrs,30);y2++)cv2=(cv2+mo*12*_wCF)*(1+_wR);
+    var _wIllIncome=parseFloat(a.illustratedRetIncome)||0;
+    if(_wIllIncome>0)return'Guaranteed cash value: <strong>'+fmtK(Math.round(cv2))+'</strong> + dividends &middot; Illustrated tax-free income: <strong>'+fmt(_wIllIncome)+'/mo</strong>';
+    return'Guaranteed cash value: <strong>'+fmtK(Math.round(cv2))+'</strong> + dividends';
+  }
   if(a.type==='roth'||a.type==='401k'){var b=0;var _rR=_cpGetNetRate(a);var match=a.type==='401k'&&CPLAN.employer?0.04:0;for(var y3=0;y3<yrs;y3++)b=(b+mo*12*(1+match))*(1+_rR);var feeNote=_cpGetFeeRate(a)>0?' ('+(_cpGetGrossRate(a)*100).toFixed(1)+'% gross − '+((_cpGetFeeRate(a)*100).toFixed(2))+'% fees)':'';return'Could grow to <strong>'+fmtK(Math.round(b))+'</strong>'+(match>0?' (incl employer match)':'')+feeNote+' by retirement';}
   if(a.type==='house'){var t2=a.target||80000;return'<strong>'+fmt(t2)+'</strong> down payment in <strong>'+Math.ceil(t2/Math.max(mo,1))+' months</strong>';}
   if(a.type==='edu'){var yrs2=CPLAN.children.length?Math.max(1,18-(CPLAN.children[0].age||0)):18;var b2=0;var veh=a.eduVehicle||'529';var _eR=_cpGetNetRate(a);var _eCF=_cpGetCF(a);var vehName=CP_EDU_VEH_NM[veh]||'529 Plan';for(var y4=0;y4<yrs2;y4++)b2=(b2+mo*12*_eCF)*(1+_eR);var eduExtra=(veh==='wl'||veh==='iul')?' + death benefit protection':'';return vehName+': <strong>'+fmtK(Math.round(b2))+'</strong> in '+yrs2+' years'+eduExtra;}
@@ -7461,11 +8149,28 @@ function _cpRenderPlanFull(){
         h+='<div><span style="color:var(--mu)">Combined income:</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN._jointIncome))+'/mo</strong></div>';
         h+='<div><span style="color:var(--mu)">Combined surplus:</span> <strong style="color:var(--gr)">'+fmt(Math.round(CPLAN._jointSurplus))+'/mo</strong></div>';
         h+='</div>';
-      } else {
-        h+='<div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;font-size:10px">';
-        h+='<div><span style="color:var(--mu)">Your client:</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN.surplus))+'/mo surplus</strong> (age '+CPLAN.age+')</div>';
-        h+='<div><span style="color:var(--mu)">'+esc(CPLAN._partner.firstName||'Partner')+':</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN._partner.surplus))+'/mo surplus</strong> (age '+CPLAN._partner.age+')</div>';
+        // Phase D multi-partner: inline-editable retirement ages. Each partner's age
+        // and "retires in N yrs" updates as the advisor scenarios. Session-only — the
+        // source of truth lives in S.profile via pfos-main.
+        var _selfRet=CPLAN.retirementAge||65;
+        var _spRet=(CPLAN._partner&&CPLAN._partner.retirementAge)||65;
+        var _selfYrs=Math.max(0,_selfRet-(CPLAN.age||35));
+        var _spYrs=Math.max(0,_spRet-(CPLAN._partner.age||35));
+        var _retInputCss='width:42px;background:rgba(0,68,191,.07);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd);font-size:11px;padding:1px 4px;border-radius:2px;outline:none;text-align:center';
+        h+='<div style="display:flex;gap:14px;margin-top:6px;flex-wrap:wrap;font-size:10px;align-items:center">';
+        h+='<div><span style="color:var(--mu)">Your client retires:</span> <input type="number" min="50" max="80" value="'+_selfRet+'" onchange="_cpSetSelfRetAge(this.value)" style="'+_retInputCss+'" title="Edit retirement age (session only — save in client profile to persist)"> <span style="color:var(--mu)">(in '+_selfYrs+' yr'+(_selfYrs===1?'':'s')+')</span></div>';
+        h+='<div><span style="color:var(--mu)">'+esc(CPLAN._partner.firstName||'Partner')+' retires:</span> <input type="number" min="50" max="80" value="'+_spRet+'" onchange="_cpSetSpouseRetAge(this.value)" style="'+_retInputCss+'" title="Edit retirement age (session only — save in client profile to persist)"> <span style="color:var(--mu)">(in '+_spYrs+' yr'+(_spYrs===1?'':'s')+')</span></div>';
         h+='</div>';
+        h+='<div style="font-size:9px;color:var(--mu);margin-top:4px;font-style:italic;line-height:1.4">Scenario edits update projections immediately. To save retirement age changes permanently, edit in the client&apos;s profile.</div>';
+      } else {
+        var _selfRetNJ=CPLAN.retirementAge||65;
+        var _spRetNJ=(CPLAN._partner&&CPLAN._partner.retirementAge)||65;
+        var _retInputCssNJ='width:42px;background:rgba(0,68,191,.07);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd);font-size:11px;padding:1px 4px;border-radius:2px;outline:none;text-align:center';
+        h+='<div style="display:flex;gap:14px;margin-top:8px;flex-wrap:wrap;font-size:10px;align-items:center">';
+        h+='<div><span style="color:var(--mu)">Your client:</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN.surplus))+'/mo surplus</strong> (age '+CPLAN.age+', retires <input type="number" min="50" max="80" value="'+_selfRetNJ+'" onchange="_cpSetSelfRetAge(this.value)" style="'+_retInputCssNJ+'" title="Scenario edit (session only)">)</div>';
+        h+='<div><span style="color:var(--mu)">'+esc(CPLAN._partner.firstName||'Partner')+':</span> <strong style="color:var(--wh)">'+fmt(Math.round(CPLAN._partner.surplus))+'/mo surplus</strong> (age '+CPLAN._partner.age+', retires <input type="number" min="50" max="80" value="'+_spRetNJ+'" onchange="_cpSetSpouseRetAge(this.value)" style="'+_retInputCssNJ+'" title="Scenario edit (session only)">)</div>';
+        h+='</div>';
+        h+='<div style="font-size:9px;color:var(--mu);margin-top:4px;font-style:italic;line-height:1.4">Scenario edits update projections immediately. To save retirement age changes permanently, edit in the client&apos;s profile.</div>';
       }
       h+='</div></div>';
     }
@@ -7540,7 +8245,8 @@ function _cpRenderPlanFull(){
     var ownerLbl='';
     if(CPLAN._partner){
       var ow2=a.owner||'self';
-      var ocLbl=ow2==='self'?(APP._currentClientName?(APP._currentClientName.split(' ')[0]):'Client'):ow2==='spouse'?(CPLAN._partner.firstName||'Partner'):'Joint';
+      var _selfClientName=APP.currentClient&&APP.currentClient.name;
+      var ocLbl=ow2==='self'?(_selfClientName?(_selfClientName.split(' ')[0]):'Client'):ow2==='spouse'?(CPLAN._partner.firstName||'Partner'):'Joint';
       var ocC=ow2==='self'?'#5B9BFF':ow2==='spouse'?'#A855F7':'#22C55E';
       ownerLbl=' <span style="font-size:9px;color:'+ocC+';background:'+ocC+'15;padding:1px 5px;border-radius:2px;margin-left:2px">'+esc(ocLbl)+'</span>';
     }
@@ -7593,7 +8299,7 @@ function _cpRenderPlanFull(){
     var proj='';
     if(a._illustrationData&&a._illustrationData.cashValueYear10>0){
       var ilD=a._illustrationData;proj='→ CV Year 10: '+fmtK(ilD.cashValueYear10)+(ilD.cashValueYear20?' · Year 20: '+fmtK(ilD.cashValueYear20):'')+(ilD.carrier?' ('+esc(ilD.carrier)+')':'');
-    } else if(['roth','401k','invest','iul','wl','edu','ibc','hsa','trad_ira','solo401k','sep_ira'].indexOf(a.type)>=0&&a.amount>0){var rt=0.07;var yr=Math.max(1,65-CPLAN.age);var bal=0;for(var y=1;y<=yr;y++)bal=(bal+a.amount*12)*(1+rt);proj='→ '+fmtK(Math.round(bal))+' at retirement ('+yr+'yr, 7%)';}
+    } else if(['roth','401k','invest','iul','wl','edu','ibc','hsa','trad_ira','solo401k','sep_ira'].indexOf(a.type)>=0&&a.amount>0){var rt=0.07;var yr=_cpYrsToRetFor(a);var bal=0;for(var y=1;y<=yr;y++)bal=(bal+a.amount*12)*(1+rt);proj='→ '+fmtK(Math.round(bal))+' at retirement ('+yr+'yr, 7%)';}
     if(a.type==='ef'&&a.amount>0){var mo=a.target>0?Math.ceil(Math.max(0,a.target-CPLAN.efBal)/a.amount):0;proj=mo>0?'→ Fully funded in ~'+mo+' months':'→ EF target reached';}
     if(a.type==='debt'&&a.amount>0&&CPLAN.totalDebt>0){proj='→ Debt-free in ~'+Math.ceil(CPLAN.totalDebt/(a.amount+CPLAN.debtMin))+' months';}
     h+='<div style="display:flex;align-items:flex-start;gap:14px;padding:16px;background:linear-gradient(135deg,rgba(14,14,56,.9),rgba(9,9,46,.8));border:1px solid var(--bd);border-left:3px solid '+c2+';border-radius:0 4px 4px 0;margin-bottom:8px;backdrop-filter:blur(8px)'+(a._completed?';opacity:0.5':'')+ '">';
@@ -7606,7 +8312,7 @@ function _cpRenderPlanFull(){
     if(irsMax<99999)h+='<span style="font-size:8px;color:var(--mu);white-space:nowrap">IRS '+fmt(irsMax)+'</span>';
     h+='</div>';
     h+='<div style="font-size:9px;margin-bottom:4px">'+_cpEffectiveCapNote(a.type,idx)+'</div>';
-    var _irsNote=_cpIRSNote(a.type);
+    var _irsNote=_cpIRSNote(a.type,a);
     if(_irsNote)h+='<div style="font-size:9px;color:var(--mu);margin-bottom:4px;line-height:1.4">'+_irsNote+'</div>';
     if(proj)h+='<div style="font-size:10px;color:var(--gr)">'+proj+'</div>';
     // Wave 5 round 11: Why explainer — small pill below projection
@@ -7867,7 +8573,7 @@ function _cpRenderPlanFull(){
     // ── Phase D: Owner selector (only when couple link exists) ──
     if(CPLAN._partner){
       var _curOwner=a.owner||'self';
-      var _selfFirst=(APP._currentClientName||'').split(' ')[0]||'Client';
+      var _selfFirst=((APP.currentClient&&APP.currentClient.name)||'').split(' ')[0]||'Client';
       var _spouseFirst=CPLAN._partner.firstName||'Partner';
       var _ownerColors={self:'#5B9BFF',spouse:'#A855F7',joint:'#22C55E'};
       var _ownerLabels={self:_selfFirst,spouse:_spouseFirst,joint:'Joint'};
@@ -8077,8 +8783,10 @@ function _cpRenderPlanFull(){
   }
   // ── Phase B: Cascade-engine widget containers ──
   h+='<div id="cplanChart" style="margin-bottom:14px"></div>';
+  h+='<div id="cplanPlanSummary" style="margin-bottom:14px"></div>';
   h+='<div id="cplanOutcomes" style="margin-bottom:14px"></div>';
   h+='<div id="cplanStressTests" style="background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:14px;min-height:80px"></div>';
+  h+='<div id="cplanDrawdown" style="margin-bottom:14px"></div>';
   h+='<div id="cplanRebalance" style="margin-bottom:14px"></div>';
   root.innerHTML=h;
   // Phase 1: refresh over-budget banner state every render
@@ -8088,8 +8796,10 @@ function _cpRenderPlanFull(){
     try{ if(typeof _cpRenderEFRunway==='function') _cpRenderEFRunway(); }catch(e){console.warn('EF runway:',e);}
     try{ if(typeof _cpRenderIncomeReplacement==='function') _cpRenderIncomeReplacement(); }catch(e){console.warn('Income replace:',e);}
     try{ if(typeof _cpRenderChart==='function') _cpRenderChart('cplanChart'); }catch(e){console.warn('Chart:',e);}
+    try{ if(typeof _cpRenderPlanSummary==='function') _cpRenderPlanSummary(); }catch(e){console.warn('Plan summary:',e);}
     try{ if(typeof _cpRenderOutcomes==='function') _cpRenderOutcomes(); }catch(e){console.warn('Outcomes:',e);}
     try{ if(typeof _cpRenderStressTests==='function') _cpRenderStressTests(); }catch(e){console.warn('Stress tests:',e);}
+    try{ if(typeof _cpRenderDrawdownPlan==='function') _cpRenderDrawdownPlan(); }catch(e){console.warn('Drawdown:',e);}
     try{ if(typeof _cpRenderRebalanceTriggers==='function') _cpRenderRebalanceTriggers(); }catch(e){console.warn('Rebalance:',e);}
     try{ _cpRenderAccountabilityBanner(); }catch(e){console.warn('Accountability:',e);}
   },0);
@@ -8097,6 +8807,27 @@ function _cpRenderPlanFull(){
 function _cpSetAmount(idx,val){
   CPLAN.allocations[idx].amount=Math.max(0,parseInt(val)||0);
   _cpEnforce();
+  CPLAN.modified=true;
+  _cpRenderPlanFull();
+}
+// Phase D multi-partner: inline retirement-age editors on the couple banner.
+// SESSION-ONLY: these update CPLAN locally so the advisor can explore "what if"
+// scenarios in real time. They do NOT persist to client_profiles.financial_data —
+// the source of truth for retirement age is pfos-main's Profile → retAge / spRetAge.
+// The advisor must edit there to commit. Marked modified so snapshot captures the
+// exploration if they save the plan.
+function _cpSetSelfRetAge(val){
+  var v=parseInt(val)||65;
+  if(v<50)v=50;if(v>80)v=80;
+  CPLAN.retirementAge=v;
+  CPLAN.modified=true;
+  _cpRenderPlanFull();
+}
+function _cpSetSpouseRetAge(val){
+  if(!CPLAN._partner)return;
+  var v=parseInt(val)||65;
+  if(v<50)v=50;if(v>80)v=80;
+  CPLAN._partner.retirementAge=v;
   CPLAN.modified=true;
   _cpRenderPlanFull();
 }
@@ -9362,16 +10093,16 @@ var _cpLearnShorts={
   ef:{t:'Emergency Fund',s:'High-yield savings for emergencies. Target: 3 months of expenses minimum. Funds the rest of the plan because without it, any disruption forces new debt.'},
   debt:{t:'Debt Elimination',s:'Pay down debt using avalanche (highest rate first), snowball (smallest balance first), hybrid (balanced), consolidation (single loan at lower rate), or IBC (build CV, kill debts via policy loans).'},
   protection:{t:'Insurance Protection',s:'Coverage review for life, disability, and umbrella insurance. With dependents, a coverage gap puts the family at financial risk if something happens to the breadwinner.'},
-  roth:{t:'Roth IRA',s:'Tax-free growth and tax-free withdrawals in retirement. 2026 limits: $7,000/yr base, $8,000/yr with 50+ catch-up. Income phase-outs apply.'},
+  roth:{t:'Roth IRA',s:'Tax-free growth and tax-free withdrawals in retirement. 2026 limits: $7,500/yr base, $8,600/yr with 50+ catch-up ($1,100). Income phase-outs apply.'},
   '401k':{t:'401(k) Match',s:'Employer matching contributions are the highest guaranteed return available. Capture the full match before any other retirement contribution. Always priority #1 for retirement.'},
-  roth401k:{t:'Roth 401(k)',s:'Employer-sponsored Roth bucket. Same 2026 limit as traditional 401(k) ($23,500/$30,500 with 50+ catch-up). No income phase-out, unlike Roth IRA.'},
+  roth401k:{t:'Roth 401(k)',s:'Employer-sponsored Roth bucket. Same 2026 limit as traditional 401(k): $24,500 base, $32,500 with 50+ catch-up, $35,750 with 60-63 super catch-up. No income phase-out, unlike Roth IRA.'},
   iul:{t:'Indexed Universal Life',s:'Permanent life insurance with cash value linked to a market index (capped & floored). Tax-free loans against CV. Properly designed: heavy paid-up additions, low base premium, the right carrier.'},
   wl:{t:'Whole Life',s:'Permanent life insurance with guaranteed cash value growth + dividends. Tax-free loans against CV. Most common underlying for IBC strategy.'},
   ibc:{t:'Infinite Banking Concept',s:'Properly designed WL or IUL used as a banking function. Pay debts via policy loans rather than direct payment, recapture interest, build CV. Requires correct policy structure to work.'},
   term_life:{t:'Term Life Insurance',s:'Temporary coverage for a fixed term (10-30 years). Pure death benefit, no cash value. Lower premiums than permanent. Good for income replacement during working years.'},
-  trad_ira:{t:'Traditional IRA',s:'Tax-deductible contributions, taxed at withdrawal. 2026 limits same as Roth ($7,000/$8,000 with 50+ catch-up). Income limits affect deductibility, not contribution.'},
-  solo401k:{t:'Solo 401(k)',s:'Self-employed retirement plan. Employee + employer contributions can total $69,000/yr ($76,500 with 50+ catch-up). Roth and Traditional buckets available.'},
-  sep_ira:{t:'SEP IRA',s:'Self-employed retirement plan. Employer contribution only — up to 25% of net self-employment income, capped at $69,000 for 2026.'},
+  trad_ira:{t:'Traditional IRA',s:'Tax-deductible contributions, taxed at withdrawal. 2026 limits same as Roth ($7,500/$8,600 with 50+ catch-up). Income limits affect deductibility, not contribution.'},
+  solo401k:{t:'Solo 401(k)',s:'Self-employed retirement plan. Employee + employer combined: $72,000 base, $80,000 with 50+ catch-up, $83,250 with 60-63 super catch-up. Roth and Traditional buckets available.'},
+  sep_ira:{t:'SEP IRA',s:'Self-employed retirement plan. Employer contribution only — up to 25% of net self-employment income, capped at $72,000 for 2026.'},
   hsa:{t:'Health Savings Account',s:'Triple tax advantage: tax-deductible contributions, tax-free growth, tax-free withdrawals for medical. Requires HDHP coverage. After 65, functions like a Traditional IRA for any purpose.'},
   edu:{t:'Education Savings',s:'529 (tax-free for qualified ed expenses), Coverdell ESA, UTMA, or WL/IUL cash value. 529 is most common but inflexible if child doesn\'t use for school.'},
   invest:{t:'Taxable Investment',s:'Brokerage account with stocks, bonds, index funds. No contribution limits, capital gains tax on growth. Flexible — accessible anytime. Use after retirement accounts are maxed.'},
@@ -9790,23 +10521,32 @@ function _cpRenderHealthScore(){
 // IRS limit note text — used inline for educational context. Annual figure derived
 // from monthly (_cpIRSMax × 12) so it stays consistent with the slider cap. If the
 // limits in _cpIRSMax change later, this updates automatically.
-function _cpIRSNote(type){
-  var age=CPLAN.age||30;var is50=age>=50;
-  var maxMo=_cpIRSMax(type);
+// Phase D multi-partner: accepts an optional allocation so spouse-owned items show
+// the spouse's catch-up status (and not the primary user's age).
+function _cpIRSNote(type,alloc){
+  var owner=(alloc&&alloc.owner)||'self';
+  var age=(owner==='spouse'&&CPLAN._partner&&CPLAN._partner.age)?CPLAN._partner.age:(CPLAN.age||30);
+  if(owner==='joint'&&CPLAN._partner&&CPLAN._partner.age)age=Math.max(CPLAN.age||30,CPLAN._partner.age);
+  var is50=age>=50;
+  var is60_63=age>=60&&age<=63;
+  var maxMo=_cpIRSMax(type,alloc||owner);
   if(maxMo>=99999)return '';
   var annual=maxMo*12;
+  // 60-63 super catch-up applies to 401k/403b/457b/Solo 401k only
+  var catchup401Note=is60_63?' — includes 60-63 super catch-up ($11,250)':(is50?' — includes 50+ catch-up ($8,000)':'');
+  var catchupIRANote=is50?' — includes 50+ catch-up ($1,100)':'';
   if(type==='roth'){
     if(maxMo===0)return '<span style="color:var(--yl)">⚠ Income above Roth IRA direct contribution limit — consider a <strong>backdoor Roth</strong> strategy.</span>';
-    return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo)'+(is50?' — includes 50+ catch-up':'');
+    return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo)'+catchupIRANote;
   }
-  if(type==='401k'||type==='roth401k')return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo)'+(is50?' — includes 50+ catch-up':'');
-  if(type==='trad_ira')return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo)'+(is50?' — includes 50+ catch-up':'');
-  if(type==='solo401k')return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo) — employee + employer combined';
+  if(type==='401k'||type==='roth401k')return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo)'+catchup401Note;
+  if(type==='trad_ira')return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo)'+catchupIRANote;
+  if(type==='solo401k')return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo) — employee + employer combined'+catchup401Note;
   if(type==='sep_ira')return 'IRS limit: 25% of net income, max $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo)';
   if(type==='hsa'){
     var hsaFamily=(CPLAN.hsaCoverage==='family'||CPLAN.hdhpCoverage==='family');
     var coverageLabel=hsaFamily?'family':'self-only';
-    var catchupLabel=age>=55?' — includes 55+ catch-up':'';
+    var catchupLabel=age>=55?' — includes 55+ catch-up ($1,000)':'';
     return 'IRS limit: $'+annual.toLocaleString()+'/yr ('+fmt(maxMo)+'/mo, '+coverageLabel+')'+catchupLabel;
   }
   return '';
@@ -11706,7 +12446,7 @@ async function renderAdvisorTracking(){
     if(isDone&&d2.note)h+='<div style="font-size:9px;color:var(--mu);font-style:italic">📝 '+esc(d2.note)+'</div>';
     if(isDone&&d2.source)h+='<div style="font-size:8px;color:var(--mu)">Tracked by: '+(d2.source==='client'?'Client':'Advisor')+'</div>';
     // Growth projection
-    if(['roth','401k','invest','iul','wl','edu','ibc'].indexOf(a.type)>=0){var rt=_advGetNetRate(a);var yr2=Math.max(1,65-(CPLAN.age||35));var bl=0;for(var y=1;y<=yr2;y++)bl=(bl+a.amount*12)*(1+rt);h+='<div style="font-size:9px;color:var(--gr)">→ '+fmtK(Math.round(bl))+' at retirement</div>';}
+    if(['roth','401k','invest','iul','wl','edu','ibc'].indexOf(a.type)>=0){var rt=_advGetNetRate(a);var yr2=_cpYrsToRetFor(a);var bl=0;for(var y=1;y<=yr2;y++)bl=(bl+a.amount*12)*(1+rt);h+='<div style="font-size:9px;color:var(--gr)">→ '+fmtK(Math.round(bl))+' at retirement</div>';}
     h+='</div><div style="text-align:right;flex-shrink:0;margin-right:8px"><div style="font-family:var(--fd);font-size:22px;color:'+c2+'">'+fmt(a.amount)+'</div><div style="font-size:8px;color:var(--mu)">/mo</div></div>';
     if(isDone)h+='<div style="padding:8px 16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr)">✓ Done</div>';
     else if(isMiss)h+='<div style="padding:8px 16px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--rd)">✗ Missed</div>';
