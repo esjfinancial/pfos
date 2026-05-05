@@ -3515,20 +3515,6 @@ function deleteManualBill(idx){
 }
 
 // ═══════════════════════════════════════════════════
-function buildOneActionHTML(){
-  var c=S.calcs; if(!c||!c.inc) return '';
-  var action=null;
-  if(c.netCF<0) action={icon:'🚨',title:'Fix Negative Cash Flow',desc:'You are spending '+fmt(Math.abs(c.netCF))+'/mo more than you earn. Cut expenses or increase income before any other financial action.',urgency:'Do this today',col:'var(--rd)'};
-  else if(c.efMonths<1) action={icon:'🛡️',title:'Start Your Emergency Fund',desc:'Open a high-yield savings account and automate '+fmt(Math.min(c.netCF*0.5,500))+'/mo transfers. Target: '+fmt(c.efT3)+' (3 months of expenses).',urgency:'This week',col:'var(--or)'};
-  else if(c.dti>43) action={icon:'💳',title:'Attack High-Interest Debt',desc:'Your DTI at '+c.dti.toFixed(0)+'% is critical. Put every extra dollar toward your highest-rate debt.',urgency:'This month',col:'var(--rd)'};
-  else if(c.efMonths<3) action={icon:'📈',title:'Build to 3-Month Emergency Fund',desc:'Continue saving until reserves reach '+fmt(c.efT3)+'. Currently '+c.efMonths.toFixed(1)+' months covered.',urgency:'Ongoing',col:'var(--yl)'};
-  else if(c.savingsRate<15) action={icon:'💰',title:'Boost Savings Rate to 15%',desc:'Current rate: '+c.savingsRate.toFixed(1)+'%. Increase by '+fmt(Math.round(c.inc*((15-c.savingsRate)/100)))+'/mo to hit the wealth-building threshold.',urgency:'This month',col:'var(--yl)'};
-  else if(c.retGap>0) action={icon:'🎯',title:'Close Retirement Gap',desc:'Increase retirement contributions by '+fmt(c.requiredMonthlyIncrease||0)+'/mo. Gap: '+fmtK(c.retGap)+'.',urgency:'This quarter',col:'#5B9BFF'};
-  else action={icon:'✅',title:'Stay the Course',desc:'Your financial fundamentals are solid. Focus on maintaining habits and reviewing quarterly.',urgency:'Keep going',col:'var(--gr)'};
-  return '<div style="padding:14px;background:'+action.col+'08;border:2px solid '+action.col+'30;border-radius:2px;margin-bottom:14px">'
-    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="font-size:24px">'+action.icon+'</span><div><div style="font-family:var(--fh);font-size:14px;font-weight:800;color:var(--wh)">'+action.title+'</div><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+action.col+'">'+action.urgency+'</div></div></div>'
-    +'<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7">'+action.desc+'</div></div>';
-}
 function buildTCOLHTML(){
   var c=S.calcs; if(!c||!c.inc) return '';
   var annNorm=0;
@@ -3539,6 +3525,89 @@ function buildTCOLHTML(){
     +(annNorm>0?'<div style="font-size:10px;color:var(--mu);margin-top:4px">Includes '+fmt(Math.round(annNorm))+'/mo from annual expenses</div>':'')
     +'</div>';
 }
+
+// ═══════════════════════════════════════════════════
+// SPENDING DONUT (Monarch / YNAB style) — shared helper
+// ═══════════════════════════════════════════════════
+// Renders an SVG donut breakdown of this month's spending by category, with a
+// legend on the right showing dollars and %. Hidden when no spending entries.
+// Same component is mirrored in pfos-client.html so the two surfaces match.
+var _SPENDING_CATS=[
+  {key:'housing',       label:'Housing',         icon:'🏠', color:'#5B9BFF'},
+  {key:'food',          label:'Food',            icon:'🍽️', color:'#22C55E'},
+  {key:'transportation',label:'Transportation',  icon:'🚗', color:'#A855F7'},
+  {key:'utilities',     label:'Utilities',       icon:'⚡', color:'#EAB308'},
+  {key:'insurance',     label:'Insurance',       icon:'🛡️', color:'#06B6D4'},
+  {key:'discretionary', label:'Discretionary',   icon:'🛍️', color:'#EC4899'},
+  {key:'subscriptions', label:'Subscriptions',   icon:'📱', color:'#8B5CF6'},
+  {key:'activeSavings', label:'Active Savings',  icon:'📈', color:'#10B981'},
+  {key:'misc',          label:'Other',           icon:'📦', color:'#94A3B8'}
+];
+function _spendingCategoryAggregates(monthEntries){
+  var totals={};
+  (monthEntries||[]).forEach(function(e){
+    var k=e.category||e.category_bucket||'misc';
+    totals[k]=(totals[k]||0)+(parseFloat(e.amount)||0);
+  });
+  var slices=_SPENDING_CATS.map(function(c){
+    return{key:c.key,label:c.label,icon:c.icon,color:c.color,amount:totals[c.key]||0};
+  }).filter(function(s){return s.amount>0;});
+  slices.sort(function(a,b){return b.amount-a.amount;});
+  return slices;
+}
+function _spendingDonutSVG(slices,totalSpent,totalIn){
+  var R=95,r=60,cx=110,cy=110;
+  var startA=-90;
+  var paths='';
+  if(slices.length===1){
+    paths+='<circle cx="'+cx+'" cy="'+cy+'" r="'+R+'" fill="'+slices[0].color+'" />';
+    paths+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="var(--bg)" />';
+  } else {
+    slices.forEach(function(s){
+      var pct=totalSpent>0?s.amount/totalSpent:0;
+      var endA=startA+pct*360;
+      var sa=startA*Math.PI/180,ea=endA*Math.PI/180;
+      var x1=cx+R*Math.cos(sa),y1=cy+R*Math.sin(sa);
+      var x2=cx+R*Math.cos(ea),y2=cy+R*Math.sin(ea);
+      var x3=cx+r*Math.cos(ea),y3=cy+r*Math.sin(ea);
+      var x4=cx+r*Math.cos(sa),y4=cy+r*Math.sin(sa);
+      var lg=pct>0.5?1:0;
+      var d='M '+x1+' '+y1+' A '+R+' '+R+' 0 '+lg+' 1 '+x2+' '+y2+' L '+x3+' '+y3+' A '+r+' '+r+' 0 '+lg+' 0 '+x4+' '+y4+' Z';
+      paths+='<path d="'+d+'" fill="'+s.color+'" stroke="var(--bg)" stroke-width="2" style="transition:opacity .15s" onmouseover="this.style.opacity=.82" onmouseout="this.style.opacity=1"><title>'+s.label+': $'+Math.round(s.amount).toLocaleString()+' ('+Math.round(pct*100)+'%)</title></path>';
+      startA=endA;
+    });
+  }
+  var pctIn=totalIn>0?Math.round(totalSpent/totalIn*100):0;
+  var svg='<svg viewBox="0 0 220 220" style="width:100%;max-width:240px;height:auto;display:block;margin:0 auto" aria-label="Spending breakdown">';
+  svg+=paths;
+  svg+='<text x="'+cx+'" y="'+(cy-12)+'" text-anchor="middle" font-size="9" fill="var(--mu)" font-family="var(--fh)" letter-spacing="1.5" style="font-weight:700">SPENT</text>';
+  svg+='<text x="'+cx+'" y="'+(cy+14)+'" text-anchor="middle" font-size="26" fill="var(--wh)" font-family="var(--fd)">$'+Math.round(totalSpent).toLocaleString()+'</text>';
+  svg+='<text x="'+cx+'" y="'+(cy+30)+'" text-anchor="middle" font-size="9" fill="var(--mu)" font-family="var(--fh)" font-weight="600">'+pctIn+'% of income</text>';
+  svg+='</svg>';
+  return svg;
+}
+function _spendingDonutBlock(monthEntries,totalSpent,totalIn){
+  if(!monthEntries||!monthEntries.length||totalSpent<=0) return '';
+  var slices=_spendingCategoryAggregates(monthEntries);
+  if(!slices.length) return '';
+  var h='<div class="sec-group"><div class="sec-group-title">📊 Spending Breakdown</div>';
+  h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;padding:16px;display:flex;align-items:center;gap:20px;flex-wrap:wrap">';
+  h+='<div style="flex:0 0 240px;min-width:200px;max-width:280px">'+_spendingDonutSVG(slices,totalSpent,totalIn)+'</div>';
+  h+='<div style="flex:1;min-width:240px">';
+  slices.forEach(function(s){
+    var pct=totalSpent>0?Math.round(s.amount/totalSpent*100):0;
+    h+='<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:12px">';
+    h+='<span style="width:10px;height:10px;background:'+s.color+';border-radius:2px;flex-shrink:0"></span>';
+    h+='<span style="font-size:14px">'+s.icon+'</span>';
+    h+='<span style="flex:1;color:var(--wh);font-family:var(--fh);font-weight:600">'+s.label+'</span>';
+    h+='<span style="font-family:var(--fd);font-size:14px;color:var(--wh);min-width:70px;text-align:right">$'+Math.round(s.amount).toLocaleString()+'</span>';
+    h+='<span style="font-family:var(--fh);font-size:11px;color:var(--mu);min-width:36px;text-align:right;font-weight:700">'+pct+'%</span>';
+    h+='</div>';
+  });
+  h+='</div></div></div>';
+  return h;
+}
+
 // HOME SECTION — Daily Financial Pulse
 // ═══════════════════════════════════════════════════
 if(!S.spendingEntries) S.spendingEntries=[];
@@ -3576,12 +3645,14 @@ function saveSnapshot(){
     alreadySpent:pf((document.getElementById('snapSpent')||{}).value),
     billsPaid:pf((document.getElementById('snapBills')||{}).value)
   };
+  S._touched=S._touched||{}; S._touched.snapshot=true;
   closeModal('snapModal');
   calc();renderHome();
 }
 function skipSnapshot(){
   var now=new Date();
   S.snapshot={setupDate:now.toISOString(),month:now.getMonth(),year:now.getFullYear(),dayOfMonth:now.getDate(),alreadySpent:0,billsPaid:0,checkingBalance:0,savingsBalance:0,skipped:true};
+  S._touched=S._touched||{}; S._touched.snapshot=true;
   renderHome();
 }
 
@@ -3633,8 +3704,6 @@ function renderHome(){
   var h='';
   // ── ADD EXPENSE + SAVINGS GOAL QUICK BUTTONS ──
   h+='<div style="display:flex;gap:8px;margin-bottom:12px"><button class="btn bbl" style="flex:1;padding:12px;font-size:13px" onclick="openQuickAdd()">+ Add Expense</button><button class="btn" style="flex:1;padding:12px;font-size:13px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr)" onclick="openSavingsGoalModal()">+ Savings Goal</button></div>';
-  // ── ONE ACTION ──
-  h+=buildOneActionHTML();
   // This Month Dashboard
   h+='<div class="sec-group"><div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:12px"><div class="sec-hdr">'+monthNames[curMonth]+' '+curYear+'</div><div style="font-family:var(--fh);font-size:11px;color:var(--mu)">Day '+dayOfMonth+' of '+daysInMonth+'</div></div>';
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:8px">';
@@ -3652,6 +3721,9 @@ function renderHome(){
   // Clickable to open the full accountability popup with plan-impact comparison.
   h+=_acctRenderBanner();
   h+='<div style="text-align:right;margin-bottom:12px"><button onclick="showSnapshotSetup()" style="background:none;border:1px solid rgba(91,155,255,.2);color:var(--mu);font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.06em;padding:6px 14px;border-radius:2px;cursor:pointer">📍 Recalibrate Starting Point</button></div></div>';
+
+  // ── SPENDING DONUT BREAKDOWN ──
+  h+=_spendingDonutBlock(monthEntries,moneyOut,moneyIn);
 
   // ── FINANCIAL TRACKING + TRUE COST OF LIVING ──
   var trackHTML=buildTrackingHTML();
@@ -4408,59 +4480,233 @@ function qaPayMethodChange(){
   }
   detail.innerHTML='';detail.style.display='none';
 }
+// ═══════════════════════════════════════════════════
+// SPENDING ENTRY SIDE EFFECTS — apply / reverse / edit
+// ═══════════════════════════════════════════════════
+// These three helpers centralize the side effects of a spending entry on
+// related state (credit-card balance, financed-debt creation, emergency-fund
+// drawdown, policy-loan increment + loan record). All spending-mutation paths
+// (saveSpendingEntry, deleteSpendingEntry, PFOS_QUICK_ADD, PFOS_EDIT_ENTRY,
+// PFOS_DELETE_ENTRY) call into these so the math stays consistent across
+// add / edit / delete and across in-page vs. portal-routed entries.
+
+// Find the preferred IBC policy list — explicit S.ibcPolicies, else WL/IUL filter on S.policies
+function _ibcPolicyList(){
+  if(S.ibcPolicies && S.ibcPolicies.length>0) return S.ibcPolicies;
+  return (S.policies||[]).filter(function(p){
+    var t=(p.type||'').toLowerCase();
+    return t.indexOf('whole')>=0 || t.indexOf('wl')>=0 || t.indexOf('iul')>=0;
+  });
+}
+
+// Apply side effects of `entry` to S. Mutates entry.payment_detail in place
+// for `financed` (replaces _createNewDebt flag with canonical {debt_id,...})
+// and `policy_loan` (replaces _incrementLoanBalance flag with canonical link).
+function _applySpendingSideEffects(entry){
+  if(!entry) return;
+  var amt=parseFloat(entry.amount)||0;
+  if(entry.payment_method==='credit_card' && entry.payment_detail && typeof entry.payment_detail.card_idx!=='undefined'){
+    var ci=entry.payment_detail.card_idx;
+    if(S.debts && S.debts[ci]){
+      S.debts[ci].balance=(parseFloat(S.debts[ci].balance)||0)+amt;
+    }
+  }
+  if(entry.payment_method==='financed' && entry.payment_detail && entry.payment_detail._createNewDebt){
+    if(!S.debts) S.debts=[];
+    var pd=entry.payment_detail;
+    var newDebt={
+      id:Date.now(),
+      name:pd.lender||entry.description||'Financed Purchase',
+      type:pd.type||'Personal Loan',
+      balance:amt,
+      rate:parseFloat(pd.rate)||0,
+      min:parseFloat(pd.min)||0,
+      actual:parseFloat(pd.min)||0
+    };
+    S.debts.push(newDebt);
+    // Replace the staging flag with a canonical reference back to the new debt
+    entry.payment_detail={debt_id:newDebt.id,debt_name:newDebt.name,rate:newDebt.rate,type:newDebt.type};
+  }
+  if(entry.payment_method==='emergency_fund'){
+    var sv=parseFloat(typeof gv==='function'?gv('aSavings'):0)||0;
+    var se=document.getElementById('aSavings');
+    if(se)se.value=Math.max(0,sv-amt);
+  }
+  if(entry.payment_method==='policy_loan' && entry.payment_detail && entry.payment_detail._incrementLoanBalance){
+    var allP=_ibcPolicyList();
+    var pli=parseInt(entry.payment_detail.policy_idx)||0;
+    if(allP[pli]){
+      var pol=allP[pli];
+      pol.loanBalance=(parseFloat(pol.loanBalance)||0)+amt;
+      if(!pol.loans) pol.loans=[];
+      pol.loans.push({
+        id:Date.now(),
+        amount:amt,
+        purpose:entry.payment_detail.purpose||entry.description||'Policy loan',
+        originationDate:entry.date||new Date().toISOString().split('T')[0],
+        rate:pol.loanRate||0.05,
+        spendingEntryId:entry.id
+      });
+      entry.payment_detail={policy_idx:pli, purpose:entry.payment_detail.purpose, policy_name:(pol.company||pol.carrier||'Policy')};
+    }
+  }
+}
+
+// Reverse side effects of `entry` from S. Used for delete and (combined with
+// _applySpendingSideEffects) for edit when payment method changes. For
+// `financed`, removes the linked debt if untouched (balance ≈ entry amount),
+// otherwise just decrements the debt balance — preserves any payments the
+// user has already made against the debt. For `policy_loan`, removes the
+// matching loan record by spendingEntryId and decrements pol.loanBalance.
+function _reverseSpendingSideEffects(entry){
+  if(!entry) return;
+  var amt=parseFloat(entry.amount)||0;
+  if(entry.payment_method==='credit_card' && entry.payment_detail && typeof entry.payment_detail.card_idx!=='undefined'){
+    var rci=entry.payment_detail.card_idx;
+    if(S.debts && S.debts[rci]){
+      S.debts[rci].balance=Math.max(0,(parseFloat(S.debts[rci].balance)||0)-amt);
+    }
+  }
+  if(entry.payment_method==='financed' && entry.payment_detail && entry.payment_detail.debt_id){
+    if(S.debts){
+      var dIdx=-1;
+      for(var i=0;i<S.debts.length;i++){
+        if(S.debts[i].id===entry.payment_detail.debt_id){dIdx=i;break;}
+      }
+      if(dIdx>=0){
+        var dbt=S.debts[dIdx];
+        var bal=parseFloat(dbt.balance)||0;
+        // If balance still equals the original financed amount (within $1), the user
+        // hasn't paid anything yet — safe to remove the debt entirely. Otherwise
+        // there's been activity (payments toward the debt), so we just decrement.
+        if(Math.abs(bal-amt)<1){
+          S.debts.splice(dIdx,1);
+        } else {
+          dbt.balance=Math.max(0,bal-amt);
+        }
+      }
+    }
+  }
+  if(entry.payment_method==='emergency_fund'){
+    var sv=parseFloat(typeof gv==='function'?gv('aSavings'):0)||0;
+    var se=document.getElementById('aSavings');
+    if(se)se.value=sv+amt;
+  }
+  if(entry.payment_method==='policy_loan' && entry.payment_detail && typeof entry.payment_detail.policy_idx!=='undefined'){
+    var allP=_ibcPolicyList();
+    var pli=parseInt(entry.payment_detail.policy_idx);
+    if(!isNaN(pli) && allP[pli]){
+      var pol=allP[pli];
+      if(pol.loans){
+        pol.loans=pol.loans.filter(function(ln){return ln.spendingEntryId!==entry.id;});
+      }
+      pol.loanBalance=Math.max(0,(parseFloat(pol.loanBalance)||0)-amt);
+    }
+  }
+}
+
+// Edit-mode side effect handler. For most cases, reverse + apply works.
+// For financed and policy_loan where the payment method is unchanged, we
+// adjust in place rather than churn the debt or loan record — this preserves
+// debt id, payment history, and loan origination date. Mutates merged.payment_detail
+// to carry over the canonical link from orig.
+function _editSpendingSideEffects(orig, merged){
+  if(!orig || !merged) return;
+  var origAmt=parseFloat(orig.amount)||0;
+  var newAmt=parseFloat(merged.amount)||0;
+  // Same-method financed → adjust the linked debt's balance by delta
+  if(orig.payment_method==='financed' && merged.payment_method==='financed'
+     && orig.payment_detail && orig.payment_detail.debt_id && S.debts){
+    var dIdx=-1;
+    for(var i=0;i<S.debts.length;i++){
+      if(S.debts[i].id===orig.payment_detail.debt_id){dIdx=i;break;}
+    }
+    if(dIdx>=0){
+      var delta=newAmt-origAmt;
+      S.debts[dIdx].balance=Math.max(0,(parseFloat(S.debts[dIdx].balance)||0)+delta);
+      // Carry over canonical reference so the entry still links to the same debt
+      merged.payment_detail=orig.payment_detail;
+      return;
+    }
+  }
+  // Same-method policy_loan → adjust pol.loanBalance and the loan record by delta
+  if(orig.payment_method==='policy_loan' && merged.payment_method==='policy_loan'
+     && orig.payment_detail && typeof orig.payment_detail.policy_idx!=='undefined'){
+    var allP=_ibcPolicyList();
+    var pli2=parseInt(orig.payment_detail.policy_idx);
+    if(!isNaN(pli2) && allP[pli2]){
+      var pol2=allP[pli2];
+      var delta2=newAmt-origAmt;
+      pol2.loanBalance=Math.max(0,(parseFloat(pol2.loanBalance)||0)+delta2);
+      if(pol2.loans){
+        for(var j=0;j<pol2.loans.length;j++){
+          if(pol2.loans[j].spendingEntryId===orig.id){
+            pol2.loans[j].amount=newAmt;
+            if(merged.payment_detail && merged.payment_detail.purpose) pol2.loans[j].purpose=merged.payment_detail.purpose;
+            break;
+          }
+        }
+      }
+      merged.payment_detail=orig.payment_detail;
+      return;
+    }
+  }
+  // Default: reverse old, then apply new
+  _reverseSpendingSideEffects(orig);
+  _applySpendingSideEffects(merged);
+}
+
 function simplifyCategory(cat){var map={housing:'housing',utilities:'housing',food:'food',transportation:'transportation',insurance:'housing',subscriptions:'entertainment',discretionary:'entertainment',activeSavings:'other',misc:'other'};return map[cat]||'other';}
 function saveSpendingEntry(){
   var amt=pf((document.getElementById('qaAmount')||{}).value);
   if(amt<=0){var ae=document.getElementById('qaAmount');if(ae){ae.style.borderColor='var(--rd)';ae.focus();}return;}
+  // Build entry. Stage payment_detail with raw flags (_createNewDebt for financed, _incrementLoanBalance for policy_loan)
+  // and let _applySpendingSideEffects/_editSpendingSideEffects normalize them — same code path PFOS_QUICK_ADD uses.
   var entry={id:Date.now(),amount:amt,description:(document.getElementById('qaDesc')||{}).value||'',category:(document.getElementById('qaCat')||{}).value||'misc',category_bucket:simplifyCategory((document.getElementById('qaCat')||{}).value||'misc'),expense_type:(document.getElementById('qaType')||{}).value||'regular',payment_method:(document.getElementById('qaPayMethod')||{}).value||'debit',payment_detail:{},couple_owner:(document.getElementById('qaOwner')||{}).value||'self',is_recurring:!!(document.getElementById('qaRecurring')||{}).checked,recurrence_freq:(document.getElementById('qaRecurFreq')||{}).value||'monthly',date:(document.getElementById('qaDate')||{}).value||new Date().toISOString().split('T')[0],created_at:new Date().toISOString()};
-  if(entry.payment_method==='credit_card'){var ci=parseInt((document.getElementById('qaCardIdx')||{}).value);if(!isNaN(ci)&&S.debts&&S.debts[ci]){entry.payment_detail={card_idx:ci,card_name:S.debts[ci].name,apr:S.debts[ci].rate};S.debts[ci].balance=(parseFloat(S.debts[ci].balance)||0)+amt;}}
+  // Stage payment_detail by method — flags consumed by _applySpendingSideEffects
+  if(entry.payment_method==='credit_card'){
+    var ci=parseInt((document.getElementById('qaCardIdx')||{}).value);
+    if(!isNaN(ci)&&S.debts&&S.debts[ci])entry.payment_detail={card_idx:ci,card_name:S.debts[ci].name,apr:S.debts[ci].rate};
+  }
   if(entry.payment_method==='financed'){
-    if(!S.debts)S.debts=[];
     var finName=(document.getElementById('qaFinName')||{}).value||entry.description||'Financed Purchase';
     var finRate=pf((document.getElementById('qaFinRate')||{}).value);
     var finMin=pf((document.getElementById('qaFinMin')||{}).value);
     var finType=(document.getElementById('qaFinType')||{}).value||'Personal Loan';
-    var newDebt={id:Date.now(),name:finName,type:finType,balance:amt,rate:finRate,min:finMin,actual:finMin};
-    S.debts.push(newDebt);
-    entry.payment_detail={debt_id:newDebt.id,debt_name:finName,rate:finRate,type:finType};
+    entry.payment_detail={lender:finName,rate:finRate,min:finMin,type:finType,_createNewDebt:true};
   }
-  // ── Policy loan: increment chosen IBC policy's loan balance + track purpose ──
   if(entry.payment_method==='policy_loan'){
     var pliRaw = (document.getElementById('qaPolicyIdx') || {}).value;
     var pli = (pliRaw != null && pliRaw !== '') ? parseInt(pliRaw) : 0;
     var pPurpose = (document.getElementById('qaPolicyLoanPurpose') || {}).value || entry.description || 'Policy loan';
-    if(!S.ibcPolicies) S.ibcPolicies = [];
-    var allPolicies = S.ibcPolicies.length > 0 ? S.ibcPolicies : (S.policies || []).filter(function(p){
-      var t = (p.type || '').toLowerCase();
-      return t.indexOf('whole') >= 0 || t.indexOf('wl') >= 0 || t.indexOf('iul') >= 0;
-    });
-    if(allPolicies[pli]){
-      var pol = allPolicies[pli];
-      pol.loanBalance = (parseFloat(pol.loanBalance) || 0) + amt;
-      // Track loans array so each loan has its own purpose/origination date
-      if(!pol.loans) pol.loans = [];
-      pol.loans.push({
-        id: Date.now(),
-        amount: amt,
-        purpose: pPurpose,
-        originationDate: entry.date || new Date().toISOString().split('T')[0],
-        rate: pol.loanRate || 0.05,
-        spendingEntryId: entry.id
-      });
-      entry.payment_detail = {policy_idx: pli, purpose: pPurpose, policy_name: (pol.company || pol.carrier || 'Policy')};
-    }
+    entry.payment_detail={policy_idx:pli, purpose:pPurpose, _incrementLoanBalance:true};
   }
-  if(entry.payment_method==='emergency_fund'){var sv=parseFloat(gv('aSavings'))||0;var se=document.getElementById('aSavings');if(se)se.value=Math.max(0,sv-amt);}
   if(!S.spendingEntries)S.spendingEntries=[];
-  if(_qaEditIdx>=0)S.spendingEntries[_qaEditIdx]=entry;else S.spendingEntries.push(entry);
+  if(_qaEditIdx>=0 && S.spendingEntries[_qaEditIdx]){
+    // Edit mode — preserve id and created_at, run edit-side-effects (handles cc/financed/policy_loan/EF reverse+apply)
+    var orig=S.spendingEntries[_qaEditIdx];
+    entry.id=orig.id;
+    entry.created_at=orig.created_at;
+    entry.updated_at=new Date().toISOString();
+    _editSpendingSideEffects(orig, entry);
+    S.spendingEntries[_qaEditIdx]=entry;
+  } else {
+    // New entry
+    _applySpendingSideEffects(entry);
+    S.spendingEntries.push(entry);
+  }
+  S._touched=S._touched||{}; S._touched.spendingEntries=true;
   _qaEditIdx=-1;calc();closeModal('quickAddModal');if(_currentSection==='home')renderHome();
 }
 function editSpendingEntry(idx){openQuickAdd(idx);}
 function deleteSpendingEntry(idx){
-  if(!S.spendingEntries||!S.spendingEntries[idx])return;var e=S.spendingEntries[idx];
-  if(e.payment_method==='credit_card'&&e.payment_detail&&e.payment_detail.card_idx!==undefined){var ci=e.payment_detail.card_idx;if(S.debts&&S.debts[ci])S.debts[ci].balance=Math.max(0,(parseFloat(S.debts[ci].balance)||0)-(parseFloat(e.amount)||0));}
-  if(e.payment_method==='emergency_fund'){var sv=parseFloat(gv('aSavings'))||0;var se=document.getElementById('aSavings');if(se)se.value=sv+(parseFloat(e.amount)||0);}
-  S.spendingEntries.splice(idx,1);calc();if(_currentSection==='home')renderHome();
+  if(!S.spendingEntries||!S.spendingEntries[idx])return;
+  var e=S.spendingEntries[idx];
+  _reverseSpendingSideEffects(e);
+  S.spendingEntries.splice(idx,1);
+  S._touched=S._touched||{}; S._touched.spendingEntries=true;
+  calc();
+  if(_currentSection==='home')renderHome();
 }
 function updateProfileSidebar(){
   var nm=getFullName();
@@ -9431,6 +9677,7 @@ function captureSnapshot(){
   S.snapshots.sort(function(a,b){return new Date(a.date)-new Date(b.date);});
   // Keep max 36 months
   if(S.snapshots.length>36) S.snapshots=S.snapshots.slice(-36);
+  S._touched=S._touched||{}; S._touched.snapshots=true;
   renderTracking();
   // Trigger save
   try{window.parent.postMessage({type:'SAVE_STATE',clientState:JSON.parse(JSON.stringify(S))},'*');}catch(e){}
@@ -10071,63 +10318,13 @@ function submitAdvisorRequestFromModal(){
           created_at:entry.created_at||new Date().toISOString(),
           _source:entry._source||'portal'
         };
-        // Side effects matching saveSpendingEntry — keeps the portal path at full parity
-        // with the pfos-main quickAddModal path.
-        // 1) credit_card → increment the chosen card's balance
-        if(normalized.payment_method==='credit_card'&&normalized.payment_detail&&typeof normalized.payment_detail.card_idx!=='undefined'){
-          var ci=normalized.payment_detail.card_idx;
-          if(S.debts&&S.debts[ci]){
-            S.debts[ci].balance=(parseFloat(S.debts[ci].balance)||0)+normalized.amount;
-          }
-        }
-        // 2) financed → create a new debt and re-link payment_detail to it
-        if(normalized.payment_method==='financed'&&normalized.payment_detail&&normalized.payment_detail._createNewDebt){
-          if(!S.debts)S.debts=[];
-          var pd=normalized.payment_detail;
-          var newDebt={
-            id:Date.now(),
-            name:pd.lender||normalized.description||'Financed Purchase',
-            type:pd.type||'Personal Loan',
-            balance:normalized.amount,
-            rate:parseFloat(pd.rate)||0,
-            min:parseFloat(pd.min)||0,
-            actual:parseFloat(pd.min)||0
-          };
-          S.debts.push(newDebt);
-          // Replace the staging payment_detail with the canonical link
-          normalized.payment_detail={debt_id:newDebt.id,debt_name:newDebt.name,rate:newDebt.rate,type:newDebt.type};
-        }
-        // 3) emergency_fund → reduce the savings input on the form (mirrors saveSpendingEntry)
-        if(normalized.payment_method==='emergency_fund'){
-          var sv=parseFloat(typeof gv==='function'?gv('aSavings'):0)||0;
-          var se=document.getElementById('aSavings');
-          if(se)se.value=Math.max(0,sv-normalized.amount);
-        }
-        // 4) policy_loan → increment chosen IBC policy's loanBalance + push to loans[] for tracking
-        if(normalized.payment_method==='policy_loan' && normalized.payment_detail && normalized.payment_detail._incrementLoanBalance){
-          if(!S.ibcPolicies) S.ibcPolicies = [];
-          var pli2 = parseInt(normalized.payment_detail.policy_idx) || 0;
-          var allPolicies2 = S.ibcPolicies.length > 0 ? S.ibcPolicies : (S.policies || []).filter(function(p){
-            var t = (p.type || '').toLowerCase();
-            return t.indexOf('whole') >= 0 || t.indexOf('wl') >= 0 || t.indexOf('iul') >= 0;
-          });
-          if(allPolicies2[pli2]){
-            var pol2 = allPolicies2[pli2];
-            pol2.loanBalance = (parseFloat(pol2.loanBalance) || 0) + normalized.amount;
-            if(!pol2.loans) pol2.loans = [];
-            pol2.loans.push({
-              id: Date.now(),
-              amount: normalized.amount,
-              purpose: normalized.payment_detail.purpose || normalized.description || 'Policy loan',
-              originationDate: normalized.date,
-              rate: pol2.loanRate || 0.05,
-              spendingEntryId: normalized.id
-            });
-            // Replace flag with canonical reference
-            normalized.payment_detail = {policy_idx: pli2, purpose: normalized.payment_detail.purpose, policy_name: (pol2.company || pol2.carrier || 'Policy')};
-          }
-        }
+        // Apply side effects via the shared helper — handles credit_card balance, financed-debt
+        // creation (via _createNewDebt flag), emergency_fund drawdown, and policy_loan increment
+        // (via _incrementLoanBalance flag). Mutates normalized.payment_detail in place to replace
+        // the staging flags with canonical links.
+        _applySpendingSideEffects(normalized);
         S.spendingEntries.push(normalized);
+        S._touched=S._touched||{}; S._touched.spendingEntries=true;
         // Recalc + persist (debounced to coalesce with any other changes)
         try{if(typeof calc==='function')calc();}catch(e){}
         clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
@@ -10135,6 +10332,90 @@ function submitAdvisorRequestFromModal(){
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
         else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
       }catch(e){console.warn('PFOS_QUICK_ADD:',e);}
+      return;
+    }
+    // ── PFOS_EDIT_ENTRY ──
+    // Sent from pfos-client when user edits a spending entry from My Spending Recent.
+    // Locates by entry id, replaces fields, recalcs and persists. Keeps pfos-main canonical.
+    if(msg.type==='PFOS_EDIT_ENTRY'){
+      try{
+        var upd=msg.entry||{};
+        if(!upd.id||!S.spendingEntries)return;
+        var idx=-1;
+        for(var i=0;i<S.spendingEntries.length;i++){
+          if(S.spendingEntries[i].id===upd.id){idx=i;break;}
+        }
+        if(idx<0)return;
+        var orig=S.spendingEntries[idx];
+        // Build merged entry (preserves id and created_at)
+        var merged={
+          id:orig.id,
+          amount:parseFloat(upd.amount)||0,
+          description:upd.description||'',
+          category:upd.category||'misc',
+          category_bucket:upd.category_bucket||(typeof simplifyCategory==='function'?simplifyCategory(upd.category||'misc'):(upd.category||'misc')),
+          expense_type:upd.expense_type||'regular',
+          payment_method:upd.payment_method||'debit',
+          payment_detail:upd.payment_detail||{},
+          couple_owner:upd.couple_owner||'self',
+          is_recurring:!!upd.is_recurring,
+          recurrence_freq:upd.recurrence_freq||'monthly',
+          date:upd.date||orig.date,
+          created_at:orig.created_at,
+          updated_at:new Date().toISOString(),
+          _source:upd._source||'portal'
+        };
+        // Edit-mode side effects via shared helper. Handles all four payment methods
+        // and the special same-method case for financed/policy_loan (adjusts in place
+        // rather than churning the debt or loan record).
+        _editSpendingSideEffects(orig, merged);
+        S.spendingEntries[idx]=merged;
+        S._touched=S._touched||{}; S._touched.spendingEntries=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+      }catch(e){console.warn('PFOS_EDIT_ENTRY:',e);}
+      return;
+    }
+    // ── PFOS_DELETE_ENTRY ──
+    // Sent from pfos-client when user deletes a spending entry from My Spending Recent.
+    // Locates by id, reverses side effects via shared helper (cc balance, financed-debt
+    // removal, EF restore, policy_loan record cleanup), removes from array, persists.
+    if(msg.type==='PFOS_DELETE_ENTRY'){
+      try{
+        var did=msg.entryId;
+        if(!did||!S.spendingEntries)return;
+        var dIdx=-1;
+        for(var di=0;di<S.spendingEntries.length;di++){
+          if(S.spendingEntries[di].id===did){dIdx=di;break;}
+        }
+        if(dIdx<0)return;
+        var dEntry=S.spendingEntries[dIdx];
+        _reverseSpendingSideEffects(dEntry);
+        S.spendingEntries.splice(dIdx,1);
+        S._touched=S._touched||{}; S._touched.spendingEntries=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+      }catch(e){console.warn('PFOS_DELETE_ENTRY:',e);}
+      return;
+    }
+    // ── PFOS_SNAPSHOT_SET ──
+    // Sent from pfos-client when user calibrates their starting point from My Spending.
+    // Replaces S.snapshot, persists, refreshes home view.
+    if(msg.type==='PFOS_SNAPSHOT_SET'){
+      try{
+        var ss=msg.snapshot||{};
+        if(!ss.setupDate)ss.setupDate=new Date().toISOString();
+        if(ss.month==null)ss.month=new Date().getMonth();
+        if(ss.year==null)ss.year=new Date().getFullYear();
+        if(ss.dayOfMonth==null)ss.dayOfMonth=new Date().getDate();
+        S.snapshot=ss;
+        S._touched=S._touched||{}; S._touched.snapshot=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+      }catch(e){console.warn('PFOS_SNAPSHOT_SET:',e);}
       return;
     }
     // ── PFOS_DEBT_PAID_OFF ──
