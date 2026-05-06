@@ -22814,13 +22814,32 @@ function _cpConvertAIRecs(aiData){
   var secMap={emergency_fund:{type:'ef',phase:1},debt:{type:'debt',phase:1},protection:{type:'protection',phase:1},retirement:{type:'roth',phase:3},investment:{type:'invest',phase:3},insurance:{type:'protection',phase:1},education:{type:'edu',phase:3},tax:{type:'invest',phase:4},estate:{type:'custom',phase:2},general:{type:'custom',phase:3}};
   var stratMap={'roth_ira':{type:'roth'},'roth_401k':{type:'roth401k'},'401k':{type:'401k'},'traditional_ira':{type:'trad_ira'},'solo_401k':{type:'solo401k'},'sep_ira':{type:'sep_ira'},'iul':{type:'iul'},'whole_life':{type:'wl'},'ibc_wl':{type:'ibc'},'ibc_iul':{type:'ibc'},'ibc':{type:'ibc'},'hsa':{type:'hsa'},'529':{type:'edu'},'coverdell':{type:'edu'},'utma':{type:'edu'},'emergency_fund':{type:'ef'},'debt_payoff':{type:'debt'},'term_life':{type:'protection'},'estate_planning':{type:'custom'},'protection_review':{type:'protection'},'rollover_myga':{type:'rollover'},'rollover_fia':{type:'rollover'},'rollover_roth_conversion':{type:'rollover'},'invest':{type:'invest'},'custom_goal':{type:'custom'}};
   var _stratKeys=Object.keys(stratMap).sort(function(a,b){return b.length-a.length;});
+  // Section-locked types: when the AI returns one of these sections, the type
+  // is determined entirely by the section — the strategy field cannot override.
+  // Reasoning: 'emergency_fund', 'debt', and 'protection' are semantically
+  // unambiguous (EF goes to HYSA, debt is debt, protection is action-only term/DI/LTC).
+  // The strategy field is meant to differentiate WITHIN sections that span
+  // multiple vehicles (retirement → roth/401k/iul/etc., investment → invest/brokerage,
+  // education → 529/coverdell/wl-cv/iul-cv). Without this lock, an AI that returns
+  // section='emergency_fund' but strategy='invest' (or partial-match of 'investment')
+  // gets type='invest' and renders investment-style growth projections (7%/yr at 20yr)
+  // on what should be a 4% HYSA showing only "X months to target."
+  var _sectionLocked={emergency_fund:true,debt:true,protection:true};
   var usedPool=0;
   var sortedRecs=aiData.recommendations.slice().sort(function(a2,b2){var p2={high:0,medium:1,low:2};return(p2[a2.priority]||1)-(p2[b2.priority]||1);});
   sortedRecs.forEach(function(r){
     var map=secMap[r.section]||{type:'custom',phase:3};
-    if(r.strategy){var _sm=stratMap[r.strategy];if(!_sm){for(var _si=0;_si<_stratKeys.length;_si++){if(r.strategy.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}}}if(_sm)map.type=_sm.type;}
+    if(r.strategy && !_sectionLocked[r.section]){var _sm=stratMap[r.strategy];if(!_sm){for(var _si=0;_si<_stratKeys.length;_si++){if(r.strategy.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}}}if(_sm)map.type=_sm.type;}
     // Title-based type override — safety net when AI strategy string doesn't match
     var _tl=(r.title||'').toLowerCase();
+    // EF safety net: if title clearly says "emergency fund" or "emergency reserve",
+    // force type='ef' regardless of section/strategy. Catches the case where the AI
+    // categorized it differently (e.g., section='general' with strategy='savings').
+    var _isEFTitle=_tl.indexOf('emergency fund')>=0||_tl.indexOf('emergency reserve')>=0||_tl.indexOf('emergency savings')>=0;
+    if(_isEFTitle){
+      map.type='ef';
+      map.phase=Math.min(map.phase||1,1);// EF is always Phase 1 (triage)
+    }
     var _isEduTitle=_tl.indexOf('education')>=0||_tl.indexOf('college')>=0||_tl.indexOf('529')>=0;
     // Education items get priority — set type='edu' and detect vehicle from title
     if(_isEduTitle){
@@ -23459,35 +23478,62 @@ function _cpShowApproachFork(){
         'roth':'free','roth401k':'free','hsa':'free','iul':'free','wl':'free','ibc':'free',
         'invest':'ltcg'
       };
+      // Try the cascade-aware simulation first. It honors phase transitions:
+      //   • Phase 1: high-rate debt + EF take most of surplus, growth gets crumbs
+      //   • Phase 2: debt cleared + EF funded → freed money cascades to growth vehicles
+      //   • Phase 3+: long-term compounding at full deployment
+      // The previous straight-line projection used Phase 1 amounts for the entire
+      // 30-yr horizon, which collapsed all three approaches to ~$2.1M regardless
+      // of vehicle mix because growth-deployed dollars were always limited to ~$2K/mo.
+      // Falls back to the legacy compounder below if the sim fails for any reason.
+      var _simBased=_cpProjectApproachWithSim(data);
       var _apprYrs=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
       var _apprRetVal=0;
       var _apprBuckets={ord:0,ltcg:0,free:0};
-      // Iterate the recommendations array (the actual AI response field).
-      // Falls back to data.allocations only if the older field is present
-      // for backward compatibility with cached/saved plans.
-      _recs.forEach(function(al){
-        var amt=al.monthly_cost||al.amount||0;if(amt<=0)return;
-        var rawStrat=(al.strategy||al.type||'').toLowerCase();
-        var aType=_apprStratMap[rawStrat]||rawStrat;
-        if(_retVehiclesAppr.indexOf(aType)<0)return;
-        var rate=0.065;// Default net return assumption (matches _cpGetGrossRate non-insurance default after fees)
-        if(aType==='wl')rate=0.04;
-        else if(aType==='iul')rate=0.055;
-        else if(aType==='ibc')rate=(rawStrat==='ibc_iul')?0.055:0.04; // honor underlying
-        else if(aType==='hsa')rate=0.055; // 6% gross - 0.5% fees
-        else if(aType==='invest')rate=0.065; // 7.5% moderate gross - 1% expense ratio
-        else if(aType==='401k'||aType==='roth401k')rate=0.06; // 7% gross - 1% plan fees
-        var bal=0;for(var _ay=1;_ay<=_apprYrs;_ay++){bal=(bal+amt*12)*(1+rate);}
-        _apprRetVal+=bal;
-        // Categorize for weighted tax — prefer explicit bucket, fall back to 'ord'
-        var _bk=_apprTaxBucket[aType]||'ord';
-        _apprBuckets[_bk]+=bal;
-      });
-      // Phase 2: sustainability (PMT, 25-yr, 1% real) — not 4% rule
-      var _apprR=0.01/12,_apprN=300;
-      var _apprPMTfactor=_apprR/(1-Math.pow(1+_apprR,-_apprN));
-      var retInc=_apprRetVal>0?Math.round(_apprRetVal*_apprPMTfactor):(hl.projected_monthly_income||0);
-      // Also recalculate retVal from our formula if we have allocation data
+      if(_simBased&&_simBased.retValue>0){
+        // Sim path: use endpoint balance + per-allocation tax-bucket categorization
+        _apprRetVal=_simBased.retValue;
+        (_simBased.allocEndBalances||[]).forEach(function(ab){
+          var aType=_apprStratMap[(ab.type||'').toLowerCase()]||ab.type;
+          if(_retVehiclesAppr.indexOf(aType)<0)return;
+          var _bk=_apprTaxBucket[aType]||'ord';
+          _apprBuckets[_bk]+=(ab.endBal||0);
+        });
+      } else {
+        // Legacy fallback: straight-line compounding from monthly_cost (no cascade)
+        _recs.forEach(function(al){
+          var amt=al.monthly_cost||al.amount||0;if(amt<=0)return;
+          var rawStrat=(al.strategy||al.type||'').toLowerCase();
+          var aType=_apprStratMap[rawStrat]||rawStrat;
+          if(_retVehiclesAppr.indexOf(aType)<0)return;
+          var rate=0.065;
+          if(aType==='wl')rate=0.04;
+          else if(aType==='iul')rate=0.055;
+          else if(aType==='ibc')rate=(rawStrat==='ibc_iul')?0.055:0.04;
+          else if(aType==='hsa')rate=0.055;
+          else if(aType==='invest')rate=0.065;
+          else if(aType==='401k'||aType==='roth401k')rate=0.06;
+          var bal=0;for(var _ay=1;_ay<=_apprYrs;_ay++){bal=(bal+amt*12)*(1+rate);}
+          _apprRetVal+=bal;
+          var _bk=_apprTaxBucket[aType]||'ord';
+          _apprBuckets[_bk]+=bal;
+        });
+      }
+      // Sustainability: prefer sim's projRetIncome (already cascade-aware + uses
+      // dynamic mortality from _cpYearsInRetirement). Fall back to PMT formula
+      // with the same dynamic mortality so the answer is consistent either way.
+      var retInc;
+      if(_simBased&&_simBased.retIncome>0){
+        retInc=_simBased.retIncome;
+      } else if(_apprRetVal>0){
+        var _yrsInRet=_cpYearsInRetirement();
+        var _apprR=0.01/12,_apprN=_yrsInRet*12;
+        var _apprPMTfactor=_apprR/(1-Math.pow(1+_apprR,-_apprN));
+        retInc=Math.round(_apprRetVal*_apprPMTfactor);
+      } else {
+        retInc=hl.projected_monthly_income||0;
+      }
+      // Also recalculate retVal from our computed value if we have data
       if(_apprRetVal>0)retVal=Math.round(_apprRetVal);
       // F5: Compute the tax bracket from RETIREMENT income, not current income.
       // The label "X% bracket" appears next to taxable retirement income, so it
@@ -23705,6 +23751,82 @@ function _cpDoAIGenerate(){
       });
     });
   });
+}
+
+// ── PER-APPROACH PROJECTION VIA FULL SIMULATION ───────────────────────────
+// Runs _cpRunSimulation() against an approach's recommendations to get the
+// cascade-aware end-state retirement value and sustainable monthly income.
+//
+// Why this exists: the strategy fork shows three approach cards, each with
+// different vehicle mixes. The previous projection used each rec's
+// monthly_cost (Phase 1 amount only) and compounded it for 30 years —
+// missing the cascade effect entirely. With debt eating most of Phase 1's
+// surplus, only ~$2K/mo got projected as growth, yielding ~$2.1M for every
+// approach regardless of vehicle mix. After cascade, Phase 2 deploys the
+// FULL surplus to growth (debt cleared, EF funded). That post-cascade amount
+// is what compounds for 25-30 years, so the real retirement value is much
+// higher and DIFFERS meaningfully between approaches.
+//
+// How it works: temporarily swap CPLAN.allocations with the approach's
+// allocations (built via _cpConvertAIRecs), run the full cascade simulation,
+// capture projRetValue + projRetIncome, then restore CPLAN.allocations.
+// Cached on approachData._simResult so re-renders during loading don't
+// re-run the sim. Cache is naturally invalidated when CPLAN._approaches[k]
+// is reassigned on regenerate (the data object is replaced wholesale).
+function _cpProjectApproachWithSim(approachData){
+  if(!approachData||!approachData.recommendations||!approachData.recommendations.length)return null;
+  if(approachData._simResult)return approachData._simResult;
+  // Save state — sim writes CPLAN._sim and we'll be replacing CPLAN.allocations
+  var _savedAllocs=CPLAN.allocations;
+  var _savedSim=CPLAN._sim;
+  var _savedProjMode=CPLAN._projectionMode;
+  var result=null;
+  try{
+    // Force trajectory mode — fork comparisons assume "all accounts in place".
+    // Without this, the sim's tracking gate would zero out contributions for
+    // any allocation not yet marked Done (which is all of them, since the user
+    // hasn't picked an approach yet).
+    CPLAN._projectionMode='preview';
+    // Convert recs to allocations (this clears CPLAN.allocations and rebuilds via secMap/stratMap)
+    _cpConvertAIRecs(approachData);
+    // Run cascade-aware simulation. Writes results to CPLAN._sim.
+    var sim=_cpRunSimulation();
+    if(sim&&sim.projRetValue>0){
+      // Capture per-allocation end balances from allocSeries for tax-bucket categorization
+      var _yrsToRet=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
+      var allocEndBalances=[];
+      if(sim.allocSeries){
+        CPLAN.allocations.forEach(function(a,i){
+          if(a.type==='debt')return;
+          if(!a.amount||a.amount<=0)return;
+          var key=a.type+'_'+i;
+          var series=sim.allocSeries[key];
+          if(series&&series.length){
+            var endIdx=Math.min(_yrsToRet,series.length-1);
+            allocEndBalances.push({type:a.type,strategy:a.type,endBal:series[endIdx]||0});
+          }
+        });
+      }
+      result={
+        retValue:sim.projRetValue||0,
+        retIncome:sim.projRetIncome||0,
+        allocEndBalances:allocEndBalances,
+        debtFreeMonth:sim.debtFreeMonth||0,
+        events:(sim.events||[]).slice(),
+        totalDeployed:CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0)
+      };
+    }
+  }catch(e){
+    console.warn('Approach simulation failed:',e&&e.message);
+  }finally{
+    // Restore saved state — order matters: allocations first so any sim cleanup uses the correct array
+    CPLAN.allocations=_savedAllocs;
+    CPLAN._sim=_savedSim;
+    if(_savedProjMode==null)delete CPLAN._projectionMode;
+    else CPLAN._projectionMode=_savedProjMode;
+  }
+  if(result)approachData._simResult=result;
+  return result;
 }
 
 // ── AUTO-SUGGEST v2: All phases funded from day 1, balanced allocation ──
@@ -24211,7 +24333,15 @@ function _cpRenderPlanV2(){
     h+='<div style="position:relative;height:10px;background:rgba(100,116,139,.06);border-radius:3px;margin-bottom:3px;overflow:hidden"><div style="display:flex;height:100%">';
     CPLAN.allocations.forEach(function(a){if(a.amount>0&&CPLAN.surplus>0){var w=Math.max(1,Math.round(a.amount/CPLAN.surplus*100));h+='<div style="height:100%;width:'+w+'%;background:'+CP_COL[a.type]+';opacity:0.2"></div>';}});
     h+='</div></div>';
-    h+='<div style="font-size:10px;color:var(--mu);margin-bottom:4px">Phase 1: '+fmt(allocated)+'/mo</div>';
+    // Phase 1 GROWTH total — apples-to-apples with Phase 2 (Phase 2 also excludes debt/ef/$0 protection).
+    // Without this filter, Phase 1 includes debt + EF totals which makes Phase 1 look
+    // larger than Phase 2 even though Phase 2 redistributes the same surplus into growth.
+    var _p1GrowthTotal=CPLAN.allocations.reduce(function(t,a){
+      if(a.type==='debt'||a.type==='ef')return t;
+      if(a.type==='protection'&&a.amount===0)return t;
+      return t+(parseFloat(a.amount)||0);
+    },0);
+    h+='<div style="font-size:10px;color:var(--mu);margin-bottom:4px">Phase 1: '+fmt(_p1GrowthTotal)+'/mo <span style="opacity:.7">growth deployment</span></div>';
     // Phase 2 layer (colored — future amounts, excluding completed items)
     var _futureTotal=0;
     h+='<div style="position:relative;height:14px;background:rgba(100,116,139,.06);border-radius:3px;overflow:hidden"><div style="display:flex;height:100%">';
@@ -24224,7 +24354,16 @@ function _cpRenderPlanV2(){
       if(fa>0&&CPLAN.surplus>0){var w=Math.max(1,Math.round(fa/CPLAN.surplus*100));h+='<div style="height:100%;width:'+w+'%;background:'+(CP_COL[a.type]||'#94A3B8')+';opacity:0.7;transition:width .3s"></div>';_futureTotal+=fa;}
     });
     h+='</div></div>';
-    h+='<div style="font-size:10px;color:var(--gr);margin-top:2px">Phase '+_activeTab+': '+fmt(_futureTotal)+'/mo (same surplus — redistributed)</div>';
+    // Compute cumulative overflow up-front so we can include it in the Phase total
+    // (matches the "same surplus — redistributed" claim by accounting for every dollar)
+    var _phaseOverflow=0;
+    if(_sim.events&&_sim.events.length){
+      _sim.events.forEach(function(_evx){
+        if(_evx&&_evx._cascadeOverflow>0)_phaseOverflow+=_evx._cascadeOverflow;
+      });
+    }
+    var _phaseTotalWithOverflow=_futureTotal+Math.round(_phaseOverflow);
+    h+='<div style="font-size:10px;color:var(--gr);margin-top:2px">Phase '+_activeTab+': '+fmt(_phaseTotalWithOverflow)+'/mo (same surplus — redistributed)</div>';
     // Phase 2+ deployment legend — show each allocation's future amount
     h+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:4px;margin-bottom:4px">';
     _sim.allocFuture.forEach(function(af){
@@ -24242,6 +24381,17 @@ function _cpRenderPlanV2(){
       if(boost>0)h+=' <span style="color:var(--gr);font-size:10px">(+'+fmt(boost)+')</span>';
       h+='</div>';
     });
+    // Cascade overflow chip — surfaces any freed money that couldn't fit in
+    // tax-advantaged or insurance vehicles. Without this, the user sees Phase 2
+    // total < Phase 1 total with no explanation. Showing the overflow tells the
+    // user explicitly: "$X is sitting as cash savings — consider adding a
+    // taxable brokerage allocation to put it to work."
+    if(_phaseOverflow>0){
+      h+='<div title="Freed money that couldn\'t fit in any IRS-capped or fixed-premium vehicle. Add a taxable brokerage (Invest) allocation to put it to work." style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--yl);background:rgba(234,179,8,.06);padding:2px 6px;border-radius:2px">';
+      h+='<span style="font-size:11px">💰</span>';
+      h+='Cash savings <span style="color:var(--yl);font-weight:700">'+fmt(Math.round(_phaseOverflow))+'</span>';
+      h+='</div>';
+    }
     h+='</div>';
     h+='</div>';
   }
@@ -24302,8 +24452,14 @@ function _cpRenderPlanV2(){
         var color=CP_COL[a.type]||'#94A3B8';
         var _prevPhaseLabel=_activeTab>2?'Phase '+(_activeTab-1):'Phase 1';
 
-        // Skip $0 action items with no boost
-        if(isActionOnly&&boost<=0)return;
+        // Skip $0 action items with no boost — but ONLY if they truly have no
+        // future funding. HSA (and similar) is often AI-tagged with phase=1
+        // ("open the account now") but funded later when debt clears (phase=2
+        // cascade). Without this guard the card vanished from Phase 2 view
+        // even though the deployment legend showed it at $367/mo. Now we keep
+        // any card with a non-zero futureAmount in any phase.
+        var _hasFutureFunding=af&&((af.futureAmount||0)>0||(af.boosts&&af.boosts.some(function(b){return b.amount>0;})));
+        if(isActionOnly&&boost<=0&&!_hasFutureFunding)return;
 
         // Boost banner — shows previous phase → current phase amount change
         if(boost>0){
@@ -26084,8 +26240,21 @@ function _cpSetBreathingRoom(v){
   var brReserve=Math.round((CPLAN.surplus||0)*brPct/100);
   var disp=document.getElementById('cpBrReserveDisplay');
   if(disp)disp.innerHTML='<div style="font-family:var(--fd);font-size:22px;color:var(--gr)">'+fmt(brReserve)+'</div><div style="font-size:11px;color:var(--mu)">/mo ('+brPct+'%)</div>';
-  // Refresh slider caps + over-budget banner since these depend on breathing room
-  if(typeof _cpUpdateSliderCaps==='function')_cpUpdateSliderCaps(-1);
+  // Auto-scale allocations if the new (smaller) budget pushes the existing total
+  // over budget. Replaces the over-budget banner with silent proportional scaling.
+  // _cpEnforce honors the allowScale gate so this only fires here and on plan load.
+  _cpEnforce({allowScale:true});
+  // Sync slider DOM values to any post-scale amounts
+  CPLAN.allocations.forEach(function(a,i){
+    var sl=document.querySelector('input[type="range"][data-cpidx="'+i+'"]');
+    if(sl)sl.value=parseFloat(a.amount)||0;
+    var mi=document.getElementById('cpManual'+i);
+    if(mi)mi.value=parseFloat(a.amount)||0;
+    var amtEl=document.getElementById('cpAmt'+i);
+    if(amtEl)amtEl.textContent=fmt(parseFloat(a.amount)||0);
+  });
+  // Refresh slider caps + cap notes — pass refreshMax:true since the budget itself changed
+  if(typeof _cpUpdateSliderCaps==='function')_cpUpdateSliderCaps(-1,{refreshMax:true});
   _cpUpdateOverBudgetBanner();
   _cpMarkModified();
 }
@@ -26913,6 +27082,17 @@ function _cpYrsToRetFor(allocOrOwner){
 function _cpRetMonthFor(allocOrOwner){
   return _cpYrsToRetFor(allocOrOwner)*12;
 }
+// Years in retirement = (life expectancy − retirement age). Used to compute how
+// long a balance must sustain monthly withdrawals. Reads retLifeExp from PFOS Main
+// (S.calcs.retLifeExp, default 90 — also editable on the Social Security calculator).
+// Falls back to 90 if not set. Also clamped to the person's actual remaining lifespan
+// so we don't compute negative years if retirementAge >= retLifeExp.
+function _cpYearsInRetirement(){
+  var rawS=(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)||{};
+  var lifeExp=parseInt((rawS.calcs&&rawS.calcs.retLifeExp))||90;
+  var retAge=CPLAN.retirementAge||65;
+  return Math.max(1,lifeExp-retAge);
+}
 function _cpOwnerCurrentlyRetired(owner){
   if(owner==='spouse'){
     if(!CPLAN._partner||!CPLAN._partner.age)return false;
@@ -26959,16 +27139,21 @@ function _cpAvailableBudget(excludeIdx){
 }
 function _cpSliderMax(type,idx){
   var irsMax=_cpIRSMax(type);
-  // If idx not provided, fall back to old behavior (preserves any other callers)
-  if(idx==null){
-    var surplusCap=Math.max(Math.min(CPLAN.surplus||1,15000),100);
-    return Math.min(irsMax,surplusCap);
-  }
-  // _cpAvailableBudget(idx) already excludes this slider's contribution from "deployed",
-  // so it represents the max this slider could legally hold without any other change.
-  var available=_cpAvailableBudget(idx);
-  var cap=Math.min(irsMax,available);
-  return Math.max(0,Math.round(cap));
+  // STATIC cap: min(IRS limit, surplus − breathing). Deliberately independent of
+  // other allocations' current amounts. The dynamic constraint (sum across all
+  // allocations ≤ budget) is enforced at slide time via snap-back in _cpSlide,
+  // not by mutating each slider's `max` attribute. Mutating max attributes during
+  // an active drag was causing every other slider's thumb to visually shift
+  // because the browser re-positions the thumb relative to its track when max
+  // changes — making sliders appear "linked" even though their `value` was unchanged.
+  // The cap NOTE (_cpEffectiveCapNote) still shows the live pool-aware available so
+  // the user knows how much room remains.
+  var surplus=CPLAN.surplus||0;
+  var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+  var budgetCap=Math.round(surplus*(1-brPct));
+  // Floor of $100 so sliders are always usable even on very small surpluses
+  if(budgetCap<100)budgetCap=Math.max(100,Math.min(surplus||100,15000));
+  return Math.max(0,Math.round(Math.min(irsMax,budgetCap)));
 }
 function _cpIRSNote(type){
   var age=CPLAN.age||30;var is50=age>=50;var is55=age>=55;var is60_63=age>=60&&age<=63;
@@ -27798,7 +27983,7 @@ function _cpRenderIncomeReplacement(){
   if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length>0){
     var _retYrsToAge65=Math.max(1,Math.min(30,(CPLAN.retirementAge||65)-(CPLAN.age||35)));
     var retAtRetire=CPLAN._sim.retirement[_retYrsToAge65]||CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
-    retIncome=Math.round(_cpSustainableMonthly(retAtRetire,25,0.01));
+    retIncome=Math.round(_cpSustainableMonthly(retAtRetire,_cpYearsInRetirement(),0.01));
   } else {
     var yrs=Math.max(1,(CPLAN.retirementAge||65)-CPLAN.age);
     var _projBal=0;
@@ -27808,7 +27993,7 @@ function _cpRenderIncomeReplacement(){
       for(var y=1;y<=Math.min(yrs,40);y++){var c2=a.amount*12*cf;bal=(bal+c2)*(1+rate);}
       _projBal+=bal;
     });
-    retIncome=Math.round(_cpSustainableMonthly(_projBal,25,0.01));
+    retIncome=Math.round(_cpSustainableMonthly(_projBal,_cpYearsInRetirement(),0.01));
   }
   var target=Math.round(_cpRetIncomeTarget('self'));
   var replacePct=target>0?Math.round(retIncome/target*100):0;
@@ -31026,8 +31211,83 @@ function _cpRunSimulation(){
         freed-=add2;
       });
     }
+    // ── OVERFLOW PASS ────────────────────────────────────────────────────
+    // After boost + second + unfunded passes, if `freed` is still > 0, it means
+    // every non-insurance growth allocation has hit its IRS cap (or the only
+    // growth vehicle in the plan is fixed-premium insurance like IUL/WL/IBC
+    // which can't accept additional contributions mid-policy). The previous
+    // behavior silently DROPPED this leftover — visible to the user as
+    // "Phase 2 deployment < Phase 1 deployment" in the comparison bar, even
+    // though the surplus hasn't changed. The money was disappearing in math.
+    //
+    // This pass handles the leftover by:
+    //   1. Preferring an existing 'invest' (taxable brokerage) allocation —
+    //      no real IRS limit, accepts unlimited overflow.
+    //   2. Falling back to any non-insurance growth allocation with remaining
+    //      headroom (catches edge cases where IRS computation differs slightly
+    //      between passes).
+    //   3. Final fallback: track on the cascade log as overflow so the
+    //      deployment bar can render it explicitly. This way money is never
+    //      lost — at worst it shows as "+ unallocated cash" the user can act on.
+    // Tax-Free plans without an `invest` allocation will fall through to (3).
+    if(freed>0){
+      // (1) Existing invest allocation — taxable brokerage, no real cap
+      var _investIdx=CPLAN.allocations.findIndex(function(a){return a.type==='invest';});
+      if(_investIdx>=0){
+        var _investMax=_cpIRSMax('invest',CPLAN.allocations[_investIdx]);
+        var _investHeadroom=Math.max(0,_investMax-allocAmounts[_investIdx]);
+        var _investAdd=Math.min(freed,_investHeadroom);
+        if(_investAdd>0){
+          allocAmounts[_investIdx]+=_investAdd;
+          allocFuture[_investIdx].futureAmount=allocAmounts[_investIdx];
+          if(allocFuture[_investIdx].startsMonth<0)allocFuture[_investIdx].startsMonth=ev.month;
+          allocFuture[_investIdx].boosts.push({month:ev.month,amount:_investAdd,from:ev.label+' (overflow)'});
+          var _existInv=destinations.find(function(d){return d.type==='invest';});
+          if(_existInv)_existInv.amount+=_investAdd;
+          else destinations.push({type:'invest',name:CP_NM['invest']||'Taxable Brokerage',amount:_investAdd});
+          freed-=_investAdd;
+        }
+      }
+      // (2) Any non-insurance growth allocation with headroom (very aggressive)
+      if(freed>0){
+        var _allGrowth=CPLAN.allocations.map(function(a,i){return{a:a,i:i};})
+          .filter(function(x){
+            if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection')return false;
+            if(x.a.type==='iul'||x.a.type==='wl'||x.a.type==='ibc')return false; // fixed premium
+            if(!_cascadeOwnerOK(x.a.owner))return false;
+            var irsMax=_cpIRSMax(x.a.type,x.a);
+            return (irsMax-allocAmounts[x.i])>0;
+          })
+          .sort(function(a,b){
+            var aHr=_cpIRSMax(a.a.type,a.a)-allocAmounts[a.i];
+            var bHr=_cpIRSMax(b.a.type,b.a)-allocAmounts[b.i];
+            return bHr-aHr;// largest headroom first
+          });
+        _allGrowth.forEach(function(g){
+          if(freed<=0)return;
+          var irsMaxG=_cpIRSMax(g.a.type,g.a);
+          var headroomG=Math.max(0,irsMaxG-allocAmounts[g.i]);
+          var addG=Math.min(freed,headroomG);
+          if(addG>0){
+            allocAmounts[g.i]+=addG;
+            allocFuture[g.i].futureAmount=allocAmounts[g.i];
+            allocFuture[g.i].boosts.push({month:ev.month,amount:addG,from:ev.label+' (overflow)'});
+            var _existG=destinations.find(function(d){return d.type===g.a.type;});
+            if(_existG)_existG.amount+=addG;
+            else destinations.push({type:g.a.type,name:g.a.customName||CP_NM[g.a.type]||g.a.type,amount:addG});
+            freed-=addG;
+          }
+        });
+      }
+      // (3) Any leftover at this point is true overflow — stash on the event so
+      // downstream UI (deployment legend) can surface it as "+ cash savings".
+      if(freed>0){
+        ev._cascadeOverflow=(ev._cascadeOverflow||0)+freed;
+        freed=0;
+      }
+    }
     if(destinations.length>0){
-      cascadeLog.push({month:ev.month,source:ev.label,freed:ev.freed,destinations:destinations});
+      cascadeLog.push({month:ev.month,source:ev.label,freed:ev.freed,destinations:destinations,overflow:ev._cascadeOverflow||0});
     }
   });
 
@@ -31198,7 +31458,7 @@ function _cpRunSimulation(){
   var projRetValue=retirementData[_yrsToRet]||retirementData[years]||0;
   // Phase 2: monthly income sustainability (PMT formula) over 25-yr retirement at 1% real return.
   // Frame against user's stated retirement income target (CPLAN.retIncome) — not 4% rule.
-  var projRetIncome=Math.round(_cpSustainableMonthly(projRetValue,25,0.01));
+  var projRetIncome=Math.round(_cpSustainableMonthly(projRetValue,_cpYearsInRetirement(),0.01));
 
   // Store result
   CPLAN._sim={
@@ -31477,7 +31737,7 @@ function _cpRenderOutcomes(){
   active.forEach(function(a){var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var b5=0,b10=0,b20=0,b30=0;for(var y=1;y<=30;y++){var c2=a.amount*12*cf;if(y<=5)b5=(b5+c2)*(1+rate);if(y<=10)b10=(b10+c2)*(1+rate);if(y<=20)b20=(b20+c2)*(1+rate);b30=(b30+c2)*(1+rate);}nw5+=b5;nw10+=b10;nw20+=b20;nw30+=b30;if(a.type!=='ef'&&a.type!=='debt'&&a.type!=='house')retBal30+=b30;});
   // Phase 2: convert balance → sustainable monthly income (PMT, 25-yr, 1% real),
   // and frame against user's stated retirement income target instead of 4% rule.
-  var _retSustained=Math.round(_cpSustainableMonthly(retBal30,25,0.01));
+  var _retSustained=Math.round(_cpSustainableMonthly(retBal30,_cpYearsInRetirement(),0.01));
   var _retTarget=Math.round(_cpRetIncomeTarget('self'));
   var _retPct=_retTarget>0?Math.min(100,Math.round(_retSustained/_retTarget*100)):0;
   var _retCol=_retPct>=100?'var(--gr)':_retPct>=80?'var(--gr)':_retPct>=50?'var(--yl)':_retPct>=25?'var(--or)':'var(--rd)';
@@ -31552,53 +31812,49 @@ function _cpRenderOutcomes(){
 // by _cpUpdateOverBudgetBanner). The user manually reduces other allocations to fit.
 // Save and Publish are disabled until the budget is balanced. This is the warn-and-let-fix
 // policy used elsewhere (e.g. when breathing room is changed).
-function _cpUpdateSliderCaps(skipIdx){
+function _cpUpdateSliderCaps(skipIdx,opts){
+  // refreshMax: only true when the BUDGET itself changes (surplus or breathing %).
+  // Default behavior (refreshMax=false) just refreshes the live cap NOTES, which
+  // describe how much pool remains. The slider `max` attribute stays static so
+  // dragging slider A doesn't visually shift sliders B, C, D…  See _cpSliderMax
+  // comment for the visual-jumping bug this prevents.
+  var _refreshMax=!!(opts&&opts.refreshMax);
   CPLAN.allocations.forEach(function(a,i){
     if(i===skipIdx)return;                                  // don't touch the slider being dragged
     if(a.type==='protection')return;                        // action-only, no slider
     if(a.phase!=null&&a.phase!==1&&a.phase!==0)return;      // only Phase 0/1 have live sliders
-    var newMax=_cpSliderMax(a.type,i);
-    // P4: Insurance premium lock — never let the cap go above the locked amount.
-    var _isPermInsCap=(a.type==='iul'||a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&(a.eduVehicle==='wl'||a.eduVehicle==='iul')));
-    if(_isPermInsCap&&a._completed){
-      newMax=Math.min(newMax,a.amount);
+    if(_refreshMax){
+      var newMax=_cpSliderMax(a.type,i);
+      // P4: Insurance premium lock — never let the cap go above the locked amount.
+      var _isPermInsCap=(a.type==='iul'||a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&(a.eduVehicle==='wl'||a.eduVehicle==='iul')));
+      if(_isPermInsCap&&a._completed){
+        newMax=Math.min(newMax,a.amount);
+      }
+      var sliderEl=document.querySelector('input[type="range"][data-cpidx="'+i+'"]');
+      var manualEl=document.getElementById('cpManual'+i);
+      if(sliderEl)sliderEl.max=newMax;
+      if(manualEl)manualEl.max=newMax;
     }
-    var sliderEl=document.querySelector('input[type="range"][data-cpidx="'+i+'"]');
-    var manualEl=document.getElementById('cpManual'+i);
-    // ONLY update the cap (max attribute) — do NOT clamp .value. Clamping would cause
-    // other sliders to visibly jump during the user's drag of the active slider.
-    if(sliderEl)sliderEl.max=newMax;
-    if(manualEl)manualEl.max=newMax;
-    // Refresh the cap note so it reflects the new live cap
+    // Always refresh the cap note — it shows the live pool-aware available budget
     var noteEl=document.getElementById('cpCapNote'+i);
     if(noteEl)noteEl.innerHTML=_cpEffectiveCapNote(a.type,i);
   });
 }
-// ── OVER-BUDGET BANNER — shows + disables Save/Propose when allocations exceed budget ──
+// ── OVER-BUDGET BANNER ── (permanently hidden)
+// Per user preference: no over-budget banner. The system auto-limits via
+// snap-back in _cpSlide (dragged slider can't push total past budget) and
+// proportional scaling in _cpEnforce({allowScale:true}) (for plans loaded
+// over-budget from external sources, and for breathing-room changes that
+// shrink the budget below current total). The function is kept as a no-op
+// so existing call sites continue to work without errors.
 function _cpUpdateOverBudgetBanner(){
-  var surplus=CPLAN.surplus||0;
-  var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
-  var brReserve=Math.round(surplus*brPct);
-  var deployed=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
-  var over=deployed-(surplus-brReserve);
   var banner=document.getElementById('cpOverBudgetBanner');
-  if(!banner)return;
-  if(over>0){
-    banner.style.display='flex';
-    banner.innerHTML='<span style="font-size:14px">⚠️</span>'
-      +'<div style="flex:1"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--rd)">Plan exceeds available budget by '+fmt(over)+'/mo</div>'
-      +'<div style="font-size:12px;color:var(--mu)">Reduce one or more allocations or lower your breathing room target. Save is disabled until resolved.</div></div>';
-    var saveBtn=document.querySelector('[onclick="cplanSave()"]');
-    if(saveBtn){saveBtn.disabled=true;saveBtn.style.opacity='0.5';saveBtn.style.cursor='not-allowed';}
-    var propBtn=document.querySelector('[onclick="cplanProposeChanges()"]');
-    if(propBtn){propBtn.disabled=true;propBtn.style.opacity='0.5';propBtn.style.cursor='not-allowed';}
-  } else {
-    banner.style.display='none';
-    var saveBtn2=document.querySelector('[onclick="cplanSave()"]');
-    if(saveBtn2){saveBtn2.disabled=false;saveBtn2.style.opacity='';saveBtn2.style.cursor='';}
-    var propBtn2=document.querySelector('[onclick="cplanProposeChanges()"]');
-    if(propBtn2){propBtn2.disabled=false;propBtn2.style.opacity='';propBtn2.style.cursor='';}
-  }
+  if(banner)banner.style.display='none';
+  // Save/Propose buttons stay enabled — auto-limit guarantees budget compliance.
+  var saveBtn=document.querySelector('[onclick="cplanSave()"]');
+  if(saveBtn){saveBtn.disabled=false;saveBtn.style.opacity='';saveBtn.style.cursor='';}
+  var propBtn=document.querySelector('[onclick="cplanProposeChanges()"]');
+  if(propBtn){propBtn.disabled=false;propBtn.style.opacity='';propBtn.style.cursor='';}
 }
 function _cpSlide(i,v){
   var _newAmt=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
@@ -31611,9 +31867,28 @@ function _cpSlide(i,v){
       _newAmt=Math.min(_newAmt,_a.amount);
     }
   }
+  // ── AUTO-SNAP TO AVAILABLE BUDGET ─────────────────────────────────────
+  // Hard limit: total deployment can never exceed (surplus − breathing reserve).
+  // If user drags this slider past what's available given other allocations,
+  // snap it down to the live cap. This replaces the over-budget banner — the
+  // system silently auto-limits instead of warning after the fact.
+  // (IRS limits are still applied below via _cpEnforce.)
+  var _surplusSlide=CPLAN.surplus||0;
+  var _brPctSlide=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+  var _budgetSlide=Math.round(_surplusSlide*(1-_brPctSlide));
+  var _othersTotal=CPLAN.allocations.reduce(function(t,al,j){return j===i?t:t+(parseFloat(al.amount)||0);},0);
+  var _availForThis=Math.max(0,_budgetSlide-_othersTotal);
+  if(_newAmt>_availForThis)_newAmt=_availForThis;
   CPLAN.allocations[i].amount=_newAmt;_cpEnforce();
-  _cpUpdateSliderCaps(i);                                   // ← NEW: push new caps to all other sliders
-  _cpUpdateOverBudgetBanner();                              // ← NEW: refresh over-budget banner
+  // Sync the dragged slider's DOM to the (possibly-snapped) value so the thumb
+  // and number input visually match a.amount. Without this, dragging past the
+  // pool ceiling would leave the thumb at the user's drag position while the
+  // amount stays clamped — a confusing disconnect.
+  var _draggedSl=document.querySelector('input[type="range"][data-cpidx="'+i+'"]');
+  if(_draggedSl)_draggedSl.value=CPLAN.allocations[i].amount;
+  var _draggedMi=document.getElementById('cpManual'+i);
+  if(_draggedMi)_draggedMi.value=CPLAN.allocations[i].amount;
+  _cpUpdateSliderCaps(i);                                   // refresh cap notes on others (max attrs are static, untouched)
   _cpMarkModified();
   // TARGETED update — only touch the elements that changed, don't rebuild the DOM
   var a=CPLAN.allocations[i];
