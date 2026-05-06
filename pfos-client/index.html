@@ -22864,7 +22864,12 @@ function _cpConvertAIRecs(aiData){
   var sortedRecs=aiData.recommendations.slice().sort(function(a2,b2){var p2={high:0,medium:1,low:2};return(p2[a2.priority]||1)-(p2[b2.priority]||1);});
   sortedRecs.forEach(function(r){
     var map=secMap[r.section]||{type:'custom',phase:3};
-    if(r.strategy && !_sectionLocked[r.section]){var _sm=stratMap[r.strategy];if(!_sm){for(var _si=0;_si<_stratKeys.length;_si++){if(r.strategy.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}}}if(_sm)map.type=_sm.type;}
+    // Strategy → type mapping. Exact match wins. If no exact match, prefer
+    // insurance keywords before falling through to the longest-first substring
+    // search — otherwise a strategy like 'roth_ira_to_iul' or 'iul_replacing_roth_ira'
+    // matches 'roth_ira' (8 chars) before 'iul' (3 chars) and lands in the Roth
+    // card despite being an IUL recommendation.
+    if(r.strategy && !_sectionLocked[r.section]){var _sm=stratMap[r.strategy];if(!_sm){var _slow=r.strategy.toLowerCase();if(_slow.indexOf('ibc_iul')>=0)_sm=stratMap['ibc_iul'];else if(_slow.indexOf('ibc_wl')>=0)_sm=stratMap['ibc_wl'];else if(_slow.indexOf('ibc')>=0||_slow.indexOf('infinite_bank')>=0)_sm=stratMap['ibc'];else if(_slow.indexOf('iul')>=0)_sm=stratMap['iul'];else if(_slow.indexOf('whole_life')>=0||_slow.indexOf('whole life')>=0)_sm=stratMap['whole_life'];else{for(var _si=0;_si<_stratKeys.length;_si++){if(r.strategy.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}}}}if(_sm)map.type=_sm.type;}
     // Title-based type override — safety net when AI strategy string doesn't match
     var _tl=(r.title||'').toLowerCase();
     // EF safety net: if title clearly says "emergency fund" or "emergency reserve",
@@ -22885,14 +22890,27 @@ function _cpConvertAIRecs(aiData){
       else if(_tl.indexOf('utma')>=0||_tl.indexOf('ugma')>=0)r._eduVeh='utma';
       else r._eduVeh='529';
     }
+    // Title chain — order matters. IBC/IUL/WL checked BEFORE roth/401k/hsa
+    // so that titles containing both (e.g. "Roth IRA + IUL Combo", "IUL
+    // Replacing Roth IRA", "Tax-Free Strategy with IUL") map to the more
+    // specific permanent insurance vehicle instead of being short-circuited
+    // by the earlier roth/401k matches. Educational titles already handled
+    // above and short-circuit out via the _isEduTitle if-block.
+    else if(_tl.indexOf('ibc')>=0||_tl.indexOf('infinite banking')>=0)map.type='ibc';
+    else if((_tl.indexOf('iul')>=0||_tl.indexOf('indexed universal')>=0)&&!_isEduTitle)map.type='iul';
+    else if(_tl.indexOf('whole life')>=0&&!_isEduTitle)map.type='wl';
     else if(_tl.indexOf('roth ira')>=0&&map.type!=='roth')map.type='roth';
     else if(_tl.indexOf('401k')>=0||_tl.indexOf('401(k)')>=0){if(_tl.indexOf('roth 401')>=0)map.type='roth401k';else if(_tl.indexOf('solo')>=0)map.type='solo401k';else map.type='401k';}
     else if(_tl.indexOf('hsa')>=0)map.type='hsa';
     else if(_tl.indexOf('sep ira')>=0||_tl.indexOf('sep-ira')>=0)map.type='sep_ira';
     else if(_tl.indexOf('traditional ira')>=0)map.type='trad_ira';
-    else if(_tl.indexOf('iul')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='iul';
-    else if(_tl.indexOf('whole life')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='wl';
-    else if(_tl.indexOf('ibc')>=0||_tl.indexOf('infinite banking')>=0)map.type='ibc';
+    // Savings-goal title override — catches custom goals (vacation, wedding,
+    // down payment, etc.) that AI categorized as section='investment' or
+    // section='tax' (both default to 'invest' in secMap → taxable brokerage
+    // card). Routes them to 'custom' so they render in the Custom Goal card.
+    // Runs BEFORE title-to-invest so a "Vacation Fund" title doesn't get
+    // re-caught by an unrelated "fund" keyword in title-to-invest.
+    else if(/vacation|wedding|honeymoon|cruise|down ?payment|home purchase|new car\b|car fund|baby fund|gift fund|graduation fund|sinking fund|saving[s]? goal|goal fund|short.?term goal/.test(_tl))map.type='custom';
     // Title-to-invest override: ONLY apply when strategy field doesn't already
     // pin to a specific tax-advantaged vehicle. Without this guard, an AI rec
     // with strategy='roth_ira' but title="Roth IRA Index Fund Allocation" would
