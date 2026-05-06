@@ -2093,16 +2093,14 @@ document.addEventListener('DOMContentLoaded',function(){_initDollarInputs();
 // The 12 .card-instructions blocks are multi-paragraph walls. Wrap each on
 // load so only the first ~3 lines are visible by default with a fade gradient,
 // and a "Read more" / "Show less" toggle appears below. Idempotent — safe to
-// call multiple times (skips already-wrapped blocks).
+// call multiple times (skips already-wrapped blocks). Always applies the
+// collapsed class — we don't measure scrollHeight because the blocks live
+// inside panels that start hidden (display:none → scrollHeight=0).
 function _initCardInstructionsCollapse(){
   var blocks=document.querySelectorAll('.card-instructions');
   blocks.forEach(function(blk){
     if(blk.dataset.ciInited)return;
     blk.dataset.ciInited='1';
-    // Wrap content for collapsible behavior. Skip very short blocks (height
-    // already small enough that a toggle would be silly).
-    var fullH=blk.scrollHeight;
-    if(fullH<=80){return;} // ~3 lines or less, nothing to truncate
     blk.classList.add('card-instructions-collapsed');
     var btn=document.createElement('button');
     btn.type='button';
@@ -2113,7 +2111,6 @@ function _initCardInstructionsCollapse(){
       var isCollapsed=blk.classList.toggle('card-instructions-collapsed');
       btn.textContent=isCollapsed?'Read more ▾':'Show less ▴';
     };
-    // Insert button right after the block
     if(blk.parentNode)blk.parentNode.insertBefore(btn,blk.nextSibling);
   });
 }
@@ -5076,6 +5073,51 @@ function addRetAccount(){
   renderRetAccounts();
 }
 
+// Returns the small "linked to income" indicator under the contrib input.
+// Three states:
+//  • Not a 401k or no linked income source → empty (no badge)
+//  • Linked + in sync → muted info text "Synced from Income"
+//  • Linked + manually edited or out of sync → yellow warning + Re-sync button
+function _retLinkBadge(a,i){
+  if(!a||a.type!=='401k_current')return '';
+  // Find the income source linked to this account
+  var srcIdx=-1;
+  (S.incomeSources||[]).forEach(function(s,si){
+    if(s._linkedRetAcctId===a.id)srcIdx=si;
+  });
+  // Also try matching by reverse link
+  if(srcIdx<0&&a._linkedIncomeSourceId){
+    (S.incomeSources||[]).forEach(function(s,si){
+      if(s.id===a._linkedIncomeSourceId)srcIdx=si;
+    });
+  }
+  if(srcIdx<0)return '';
+  var src=S.incomeSources[srcIdx];
+  if(_incSrcMode(src)!=='detailed')return '';
+  var checks=_checksPerMonth(src.pay_frequency);
+  var incomeMonthly=Math.round((parseFloat(src.deduction_401k)||0)*checks);
+  if(incomeMonthly<=0)return '';
+  var current=Math.round(parseFloat(a.contrib)||0);
+  var diff=Math.abs(current-incomeMonthly);
+  var inSync=diff<=2; // allow $2 rounding tolerance
+  if(inSync){
+    return '<div style="margin-top:4px;font-size:11px;color:var(--mu);font-style:italic">🔗 Synced from Income — '+escH(src.name||'paycheck')+'</div>';
+  }
+  // Out of sync — show warning + re-sync button
+  return '<div style="margin-top:4px;padding:6px 8px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.18);border-radius:2px;font-size:12px;color:var(--yl);line-height:1.5">⚠️ Income shows '+fmt(incomeMonthly)+'/mo, retirement shows '+fmt(current)+'/mo. <button type="button" onclick="_retResyncFromIncome('+i+')" style="background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);color:var(--gr);font-family:var(--fh);font-size:11px;font-weight:700;padding:3px 8px;border-radius:2px;cursor:pointer;margin-left:4px">🔄 Re-sync</button></div>';
+}
+// Reset to the income card's value (clears manual-edit flag + recomputes).
+function _retResyncFromIncome(i){
+  if(!S.retAccounts||!S.retAccounts[i])return;
+  S.retAccounts[i]._userEditedContrib=false;
+  // Find the linked income source and trigger sync
+  (S.incomeSources||[]).forEach(function(s,si){
+    if(s._linkedRetAcctId===S.retAccounts[i].id||s.id===S.retAccounts[i]._linkedIncomeSourceId){
+      _syncRetAcctFromIncomeSource(si);
+    }
+  });
+  calc();
+}
 // ── Phase 1B: Auto-create / sync 401k account from detailed income source ──
 // When a user enters paycheck details with a 401k deduction, auto-create or
 // update a matching 401k retirement account. Linked via src._linkedRetAcctId
@@ -5124,16 +5166,25 @@ function _syncRetAcctFromIncomeSource(srcIdx){
   if(existingIdx>=0){
     // Update existing (linked or just-adopted) account
     var existing=S.retAccounts[existingIdx];
-    existing.contrib=monthlyContrib;
+    // Respect manual edits: if the user explicitly typed a contrib value
+    // on the retirement card, don't overwrite it on auto-sync. They can
+    // press "🔄 Re-sync from income" or change contribPct to opt back in.
+    if(!existing._userEditedContrib){
+      existing.contrib=monthlyContrib;
+    }
+    // matchPct is a property of the employer plan, not user-driven, so
+    // always keep it in sync.
     existing.matchPct=matchPct;
-    // Fix #3: ALWAYS recompute contribPct from real gross — the old code
-    // preserved a stale contribPct (e.g. 4 from "4% of take-home") which
-    // confused users. The income card is now the source of truth for both.
+    // Always recompute contribPct from real gross so the "% of gross" UI
+    // reads correctly even if the dollar amount was manually edited.
     var monthlyGross=_incSrcMonthlyGross(src);
-    if(monthlyGross>0)existing.contribPct=Math.round((monthlyContrib/monthlyGross)*100*10)/10;
+    if(monthlyGross>0){
+      var actualContrib=existing.contrib||monthlyContrib;
+      existing.contribPct=Math.round((actualContrib/monthlyGross)*100*10)/10;
+    }
     S._touched.retAccounts=true;
     renderRetAccounts();
-    _showAutoSyncBanner('updated');
+    if(!existing._userEditedContrib)_showAutoSyncBanner('updated');
   } else {
     // Create new linked 401k account
     var newAcct={
@@ -5195,14 +5246,27 @@ function updRetAccount(i,field,val){
   } else {
     S.retAccounts[i][field]=['balance','contrib','matchPct','contribPct'].indexOf(field)!==-1?(pf(val)):val;
   }
+  // Mark direct user edits to contrib so the income → retirement auto-sync
+  // won't overwrite them. Cleared by the "Re-sync from income" button or by
+  // changing contribPct (which then drives contrib programmatically).
+  if(field==='contrib'){
+    S.retAccounts[i]._userEditedContrib=true;
+  }
   // Sync: when contribPct changes, update dollar contribution
+  // Fix: use incGross (real W-2 gross) for the pct calculation, not c.inc
+  // (take-home). 401k contribution % is a percentage of gross by definition,
+  // so the old code under-stated by ~25-30% for typical W-2 earners.
   if(field==='contribPct'){
-    var _inc=(S.calcs&&S.calcs.inc)||0;
-    if(_inc>0&&S.retAccounts[i].contribPct>0){
-      S.retAccounts[i].contrib=Math.round(_inc*(S.retAccounts[i].contribPct/100));
+    var _c=S.calcs||{};
+    var _base=_c.incGross||_c.inc||0;
+    if(_base>0&&S.retAccounts[i].contribPct>0){
+      S.retAccounts[i].contrib=Math.round(_base*(S.retAccounts[i].contribPct/100));
     } else {
       S.retAccounts[i].contrib=0;
     }
+    // contribPct is now driving contrib — clear the manual flag so income
+    // sync can resume if user later wants it.
+    S.retAccounts[i]._userEditedContrib=false;
     // Targeted DOM update — DO NOT re-render the list, that destroys the input being typed in
     var _cEl=document.getElementById('retContrib_'+i);
     if(_cEl) _cEl.value=S.retAccounts[i].contrib||'';
@@ -5288,7 +5352,9 @@ function renderRetAccounts(){
       +'</div>'
       +'<div class="row">'
       +'<div class="fi"><label class="lb">Current Balance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="updRetAccount('+i+',\'balance\',this.value)" style="padding-left:22px"></div></div>'
-      +(rt.allowContrib?'<div class="fi"><label class="lb">'+(isPension?'Est. Monthly Benefit':'Monthly Contribution')+'</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="retContrib_'+i+'" type="number" placeholder="0" value="'+(a.contrib||'')+'" oninput="updRetAccount('+i+',\'contrib\',this.value)" style="padding-left:22px"></div></div>':'')
+      +(rt.allowContrib?'<div class="fi"><label class="lb">'+(isPension?'Est. Monthly Benefit':'Monthly Contribution')+'</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="retContrib_'+i+'" type="number" placeholder="0" value="'+(a.contrib||'')+'" oninput="updRetAccount('+i+',\'contrib\',this.value)" style="padding-left:22px"></div>'
+        +(_retLinkBadge(a,i))
+        +'</div>':'')
       +'</div>'
       +(rt.allowMatch?'<div class="row"><div class="fi"><label class="lb">Your Contribution %</label><input class="inp" type="number" placeholder="0" value="'+(a.contribPct||'')+'" oninput="updRetAccount('+i+',\'contribPct\',this.value)" min="0" max="100"></div><div class="fi"><label class="lb">Employer Match % (up to)</label><input class="inp" type="number" placeholder="0" value="'+(a.matchPct||'')+'" oninput="updRetAccount('+i+',\'matchPct\',this.value)" min="0" max="100"></div></div>':'');
     // Pension: show benefit field only, no return assumptions
