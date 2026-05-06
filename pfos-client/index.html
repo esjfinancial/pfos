@@ -23087,6 +23087,21 @@ function _cpShowApproachFork(){
   if(_mfj){if(_annInc>751600)_taxPct=37;else if(_annInc>501050)_taxPct=35;else if(_annInc>394600)_taxPct=32;else if(_annInc>206700)_taxPct=24;else if(_annInc>96950)_taxPct=22;else if(_annInc>23850)_taxPct=12;}
   else{if(_annInc>626350)_taxPct=37;else if(_annInc>250525)_taxPct=35;else if(_annInc>197300)_taxPct=32;else if(_annInc>103350)_taxPct=24;else if(_annInc>48475)_taxPct=22;else if(_annInc>11925)_taxPct=12;}
   var _pool=Math.round(CPLAN.surplus*(1-(CPLAN._breathingPct||15)/100));
+  // Staleness detection: if any cached approach was generated against
+  // significantly different financial inputs (surplus, income, age), the
+  // displayed retirement values won't reflect the user's current data.
+  // Show a banner with one-click regeneration when this happens.
+  var _isStale=false,_staleReasons=[];
+  ['traditional','tax_free','hybrid'].forEach(function(k){
+    var d=ap[k];if(!d||!d._genMeta)return;
+    var m=d._genMeta;
+    var surplusDelta=Math.abs((CPLAN.surplus||0)-(m.surplus||0));
+    var surplusPct=(m.surplus||0)>0?(surplusDelta/(m.surplus||1)):(surplusDelta>50?1:0);
+    if(surplusDelta>=50&&surplusPct>=0.03){_isStale=true;if(_staleReasons.indexOf('surplus')<0)_staleReasons.push('surplus');}
+    if((CPLAN.age||0)!==(m.age||0)&&m.age>0){_isStale=true;if(_staleReasons.indexOf('age')<0)_staleReasons.push('age');}
+    var incomeDelta=Math.abs((CPLAN.income||0)-(m.income||0));
+    if(incomeDelta>=200){_isStale=true;if(_staleReasons.indexOf('income')<0)_staleReasons.push('income');}
+  });
   var cards=[
     {key:'traditional',label:'Traditional',icon:'📊',desc:'401k, Roth IRA, index funds, 529 plans, term life. Proven, widely-accepted vehicles.',color:'#5B9BFF',taxRatio:1},
     {key:'tax_free',label:'Tax-Free Income',icon:'🛡️',desc:'Roth IRA, HSA, IUL, Whole Life, IBC. Tax-free access via policy loans and Roth withdrawals.',color:'#22C55E',taxRatio:0},
@@ -23097,6 +23112,21 @@ function _cpShowApproachFork(){
   h+='<div style="font-family:var(--fh);font-size:22px;font-weight:800;color:var(--wh);margin-bottom:6px">Choose Your Strategy</div>';
   h+='<div style="font-size:14px;color:var(--mu);line-height:1.6">Three approaches built from your exact financial data. Same surplus (<strong style="color:var(--gr)">'+fmt(_pool)+'/mo</strong>), different vehicles.</div>';
   h+='</div>';
+  // Stale-data banner — appears when current surplus/income/age differs from
+  // the values in effect when these approaches were generated.
+  if(_isStale){
+    var reasonText=_staleReasons.length>1?_staleReasons.slice(0,-1).join(', ')+' and '+_staleReasons[_staleReasons.length-1]:_staleReasons[0];
+    h+='<div style="margin-bottom:18px;padding:14px 16px;background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.3);border-radius:6px;display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap">'
+      +'<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:240px">'
+        +'<span style="font-size:20px">⚠️</span>'
+        +'<div>'
+          +'<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--yl);letter-spacing:.04em;margin-bottom:3px">PLAN MAY BE OUT OF DATE</div>'
+          +'<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.5">Your '+reasonText+' changed since these were generated. Projections still reflect the older numbers — regenerate to see updated allocations.</div>'
+        +'</div>'
+      +'</div>'
+      +'<button onclick="_cpDoAIGenerate()" style="padding:9px 18px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.08em;background:rgba(234,179,8,.15);border:1px solid rgba(234,179,8,.45);color:var(--yl);border-radius:4px;cursor:pointer;white-space:nowrap;min-height:36px">🔄 Regenerate All</button>'
+    +'</div>';
+  }
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px">';
   cards.forEach(function(cd){
     var data=ap[cd.key];
@@ -23277,13 +23307,19 @@ function _cpRetryApproach(key){
   var flags=_cpExtractRedFlags();
   var prevPlan=(fd&&fd.allocation_plan)||null;
   var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:rawS.householdType||'individual',previousPlan:prevPlan};
+  // Snapshot inputs at retry time
+  var _genSurplus=CPLAN.surplus||0,_genIncome=CPLAN.income||0,_genAge=CPLAN.age||0;
   // Phase D: forward partner data so AI can produce owner-tagged recs
   _cpLoadPartnerForAI().then(function(partnerInfo){
     if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
     delete CPLAN._approaches[key];// Set back to loading
     _cpShowApproachFork();
     db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:key})})
-    .then(function(r){CPLAN._approaches[key]=r.data&&r.data.recommendations?r.data:null;})
+    .then(function(r){
+      var rec=r.data&&r.data.recommendations?r.data:null;
+      if(rec){rec._genMeta={surplus:_genSurplus,income:_genIncome,age:_genAge,generatedAt:Date.now()};}
+      CPLAN._approaches[key]=rec;
+    })
     .catch(function(){CPLAN._approaches[key]=null;})
     .then(function(){_cpShowApproachFork();});
   });
@@ -23364,11 +23400,18 @@ function _cpDoAIGenerate(){
     CPLAN._approaches={};
     _cpShowApproachFork();
     // Fire 3 independent calls — each updates UI as it completes
+    // Snapshot the financial inputs at generation time so the UI can flag
+    // staleness later if the user changes their numbers without regenerating.
+    var _genSurplus=CPLAN.surplus||0;
+    var _genIncome=CPLAN.income||0;
+    var _genAge=CPLAN.age||0;
     var _apDone=0;
     ['traditional','tax_free','hybrid'].forEach(function(ap){
       db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:ap})})
       .then(function(r){
-        CPLAN._approaches[ap]=r.data&&r.data.recommendations?r.data:null;
+        var rec=r.data&&r.data.recommendations?r.data:null;
+        if(rec){rec._genMeta={surplus:_genSurplus,income:_genIncome,age:_genAge,generatedAt:Date.now()};}
+        CPLAN._approaches[ap]=rec;
       }).catch(function(){
         CPLAN._approaches[ap]=null;
       }).then(function(){
