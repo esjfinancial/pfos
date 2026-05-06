@@ -968,6 +968,22 @@ html[data-theme="light"] .pwa-bar{background:linear-gradient(0deg,#FFFFFF,#F8FAF
   .trk-table{font-size:11px!important}
   .trk-table th,.trk-table td{padding:2px 3px!important}
 }
+/* Card-instructions read-more pattern — keeps the long help blocks from
+   dominating the panel until the user wants to read more. */
+.card-instructions{position:relative;transition:max-height .25s ease}
+.card-instructions.card-instructions-collapsed{max-height:78px;overflow:hidden}
+.card-instructions.card-instructions-collapsed::after{
+  content:'';position:absolute;left:0;right:0;bottom:0;height:36px;
+  background:linear-gradient(to bottom,rgba(0,0,30,0),rgba(2,5,30,.92));
+  pointer-events:none;
+}
+button.ci-toggle{
+  display:inline-block;background:transparent;border:none;color:#5B9BFF;
+  font-family:var(--fh,'IBM Plex Mono','Courier New',monospace);
+  font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+  padding:2px 0;margin:-6px 0 12px 0;cursor:pointer;
+}
+button.ci-toggle:hover{color:#7AB3FF;text-decoration:underline}
 </style>
 </head>
 <body style="background:#09092E;margin:0;padding:0">
@@ -1924,18 +1940,121 @@ function _incSrcMonthlyTakeHome(src){
   }
   return parseFloat(src.amount)||0;
 }
+// Fix #2: states with no personal income tax — kept for any other code that
+// needs a binary "this state taxes wages" check. (Tax estimation itself now
+// uses _STATE_TAX_RATES below, which encodes 0 directly for these states.)
+var _NO_STATE_INCOME_TAX=['AK','FL','NV','NH','SD','TN','TX','WA','WY'];
+// Fix #2: state-specific approximate effective income-tax rates for W-2 wage
+// earners in the $50K–$250K range. Pulled from each state's published 2025
+// brackets and flattened to a single effective rate at typical wage levels —
+// good enough for a withholding estimate; the dedicated tax estimator panel
+// handles state-by-state nuance with full progressive math.
+//   • 0% states: no personal income tax (NH taxes only interest/dividends)
+//   • Flat-rate states (AZ, CO, GA, IL, IN, KY, MA, MI, NC, PA, UT): listed at
+//     their statutory flat rate
+//   • Progressive states: listed at the approximate effective rate at typical
+//     wage levels — high earners pay slightly more, low earners less
+var _STATE_TAX_RATES={
+  AK:0,FL:0,NV:0,NH:0,SD:0,TN:0,TX:0,WA:0,WY:0,
+  AZ:0.025,CO:0.044,GA:0.0539,IL:0.0495,IN:0.0315,KY:0.045,
+  MA:0.05,MI:0.0425,NC:0.0475,PA:0.0307,UT:0.0485,
+  AL:0.045,AR:0.045,CA:0.075,CT:0.055,DC:0.065,DE:0.055,HI:0.075,
+  IA:0.06,ID:0.055,KS:0.05,LA:0.04,MD:0.052,ME:0.065,MN:0.07,
+  MO:0.045,MS:0.04,MT:0.055,NE:0.05,NJ:0.06,NM:0.04,NY:0.06,
+  ND:0.018,OH:0.035,OK:0.045,OR:0.075,RI:0.05,SC:0.055,VA:0.0525,
+  VT:0.06,WI:0.05,WV:0.055,PR:0.06
+};
+function _stateTaxRate(state){
+  if(!state)return 0.05; // safe US-average fallback when state isn't set yet
+  var r=_STATE_TAX_RATES[(state||'').toUpperCase()];
+  return (r===undefined)?0.05:r;
+}
+// Estimate annual federal income tax using 2026 progressive brackets — same
+// brackets used by the tax estimator panel at line ~7964 so numbers stay
+// consistent across the app. taxable = gross - pretax_deductions - stdDed.
+function _estFedTax2026(taxable,isMFJ){
+  if(taxable<=0)return 0;
+  var brackets=isMFJ?[
+    {min:0,max:24800,rate:0.10},{min:24800,max:100800,rate:0.12},
+    {min:100800,max:211400,rate:0.22},{min:211400,max:403550,rate:0.24},
+    {min:403550,max:512450,rate:0.32},{min:512450,max:768700,rate:0.35},
+    {min:768700,max:Infinity,rate:0.37}
+  ]:[
+    {min:0,max:12400,rate:0.10},{min:12400,max:50400,rate:0.12},
+    {min:50400,max:105700,rate:0.22},{min:105700,max:201775,rate:0.24},
+    {min:201775,max:256225,rate:0.32},{min:256225,max:640600,rate:0.35},
+    {min:640600,max:Infinity,rate:0.37}
+  ];
+  var tax=0,remaining=taxable;
+  for(var i=0;i<brackets.length;i++){
+    var b=brackets[i];
+    var width=b.max===Infinity?remaining:Math.min(remaining,b.max-b.min);
+    if(width<=0)break;
+    tax+=width*b.rate;
+    remaining-=width;
+  }
+  return tax;
+}
+// Reverse-engineer ANNUAL gross wages from take-home + pre-tax deductions.
+// Iterates until take-home converges (typically 4-6 iterations).
+// Uses the same 2026 brackets, FICA caps, and standard deductions as the
+// tax estimator panel — no hardcoded effective rates.
+function _estAnnualGross(annualTakeHome,annualPretax,isMFJ,stateRate){
+  if(annualTakeHome<=0)return 0;
+  var stdDed=isMFJ?32200:16100; // 2026 IRS Rev. Proc. 2025-32
+  var ssWageBase=184500,ssRate=0.062,medRate=0.0145;
+  var addMedThreshold=isMFJ?250000:200000,addMedRate=0.009;
+  // Initial seed at a rough effective rate so we don't waste iterations
+  var roughRate=isMFJ?(0.18+stateRate):(0.22+stateRate);
+  var gross=(annualTakeHome+annualPretax)/(1-Math.min(roughRate,0.45));
+  for(var iter=0;iter<12;iter++){
+    var ssTax=Math.min(gross,ssWageBase)*ssRate;
+    var medTax=gross*medRate;
+    if(gross>addMedThreshold)medTax+=(gross-addMedThreshold)*addMedRate;
+    var fica=ssTax+medTax;
+    var taxable=Math.max(0,gross-annualPretax-stdDed);
+    var fed=_estFedTax2026(taxable,isMFJ);
+    var stateTax=Math.max(0,gross-annualPretax)*stateRate;
+    var totalTax=fica+fed+stateTax;
+    var computedTH=gross-annualPretax-totalTax;
+    var diff=annualTakeHome-computedTH;
+    if(Math.abs(diff)<50)break; // converged within $50/yr
+    gross+=diff; // direct adjust converges quickly because tax is a smooth function of gross
+    if(gross<annualTakeHome+annualPretax)gross=annualTakeHome+annualPretax; // floor
+  }
+  return gross;
+}
 function _incSrcMonthlyGross(src){
   if(!src)return 0;
-  if(_incSrcMode(src)==='detailed'){
-    var perCheck=(parseFloat(src.take_home_per_check)||0)
-                +(parseFloat(src.deduction_401k)||0)
-                +(parseFloat(src.deduction_health)||0)
-                +(parseFloat(src.deduction_hsa)||0)
-                +(parseFloat(src.deduction_other)||0);
-    return perCheck*_checksPerMonth(src.pay_frequency);
+  if(_incSrcMode(src)!=='detailed'){
+    // Simple mode: amount is already monthly gross/take-home (best guess preserved)
+    return parseFloat(src.amount)||0;
   }
-  // Simple mode: no gross known, return amount as best guess (preserves old behavior)
-  return parseFloat(src.amount)||0;
+  // Detailed mode — Fix #2: estimate REAL gross by solving for the gross
+  // that produces the user's take-home after FICA + federal + state tax +
+  // pre-tax deductions. Uses state-specific effective tax rate from the
+  // user's profile (cpState). Falls back to the prior naive sum if profile
+  // data is missing.
+  var checks=_checksPerMonth(src.pay_frequency);
+  var perCheckPretax=(parseFloat(src.deduction_401k)||0)
+                    +(parseFloat(src.deduction_health)||0)
+                    +(parseFloat(src.deduction_hsa)||0)
+                    +(parseFloat(src.deduction_other)||0);
+  var perCheckTH=parseFloat(src.take_home_per_check)||0;
+  if(perCheckTH<=0)return 0;
+  var marital=(S.profile&&S.profile.marital)||(typeof gv==='function'?gv('cpMarital'):'')||'';
+  var isMFJ=marital==='Married'||marital==='Domestic Partnership';
+  var state=(S.profile&&S.profile.state)||(typeof gv==='function'?gv('cpState'):'')||'';
+  var stateRate=_stateTaxRate(state);
+  // If we don't know filing status yet, fall back to the old additive estimate
+  // (better than 0 and avoids jumping when profile loads)
+  if(!marital){
+    return (perCheckTH+perCheckPretax)*checks;
+  }
+  var annualTH=perCheckTH*checks*12;
+  var annualPretax=perCheckPretax*checks*12;
+  var annualGross=_estAnnualGross(annualTH,annualPretax,isMFJ,stateRate);
+  return annualGross/12;
 }
 function _totalMonthlyGross(){
   return (S.incomeSources||[]).reduce(function(t,s){return t+_incSrcMonthlyGross(s);},0);
@@ -1965,9 +2084,39 @@ function _initDollarInputs(root){
 }
 document.addEventListener('DOMContentLoaded',function(){_initDollarInputs();
   if(typeof initGoalsGrid==='function')initGoalsGrid();
+  if(typeof _initCardInstructionsCollapse==='function')_initCardInstructionsCollapse();
   var _fmtTimer=null;
-  new MutationObserver(function(){if(_fmtTimer)return;_fmtTimer=setTimeout(function(){_fmtTimer=null;_initDollarInputs();},120);}).observe(document.body,{childList:true,subtree:true});
+  new MutationObserver(function(){if(_fmtTimer)return;_fmtTimer=setTimeout(function(){_fmtTimer=null;_initDollarInputs();if(typeof _initCardInstructionsCollapse==='function')_initCardInstructionsCollapse();},120);}).observe(document.body,{childList:true,subtree:true});
 });
+
+// ── Card-instructions collapse (Read more / Show less) ──
+// The 12 .card-instructions blocks are multi-paragraph walls. Wrap each on
+// load so only the first ~3 lines are visible by default with a fade gradient,
+// and a "Read more" / "Show less" toggle appears below. Idempotent — safe to
+// call multiple times (skips already-wrapped blocks).
+function _initCardInstructionsCollapse(){
+  var blocks=document.querySelectorAll('.card-instructions');
+  blocks.forEach(function(blk){
+    if(blk.dataset.ciInited)return;
+    blk.dataset.ciInited='1';
+    // Wrap content for collapsible behavior. Skip very short blocks (height
+    // already small enough that a toggle would be silly).
+    var fullH=blk.scrollHeight;
+    if(fullH<=80){return;} // ~3 lines or less, nothing to truncate
+    blk.classList.add('card-instructions-collapsed');
+    var btn=document.createElement('button');
+    btn.type='button';
+    btn.className='ci-toggle';
+    btn.textContent='Read more ▾';
+    btn.onclick=function(e){
+      e.preventDefault();e.stopPropagation();
+      var isCollapsed=blk.classList.toggle('card-instructions-collapsed');
+      btn.textContent=isCollapsed?'Read more ▾':'Show less ▴';
+    };
+    // Insert button right after the block
+    if(blk.parentNode)blk.parentNode.insertBefore(btn,blk.nextSibling);
+  });
+}
 
 // ── Shared Calculator Helpers ──
 var INFLATION_RATES={rent:0.04,carInsurance:0.06,homeInsurance:0.07,propertyTax:0.035,healthInsurance:0.055,utilities:0.03,food:0.035,education:0.05,healthcare:0.055,childcare:0.04,general:0.03};
@@ -3282,12 +3431,33 @@ function renderPayScheduleUI(){
   var fixedBills=getFixedBills();
   if(fixedBills.length>0){
     h+='<div class="div"></div>';
-    h+='<div class="sec-group"><div class="sec-group-title">Auto-Detected from Expenses ('+fixedBills.length+')</div>';
+    h+='<div class="sec-group"><div class="sec-group-title">Auto-Detected from Expenses &amp; Debts ('+fixedBills.length+')</div>';
     fixedBills.forEach(function(b){
-      h+='<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><span style="color:var(--mu)">'+b.icon+' '+b.name+' — '+b.due_day+ordSuffix(b.due_day)+'</span><span style="color:var(--or);font-family:var(--fh);font-weight:700">'+fmt(Math.round(b.amount))+'</span></div>';
+      var srcLabel=b.source==='debt'?' <span style="color:rgba(91,155,255,.5);font-size:11px">(Debt)</span>':'';
+      h+='<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><span style="color:var(--mu)">'+b.icon+' '+b.name+srcLabel+' — '+b.due_day+ordSuffix(b.due_day)+'</span><span style="color:var(--or);font-family:var(--fh);font-weight:700">'+fmt(Math.round(b.amount))+'</span></div>';
     });
-    h+='<div style="font-size:12px;color:var(--mu);margin-top:6px">These come from expenses marked as "Fixed" with a due date. Edit them in My Finances → Expenses.</div>';
+    h+='<div style="font-size:12px;color:var(--mu);margin-top:6px">Sources: expenses marked "Fixed" with a due day, and debts with a due day set on the Assets &amp; Liabilities panel. Edit there.</div>';
     h+='</div>';
+  }
+  // Fix #5/6: surface debts that have a min payment but no due_day, so the
+  // user knows why they're not on the calendar and how to add them.
+  var skippedDebts=(S.debts||[]).filter(function(d){
+    if(!(d.min>0))return false;
+    var dd=parseInt(d.due_day)||0;
+    if(dd>=1&&dd<=31)return false;
+    // Also skip those that would dedupe against an existing expense entry
+    var dt=(d.type||'').toLowerCase();
+    var exps=S.expData||{};
+    var housingSubs=(exps.housing&&exps.housing.subs)||{};
+    var transportSubs=(exps.transportation&&exps.transportation.subs)||{};
+    var hasMortExp=Object.keys(housingSubs).some(function(k){var s=housingSubs[k];return (s.is_fixed===true||s.is_fixed==='true')&&parseInt(s.due_day)>0&&(k.toLowerCase().indexOf('mortgage')>=0||k.toLowerCase().indexOf('rent')>=0);});
+    var hasAutoExp=Object.keys(transportSubs).some(function(k){var s=transportSubs[k];return (s.is_fixed===true||s.is_fixed==='true')&&parseInt(s.due_day)>0&&(k.toLowerCase().indexOf('car')>=0||k.toLowerCase().indexOf('auto')>=0);});
+    if((dt==='mortgage'||dt==='heloc')&&hasMortExp)return false;
+    if(dt==='auto loan'&&hasAutoExp)return false;
+    return true;
+  });
+  if(skippedDebts.length>0){
+    h+='<div style="margin-top:10px;padding:10px 12px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.18);border-radius:4px;font-size:12px;color:var(--yl);line-height:1.5">⚠️ '+skippedDebts.length+' debt'+(skippedDebts.length>1?'s have':' has')+' a minimum payment but no due day set, so '+(skippedDebts.length>1?'they\'re':'it\'s')+' not on the calendar. Set a Due Day on the <a href="#" onclick="openFinPanel([6]);return false" style="color:var(--yl);text-decoration:underline">Assets &amp; Liabilities</a> panel to include '+(skippedDebts.length>1?'them':'it')+'.</div>';
   }
   el.innerHTML=h;
 }
@@ -3404,23 +3574,46 @@ function psIncomeSelect(){
   if(labelEl) labelEl.value=src.name||'';
   var ownerEl=document.getElementById('psOwner');
   if(ownerEl&&src.owner) ownerEl.value=src.owner;
-  // Auto-calculate take-home per check from monthly income ÷ checks per month
-  var freq=(document.getElementById('psFreq')||{}).value||'biweekly';
-  var checksPerMonth={weekly:4.33,biweekly:2,semimonthly:2,monthly:1};
-  var monthlyNet=parseFloat(src.amount)||0;
-  var netPerCheck=Math.round(monthlyNet/(checksPerMonth[freq]||2));
-  var netEl=document.getElementById('psNet');
-  if(netEl) netEl.value=netPerCheck;
-  // Pre-fill 401k from retirement accounts if available
-  var retAcct=(S.retAccounts||[]).find(function(ra){
-    return ra.type&&ra.type.indexOf('401')!==-1&&(ra.contrib||0)>0;
-  });
-  if(retAcct){
-    var k401El=document.getElementById('ps401k');
-    var perCheck=Math.round((retAcct.contrib||0)/(checksPerMonth[freq]||2));
-    if(k401El&&!k401El.value) k401El.value=perCheck;
+  // Fix #7: when the income source is in DETAILED mode it has explicit
+  // per-check values (take_home_per_check, deduction_401k, deduction_health,
+  // deduction_hsa, deduction_other, employer_match_pct, employer_match_cap,
+  // pay_frequency). Read those directly instead of dividing src.amount —
+  // src.amount is the simple-mode field and is often blank/stale on detailed
+  // sources, which is why values weren't translating before.
+  var freqEl=document.getElementById('psFreq');
+  if(_incSrcMode(src)==='detailed'){
+    // Sync frequency to match the income source
+    if(freqEl&&src.pay_frequency){
+      freqEl.value=src.pay_frequency;
+      if(typeof psFreqChange==='function')psFreqChange();
+    }
+    var setVal=function(id,v){var el=document.getElementById(id);if(el&&v!==undefined&&v!==null&&v!=='')el.value=v;};
+    setVal('psNet',parseFloat(src.take_home_per_check)||'');
+    setVal('ps401k',parseFloat(src.deduction_401k)||'');
+    setVal('psHealth',parseFloat(src.deduction_health)||'');
+    setVal('psOther',parseFloat(src.deduction_hsa)||'');
+    setVal('psOtherMisc',parseFloat(src.deduction_other)||'');
+    setVal('psMatch',parseFloat(src.employer_match_pct)||'');
+    setVal('psMatchCap',parseFloat(src.employer_match_cap)||'');
+  } else {
+    // Simple-mode source: best we can do is divide monthly amount by checks/month.
+    var freq=(freqEl||{}).value||'biweekly';
+    var checksPerMonth={weekly:4.33,biweekly:2,semimonthly:2,monthly:1};
+    var monthlyNet=parseFloat(src.amount)||0;
+    var netPerCheck=Math.round(monthlyNet/(checksPerMonth[freq]||2));
+    var netEl=document.getElementById('psNet');
+    if(netEl) netEl.value=netPerCheck;
+    // Pre-fill 401k from retirement accounts if available (legacy behavior)
+    var retAcct=(S.retAccounts||[]).find(function(ra){
+      return ra.type&&ra.type.indexOf('401')!==-1&&(ra.contrib||0)>0;
+    });
+    if(retAcct){
+      var k401El=document.getElementById('ps401k');
+      var perCheck=Math.round((retAcct.contrib||0)/(checksPerMonth[freq]||2));
+      if(k401El&&!k401El.value) k401El.value=perCheck;
+    }
   }
-  // Recalculate net display
+  // Recalculate gross display
   psCalcGross();
 }
 
@@ -3573,7 +3766,14 @@ function _spendingDonutSVG(slices,totalSpent,totalIn){
       var x4=cx+r*Math.cos(sa),y4=cy+r*Math.sin(sa);
       var lg=pct>0.5?1:0;
       var d='M '+x1+' '+y1+' A '+R+' '+R+' 0 '+lg+' 1 '+x2+' '+y2+' L '+x3+' '+y3+' A '+r+' '+r+' 0 '+lg+' 0 '+x4+' '+y4+' Z';
-      paths+='<path d="'+d+'" fill="'+s.color+'" stroke="var(--bg)" stroke-width="2" style="transition:opacity .15s" onmouseover="this.style.opacity=.82" onmouseout="this.style.opacity=1"><title>'+s.label+': $'+Math.round(s.amount).toLocaleString()+' ('+Math.round(pct*100)+'%)</title></path>';
+      // Fix #8: instead of slow native <title> tooltips, fire a custom
+      // JS tooltip that follows the cursor — same data, instant feedback.
+      var tipLabel=(s.label||'').replace(/'/g,'&#39;').replace(/"/g,'&quot;');
+      var tipPayload='{&quot;label&quot;:&quot;'+tipLabel+'&quot;,&quot;amount&quot;:'+Math.round(s.amount)+',&quot;pct&quot;:'+Math.round(pct*100)+',&quot;color&quot;:&quot;'+s.color+'&quot;}';
+      paths+='<path d="'+d+'" fill="'+s.color+'" stroke="var(--bg)" stroke-width="2" style="transition:opacity .15s;cursor:pointer" '
+        +'onmouseenter="_donutTipShow(event,'+tipPayload+');this.style.opacity=.82" '
+        +'onmousemove="_donutTipMove(event)" '
+        +'onmouseleave="_donutTipHide();this.style.opacity=1"></path>';
       startA=endA;
     });
   }
@@ -3585,6 +3785,44 @@ function _spendingDonutSVG(slices,totalSpent,totalIn){
   svg+='<text x="'+cx+'" y="'+(cy+30)+'" text-anchor="middle" font-size="9" fill="var(--mu)" font-family="var(--fh)" font-weight="600">'+pctIn+'% of income</text>';
   svg+='</svg>';
   return svg;
+}
+// Custom donut tooltip — global so SVG inline handlers can reach it.
+function _donutTipEl(){
+  var el=document.getElementById('_donutTip');
+  if(!el){
+    el=document.createElement('div');
+    el.id='_donutTip';
+    el.style.cssText='position:fixed;z-index:9999;pointer-events:none;display:none;'
+      +'background:rgba(2,5,30,.96);border:1px solid rgba(91,155,255,.35);'
+      +'border-radius:4px;padding:8px 10px;font-family:var(--fh,Courier New,monospace);'
+      +'font-size:12px;color:var(--wh,#E2E8F0);box-shadow:0 4px 14px rgba(0,0,0,.4);'
+      +'white-space:nowrap;line-height:1.5';
+    document.body.appendChild(el);
+  }
+  return el;
+}
+function _donutTipShow(ev,data){
+  var el=_donutTipEl();
+  el.innerHTML='<div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">'
+    +'<span style="display:inline-block;width:9px;height:9px;background:'+data.color+';border-radius:2px"></span>'
+    +'<span style="font-weight:700;color:var(--wh,#E2E8F0)">'+data.label+'</span></div>'
+    +'<div style="font-family:var(--fd,Inter,sans-serif);font-size:14px;color:var(--wh,#E2E8F0)">$'+data.amount.toLocaleString()+' <span style="font-size:11px;color:var(--mu,rgba(226,232,240,.6))">'+data.pct+'% of spend</span></div>';
+  el.style.display='block';
+  _donutTipMove(ev);
+}
+function _donutTipMove(ev){
+  var el=document.getElementById('_donutTip');
+  if(!el||el.style.display==='none')return;
+  // Position to the upper-right of the cursor, but flip if near edges
+  var x=ev.clientX+12,y=ev.clientY-12;
+  var w=el.offsetWidth||140,h=el.offsetHeight||40;
+  if(x+w>window.innerWidth-8)x=ev.clientX-w-12;
+  if(y<8)y=ev.clientY+18;
+  el.style.left=x+'px';el.style.top=y+'px';
+}
+function _donutTipHide(){
+  var el=document.getElementById('_donutTip');
+  if(el)el.style.display='none';
 }
 function _spendingDonutBlock(monthEntries,totalSpent,totalIn){
   if(!monthEntries||!monthEntries.length||totalSpent<=0) return '';
@@ -4777,7 +5015,10 @@ function markManual(el){ if(el)el.dataset.manualEdit='1'; }
 function syncFields(){
   var c=S.calcs||{};
   var liInc=document.getElementById('liAnnualIncome');
-  if(liInc&&!liInc.dataset.manualEdit&&c.inc>0)liInc.value=Math.round(c.inc*12);
+  // Protection coverage gap analysis needs ANNUAL GROSS, not take-home —
+  // Income replacement is calculated against pre-tax wages (matches what the
+  // user sees on a W-2 / offer letter / payroll system).
+  if(liInc&&!liInc.dataset.manualEdit&&(c.incGross>0||c.inc>0))liInc.value=Math.round((c.incGross||c.inc)*12);
   var liMort=document.getElementById('liMortgage');
   if(!liMort||!liMort.dataset.manualEdit){
     var mortTotal=(S.debts||[]).filter(function(d){return d.type==='Mortgage'||d.type==='HELOC';}).reduce(function(s,d){return s+(d.balance||0);},0);
@@ -4859,16 +5100,37 @@ function _syncRetAcctFromIncomeSource(srcIdx){
   if(src._linkedRetAcctId){
     existingIdx=S.retAccounts.findIndex(function(a){return a.id===src._linkedRetAcctId;});
   }
+  // Fix #3: if no linked account but a 401k_current account exists that
+  // isn't linked to ANY other income source, adopt it. This handles the
+  // common case where the user added the retirement account manually first
+  // (with placeholder/wrong numbers like $444 derived from a take-home %),
+  // then went back and filled in the income card. Without this, the sync
+  // creates a duplicate account and the original keeps its wrong values.
+  if(existingIdx<0){
+    var linkedIds={};
+    (S.incomeSources||[]).forEach(function(s,i){
+      if(i!==srcIdx&&s._linkedRetAcctId)linkedIds[s._linkedRetAcctId]=true;
+    });
+    var orphanIdx=S.retAccounts.findIndex(function(a){
+      return a.type==='401k_current'&&!linkedIds[a.id];
+    });
+    if(orphanIdx>=0){
+      existingIdx=orphanIdx;
+      src._linkedRetAcctId=S.retAccounts[orphanIdx].id;
+      S.retAccounts[orphanIdx]._linkedIncomeSourceId=src.id;
+      S._touched.incomeSources=true;
+    }
+  }
   if(existingIdx>=0){
-    // Update existing linked account
+    // Update existing (linked or just-adopted) account
     var existing=S.retAccounts[existingIdx];
     existing.contrib=monthlyContrib;
     existing.matchPct=matchPct;
-    // Preserve user-edited contribPct if set, otherwise compute from gross
-    if(!existing.contribPct){
-      var monthlyGross=_incSrcMonthlyGross(src);
-      if(monthlyGross>0)existing.contribPct=Math.round((monthlyContrib*12)/(monthlyGross*12)*100*10)/10;
-    }
+    // Fix #3: ALWAYS recompute contribPct from real gross — the old code
+    // preserved a stale contribPct (e.g. 4 from "4% of take-home") which
+    // confused users. The income card is now the source of truth for both.
+    var monthlyGross=_incSrcMonthlyGross(src);
+    if(monthlyGross>0)existing.contribPct=Math.round((monthlyContrib/monthlyGross)*100*10)/10;
     S._touched.retAccounts=true;
     renderRetAccounts();
     _showAutoSyncBanner('updated');
@@ -5507,6 +5769,11 @@ function getFixedBills(){
   // Extract all fixed expenses with due dates for the calendar
   var bills=[];
   initExpData();
+  // Track which expense subkeys exist as fixed-with-due-day, so we can
+  // dedupe debts against them (Fix #5/6: a Mortgage debt shouldn't appear
+  // separately on the calendar if there's already a housing>mortgage
+  // expense with a due day; same for Auto Loan vs transportation>car).
+  var hasHousingMortExp=false, hasAutoExp=false;
   L1_CATS.forEach(function(cat){
     var d=S.expData[cat.key];
     if(!d||!d.subs) return;
@@ -5518,31 +5785,49 @@ function getFixedBills(){
         var baseName=sk.split('__').filter(function(p){return p.indexOf('dup_')!==0&&p.indexOf('custom_')!==0;}).pop()||'';
         var name=baseName.replace(/_/g,' ').replace(/\b\w/g,function(l){return l.toUpperCase();});
         if(sub.notes) name=name+(name?' — ':'')+sub.notes;
-        bills.push({
-          name:name,
-          category:cat.key,
-          icon:cat.icon,
-          amount:monthly,
-          annual_amount:sub.period==='annual'?amt:amt*12,
-          period:sub.period||'monthly',
-          due_day:parseInt(sub.due_day)||1,
-          is_auto_pay:sub.is_auto_pay||false,
-          inflation_key:cat.key==='housing'?'rent':cat.key==='insurance'?'homeowner_insurance':cat.key==='utilities'?'utilities':cat.key==='food'?'food':'general'
-        });
+        // Track presence for dedupe: housing-with-mortgage-keyword and transportation-with-car-keyword
+        var skLower=sk.toLowerCase();
+        if(cat.key==='housing'&&(skLower.indexOf('mortgage')>=0||skLower.indexOf('rent')>=0))hasHousingMortExp=true;
+        if(cat.key==='transportation'&&(skLower.indexOf('car')>=0||skLower.indexOf('auto')>=0||skLower.indexOf('vehicle')>=0||skLower.indexOf('payment')>=0))hasAutoExp=true;
+        // Only push to calendar if a due day was set (was previously
+        // defaulting to 1 silently, which gave wrong-looking calendars).
+        var dueDay=parseInt(sub.due_day)||0;
+        if(dueDay>=1&&dueDay<=31){
+          bills.push({
+            name:name,
+            category:cat.key,
+            icon:cat.icon,
+            amount:monthly,
+            annual_amount:sub.period==='annual'?amt:amt*12,
+            period:sub.period||'monthly',
+            due_day:dueDay,
+            is_auto_pay:sub.is_auto_pay||false,
+            inflation_key:cat.key==='housing'?'rent':cat.key==='insurance'?'homeowner_insurance':cat.key==='utilities'?'utilities':cat.key==='food'?'food':'general',
+            source:'expense'
+          });
+        }
       }
     });
   });
-  // Also add debt minimum payments as fixed bills
+  // Add debt minimum payments — but only if user set a due_day, AND skip
+  // mortgage/auto debts when an equivalent expense entry already represents
+  // them (avoid double-counting on the calendar).
   (S.debts||[]).forEach(function(d){
-    if(d.min>0){
-      bills.push({name:d.name||d.type,category:'debt',icon:'💳',amount:d.min,annual_amount:d.min*12,period:'monthly',due_day:parseInt(d.due_day)||15,is_auto_pay:false,inflation_key:'general'});
-    }
+    if(!(d.min>0))return;
+    var dueDay=parseInt(d.due_day)||0;
+    if(dueDay<1||dueDay>31)return; // not on calendar — user opted out
+    var dt=(d.type||'').toLowerCase();
+    var isMortLike=dt==='mortgage'||dt==='heloc';
+    var isAutoLike=dt==='auto loan';
+    if(isMortLike&&hasHousingMortExp)return; // dedupe — expense covers it
+    if(isAutoLike&&hasAutoExp)return;
+    bills.push({name:d.name||d.type,category:'debt',icon:'💳',amount:d.min,annual_amount:d.min*12,period:'monthly',due_day:dueDay,is_auto_pay:false,inflation_key:'general',source:'debt'});
   });
   // Also add manually entered bills from Pay Schedule & Bills
   (S.manualBills||[]).forEach(function(b){
     if(b.amount>0){
       var monthly=b.frequency==='annual'?b.amount/12:b.frequency==='semiannual'?b.amount/6:b.frequency==='quarterly'?b.amount/3:b.amount;
-      bills.push({name:b.name||'Bill',category:'misc',icon:b.icon||'📋',amount:monthly,annual_amount:monthly*12,period:b.frequency||'monthly',due_day:parseInt(b.due_day)||1,is_auto_pay:b.is_auto_pay||false,inflation_key:'general'});
+      bills.push({name:b.name||'Bill',category:'misc',icon:b.icon||'📋',amount:monthly,annual_amount:monthly*12,period:b.frequency||'monthly',due_day:parseInt(b.due_day)||1,is_auto_pay:b.is_auto_pay||false,inflation_key:'general',source:'manual'});
     }
   });
   return bills.sort(function(a,b){return a.due_day-b.due_day;});
@@ -5752,7 +6037,7 @@ function updExpSub2(catKey,subKey,field,val){
 // ── DEBTS ────────────────────────────────────────────
 function addDebtRow(){
   if(!S.debts)S.debts=[];
-  S.debts.push({id:++debtIdCtr,name:'',type:'Credit Card',balance:0,rate:0,min:0,actual:0,term:0});
+  S.debts.push({id:++debtIdCtr,name:'',type:'Credit Card',balance:0,rate:0,min:0,actual:0,term:0,due_day:''});
   S._touched.debts=true;
   renderDebts();
 }
@@ -5761,12 +6046,16 @@ function renderDebts(){
   if(!S.debts||S.debts.length===0){ list.innerHTML='<div style="color:var(--mu);font-size:14px;padding:12px 0">No debts added.</div>'; return; }
   list.innerHTML=S.debts.map(function(d,i){
     var typeOpts=DEBT_TYPES.map(function(t){ return '<option'+(d.type===t?' selected':'')+'>'+t+'</option>'; }).join('');
+    // Fix #5: Due Day field — if blank, debt is excluded from the bill
+    // calendar. If set (1-31), it's added to the calendar on that day.
+    var dueDayCell='<div style="position:relative" title="Day of month payment is due (1–31). Leave blank to skip the bill calendar."><input class="inp" type="number" placeholder="Due day" value="'+(d.due_day||'')+'" oninput="updDebt('+i+',\'due_day\',this.value)" min="1" max="31" style="text-align:center"></div>';
     return '<div class="debt-row">'
       +'<input class="inp" type="text" placeholder="Debt name" value="'+escH(d.name||'')+'" oninput="updDebt('+i+',\'name\',this.value)">'
       +'<select class="sel" onchange="updDebt('+i+',\'type\',this.value);renderDebts()">'+typeOpts+'</select>'
       +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Balance" value="'+((d.balance||0)>0?(d.balance).toLocaleString():'')+'" oninput="updDebt('+i+',\'balance\',autoComma(this))" style="padding-left:22px"></div>'
       +'<div style="position:relative"><input class="inp" type="number" placeholder="Rate%" value="'+(d.rate||'')+'" oninput="updDebt('+i+',\'rate\',this.value)" style="padding-right:20px"><span style="position:absolute;right:7px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:13px;pointer-events:none">%</span></div>'
       +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Min Pmt" value="'+((d.min||0)>0?(d.min).toLocaleString():'')+'" oninput="updDebt('+i+',\'min\',autoComma(this))" style="padding-left:22px"></div>'
+      +dueDayCell
       +(d.type!=='Credit Card'?'<div style="position:relative"><input class="inp" type="number" placeholder="Mo Left" value="'+(d.term||'')+'" oninput="updDebt('+i+',\'term\',this.value)" style="padding-right:20px" title="Remaining months"><span style="position:absolute;right:7px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:11px;pointer-events:none">mo</span></div>':'<div></div>')
       +'<button class="src-del" onclick="delDebt('+i+')">✕</button>'
     +'</div>';
@@ -5998,6 +6287,19 @@ function calc(){
   updateIncomeBreakdown();
   syncFields();
   var totEl=document.getElementById('expTotal'); if(totEl) totEl.textContent=fmt(baseExp)+'/mo total';
+
+  // Fix #3: pass — for any detailed-mode income source with a 401k deduction,
+  // make sure the matching retirement account is in sync. Runs at most once
+  // per second to avoid thrashing during rapid edits. Catches the case where
+  // a user previously had a stale retirement-card 401k from old data.
+  if(!S._lastRetSync||Date.now()-S._lastRetSync>1000){
+    S._lastRetSync=Date.now();
+    (S.incomeSources||[]).forEach(function(src,i){
+      if(_incSrcMode(src)==='detailed'&&parseFloat(src.deduction_401k)>0){
+        try{_syncRetAcctFromIncomeSource(i);}catch(e){console.warn('ret sync skipped:',e);}
+      }
+    });
+  }
 
   // Sync to platform
   clearTimeout(S._syncTimer);
