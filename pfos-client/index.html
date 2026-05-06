@@ -21797,6 +21797,13 @@ var _cpActionOnlyTypes={protection:1,umbrella:1,estate:1,ibc_audit:1,annuity_res
 function _cpIsActionOnly(a){
   if(!a)return false;
   if(_cpActionOnlyTypes[a.type])return true;
+  // HSA gated by missing HDHP confirmation is action-only: the user can't
+  // contribute until they confirm HDHP enrollment, so the card shouldn't
+  // render with an editable $0 slider — it should show the "Confirm HDHP"
+  // action message instead. Without this, HSA with _hdhpGated showed a
+  // $0/$X slider in the plan view, looking like a normal allocation that
+  // simply hadn't been funded, with no visual cue for why.
+  if(a.type==='hsa'&&a._hdhpGated)return true;
   // Custom items with no target/amount are also treated as action-only
   if(a.type==='custom'&&!a.target&&!a.amount)return true;
   return false;
@@ -22874,6 +22881,29 @@ function _cpConvertAIRecs(aiData){
     if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
     if(r.fee_impact&&r.fee_impact!=='None')reason+='\n💰 Fees: '+r.fee_impact;
     if(r.tax_impact&&r.tax_impact!=='None')reason+='\n🏛️ Tax: '+r.tax_impact;
+    // ── STALE-DOLLAR SANITIZATION ──
+    // The AI's prose typically opens with the original recommended amount
+    // ("Allocate $291/mo to your existing high-yield savings account…").
+    // After server-side under-deployment correction, frontend cascade
+    // redistribution, slider edits, or breathing-room scaling, the actual
+    // a.amount diverges from this literal string — body text shows $291/mo
+    // while the slider shows $308/mo. The AI's structural reasoning is still
+    // valid (it's an EF in a HYSA), but the specific dollar figure is wrong.
+    //
+    // Convert literal monthly amounts to a {{AMOUNT}} placeholder that gets
+    // interpolated at render time with the current a.amount. Patterns matched
+    // (case-insensitive, broad to catch AI variations):
+    //   "$291/mo" "$291 per month" "$291 monthly" "Allocate $291" "contribute $291"
+    //   "fund $291" "commit $291" "directing $291" "putting $291"
+    // Annual figures (e.g., "$3,500/yr") and total-target figures
+    // (e.g., "$10,000 target", "$18,452 goal") are left alone — those refer to
+    // IRS limits or goal targets, not the live deployment amount.
+    reason=reason
+      .replace(/(?:Allocate|Contribute|Direct(?:ing)?|Fund(?:ing)?|Commit(?:ing|ting)?|Put(?:ting)?|Set\s+aside|Save)\s+\$\d[\d,]*(?:\s*\/\s*mo|\s*\/\s*month|\s+per\s+month|\s*monthly)?/gi,'Allocate {{AMOUNT}}/mo')
+      .replace(/\$\d[\d,]*\s*\/\s*mo(?!nth)/g,'{{AMOUNT}}/mo')
+      .replace(/\$\d[\d,]*\s*\/\s*month\b/gi,'{{AMOUNT}}/mo')
+      .replace(/\$\d[\d,]*\s+per\s+month\b/gi,'{{AMOUNT}}/mo')
+      .replace(/\$\d[\d,]*\s+monthly\b/gi,'{{AMOUNT}}/mo');
     // Phase D: preserve owner tag from AI; default to 'self' if missing or invalid
     var _ownerTag=(r.owner&&['self','spouse','joint'].indexOf(r.owner)>=0)?r.owner:'self';
     // B1: Derive _ibcUnderlyingType from AI strategy so IBC-IUL allocations get
@@ -23577,12 +23607,15 @@ function _cpShowApproachFork(){
       var netInc=retInc-taxAmt;
       // Effective blended rate for the inline label
       var _effRate=retInc>0?Math.round(taxAmt/retInc*100):0;
-      // Tooltip breakdown — shown on hover of the (i) icon
-      var _tipParts=[];
-      if(_bkInc.ord>0)_tipParts.push('Ordinary income (Trad 401k/IRA): $'+fmt(_bkInc.ord)+'/mo × '+_retTaxPct+'% = $'+fmt(_bkTax.ord)+' tax');
-      if(_bkInc.ltcg>0)_tipParts.push('Long-term capital gains (taxable brokerage): $'+fmt(_bkInc.ltcg)+'/mo × '+_ltcgRate+'% = $'+fmt(_bkTax.ltcg)+' tax');
-      if(_bkInc.free>0)_tipParts.push('Tax-free (Roth, HSA, insurance loans): $'+fmt(_bkInc.free)+'/mo × 0% = $0 tax');
-      var _tipText=_tipParts.length>0?_tipParts.join('\n'):'No allocation data — tax estimate uses approach default.';
+      // Tax breakdown rendered inline below the gross/tax/net rows so the
+      // composition is visible without requiring hover (native HTML title=
+      // delays ~700ms before showing and is not discoverable). Only renders
+      // when there's enough data to be informative — single-bucket plans
+      // (e.g., pure Tax-Free with 100% in 'free' bucket) don't need it.
+      var _bkLines=[];
+      if(_bkInc.ord>0)_bkLines.push({label:'Ordinary income (Trad 401k/IRA)',inc:_bkInc.ord,rate:_retTaxPct,tax:_bkTax.ord});
+      if(_bkInc.ltcg>0)_bkLines.push({label:'LTCG (taxable brokerage)',inc:_bkInc.ltcg,rate:_ltcgRate,tax:_bkTax.ltcg});
+      if(_bkInc.free>0)_bkLines.push({label:'Tax-free (Roth, HSA, ins. loans)',inc:_bkInc.free,rate:0,tax:0});
       h+='<div style="margin-bottom:14px">';
       h+='<div style="font-family:var(--fd);font-size:28px;color:'+cd.color+'">'+fmtK(retVal)+'</div>';
       h+='<div style="font-size:12px;color:var(--mu)">projected at retirement</div>';
@@ -23593,15 +23626,28 @@ function _cpShowApproachFork(){
       h+='<div style="font-size:11px;color:var(--mu);letter-spacing:.06em;margin-bottom:6px">RETIREMENT INCOME</div>';
       h+='<div style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(retInc)+'/mo <span style="font-size:12px;color:var(--mu)">gross</span></div>';
       // Fix-C: show the EFFECTIVE blended rate (weighted across ord/ltcg/free buckets)
-      // rather than a flat retirement-bracket %, plus an (i) tooltip with the per-bucket
-      // breakdown so users can see how the tax was computed.
+      // rather than a flat retirement-bracket %.
       if(taxAmt>0){
         var _bracketLabel=(_bkTax.ord>0&&_bkTax.ltcg===0)?(_retTaxPct+'% retirement bracket'):(_effRate+'% blended');
-        h+='<div style="font-size:13px;color:var(--rd);margin:3px 0">− '+fmt(taxAmt)+' tax ('+_bracketLabel+') <span title="'+_tipText.replace(/"/g,'&quot;')+'" style="display:inline-block;width:14px;height:14px;line-height:14px;border-radius:50%;background:rgba(226,232,240,.1);color:var(--mu);font-size:10px;text-align:center;cursor:help;margin-left:2px;vertical-align:middle">i</span></div>';
+        h+='<div style="font-size:13px;color:var(--rd);margin:3px 0">− '+fmt(taxAmt)+' tax ('+_bracketLabel+')</div>';
       } else {
-        h+='<div style="font-size:13px;color:var(--gr);margin:3px 0">$0 tax — accessed tax-free <span title="'+_tipText.replace(/"/g,'&quot;')+'" style="display:inline-block;width:14px;height:14px;line-height:14px;border-radius:50%;background:rgba(34,197,94,.12);color:var(--gr);font-size:10px;text-align:center;cursor:help;margin-left:2px;vertical-align:middle">i</span></div>';
+        h+='<div style="font-size:13px;color:var(--gr);margin:3px 0">$0 tax — accessed tax-free</div>';
       }
       h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:'+(taxAmt>0?'var(--wh)':'var(--gr)')+'">'+fmt(netInc)+'/mo <span style="font-size:11px;font-weight:400;color:var(--mu)">net after tax</span></div>';
+      // Always-visible bucket breakdown (replaces hover tooltip). Renders only when
+      // there are 2+ buckets — single-bucket cases (pure Tax-Free) are self-evident.
+      if(_bkLines.length>=2){
+        h+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(100,116,139,.15)">';
+        _bkLines.forEach(function(bl){
+          var _bkColor=bl.rate===0?'var(--gr)':(bl.label.indexOf('LTCG')>=0?'var(--yl)':'var(--mu)');
+          h+='<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;line-height:1.5;margin-bottom:1px">';
+          h+='<span style="color:var(--mu);flex:1">'+bl.label+'</span>';
+          h+='<span style="color:var(--wh);font-family:var(--fd);font-size:11px;margin:0 6px">'+fmt(bl.inc)+'/mo</span>';
+          h+='<span style="color:'+_bkColor+';font-family:var(--fd);font-size:11px;min-width:42px;text-align:right">'+(bl.rate>0?'-'+fmt(bl.tax):'$0')+'</span>';
+          h+='</div>';
+        });
+        h+='</div>';
+      }
       h+='</div>';
       // Deployed
       h+='<div style="margin-bottom:14px"><div style="font-family:var(--fd);font-size:16px;color:var(--wh)">'+fmt(monthlyCost)+'<span style="font-size:12px;color:var(--mu)">/mo deployed</span></div>';
@@ -24652,8 +24698,13 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _cardInfo=(_cardSlug&&typeof _cpInfoBtn==='function')?_cpInfoBtn(_cardSlug,name):'';
     h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);display:flex;align-items:center">'+name+_cardInfo+'</div>';
   }
-  // "Why this" in guided or AI reasoning
-  if(a.reason)h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+a.reason+'</div>';
+  // "Why this" in guided or AI reasoning. Interpolate {{AMOUNT}} placeholders
+  // with the live a.amount so the prose always matches the slider — see
+  // STALE-DOLLAR SANITIZATION block in _cpConvertAIRecs for why.
+  if(a.reason){
+    var _liveReason=a.reason.replace(/\{\{AMOUNT\}\}/g,'$'+fmt(a.amount||0));
+    h+='<div id="cpReason'+idx+'" style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+_liveReason+'</div>';
+  }
   else{var why=_cpWhy(a.type);if(why)h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+why+'</div>';}
   h+='</div></div>';
   // Amount display + Slider — skip for action-only items (protection, estate)
@@ -24667,6 +24718,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     else if(a.type==='ibc_audit')_aoMsg='Action required — upload your policy to the Policy Audit tool for an IBC structural review.';
     else if(a.type==='annuity_research')_aoMsg='Action required — research annuity options. Mark complete to log a premium if you purchase one.';
     else if(a.type==='diversify')_aoMsg='Action required — explore side income, rental, or investment dividends. No expense to log; mark complete when you have a plan.';
+    else if(a.type==='hsa'&&a._hdhpGated)_aoMsg='Action required — HSA contributions need HDHP enrollment. Confirm you\'re on a High Deductible Health Plan through your employer or marketplace, then return here to set a contribution amount up to the IRS limit ($367/mo self / $712/mo family).';
     h+='<div style="padding:10px 12px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.15);border-radius:4px;margin-top:8px;font-size:13px;color:var(--yl);line-height:1.5;display:flex;align-items:center;gap:8px"><span style="font-size:16px">📋</span><span>'+_aoMsg+'</span></div>';
   } else {
     h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_cpHex2Rgba(color,0.08)+';border-radius:4px"><div id="cpAmt'+idx+'" style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(a.amount)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
@@ -24701,9 +24753,20 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _endLabel='ongoing';
     if(a.type==='debt'&&CPLAN._sim&&CPLAN._sim.debtFreeMonth>0){
       _endLabel=new Date(Date.now()+CPLAN._sim.debtFreeMonth*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+' ('+CPLAN._sim.debtFreeMonth+' mo)';
-    } else if(a.type==='ef'&&a.target>0){
-      var _efMo=Math.ceil(Math.max(0,(a.target-(CPLAN.efBal||0)))/a.amount);
-      if(_efMo>0)_endLabel=new Date(Date.now()+_efMo*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+' ('+_efMo+' mo)';
+    } else if(a.type==='ef'){
+      // Read EF target/balance from CPLAN (canonical, populated at line ~23335)
+      // — NOT from a.target which is typically unset for AI-generated EF allocations.
+      // Falls through to "ongoing" only if neither source has a target.
+      var _efTgt=parseFloat(CPLAN.efTarget||a.target||0);
+      var _efBal=parseFloat(CPLAN.efBal||a.goalCurrent||0);
+      if(_efTgt>0){
+        var _efMo=Math.ceil(Math.max(0,(_efTgt-_efBal))/Math.max(1,a.amount));
+        if(_efMo>0)_endLabel=new Date(Date.now()+_efMo*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+' ('+_efMo+' mo)';
+      }
+    } else if(a.type==='custom'&&a.target>0){
+      // Same pattern for custom goals — was previously falling through to "ongoing"
+      var _cMo=Math.ceil(Math.max(0,(a.target-(a.goalCurrent||0)))/Math.max(1,a.amount));
+      if(_cMo>0)_endLabel=new Date(Date.now()+_cMo*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+' ('+_cMo+' mo)';
     }
     h+='<div style="font-size:11px;color:var(--mu);margin-top:4px">'+_startMo+' → '+_endLabel+'</div>';
   }
@@ -31966,6 +32029,12 @@ function _cpSlide(i,v){
   // 1. Update amount display
   var amtEl=document.getElementById('cpAmt'+i);
   if(amtEl)amtEl.textContent=fmt(a.amount);
+  // 1b. Update reason text — interpolate {{AMOUNT}} with the live a.amount so
+  // body prose stays in sync with the slider (no more stale "$291/mo" text).
+  var reasonEl=document.getElementById('cpReason'+i);
+  if(reasonEl&&a.reason){
+    reasonEl.innerHTML=a.reason.replace(/\{\{AMOUNT\}\}/g,'$'+fmt(a.amount||0));
+  }
   // Update this slider's own cap note too
   var noteSelf=document.getElementById('cpCapNote'+i);
   if(noteSelf)noteSelf.innerHTML=_cpEffectiveCapNote(a.type,i);
