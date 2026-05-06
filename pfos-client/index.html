@@ -22862,10 +22862,19 @@ function _cpConvertAIRecs(aiData){
     else if(_tl.indexOf('hsa')>=0)map.type='hsa';
     else if(_tl.indexOf('sep ira')>=0||_tl.indexOf('sep-ira')>=0)map.type='sep_ira';
     else if(_tl.indexOf('traditional ira')>=0)map.type='trad_ira';
-    else if((_tl.indexOf('iul')>=0||_tl.indexOf('indexed universal')>=0)&&_tl.indexOf('ibc')<0)map.type='iul';
-    else if(_tl.indexOf('whole life')>=0&&_tl.indexOf('ibc')<0)map.type='wl';
+    else if(_tl.indexOf('iul')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='iul';
+    else if(_tl.indexOf('whole life')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='wl';
     else if(_tl.indexOf('ibc')>=0||_tl.indexOf('infinite banking')>=0)map.type='ibc';
-    else if(_tl.indexOf('taxable invest')>=0||_tl.indexOf('investment account')>=0||_tl.indexOf('brokerage')>=0||_tl.indexOf('index fund')>=0||_tl.indexOf('reit')>=0)map.type='invest';
+    // Title-to-invest override: ONLY apply when strategy field doesn't already
+    // pin to a specific tax-advantaged vehicle. Without this guard, an AI rec
+    // with strategy='roth_ira' but title="Roth IRA Index Fund Allocation" would
+    // get force-mapped to type='invest' (taxable brokerage) by the title match
+    // on "index fund", incorrectly classifying tax-advantaged Roth dollars as
+    // taxable LTCG buckets in the strategy fork's tax breakdown.
+    else if((_tl.indexOf('taxable invest')>=0||_tl.indexOf('investment account')>=0||_tl.indexOf('brokerage')>=0||_tl.indexOf('index fund')>=0||_tl.indexOf('reit')>=0)
+            && ['roth','roth401k','401k','hsa','iul','wl','ibc','trad_ira','solo401k','sep_ira','edu'].indexOf(map.type)<0){
+      map.type='invest';
+    }
     else if(_tl.indexOf('term life')>=0||_tl.indexOf('disability')>=0||_tl.indexOf('umbrella')>=0)map.type='protection';
     else if(_tl.indexOf('estate')>=0||_tl.indexOf('will')>=0||_tl.indexOf('trust')>=0||_tl.indexOf('beneficiary')>=0)map.type='custom';
     var phase=r.phase||map.phase;
@@ -23368,6 +23377,76 @@ function _cpConvertAIRecs(aiData){
   if(aiData.summary)CPLAN._aiSummary=aiData.summary;
   if(aiData.complianceNote)CPLAN._complianceNote=aiData.complianceNote;
   if(aiData.debtStrategy)CPLAN.debtStrategy=aiData.debtStrategy;
+
+  // ── POST-GATE FULL DEPLOYMENT (frontend mirror of server FIX 3) ──
+  // After all the frontend gates (HSA HDHP gate, insurance minimums, debt-type
+  // force, etc.) have potentially zeroed out allocations, the total deployed
+  // can drop below the pool — leaving money idle. The server-side correction
+  // already ran when the AI returned, but it can't account for frontend gates
+  // that fire after parsing. This pass routes any remaining gap into the
+  // largest absorbing vehicle using the same ladder as the server fix.
+  // Without this, HSA gating in Tax-Free silently drops $300+/mo and the
+  // sliders look "not maxed" (deployed < pool).
+  (function _redeployPostGate(){
+    var _pool=Math.round((CPLAN.surplus||0)*(1-(CPLAN._breathingPct||15)/100));
+    var _deployed=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+    var _gap=_pool-_deployed;
+    if(_gap<=50)return;// Rounding-noise threshold
+
+    // Tier 1: existing IUL/WL/IBC premium (no IRS cap, fixed-premium domain rule
+    // notwithstanding — at plan-load before user marks Done, the premium isn't
+    // locked yet, so the AI's recommended amount can be adjusted up)
+    var _insTypes=['iul','wl','ibc'];
+    var _ins=CPLAN.allocations
+      .map(function(a,i){return{a:a,i:i};})
+      .filter(function(x){return _insTypes.indexOf(x.a.type)>=0&&x.a.amount>0&&!x.a._completed;})
+      .sort(function(a,b){return(parseFloat(b.a.amount)||0)-(parseFloat(a.a.amount)||0);});
+    if(_ins.length>0){
+      _ins[0].a.amount=Math.round((parseFloat(_ins[0].a.amount)||0)+_gap);
+      var _curReason=_ins[0].a.reason||'';
+      if(_curReason.indexOf('absorb')<0){
+        _ins[0].a.reason=_curReason+(_curReason?'\n':'')+'⚙️ Premium adjusted to absorb gap from frontend gating ($'+fmt(_gap)+'/mo).';
+      }
+      return;
+    }
+
+    // Tier 2: existing taxable brokerage (no IRS cap)
+    var _investAlloc=CPLAN.allocations.find(function(a){return a.type==='invest'&&!a._completed;});
+    if(_investAlloc){
+      _investAlloc.amount=Math.round((parseFloat(_investAlloc.amount)||0)+_gap);
+      return;
+    }
+
+    // Tier 3: any non-fixed-premium growth allocation with IRS headroom,
+    // largest headroom first
+    var _growth=CPLAN.allocations.map(function(a,i){return{a:a,i:i};})
+      .filter(function(x){
+        if(_insTypes.indexOf(x.a.type)>=0)return false;
+        if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection'||x.a.type==='custom')return false;
+        if(x.a._completed||x.a._hdhpGated)return false;
+        var irsMax=typeof _cpIRSMax==='function'?_cpIRSMax(x.a.type,x.a):Infinity;
+        return (irsMax-(parseFloat(x.a.amount)||0))>0;
+      })
+      .sort(function(a,b){
+        var aHr=(typeof _cpIRSMax==='function'?_cpIRSMax(a.a.type,a.a):Infinity)-(parseFloat(a.a.amount)||0);
+        var bHr=(typeof _cpIRSMax==='function'?_cpIRSMax(b.a.type,b.a):Infinity)-(parseFloat(b.a.amount)||0);
+        return bHr-aHr;
+      });
+    var _remaining=_gap;
+    _growth.forEach(function(g){
+      if(_remaining<=0)return;
+      var irsMaxG=typeof _cpIRSMax==='function'?_cpIRSMax(g.a.type,g.a):Infinity;
+      var headroom=Math.max(0,irsMaxG-(parseFloat(g.a.amount)||0));
+      var addG=Math.min(_remaining,headroom);
+      if(addG>0){
+        g.a.amount=Math.round((parseFloat(g.a.amount)||0)+addG);
+        _remaining-=addG;
+      }
+    });
+    // If anything still left over, it's true unallocated cash — silently leave
+    // it in breathing room (slider note shows the delta as "available to allocate")
+  })();
+
   // Fix #2: run the enforce safety net once now (allowScale=true) so over-budget
   // AI plans get scaled down at load time. Subsequent interactive _cpEnforce()
   // calls from sliders use default opts (allowScale=false) so individual edits
@@ -23514,6 +23593,23 @@ function _cpShowApproachFork(){
         'edu':'free','ef':'free','custom':'free',
         'invest':'ltcg'
       };
+      // Tax-Free approach override: 401k allocations in Tax-Free are capped at the
+      // employer match (per Tax-Free's vehicle whitelist + match-only rule). Those
+      // pre-tax dollars technically generate ordinary income at withdrawal, but
+      // Tax-Free's design assumption is that the user converts them to Roth at
+      // retirement (in-plan Roth conversion at age 59½, or rollover to Roth IRA).
+      // Treating them as 'free' in this approach keeps the strategy fork's framing
+      // consistent with the approach's name ("Tax-Free Income") — every bucket
+      // shows zero tax. Without this override, Tax-Free showed $X ordinary income
+      // for the 401k match, which contradicted the approach's labeling.
+      if(cd.key==='tax_free'){
+        _apprTaxBucket['401k']='free';
+        _apprTaxBucket['trad_ira']='free';
+        _apprTaxBucket['solo401k']='free';
+        _apprTaxBucket['sep_ira']='free';
+        _apprTaxBucket['rollover']='free';
+        _apprTaxBucket['invest']='free';// any leftover invest from a stale plan
+      }
       // Try the cascade-aware simulation first. It honors phase transitions:
       //   • Phase 1: high-rate debt + EF take most of surplus, growth gets crumbs
       //   • Phase 2: debt cleared + EF funded → freed money cascades to growth vehicles
@@ -23522,7 +23618,7 @@ function _cpShowApproachFork(){
       // 30-yr horizon, which collapsed all three approaches to ~$2.1M regardless
       // of vehicle mix because growth-deployed dollars were always limited to ~$2K/mo.
       // Falls back to the legacy compounder below if the sim fails for any reason.
-      var _simBased=_cpProjectApproachWithSim(data);
+      var _simBased=_cpProjectApproachWithSim(data,cd.key);
       var _apprYrs=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
       var _apprRetVal=0;
       var _apprBuckets={ord:0,ltcg:0,free:0};
@@ -23828,7 +23924,7 @@ function _cpDoAIGenerate(){
 // Cached on approachData._simResult so re-renders during loading don't
 // re-run the sim. Cache is naturally invalidated when CPLAN._approaches[k]
 // is reassigned on regenerate (the data object is replaced wholesale).
-function _cpProjectApproachWithSim(approachData){
+function _cpProjectApproachWithSim(approachData,approachKey){
   if(!approachData||!approachData.recommendations||!approachData.recommendations.length)return null;
   if(approachData._simResult)return approachData._simResult;
   // Save state — sim writes CPLAN._sim and we'll be replacing CPLAN.allocations
@@ -23844,6 +23940,21 @@ function _cpProjectApproachWithSim(approachData){
     CPLAN._projectionMode='preview';
     // Convert recs to allocations (this clears CPLAN.allocations and rebuilds via secMap/stratMap)
     _cpConvertAIRecs(approachData);
+    // Tax-Free guard: if any invest allocation slipped through (e.g., AI returned
+    // a Roth rec with title containing "index fund" that title-override caught),
+    // reclassify it as roth. The Tax-Free vehicle whitelist on the server
+    // explicitly excludes invest/taxable_brokerage, so an invest allocation here
+    // is a parsing artifact, not a real plan element. Without this, the fork's
+    // tax breakdown shows a phantom LTCG bucket on Tax-Free.
+    var _isTaxFree=(approachKey==='tax_free'||approachData.approach==='tax_free');
+    if(_isTaxFree){
+      CPLAN.allocations.forEach(function(a){
+        if(a.type==='invest'){
+          a.type='roth';
+          a._reclassifiedFromInvest=true;
+        }
+      });
+    }
     // Run cascade-aware simulation. Writes results to CPLAN._sim.
     var sim=_cpRunSimulation();
     if(sim){
