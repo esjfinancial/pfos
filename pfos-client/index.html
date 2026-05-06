@@ -22349,6 +22349,285 @@ function _extend(base,more){var o={};for(var k in base)o[k]=base[k];for(var k2 i
 
 // Note: dismissal tracking on remove is wired directly inside _cpRemove (see that function).
 
+// ── IBC three-state card handlers ──────────────────────────────────────────
+// State machine on the debt allocation: a._ibcState ∈ {
+//   'considering' (default) — hypothetical projection + Request Agent / Audit buttons
+//   'upload_mode' — inline file picker + policy-type select + Run Audit button
+//   'auditing_inflight' — loading spinner while audit-policy edge fn runs
+//   'auditing' — audit complete; summary visible + expandable full detail + Done button
+//   'active' — user confirmed they bought this policy; yearly review uploads recalibrate
+// }
+// The entire flow lives INSIDE the IBC card on the plan page. No modals.
+// Closing the page or scrolling away never disrupts the plan view.
+//
+// Files in flight are stored per-allocation as a._pendingFile{Data,Type,Name}
+// so multiple IBC allocations (if they ever exist) don't collide.
+
+function _cpIBCStartAudit(allocIdx){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a)return;
+  a._ibcState='upload_mode';
+  // Reset any prior pending file so the upload UI starts clean.
+  delete a._pendingFileData;
+  delete a._pendingFileType;
+  delete a._pendingFileName;
+  // Track whether this is a yearly-review (vs initial audit). Set elsewhere
+  // by _cpIBCUploadReview; cleared here by default.
+  a._pendingIsYearlyReview=false;
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+}
+
+function _cpIBCUploadReview(allocIdx){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a)return;
+  a._ibcState='upload_mode';
+  delete a._pendingFileData;
+  delete a._pendingFileType;
+  delete a._pendingFileName;
+  a._pendingIsYearlyReview=true;
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+}
+
+// Called by the inline file <input>'s onchange handler. Reads the chosen file
+// to base64 and stashes on the allocation. Then forces a re-render so the
+// UI shows the filename + enables the "Run Audit" button.
+function _cpIBCHandleFile(allocIdx,inputEl){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a||!inputEl||!inputEl.files||!inputEl.files[0])return;
+  var file=inputEl.files[0];
+  var maxBytes=20*1024*1024;
+  if(file.size>maxBytes){alert('File too large. Maximum size is 20MB.');return;}
+  var ftype=(file.type||'').indexOf('pdf')>=0||(file.name||'').toLowerCase().endsWith('.pdf')?'pdf':'image';
+  var reader=new FileReader();
+  reader.onload=function(){
+    a._pendingFileData=String(reader.result||'').split(',')[1]||'';
+    a._pendingFileType=ftype;
+    a._pendingFileName=file.name||'illustration';
+    if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  };
+  reader.onerror=function(){alert('Could not read the file. Please try a different file.');};
+  reader.readAsDataURL(file);
+}
+
+// Drives the audit-policy edge function call directly from the IBC card.
+// Reads file data from the allocation (set by _cpIBCHandleFile), reads policy
+// type + isNew flags from inline selects, calls the edge function, and on
+// success applies results to the allocation via _cpIBCApplyAuditResult.
+async function _cpIBCRunInlineAudit(allocIdx){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a)return;
+  if(!a._pendingFileData){alert('Please upload your illustration first.');return;}
+  var typeSel=document.getElementById('_ibcPolType_'+allocIdx);
+  var newSel=document.getElementById('_ibcPolNew_'+allocIdx);
+  var policyType=(typeSel&&typeSel.value)||'whole_life';
+  var isNew=(newSel&&newSel.value)==='yes';
+  // Capture the audit context before transitioning to inflight (the inflight
+  // render won't have these inputs to read from).
+  a._pendingPolicyType=policyType;
+  a._pendingIsNew=isNew;
+  a._ibcState='auditing_inflight';
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  // Build the payload — same shape the existing Policy Audit calculator uses
+  // when uploading a file. The client profile block helps the AI tailor the audit.
+  var cs=(typeof S!=='undefined'&&S.calcs)?S.calcs:{};
+  var payload={
+    mode:'audit',
+    policyType:policyType,
+    purpose:'ibc',
+    isNew:isNew,
+    fileData:a._pendingFileData,
+    fileType:a._pendingFileType||'pdf',
+    clientProfile:{
+      age:(typeof S!=='undefined'&&S.profile&&S.profile.currentAge)||0,
+      income:cs.inc||0,
+      riskProfile:(typeof S!=='undefined'&&S.riskProfile&&S.riskProfile.label)||'',
+      dependents:((typeof S!=='undefined'&&S.children)||[]).length||0,
+      totalDebt:cs.totalDebt||0,
+      efMonths:cs.efMonths||0,
+      protectionGap:cs.protGap||0,
+      netWorth:cs.netWorth||0
+    }
+  };
+  try{
+    var token='';
+    try{token=(await db.auth.getSession()).data.session?.access_token||'';}catch(_e){}
+    var res=await fetch(SUPABASE_URL+'/functions/v1/audit-policy',{
+      method:'POST',
+      headers:{'Content-Type':'application/json','Authorization':'Bearer '+token},
+      body:JSON.stringify(payload)
+    });
+    var data=await res.json();
+    if(data&&!data.error){
+      // Store the FULL audit response on the allocation so the expandable
+      // detail view can render the same content as the calculator's renderAIAuditResults.
+      a._auditFullResponse=data;
+      _cpIBCApplyAuditResult(data);
+    } else {
+      a._ibcState=a._auditedIllustration?'auditing':'upload_mode';
+      a._auditError=(data&&(data.message||data.error))||'Audit failed. Please try again.';
+      if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+    }
+  } catch(err){
+    a._ibcState=a._auditedIllustration?'auditing':'upload_mode';
+    a._auditError=(err&&err.message)||'Connection error reaching audit service.';
+    if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  }
+}
+
+function _cpIBCCancelUpload(allocIdx){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a)return;
+  a._ibcState=a._auditedIllustration?(a._ibcActivatedAt?'active':'auditing'):'considering';
+  delete a._pendingFileData;
+  delete a._pendingFileType;
+  delete a._pendingFileName;
+  delete a._auditError;
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+}
+
+function _cpIBCToggleAuditDetail(allocIdx){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a)return;
+  a._ibcAuditExpanded=!a._ibcAuditExpanded;
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+}
+
+function _cpIBCMarkActive(allocIdx){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a||!a._auditedIllustration){alert('No audited illustration found. Please run the audit first.');return;}
+  // Confirmation: only "Yes — this is the policy I actually purchased" advances state.
+  // "No" or "Not yet" keeps the audit data on file but doesn't mark active.
+  var msg='Is this the policy you actually purchased?\n\n'
+    +(a._auditedIllustration.carrier?'Carrier: '+a._auditedIllustration.carrier+'\n':'')
+    +(a._auditedIllustration.product?'Product: '+a._auditedIllustration.product+'\n':'')
+    +(a._auditedIllustration.premium?'Premium: $'+a._auditedIllustration.premium+'/mo\n':'')
+    +'\nClick OK only if this matches the policy you bought.';
+  if(!confirm(msg))return;
+  a._ibcState='active';
+  a._ibcActivatedAt=new Date().toISOString();
+  // ── Plan → Protection write-back ──
+  // Push this policy into pfos-main's S.policies via the existing PFOS_PLAN_UPDATE
+  // /add_policy channel. This makes the policy visible in the Protection panel
+  // and ensures generate-recommendations sees it as an existing IBC policy on
+  // the next regeneration (closing the bidirectional loop).
+  // Dedup is handled in pfos-main by id; we use a stable id derived from the
+  // audit so re-confirming doesn't insert duplicates.
+  if(!a._linkedPolicyId){
+    var aud=a._auditedIllustration||{};
+    // Map audit's product type back to one of pfos-main's POLICY_TYPES options.
+    // Default to Whole Life since IBC orthodoxy is WL; only deviate if audit
+    // explicitly identified IUL or UL.
+    var polTypeStr='Whole Life';
+    var rawType=String(aud.product||'').toLowerCase();
+    if(rawType.indexOf('iul')>=0||rawType.indexOf('indexed universal')>=0)polTypeStr='IUL (Indexed Universal Life)';
+    else if(rawType.indexOf('universal')>=0)polTypeStr='Universal Life';
+    var policyId=aud.auditId||('ibc_plan_'+Date.now());
+    a._linkedPolicyId=policyId;
+    var policyPayload={
+      id:policyId,
+      company:aud.carrier||'',
+      type:polTypeStr,
+      coverage:aud.deathBenefit||0,
+      premium:aud.premium||0,
+      cashValue:0, // Just purchased — CV starts at 0 and grows per illustration
+      policyNumber:'',
+      termYears:0, // Permanent
+      ibcFlag:'yes',
+      notes:'Added from plan view IBC card. Audit grade: '+(aud.grade||'?')+'. '+(aud.product?'Product: '+aud.product+'. ':'')+'Linked to debt allocation #'+allocIdx+'.',
+      _planLinked:true,
+      _planAllocType:'ibc',
+      _planAllocName:'IBC for debt elimination'
+    };
+    if(typeof _cpSendToPfosMain==='function'){
+      _cpSendToPfosMain('add_policy',policyPayload);
+    }
+  }
+  if(typeof cplanSave==='function')cplanSave();
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+}
+
+function _cpIBCResetState(allocIdx){
+  var a=CPLAN.allocations&&CPLAN.allocations[allocIdx];
+  if(!a)return;
+  if(a._ibcState==='active'){
+    if(!confirm('Revert this policy to hypothetical projections? (Use this if you surrendered or replaced the policy.) This will clear the audit and yearly review data.\n\nNote: the policy entry in your Protection panel will not be removed automatically — please remove it manually if you no longer have this policy.'))return;
+  }
+  a._ibcState='considering';
+  delete a._auditedIllustration;
+  delete a._yearlyReviews;
+  delete a._ibcActivatedAt;
+  delete a._auditFullResponse;
+  delete a._ibcAuditExpanded;
+  delete a._auditError;
+  delete a._linkedPolicyId;
+  if(typeof cplanSave==='function')cplanSave();
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+}
+
+// Hook called by _cpIBCRunInlineAudit on success. Snapshots key extracted
+// fields onto the allocation as a._auditedIllustration (or pushes onto
+// a._yearlyReviews[] if this run was launched as a yearly review).
+// Transitions state from 'auditing_inflight' to 'auditing' (waits for user's
+// "Done" confirmation to advance to 'active').
+function _cpIBCApplyAuditResult(auditResponse){
+  // Find the allocation that's currently in 'auditing_inflight'. Should be
+  // exactly one given the inline flow (state transitions are mutually
+  // exclusive per allocation).
+  var idx=-1,a=null;
+  if(CPLAN.allocations){
+    for(var _i=0;_i<CPLAN.allocations.length;_i++){
+      if(CPLAN.allocations[_i]&&CPLAN.allocations[_i]._ibcState==='auditing_inflight'){idx=_i;a=CPLAN.allocations[_i];break;}
+    }
+  }
+  if(!a)return;
+  var ed=(auditResponse&&auditResponse.extractedData)||{};
+  var snapshot={
+    uploadedAt:new Date().toISOString(),
+    carrier:auditResponse.carrier||ed.carrier||'',
+    product:auditResponse.product||ed.product||'',
+    grade:auditResponse.grade||'',
+    gradeSummary:auditResponse.gradeSummary||'',
+    premium:parseFloat(ed.premium)||0,
+    premiumFrequency:ed.premiumFrequency||'monthly',
+    deathBenefit:parseFloat(ed.deathBenefit)||0,
+    loanRate:parseFloat(ed.loanRate)||0,
+    loanType:ed.loanType||'',
+    loanInterestType:ed.loanInterestType||'simple',
+    recognitionType:ed.recognitionType||'',
+    illustratedRate:parseFloat(ed.illustratedRate)||0,
+    guaranteedRate:parseFloat(ed.guaranteedRate)||0,
+    dividendRate:parseFloat(ed.dividendRate)||0,
+    cv10G:parseFloat(ed.cashValueYear10Guaranteed)||0,
+    cv10I:parseFloat(ed.cashValueYear10Illustrated)||0,
+    cv20G:parseFloat(ed.cashValueYear20Guaranteed)||0,
+    cv20I:parseFloat(ed.cashValueYear20Illustrated)||0,
+    cv30G:parseFloat(ed.cashValueYear30Guaranteed)||0,
+    cv30I:parseFloat(ed.cashValueYear30Illustrated)||0,
+    cashValueByYear:Array.isArray(ed.cashValueByYear)?ed.cashValueByYear.map(function(v){return parseFloat(v)||0;}):null,
+    surrenderPeriodYears:parseInt(ed.surrenderPeriodYears)||0,
+    keyFindings:auditResponse.keyFindings||[],
+    auditId:auditResponse.id||('audit_'+Date.now())
+  };
+  if(a._pendingIsYearlyReview){
+    if(!a._yearlyReviews)a._yearlyReviews=[];
+    a._yearlyReviews.push(snapshot);
+    a._ibcState='active';
+  } else {
+    a._auditedIllustration=snapshot;
+    a._ibcState=a._ibcActivatedAt?'active':'auditing';
+  }
+  // Cleanup pending state
+  delete a._pendingFileData;
+  delete a._pendingFileType;
+  delete a._pendingFileName;
+  delete a._pendingPolicyType;
+  delete a._pendingIsNew;
+  delete a._pendingIsYearlyReview;
+  delete a._auditError;
+  if(typeof cplanSave==='function')cplanSave();
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+}
+
 function _cpRequestAgent(){
   var schedUrl=APP._advisorSchedulingUrl||'';
   if(schedUrl){
@@ -23152,12 +23431,14 @@ function _cpShowApproachFork(){
       // Success — show data with tax breakdown
       var hl=data.headline||{};
       var retVal=hl.projected_retirement_value||0;
-      // F1 fix: recompute monthlyCost from actual allocations rather than trusting
-      // the AI's headline.total_monthly_cost (which sometimes disagrees with the
+      // F1 fix: recompute monthlyCost from actual recommendations rather than
+      // trusting hl.total_monthly_cost (which sometimes disagrees with the
       // sum, producing the "Hybrid $2,300 vs plan $2,550" mismatch).
+      // Note: edge function returns `recommendations` array, not `allocations`.
+      var _recs=data.recommendations||data.allocations||[];
       var monthlyCost=0;
-      if(data.allocations&&data.allocations.length>0){
-        monthlyCost=data.allocations.reduce(function(t,al){return t+(al.monthly_cost||al.amount||0);},0);
+      if(_recs.length>0){
+        monthlyCost=_recs.reduce(function(t,al){return t+(al.monthly_cost||al.amount||0);},0);
       }
       if(monthlyCost===0)monthlyCost=hl.total_monthly_cost||0;
       // A3 fix: per-strategy rate must distinguish IBC-IUL (5.5%) from IBC-WL (4%).
@@ -23181,26 +23462,27 @@ function _cpShowApproachFork(){
       var _apprYrs=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
       var _apprRetVal=0;
       var _apprBuckets={ord:0,ltcg:0,free:0};
-      if(data.allocations&&data.allocations.length>0){
-        data.allocations.forEach(function(al){
-          var amt=al.monthly_cost||al.amount||0;if(amt<=0)return;
-          var rawStrat=(al.strategy||al.type||'').toLowerCase();
-          var aType=_apprStratMap[rawStrat]||rawStrat;
-          if(_retVehiclesAppr.indexOf(aType)<0)return;
-          var rate=0.065;// Default net return assumption (matches _cpGetGrossRate non-insurance default after fees)
-          if(aType==='wl')rate=0.04;
-          else if(aType==='iul')rate=0.055;
-          else if(aType==='ibc')rate=(rawStrat==='ibc_iul')?0.055:0.04; // honor underlying
-          else if(aType==='hsa')rate=0.055; // 6% gross - 0.5% fees
-          else if(aType==='invest')rate=0.065; // 7.5% moderate gross - 1% expense ratio
-          else if(aType==='401k'||aType==='roth401k')rate=0.06; // 7% gross - 1% plan fees
-          var bal=0;for(var _ay=1;_ay<=_apprYrs;_ay++){bal=(bal+amt*12)*(1+rate);}
-          _apprRetVal+=bal;
-          // Categorize for weighted tax — prefer explicit bucket, fall back to 'ord'
-          var _bk=_apprTaxBucket[aType]||'ord';
-          _apprBuckets[_bk]+=bal;
-        });
-      }
+      // Iterate the recommendations array (the actual AI response field).
+      // Falls back to data.allocations only if the older field is present
+      // for backward compatibility with cached/saved plans.
+      _recs.forEach(function(al){
+        var amt=al.monthly_cost||al.amount||0;if(amt<=0)return;
+        var rawStrat=(al.strategy||al.type||'').toLowerCase();
+        var aType=_apprStratMap[rawStrat]||rawStrat;
+        if(_retVehiclesAppr.indexOf(aType)<0)return;
+        var rate=0.065;// Default net return assumption (matches _cpGetGrossRate non-insurance default after fees)
+        if(aType==='wl')rate=0.04;
+        else if(aType==='iul')rate=0.055;
+        else if(aType==='ibc')rate=(rawStrat==='ibc_iul')?0.055:0.04; // honor underlying
+        else if(aType==='hsa')rate=0.055; // 6% gross - 0.5% fees
+        else if(aType==='invest')rate=0.065; // 7.5% moderate gross - 1% expense ratio
+        else if(aType==='401k'||aType==='roth401k')rate=0.06; // 7% gross - 1% plan fees
+        var bal=0;for(var _ay=1;_ay<=_apprYrs;_ay++){bal=(bal+amt*12)*(1+rate);}
+        _apprRetVal+=bal;
+        // Categorize for weighted tax — prefer explicit bucket, fall back to 'ord'
+        var _bk=_apprTaxBucket[aType]||'ord';
+        _apprBuckets[_bk]+=bal;
+      });
       // Phase 2: sustainability (PMT, 25-yr, 1% real) — not 4% rule
       var _apprR=0.01/12,_apprN=300;
       var _apprPMTfactor=_apprR/(1-Math.pow(1+_apprR,-_apprN));
@@ -24637,7 +24919,12 @@ function _cpBuildCard(a,idx,isUnassigned){
       var _minOnlyLabel=_dMinSim.months>=360?'NEVER PAYS OFF at minimums':_dMinSim.months+' mo / '+fmtK(_dMinSim.interest)+' interest';
       var avalRes=_cpDebtSimulate(_cpDebtSort(_activeDebts,'avalanche'),a.amount);
       var snowRes=_cpDebtSimulate(_cpDebtSort(_activeDebts,'snowball'),a.amount);
-      var hybRes=_cpDebtSimulate(_cpDebtSort(_activeDebts,'hybrid'),a.amount);
+      // Hybrid: use _cpCalcDebtPlan which tries every permutation and returns
+      // the fastest, OR returns N/A if no order beats avalanche/snowball.
+      var hybRes=_cpCalcDebtPlan(_activeDebts,a.amount,'hybrid');
+      // IBC: use the real IBC simulator. Returns null if not eligible (e.g.,
+      // surplus too low to fund a meaningful policy).
+      var ibcRes=(typeof _cpCalcIBCDebt==='function')?_cpCalcIBCDebt(_activeDebts,a.amount):null;
 
       // Consolidation simulation: high-rate debts only
       var _consolRate=(CPLAN._consolRate||8)/100/12;
@@ -24649,21 +24936,41 @@ function _cpBuildCard(a,idx,isUnassigned){
       var strats=[
         {key:'avalanche',lbl:'Avalanche',mo:avalRes.months,int:avalRes.interest},
         {key:'snowball',lbl:'Snowball',mo:snowRes.months,int:snowRes.interest},
-        {key:'hybrid',lbl:'Hybrid',mo:hybRes.months,int:hybRes.interest},
+        // Hybrid: show actual months/interest if it beat the others; flag N/A otherwise
+        (hybRes&&hybRes._naReason)
+          ?{key:'hybrid',lbl:'Hybrid',na:true,naReason:hybRes._naReason}
+          :{key:'hybrid',lbl:'Hybrid',mo:hybRes.months,int:hybRes.interest},
         {key:'consolidation',lbl:'Consolidation',mo:_consolTerm,int:_consolInt},
-        {key:'ibc',lbl:'IBC',mo:avalRes.months,int:avalRes.interest,cv:Math.round(a.amount*avalRes.months*0.30)}
+        // IBC: show real numbers from the IBC simulator. fullFreeMonth includes
+        // loan repayment (true debt-free moment); months alone = original cards
+        // gone. Show months for the headline but mention loan still being repaid.
+        (ibcRes&&ibcRes.eligible===false)
+          ?{key:'ibc',lbl:'IBC',na:true,naReason:ibcRes.reason||'Not eligible'}
+          :(ibcRes
+              ?{key:'ibc',lbl:'IBC',mo:ibcRes.months,int:ibcRes.interest,cv:ibcRes.vehicle,fullFree:ibcRes.fullFreeMonth}
+              :{key:'ibc',lbl:'IBC',na:true,naReason:'IBC simulator unavailable'})
       ];
-      var bestMo=Math.min.apply(null,strats.map(function(s){return s.mo;}));
+      // bestMo: minimum among numeric (non-N/A) months; falls through to undefined if all N/A
+      var bestMo=strats.filter(function(s){return!s.na&&s.mo>0;}).reduce(function(m,s){return m===null||s.mo<m?s.mo:m;},null);
       h+='<div style="margin:10px 0;padding:12px;background:rgba(0,68,191,.04);border:1px solid rgba(0,68,191,.1);border-radius:6px">';
       h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">STRATEGY COMPARISON · High-rate min-only: '+_minOnlyLabel+'</div>';
       h+='<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px">';
       strats.forEach(function(s){
-        var isSel=CPLAN.debtStrategy===s.key;var isBest=s.mo===bestMo;
         var bc2=s.key==='consolidation'?'rgba(91,155,255':s.key==='ibc'?'rgba(168,85,247':'rgba(249,115,22';
+        if(s.na){
+          // N/A card — muted, not clickable, shows reason on hover
+          h+='<div title="'+(s.naReason||'').replace(/"/g,'&quot;')+'" style="text-align:center;padding:10px 6px;border-radius:4px;border:2px solid rgba(100,116,139,.15);background:rgba(100,116,139,.04);opacity:.6">';
+          h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--mu);margin-bottom:4px;letter-spacing:.04em">'+s.lbl+'</div>';
+          h+='<div style="font-family:var(--fd);font-size:20px;color:var(--mu)">N/A</div>';
+          h+='<div style="font-size:10px;color:var(--mu);line-height:1.3;margin-top:6px">'+(s.naReason||'No improvement')+'</div>';
+          h+='</div>';
+          return;
+        }
+        var isSel=CPLAN.debtStrategy===s.key;var isBest=bestMo!=null&&s.mo===bestMo;
         h+='<div onclick="CPLAN.debtStrategy=\''+s.key+'\';_cpRenderPlanV2()" style="cursor:pointer;text-align:center;padding:10px 6px;border-radius:4px;border:2px solid '+(isSel?bc2+',.5)':isBest?'rgba(34,197,94,.3)':'rgba(0,68,191,.1)')+';background:'+(isSel?bc2+',.15)':bc2+',.04)')+';transition:all .15s">';
         h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--mu);margin-bottom:4px;letter-spacing:.04em">'+s.lbl+'</div>';
         h+='<div style="font-family:var(--fd);font-size:20px;color:'+(isSel?bc2+',1)':'var(--wh)')+'">'+s.mo+'</div>';
-        h+='<div style="font-size:11px;color:var(--mu)">months</div>';
+        h+='<div style="font-size:11px;color:var(--mu)">months'+(s.key==='ibc'&&s.fullFree&&s.fullFree>s.mo?' (cards) · '+s.fullFree+' mo (incl. loan)':'')+'</div>';
         h+='<div style="font-size:12px;color:var(--or);margin-top:4px;font-weight:600">'+fmtK(s.int)+'</div>';
         h+='<div style="font-size:10px;color:var(--mu)">interest</div>';
         if(s.cv)h+='<div style="font-size:12px;color:var(--pu);margin-top:4px;font-weight:600">+'+fmtK(s.cv)+'</div><div style="font-size:10px;color:var(--pu)">cash value</div>';
@@ -24673,6 +24980,46 @@ function _cpBuildCard(a,idx,isUnassigned){
         h+='</div>';
       });
       h+='</div>';
+      // ── Per-strategy instructions panel ──
+      // Shows the user EXACTLY what their selected strategy does in plain language,
+      // with their specific numbers plugged in. Updates whenever they click a card
+      // (re-renders via _cpRenderPlanV2). Five blurbs, action-oriented, ~3-4 lines.
+      var _stratKey=CPLAN.debtStrategy||'avalanche';
+      var _avlSorted=_cpDebtSort(_activeDebts.slice(),'avalanche');
+      var _snwSorted=_cpDebtSort(_activeDebts.slice(),'snowball');
+      var _topAval=_avlSorted[0]||{};
+      var _topSnow=_snwSorted[0]||{};
+      var _totalMins=_activeDebts.reduce(function(t,d){return t+(parseFloat(d.min||d.payment)||0);},0);
+      var _instr='',_iCol='#F97316',_iLabel='Strategy',_iIcon='📐';
+      if(_stratKey==='avalanche'){
+        _iCol='#F97316';_iLabel='AVALANCHE — How this works';_iIcon='📐';
+        _instr='Pay the minimum on every debt every month. Throw your extra '+fmt(a.amount)+'/mo at <strong>'+((_topAval.name?String(_topAval.name).replace(/[<>&]/g,''):'')||'your highest-rate debt')+'</strong> ('+(_topAval.rate||0)+'% APR) until it clears around month '+(avalRes.order[0]&&avalRes.order[0].month||'—')+'. Then '+fmt(parseFloat(_topAval.min||_topAval.payment)||0)+' minimum + '+fmt(a.amount)+' extra cascades to the next-highest-rate debt. Continue until all paid. <strong style="color:#22C55E">Saves the most interest</strong> — '+fmtK(avalRes.interest)+' total vs '+fmtK(snowRes.interest)+' for snowball.';
+      } else if(_stratKey==='snowball'){
+        _iCol='#22C55E';_iLabel='SNOWBALL — How this works';_iIcon='⛄';
+        _instr='Pay the minimum on every debt every month. Throw your extra '+fmt(a.amount)+'/mo at <strong>'+((_topSnow.name?String(_topSnow.name).replace(/[<>&]/g,''):'')||'your smallest balance')+'</strong> (balance '+fmtK(parseFloat(_topSnow.balance)||0)+') until it clears around month '+(snowRes.order[0]&&snowRes.order[0].month||'—')+'. <strong style="color:#22C55E">That\'s your first win</strong> — the freed minimum cascades to the next-smallest debt. Builds momentum but pays '+fmtK(Math.max(0,snowRes.interest-avalRes.interest))+' more interest than avalanche.';
+      } else if(_stratKey==='hybrid'){
+        _iCol='#A855F7';_iLabel='HYBRID — How this works';_iIcon='⚖️';
+        if(hybRes&&hybRes._naReason){
+          _instr='PFOS tested every possible payoff order for your specific debts. <strong>None finishes faster or cheaper</strong> than avalanche or snowball. For your debt mix, hybrid offers no improvement — pick avalanche for the lowest interest, or snowball if you need the early-win momentum.';
+        } else if(hybRes&&hybRes._hybridOrder){
+          var _hybNames=hybRes._hybridOrder.map(function(n){return String(n).replace(/[<>&]/g,'');}).join(' → ');
+          _instr='PFOS tested every payoff order. Best result: <strong>'+_hybNames+'</strong>. Pay this order — minimums on all, extra '+fmt(a.amount)+'/mo to whichever is at the front of the list, then cascade as each clears. Finishes in '+hybRes.months+' months with '+fmtK(hybRes.interest)+' interest.';
+        } else {
+          _instr='PFOS tries every possible payoff order to find one that beats both avalanche and snowball. For your debt mix, the answer depends on your specific balances and rates — try clicking Avalanche or Snowball to see those approaches.';
+        }
+      } else if(_stratKey==='consolidation'){
+        _iCol='#5B9BFF';_iLabel='CONSOLIDATION — How this works';_iIcon='🏦';
+        _instr='Take a single loan at ~'+(CPLAN._consolRate||8)+'% APR to pay off all '+_activeDebts.length+' debts at once. Then pay '+fmt(_consolPmt)+'/mo for '+(CPLAN._consolTerm||60)+' months on the consolidation loan. <strong>Saves on interest only if your consolidation rate is meaningfully below your average current rate</strong> — requires good credit. Doesn\'t build any asset; it just restructures the debt.';
+      } else if(_stratKey==='ibc'){
+        _iCol='#A855F7';_iLabel='IBC / MONEY MULTIPLIER — How this works';_iIcon='💎';
+        _instr='Fund a properly designed Whole Life policy with <strong>'+fmt(a.amount)+'/mo</strong> as premium. Pay only minimums ('+fmt(_totalMins)+'/mo total) on cards. When cash value reaches each card\'s balance, take a policy loan to pay it off — starting with the highest-rate card. Each cleared card\'s minimum redirects to repay the policy loan. The policy keeps growing the entire time. <strong style="color:'+_iCol+'">You\'ll need a licensed agent — illustrations and policy design are carrier-specific. Use the buttons below to request one or audit your existing policy.</strong>';
+      }
+      if(_instr){
+        h+='<div style="margin-top:10px;padding:12px 14px;background:'+_cpHex2Rgba(_iCol,0.05)+';border:1px solid '+_cpHex2Rgba(_iCol,0.2)+';border-radius:4px;border-left:3px solid '+_iCol+'">';
+        h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:14px">'+_iIcon+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:'+_iCol+'">'+_iLabel+'</span></div>';
+        h+='<div style="font-size:13px;line-height:1.5;color:rgba(226,232,240,.85)">'+_instr+'</div>';
+        h+='</div>';
+      }
       // Consolidation loan terms input — shown when consolidation is selected
       if(CPLAN.debtStrategy==='consolidation'){
         h+='<div style="margin-top:8px;padding:10px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);border-radius:4px">';
@@ -24696,6 +25043,16 @@ function _cpBuildCard(a,idx,isUnassigned){
       var _ceSorted=_cpDebtSort(_ceDebts,CPLAN.debtStrategy||'avalanche');
       var _ceResult=_cpDebtSimulate(_ceSorted,a.amount);
       moLeft=_ceResult.months;
+    } else if(a.type==='ef'){
+      // Fix: canonical EF formula — months = (target - current_balance) / monthly.
+      // Previously used (a.target - a.goalCurrent) / a.amount, but a.target is
+      // sometimes the FULL target ($18,452) and sometimes just remaining
+      // ($11,452) depending on whether AI provided target_amount or our
+      // backstop computed it — and a.goalCurrent is never set for EF, defaulting
+      // to 0. So the calc was unstable. CPLAN.efTarget and CPLAN.efBal are
+      // canonical (single source of truth populated at line ~23335).
+      var _efRemaining=Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0));
+      moLeft=Math.ceil(_efRemaining/Math.max(1,a.amount));
     } else {
       var effAmt=Math.max(1,a.amount);moLeft=Math.ceil((a.target-(a.goalCurrent||0))/effAmt);
     }
@@ -24706,102 +25063,365 @@ function _cpBuildCard(a,idx,isUnassigned){
   }
   // ── IBC Projection Chart — AV line + CV staircase with policy loan drops ──
   if(a.type==='debt'&&CPLAN.debtStrategy==='ibc'&&a.amount>0){
-    // True IBC: 100% of the user's "extra debt payment" goes to the policy as premium.
-    // Debts get only their minimums during accumulation; loans are taken when CV is enough.
     var _ibcPrem=a.amount;
-    var _ibcGrowthRate=0.04/12;// 4% WL illustrated rate monthly
-    var _ibcLoanRate=0.05/12;// 5% policy loan rate monthly
     var _ibcHiDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.rate)||0)>10&&(parseFloat(d.balance)||0)>0;});
-    // Use IBC-specific simulation (policy loans when CV is large enough)
     var _ibcResult=_cpCalcIBCDebt(_ibcHiDebts,_ibcPrem);
-    var _ibcPayoffLog=(_ibcResult&&_ibcResult.payoffLog)||[];
-    var _ibcFullFree=(_ibcResult&&_ibcResult.fullFreeMonth)||60;
-    var _ibcTotalMonths=Math.min(360,Math.max(_ibcFullFree+24,48));
-    var _avData=[],_cvData=[],_ibcMilestones=[];
-    var _av=0,_outstandingLoans=0,_freedMins=0;
-    // WL surrender value factor — CV as % of AV (front-loaded costs)
-    function _svFactor(month){
-      var yr=month/12;
-      if(yr<=1)return 0.30+yr*0.15;
-      if(yr<=3)return 0.45+(yr-1)*0.10;
-      if(yr<=5)return 0.65+(yr-3)*0.075;
-      if(yr<=7)return 0.80+(yr-5)*0.05;
-      if(yr<=10)return 0.90+(yr-7)*0.027;
-      return Math.min(1.0,0.98+(yr-10)*0.004);
-    }
-    for(var _im=0;_im<=_ibcTotalMonths;_im++){
-      _av=(_av+_ibcPrem)*(1+_ibcGrowthRate);
-      // Policy loan taken when IBC sim says so (CV large enough to cover card balance)
-      _ibcPayoffLog.forEach(function(pl){
-        if(pl.month===_im){
-          _outstandingLoans+=(pl.balAtLoan||0);
-          var matchD=_ibcHiDebts.find(function(d){return(d.name||d.type||'')===(pl.name||'');});
-          _freedMins+=(matchD?(parseFloat(matchD.min)||parseFloat(matchD.payment)||0):0);
-          _ibcMilestones.push({month:_im,label:pl.name||'Paid off',type:'payoff'});
+    // Bail out cleanly if IBC isn't eligible (e.g., surplus too low).
+    if(_ibcResult&&_ibcResult.eligible===false){
+      h+='<div style="margin-top:10px;padding:12px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.1);border-radius:4px;color:var(--mu);font-size:12px;text-align:center">'
+        +'IBC projection unavailable: '+(_ibcResult.reason||'not eligible')+
+      '</div>';
+    } else if(_ibcResult&&_ibcResult.series&&_ibcResult.series.length>0){
+      // Pull per-month time series from the simulator. AV (accumulated value)
+      // is the policy's gross value; CV (cash value) is what's accessible to
+      // the user net of any outstanding policy loans. CV drops when a loan
+      // is taken to pay off a card, recovers as freed-minimums repay the loan.
+      var _ibcPayoffLog=_ibcResult.payoffLog||[];
+      var _ibcFullFree=_ibcResult.fullFreeMonth||60;
+      var _series=_ibcResult.series;
+      var _ibcTotalMonths=_series[_series.length-1].month;
+      var _avData=_series.map(function(r){return r.av;});
+      var _cvData=_series.map(function(r){return r.cv;});
+      // ── Override: when policy is audited or active, use carrier's illustrated
+      // CV trajectory (cashValueByYear array) instead of hypothetical sim. The
+      // sim's loan dynamics still drive CV-net-of-loans (loanBal is real because
+      // it comes from real debts and minimums), but the gross AV is the carrier's
+      // actual projected number. Year-by-year illustrated CV is interpolated to
+      // monthly resolution. If cashValueByYear is empty/missing, fall back to
+      // sim-only and show a small notice.
+      var _ibcChartUsesIllustration=false;
+      if((a._ibcState==='auditing'||a._ibcState==='active')&&a._auditedIllustration){
+        var _aud=a._auditedIllustration;
+        var _illuYears=Array.isArray(_aud.cashValueByYear)?_aud.cashValueByYear.slice():[];
+        // Estimate fallback when cashValueByYear missing: use 3-point anchors
+        // (year 10 / 20 / 30 illustrated values) and linearly interpolate.
+        if(_illuYears.length===0&&(_aud.cv10I>0||_aud.cv20I>0||_aud.cv30I>0)){
+          var _anchors=[{y:0,v:0},{y:10,v:_aud.cv10I||0},{y:20,v:_aud.cv20I||0},{y:30,v:_aud.cv30I||0}].filter(function(p,i){return i===0||p.v>0;});
+          for(var _ay=0;_ay<=30;_ay++){
+            // Find the bracketing anchors
+            var _lo=_anchors[0],_hi=_anchors[_anchors.length-1];
+            for(var _ai=0;_ai<_anchors.length-1;_ai++){
+              if(_anchors[_ai].y<=_ay&&_anchors[_ai+1].y>=_ay){_lo=_anchors[_ai];_hi=_anchors[_ai+1];break;}
+            }
+            var _frac=_hi.y===_lo.y?0:(_ay-_lo.y)/(_hi.y-_lo.y);
+            _illuYears.push(_lo.v+(_hi.v-_lo.v)*_frac);
+          }
         }
-      });
-      if(_outstandingLoans>0){
-        _outstandingLoans=_outstandingLoans*(1+_ibcLoanRate)-_freedMins;
-        if(_outstandingLoans<=0){
-          _outstandingLoans=0;
-          if(_ibcMilestones.every(function(m){return m.type!=='recovery';})){
-            _ibcMilestones.push({month:_im,label:'CV=AV recovered',type:'recovery'});
+        // When known points exist but some intermediate years are 0 placeholders
+        // (per audit-policy "leave intermediate as 0" rule), interpolate over them.
+        if(_illuYears.length>1){
+          var _knownIdxs=[];for(var _ki=0;_ki<_illuYears.length;_ki++){if(_illuYears[_ki]>0)_knownIdxs.push(_ki);}
+          if(_knownIdxs.length>=2){
+            // Forward-fill year 0 with 0 if not present (policies start at 0 CV)
+            if(_illuYears[0]<=0&&_knownIdxs[0]>0)_illuYears[0]=0;
+            // Linear interpolation between known points for any 0-placeholder year
+            for(var _yi=1;_yi<_illuYears.length-1;_yi++){
+              if(_illuYears[_yi]>0)continue;
+              var _prevK=null,_nextK=null;
+              for(var _kj=0;_kj<_knownIdxs.length;_kj++){
+                if(_knownIdxs[_kj]<_yi)_prevK=_knownIdxs[_kj];
+                else if(_knownIdxs[_kj]>_yi&&_nextK===null){_nextK=_knownIdxs[_kj];break;}
+              }
+              if(_prevK!=null&&_nextK!=null){
+                var _pv=_illuYears[_prevK]||0,_nv=_illuYears[_nextK]||0;
+                _illuYears[_yi]=_pv+(_nv-_pv)*(_yi-_prevK)/(_nextK-_prevK);
+              }
+            }
+          }
+        }
+        // Build monthly AV from year-by-year illustrated CV (interpolating between annual anniversaries).
+        if(_illuYears.length>1){
+          _ibcChartUsesIllustration=true;
+          for(var _mi=0;_mi<_series.length;_mi++){
+            var _mo=_series[_mi].month;
+            var _yr=Math.floor(_mo/12);
+            var _frac2=(_mo%12)/12;
+            var _vLo=_illuYears[Math.min(_yr,_illuYears.length-1)]||0;
+            var _vHi=_illuYears[Math.min(_yr+1,_illuYears.length-1)]||_vLo;
+            _avData[_mi]=_vLo+(_vHi-_vLo)*_frac2;
+            // CV (accessible) = AV minus outstanding loan balance from sim
+            _cvData[_mi]=Math.max(0,_avData[_mi]-(_series[_mi].loanBal||0));
           }
         }
       }
-      var _rawCV=_av*_svFactor(_im)-_outstandingLoans;
-      _avData.push(Math.round(_av));
-      _cvData.push(Math.round(Math.max(0,_rawCV)));
+      // Milestones: card payoffs from the sim's actual events
+      var _ibcMilestones=_ibcPayoffLog.map(function(pl){
+        return{month:pl.month,label:(pl.name||'Paid off')+' loan',type:'payoff'};
+      });
+      // CV-recovers-loan milestone: first month after fullFreeMonth where
+      // outstanding loan is zero (in series, that's the first row with
+      // loanBal===0 AFTER any non-zero loanBal earlier).
+      var _hadLoan=false,_recoveryMo=null;
+      for(var _ri=0;_ri<_series.length;_ri++){
+        if(_series[_ri].loanBal>0)_hadLoan=true;
+        else if(_hadLoan&&_recoveryMo===null){_recoveryMo=_series[_ri].month;break;}
+      }
+      if(_recoveryMo!=null)_ibcMilestones.push({month:_recoveryMo,label:'Loan repaid',type:'recovery'});
+      // Break-even: first month where CV ≥ cumulative premium paid (after 24mo)
+      var _cumPrem=0;
+      for(var _bi=0;_bi<_series.length;_bi++){
+        _cumPrem+=_ibcPrem;
+        if(_series[_bi].cv>=_cumPrem&&_series[_bi].month>24){
+          _ibcMilestones.push({month:_series[_bi].month,label:'Break-even',type:'breakeven'});
+          break;
+        }
+      }
+      // Render SVG chart
+      var _iW=500,_iH=180,_iPL=45,_iPR=50,_iPT=16,_iPB=24;
+      var _iCW=_iW-_iPL-_iPR,_iCH=_iH-_iPT-_iPB;
+      var _iMaxV=Math.max.apply(null,_avData)||1;
+      function _ix(m){return _iPL+m/_ibcTotalMonths*_iCW;}
+      function _iy(v){return _iPT+_iCH-(v/_iMaxV)*_iCH;}
+      h+='<div style="margin-top:10px;padding:12px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.1);border-radius:4px">';
+      h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:2px">IBC POLICY PROJECTION (WHOLE LIFE)</div>';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;flex-wrap:wrap;gap:8px">';
+      h+='<div style="font-size:11px;color:var(--mu)">Premium: '+fmt(_ibcPrem)+'/mo · Annual crediting · Simple loan interest</div>';
+      h+='<div style="font-family:var(--fd);font-size:14px;color:#A855F7">'+fmtK(_avData[_avData.length-1])+'<span style="font-size:11px;color:var(--mu)"> AV at yr '+Math.round(_ibcTotalMonths/12)+'</span></div>';
+      h+='</div>';
+      var _iSvg='<svg viewBox="0 0 '+_iW+' '+_iH+'" style="width:100%;height:auto;display:block;max-height:200px">';
+      // Grid lines
+      for(var _ig=0;_ig<=4;_ig++){var _gv=_iMaxV*_ig/4;_iSvg+='<line x1="'+_iPL+'" y1="'+_iy(_gv)+'" x2="'+(_iW-_iPR)+'" y2="'+_iy(_gv)+'" stroke="rgba(168,85,247,.06)" stroke-width="0.5"/>';_iSvg+='<text x="'+(_iPL-4)+'" y="'+(_iy(_gv)+3)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(_gv))+'</text>';}
+      // CV shaded area (drops on loans, recovers on repay)
+      var _cvPts='';for(var _ic=0;_ic<_series.length;_ic++)_cvPts+=_ix(_series[_ic].month)+','+_iy(_cvData[_ic])+' ';
+      var _cvBotPts='';for(var _ic2=_series.length-1;_ic2>=0;_ic2--)_cvBotPts+=_ix(_series[_ic2].month)+','+_iy(0)+' ';
+      _iSvg+='<polygon points="'+_cvPts+_cvBotPts+'" fill="rgba(34,197,94,.12)"/>';
+      // CV line
+      _iSvg+='<polyline points="'+_cvPts.trim()+'" fill="none" stroke="rgba(34,197,94,.7)" stroke-width="1.5"/>';
+      // AV line (always rising)
+      var _avPts='';for(var _ia=0;_ia<_series.length;_ia++)_avPts+=_ix(_series[_ia].month)+','+_iy(_avData[_ia])+' ';
+      _iSvg+='<polyline points="'+_avPts.trim()+'" fill="none" stroke="#A855F7" stroke-width="2"/>';
+      // Milestones
+      _ibcMilestones.forEach(function(ms){
+        if(ms.month<=0||ms.month>=_ibcTotalMonths)return;
+        var msCol=ms.type==='payoff'?'rgba(249,115,22,.5)':ms.type==='recovery'?'rgba(34,197,94,.6)':'rgba(91,155,255,.5)';
+        _iSvg+='<line x1="'+_ix(ms.month)+'" y1="'+_iPT+'" x2="'+_ix(ms.month)+'" y2="'+(_iH-_iPB)+'" stroke="'+msCol+'" stroke-width="0.5" stroke-dasharray="2,2"/>';
+        _iSvg+='<text x="'+_ix(ms.month)+'" y="'+(_iPT-3)+'" fill="'+msCol+'" font-size="6" text-anchor="middle" font-family="var(--fh)">'+ms.label+'</text>';
+      });
+      // End labels
+      _iSvg+='<text x="'+(_iW-_iPR+4)+'" y="'+(_iy(_avData[_avData.length-1])+3)+'" fill="#A855F7" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(_avData[_avData.length-1])+'</text>';
+      _iSvg+='<text x="'+(_iW-_iPR+4)+'" y="'+(_iy(_cvData[_cvData.length-1])+3)+'" fill="rgba(34,197,94,.8)" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(_cvData[_cvData.length-1])+'</text>';
+      // X axis labels (years)
+      var _ibcYrs=Math.round(_ibcTotalMonths/12);
+      for(var _yx=0;_yx<=_ibcYrs;_yx+=Math.max(1,Math.round(_ibcYrs/5))){_iSvg+='<text x="'+_ix(_yx*12)+'" y="'+(_iH-_iPB+14)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="middle" font-family="var(--fh)">Yr '+_yx+'</text>';}
+      _iSvg+='</svg>';
+      h+=_iSvg;
+      // Legend + summary line
+      h+='<div style="display:flex;gap:12px;font-size:11px;color:var(--mu);margin-top:4px;flex-wrap:wrap">';
+      h+='<span><span style="display:inline-block;width:10px;height:2px;background:#A855F7;margin-right:3px;vertical-align:middle"></span>Accumulated Value (gross)</span>';
+      h+='<span><span style="display:inline-block;width:10px;height:8px;background:rgba(34,197,94,.2);border:1px solid rgba(34,197,94,.5);margin-right:3px;vertical-align:middle;border-radius:1px"></span>Cash Value (net of loans — your asset)</span>';
+      // Source badge: shows whether chart numbers come from a real carrier
+      // illustration (auditing/active state) or hypothetical industry-typical
+      // assumptions (considering state). Helps the user trust what they're
+      // seeing — and reminds them that hypothetical means hypothetical.
+      if(_ibcChartUsesIllustration){
+        var _badgeCarrier=(a._auditedIllustration&&a._auditedIllustration.carrier)?String(a._auditedIllustration.carrier).replace(/[<>&]/g,''):'your policy';
+        h+='<span style="margin-left:auto;padding:2px 8px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);color:var(--gr);border-radius:3px;font-weight:600;font-size:10px;letter-spacing:.04em">📄 Showing '+_badgeCarrier+'\'s illustrated values</span>';
+      } else {
+        h+='<span style="margin-left:auto;padding:2px 8px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.2);color:#C99FFF;border-radius:3px;font-weight:600;font-size:10px;letter-spacing:.04em">⚠️ Hypothetical — not a carrier illustration</span>';
+      }
+      h+='</div>';
+      // Outcome line: total premiums paid, debt + loan interest, final CV (the asset kept)
+      h+='<div style="margin-top:8px;padding:8px;background:rgba(0,0,0,.15);border-radius:3px;display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:11px">';
+      h+='<div><div style="color:var(--mu);font-size:10px">Total premiums paid</div><div style="font-family:var(--fd);color:var(--wh)">'+fmtK(_ibcResult._totalPremiumsPaid||0)+'</div></div>';
+      h+='<div><div style="color:var(--mu);font-size:10px">Loan interest paid</div><div style="font-family:var(--fd);color:var(--or)">'+fmtK(_ibcResult._totalLoanInterest||0)+'</div></div>';
+      h+='<div><div style="color:var(--mu);font-size:10px">Final cash value (asset)</div><div style="font-family:var(--fd);color:var(--gr)">'+fmtK(_cvData[_cvData.length-1])+'</div></div>';
+      h+='</div></div>';
+      // ── IBC card: inline state machine — never opens a modal ──
+      // States: 'considering' → 'upload_mode' → 'auditing_inflight' → 'auditing' → 'active'
+      // The whole flow happens right here. Closing/clicking out keeps the user in plan view.
+      var _ibcState=a._ibcState||'considering';
+      var _auditMeta=a._auditedIllustration||null;
+      h+='<div style="margin-top:10px;padding:14px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:4px;border-left:3px solid #A855F7">';
+      // Show any error from a failed prior audit attempt at the top
+      if(a._auditError){
+        h+='<div style="padding:8px 10px;margin-bottom:10px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);border-radius:4px;font-size:12px;color:var(--rd)"><strong>Audit error:</strong> '+(String(a._auditError).replace(/[<>&]/g,''))+'</div>';
+      }
+      if(_ibcState==='considering'){
+        // Hypothetical state — encourage user to talk to an agent or audit their own policy
+        h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="font-size:14px">💎</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:#A855F7">YOUR NEXT STEP</span></div>';
+        h+='<div style="font-size:13px;line-height:1.5;color:rgba(226,232,240,.85);margin-bottom:12px">The numbers above are <strong>hypothetical projections</strong> using industry-typical assumptions (4% growth, 5% loan rate, simple interest). Real numbers come from a carrier illustration designed for your age, health, and policy structure. To see what an actual policy would look like for you:</div>';
+        h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        h+='<button onclick="_cpRequestAgent()" style="flex:1;min-width:200px;padding:10px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:4px;min-height:42px;letter-spacing:.04em">📞 Request an Agent</button>';
+        h+='<button onclick="_cpIBCStartAudit('+idx+')" style="flex:1;min-width:200px;padding:10px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:42px;letter-spacing:.04em">📄 I have my own policy / illustration</button>';
+        h+='</div>';
+      } else if(_ibcState==='upload_mode'){
+        // Inline file picker + policy type select + run button. Plan view stays put.
+        var _isYR=!!a._pendingIsYearlyReview;
+        var _hasFile=!!a._pendingFileData;
+        h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="font-size:14px">'+(_isYR?'📊':'📄')+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:#A855F7">'+(_isYR?'UPLOAD YEARLY REVIEW':'AUDIT YOUR ILLUSTRATION')+'</span></div>';
+        h+='<div style="font-size:12px;line-height:1.5;color:rgba(226,232,240,.7);margin-bottom:10px">'+(_isYR?'Upload your most recent annual policy statement. Claude will read it and recalibrate your projection using your policy\'s actual performance.':'Upload your insurance illustration as a PDF or image. Claude reads every page, runs MEC test, COI projections, AG49-A check, and structural review — then this card shows you the audit summary right here.')+'</div>';
+        // Drop zone — clicking the box opens file picker
+        h+='<label for="_ibcFile_'+idx+'" style="display:block;padding:18px;background:var(--bg-card);border:2px dashed '+(_hasFile?'rgba(34,197,94,.4)':'rgba(91,155,255,.3)')+';border-radius:6px;text-align:center;cursor:pointer;margin-bottom:10px">';
+        if(_hasFile){
+          h+='<div style="font-size:24px;margin-bottom:4px">✅</div>';
+          h+='<div style="font-size:13px;color:var(--gr);font-weight:700;margin-bottom:2px">'+(String(a._pendingFileName||'illustration').replace(/[<>&]/g,'')).slice(0,80)+'</div>';
+          h+='<div style="font-size:11px;color:var(--mu)">Click to choose a different file</div>';
+        } else {
+          h+='<div style="font-size:24px;margin-bottom:4px">📄</div>';
+          h+='<div style="font-size:13px;color:var(--wh);font-weight:700;margin-bottom:2px">Click to upload illustration</div>';
+          h+='<div style="font-size:11px;color:var(--mu)">PDF or image · max 20MB</div>';
+        }
+        h+='</label>';
+        h+='<input type="file" id="_ibcFile_'+idx+'" accept=".pdf,image/*" style="display:none" onchange="_cpIBCHandleFile('+idx+',this)">';
+        // Type + isNew selects (small, inline)
+        h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">';
+        h+='<div><label style="font-size:11px;color:var(--mu);display:block;margin-bottom:3px;letter-spacing:.04em">Policy type</label><select id="_ibcPolType_'+idx+'" class="sel" style="min-height:34px;width:100%;font-size:13px"><option value="whole_life" selected>Whole Life</option><option value="iul">Indexed Universal Life</option><option value="universal_life">Universal Life</option><option value="unknown">Not sure</option></select></div>';
+        h+='<div><label style="font-size:11px;color:var(--mu);display:block;margin-bottom:3px;letter-spacing:.04em">Status</label><select id="_ibcPolNew_'+idx+'" class="sel" style="min-height:34px;width:100%;font-size:13px"><option value="yes">Considering buying</option><option value="no" selected>I already own this</option></select></div>';
+        h+='</div>';
+        h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        h+='<button onclick="_cpIBCRunInlineAudit('+idx+')" '+(_hasFile?'':'disabled ')+'style="flex:1;min-width:180px;padding:10px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:'+(_hasFile?'#F97316':'rgba(249,115,22,.2)')+';border:none;color:'+(_hasFile?'#fff':'rgba(255,255,255,.4)')+';cursor:'+(_hasFile?'pointer':'not-allowed')+';border-radius:4px;min-height:42px;letter-spacing:.06em;text-transform:uppercase">🤖 Run AI Audit</button>';
+        h+='<button onclick="_cpIBCCancelUpload('+idx+')" style="padding:10px 16px;font-family:var(--fh);font-size:12px;font-weight:600;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:4px;min-height:42px">Cancel</button>';
+        h+='</div>';
+      } else if(_ibcState==='auditing_inflight'){
+        // Loading state — Claude is reading the illustration
+        h+='<div style="text-align:center;padding:30px 20px">';
+        h+='<div style="font-size:36px;margin-bottom:10px">🤖</div>';
+        h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:6px">Claude is reading your illustration...</div>';
+        h+='<div style="font-size:12px;color:var(--mu);line-height:1.6;max-width:480px;margin:0 auto">Running MEC test, commission check, sustainability analysis, COI projections, loan provisions, rider review, AG49-A check, and carrier strength evaluation. This typically takes 30-90 seconds.</div>';
+        // Indeterminate progress bar
+        h+='<div style="margin-top:14px;height:3px;background:rgba(168,85,247,.1);border-radius:2px;overflow:hidden;max-width:300px;margin-left:auto;margin-right:auto">';
+        h+='<div style="width:40%;height:100%;background:linear-gradient(90deg,transparent,#A855F7,transparent);animation:_ibcShimmer 1.5s ease-in-out infinite"></div>';
+        h+='</div>';
+        h+='<style>@keyframes _ibcShimmer{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}</style>';
+        h+='</div>';
+      } else if(_ibcState==='auditing'){
+        // Audit complete — summary card with click-to-expand for full detail
+        var _audCarrier=(_auditMeta&&_auditMeta.carrier)||'Unknown carrier';
+        var _audProduct=(_auditMeta&&_auditMeta.product)||'Whole Life';
+        var _audGrade=(_auditMeta&&_auditMeta.grade)||'—';
+        var _audGradeSummary=(_auditMeta&&_auditMeta.gradeSummary)||'';
+        var _audPremium=(_auditMeta&&_auditMeta.premium)||0;
+        var _audDB=(_auditMeta&&_auditMeta.deathBenefit)||0;
+        var _audGradeColor=(_audGrade.charAt(0)==='A'||_audGrade.charAt(0)==='B')?'var(--gr)':_audGrade.charAt(0)==='C'?'var(--or)':'var(--rd)';
+        h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px"><span style="font-size:14px">🔍</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:#A855F7">AUDIT COMPLETE — YOUR ILLUSTRATION</span></div>';
+        // Summary bar — carrier + grade + premium + DB at a glance
+        h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px;padding:10px;background:rgba(0,0,0,.15);border-radius:4px">';
+        h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Carrier</div><div style="font-family:var(--fh);font-size:13px;color:var(--wh);font-weight:700">'+(String(_audCarrier).replace(/[<>&]/g,''))+'</div></div>';
+        h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Product</div><div style="font-family:var(--fh);font-size:12px;color:var(--wh);font-weight:600">'+(String(_audProduct).replace(/[<>&]/g,''))+'</div></div>';
+        h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Grade</div><div style="font-family:var(--fd);font-size:22px;color:'+_audGradeColor+';font-weight:700">'+(String(_audGrade).replace(/[<>&]/g,''))+'</div></div>';
+        if(_audPremium>0)h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Premium</div><div style="font-family:var(--fd);font-size:14px;color:var(--wh)">'+fmt(_audPremium)+'<span style="font-size:11px;color:var(--mu)"> /mo</span></div></div>';
+        if(_audDB>0)h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Death benefit</div><div style="font-family:var(--fd);font-size:14px;color:#5B9BFF">'+fmtK(_audDB)+'</div></div>';
+        h+='</div>';
+        // Grade summary line
+        if(_audGradeSummary){
+          h+='<div style="font-size:13px;line-height:1.5;color:rgba(226,232,240,.85);margin-bottom:10px;padding:8px 10px;background:rgba(168,85,247,.04);border-left:2px solid #A855F7;border-radius:3px">'+(String(_audGradeSummary).replace(/[<>&]/g,''))+'</div>';
+        }
+        // Top key finding (1 line) as a teaser to expand
+        var _kfList=(_auditMeta&&_auditMeta.keyFindings)||[];
+        if(_kfList.length>0){
+          h+='<div style="font-size:12px;color:var(--mu);margin-bottom:10px"><span style="color:var(--or);font-weight:700">🔑 Top finding:</span> '+(String(_kfList[0]).replace(/[<>&]/g,'')).slice(0,200)+(_kfList[0].length>200?'…':'')+'</div>';
+        }
+        // Expand toggle for full audit detail
+        var _expanded=!!a._ibcAuditExpanded;
+        h+='<button onclick="_cpIBCToggleAuditDetail('+idx+')" style="width:100%;padding:9px 12px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:4px;margin-bottom:10px;text-align:left;letter-spacing:.04em;display:flex;justify-content:space-between;align-items:center"><span>'+(_expanded?'▼ Hide full audit details':'▶ Show full audit details')+'</span><span style="font-size:10px;color:var(--mu);font-weight:500">'+(_expanded?'Click to collapse':'Click to expand')+'</span></button>';
+        if(_expanded){
+          // Full audit detail rendered inline (mirrors what the calculator's
+          // renderAIAuditResults shows, but pulls from a._auditFullResponse).
+          h+='<div style="padding:12px;background:rgba(0,0,0,.1);border-radius:4px;margin-bottom:10px;max-height:600px;overflow-y:auto">';
+          var _full=a._auditFullResponse||{};
+          // Disclaimer
+          h+='<div style="padding:8px 10px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.15);border-radius:3px;font-size:11px;color:var(--yl);line-height:1.6;margin-bottom:10px"><strong>⚠️ EDUCATIONAL ANALYSIS ONLY — NOT INSURANCE ADVICE.</strong> Grades and findings are based on the data provided. Do not surrender, replace, or modify any policy based solely on this output. Consult a licensed insurance professional.</div>';
+          // All key findings
+          if(_kfList.length>0){
+            h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--or);margin-bottom:6px">🔑 KEY FINDINGS</div>';
+            _kfList.forEach(function(f){
+              h+='<div style="padding:6px 10px;background:rgba(0,0,0,.15);border-left:2px solid var(--or);border-radius:3px;margin-bottom:3px;font-size:12px;color:rgba(226,232,240,.8);line-height:1.6">'+(String(f).replace(/[<>&]/g,''))+'</div>';
+            });
+          }
+          // Detailed audit checks
+          if(_full.checks&&_full.checks.length>0){
+            h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin:14px 0 6px">🔬 DETAILED AUDIT CHECKS</div>';
+            _full.checks.forEach(function(ck){
+              var sc=ck.status==='pass'?'var(--gr)':ck.status==='warning'?'var(--or)':ck.status==='fail'?'var(--rd)':'#5B9BFF';
+              var si=ck.status==='pass'?'✅':ck.status==='warning'?'⚠️':ck.status==='fail'?'❌':'ℹ️';
+              h+='<div style="padding:8px 10px;background:rgba(0,0,0,.15);border-left:2px solid '+sc+';border-radius:3px;margin-bottom:4px">';
+              h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:3px"><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh)">'+si+' '+(String(ck.title||ck.id||'').replace(/[<>&]/g,''))+'</span><span style="font-size:10px;color:'+sc+';font-weight:700;text-transform:uppercase">'+(String(ck.status||'').replace(/[<>&]/g,''))+'</span></div>';
+              if(ck.finding)h+='<div style="font-size:11px;color:var(--mu);line-height:1.6;margin-bottom:2px">'+(String(ck.finding).replace(/[<>&]/g,''))+'</div>';
+              if(ck.impact)h+='<div style="font-size:11px;color:var(--or);line-height:1.5"><strong>Impact:</strong> '+(String(ck.impact).replace(/[<>&]/g,''))+'</div>';
+              if(ck.action)h+='<div style="font-size:11px;color:var(--gr);line-height:1.5"><strong>Action:</strong> '+(String(ck.action).replace(/[<>&]/g,''))+'</div>';
+              h+='</div>';
+            });
+          }
+          // Strengths & Concerns
+          if(_full.strengths&&_full.strengths.length>0){
+            h+='<div style="padding:8px 10px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.12);border-radius:3px;margin-top:10px;font-size:12px;color:var(--mu);line-height:1.7"><strong style="color:var(--gr)">✅ Strengths:</strong><br>';
+            _full.strengths.forEach(function(s){h+='• '+(String(s).replace(/[<>&]/g,''))+'<br>';});
+            h+='</div>';
+          }
+          if(_full.concerns&&_full.concerns.length>0){
+            h+='<div style="padding:8px 10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.12);border-radius:3px;margin-top:6px;font-size:12px;color:var(--mu);line-height:1.7"><strong style="color:var(--rd)">⚠️ Concerns:</strong><br>';
+            _full.concerns.forEach(function(c){h+='• '+(String(c).replace(/[<>&]/g,''))+'<br>';});
+            h+='</div>';
+          }
+          // Income analysis
+          var _ia=_full.incomeAnalysis;
+          if(_ia&&(_ia.illustratedIncome>0||_ia.realisticIncome>0)){
+            h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--or);margin:12px 0 6px">💰 INCOME DISTRIBUTION ANALYSIS</div>';
+            h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:6px">';
+            h+='<div style="padding:6px;background:rgba(0,0,0,.15);border-radius:3px;text-align:center"><div style="font-size:10px;color:var(--mu);text-transform:uppercase">Illustrated</div><div style="font-family:var(--fd);font-size:13px;color:var(--or)">'+fmtK(_ia.illustratedIncome||0)+'/yr</div></div>';
+            h+='<div style="padding:6px;background:rgba(0,0,0,.15);border-radius:3px;text-align:center"><div style="font-size:10px;color:var(--mu);text-transform:uppercase">Realistic</div><div style="font-family:var(--fd);font-size:13px;color:var(--yl)">'+fmtK(_ia.realisticIncome||0)+'/yr</div></div>';
+            h+='<div style="padding:6px;background:rgba(0,0,0,.15);border-radius:3px;text-align:center"><div style="font-size:10px;color:var(--mu);text-transform:uppercase">Guaranteed</div><div style="font-family:var(--fd);font-size:13px;color:var(--rd)">'+fmtK(_ia.guaranteedIncome||0)+'/yr</div></div>';
+            h+='</div>';
+            h+='<div style="font-size:11px;color:var(--mu);line-height:1.6">Sustainable to age: Illustrated='+(_ia.sustainableToAgeIllustrated||'?')+' · Realistic='+(_ia.sustainableToAgeRealistic||'?')+' · Guaranteed='+(_ia.sustainableToAgeGuaranteed||'?')+'</div>';
+            if(_ia.ag49aCompliant===false)h+='<div style="font-size:11px;color:var(--rd);margin-top:4px">⚠️ AG49-A: Illustration may exceed compliant income limits.</div>';
+          }
+          // Restructure / replacement / alternative comparisons
+          if(_full.restructureRecommendation){
+            h+='<div style="padding:8px 10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:3px;margin-top:10px;font-size:12px;color:rgba(226,232,240,.8);line-height:1.6"><strong style="color:#5B9BFF">🛠️ Restructure scenario:</strong><br>'+(String(_full.restructureRecommendation).replace(/[<>&]/g,''))+'</div>';
+          }
+          h+='</div>';
+        }
+        h+='<div style="font-size:13px;line-height:1.5;color:rgba(226,232,240,.85);margin-bottom:10px">The chart above now reflects YOUR policy\'s illustrated cash value. When you\'ve actually purchased a policy, click Done to mark it active — you\'ll then upload yearly reviews to keep projections calibrated.</div>';
+        h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        h+='<button onclick="_cpIBCMarkActive('+idx+')" style="flex:1;min-width:180px;padding:10px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:4px;min-height:42px;letter-spacing:.04em">✓ Done — this is my policy</button>';
+        h+='<button onclick="_cpIBCStartAudit('+idx+')" style="flex:1;min-width:140px;padding:10px 16px;font-family:var(--fh);font-size:12px;font-weight:600;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:4px;min-height:42px">Re-audit / different policy</button>';
+        h+='<button onclick="_cpIBCResetState('+idx+')" style="padding:10px 12px;font-family:var(--fh);font-size:12px;font-weight:600;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:4px;min-height:42px">Cancel</button>';
+        h+='</div>';
+      } else if(_ibcState==='active'){
+        // Active policy — show last update, expandable audit detail still available, yearly review upload
+        var _audCarrier2=(_auditMeta&&_auditMeta.carrier)||'Your policy';
+        var _audProduct2=(_auditMeta&&_auditMeta.product)||'';
+        var _audGrade2=(_auditMeta&&_auditMeta.grade)||'';
+        var _lastReviewMeta=(a._yearlyReviews&&a._yearlyReviews.length)?a._yearlyReviews[a._yearlyReviews.length-1]:null;
+        var _lastUpdateLabel=_lastReviewMeta?'Last yearly review: '+(_lastReviewMeta.uploadedAt?new Date(_lastReviewMeta.uploadedAt).toLocaleDateString():'recent'):(_auditMeta&&_auditMeta.uploadedAt?'Last audit: '+new Date(_auditMeta.uploadedAt).toLocaleDateString():'Audit on file');
+        h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="font-size:14px">✅</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:var(--gr)">ACTIVE POLICY IN FORCE</span></div>';
+        h+='<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:10px;padding:10px;background:rgba(0,0,0,.15);border-radius:4px">';
+        h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Carrier</div><div style="font-family:var(--fh);font-size:13px;color:var(--wh);font-weight:700">'+(String(_audCarrier2).replace(/[<>&]/g,''))+'</div></div>';
+        if(_audProduct2)h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Product</div><div style="font-family:var(--fh);font-size:12px;color:var(--wh);font-weight:600">'+(String(_audProduct2).replace(/[<>&]/g,''))+'</div></div>';
+        if(_audGrade2)h+='<div><div style="color:var(--mu);font-size:10px;letter-spacing:.06em;text-transform:uppercase">Last grade</div><div style="font-family:var(--fd);font-size:18px;color:#A855F7">'+(String(_audGrade2).replace(/[<>&]/g,''))+'</div></div>';
+        h+='</div>';
+        h+='<div style="font-size:12px;color:var(--mu);margin-bottom:10px">'+_lastUpdateLabel+'. Upload your annual policy statement each year to recalibrate the projection from actual values.</div>';
+        // Expandable audit detail still accessible from active state
+        if(a._auditFullResponse){
+          var _expActive=!!a._ibcAuditExpanded;
+          h+='<button onclick="_cpIBCToggleAuditDetail('+idx+')" style="width:100%;padding:8px 12px;font-family:var(--fh);font-size:11px;font-weight:600;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:3px;margin-bottom:10px;text-align:left;letter-spacing:.04em">'+(_expActive?'▼ Hide audit details':'▶ View original audit details')+'</button>';
+          if(_expActive){
+            // Same expanded block as in 'auditing' state (ideally extracted to a helper, but inlined here for simplicity)
+            var _full=a._auditFullResponse||{};
+            h+='<div style="padding:10px;background:rgba(0,0,0,.1);border-radius:3px;margin-bottom:10px;max-height:500px;overflow-y:auto;font-size:12px;color:var(--mu);line-height:1.6">';
+            if(_full.gradeSummary)h+='<div style="margin-bottom:8px;color:rgba(226,232,240,.8)"><strong>Summary:</strong> '+(String(_full.gradeSummary).replace(/[<>&]/g,''))+'</div>';
+            if(_full.keyFindings&&_full.keyFindings.length>0){
+              h+='<div style="margin-top:6px"><strong style="color:var(--or)">Key findings:</strong></div>';
+              _full.keyFindings.forEach(function(f){h+='• '+(String(f).replace(/[<>&]/g,''))+'<br>';});
+            }
+            if(_full.strengths&&_full.strengths.length>0){
+              h+='<div style="margin-top:6px"><strong style="color:var(--gr)">Strengths:</strong></div>';
+              _full.strengths.forEach(function(s){h+='• '+(String(s).replace(/[<>&]/g,''))+'<br>';});
+            }
+            if(_full.concerns&&_full.concerns.length>0){
+              h+='<div style="margin-top:6px"><strong style="color:var(--rd)">Concerns:</strong></div>';
+              _full.concerns.forEach(function(c){h+='• '+(String(c).replace(/[<>&]/g,''))+'<br>';});
+            }
+            h+='</div>';
+          }
+        }
+        h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
+        h+='<button onclick="_cpIBCUploadReview('+idx+')" style="flex:1;min-width:200px;padding:10px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:42px;letter-spacing:.04em">📊 Upload yearly review</button>';
+        h+='<button onclick="_cpIBCResetState('+idx+')" style="padding:10px 12px;font-family:var(--fh);font-size:12px;font-weight:600;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:4px;min-height:42px" title="Revert to hypothetical projection (e.g., if you surrendered or replaced this policy)">Reset</button>';
+        h+='</div>';
+      }
+      h+='</div>';
     }
-    var _totalPremPaid=0;
-    for(var _be=0;_be<=_ibcTotalMonths;_be++){
-      _totalPremPaid+=_ibcPrem;
-      if(_cvData[_be]>=_totalPremPaid&&_be>24){_ibcMilestones.push({month:_be,label:'Break-even',type:'breakeven'});break;}
-    }
-    // Render SVG chart
-    var _iW=500,_iH=180,_iPL=45,_iPR=50,_iPT=16,_iPB=24;
-    var _iCW=_iW-_iPL-_iPR,_iCH=_iH-_iPT-_iPB;
-    var _iMaxV=Math.max.apply(null,_avData)||1;
-    function _ix(m){return _iPL+m/_ibcTotalMonths*_iCW;}
-    function _iy(v){return _iPT+_iCH-(v/_iMaxV)*_iCH;}
-    h+='<div style="margin-top:10px;padding:12px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.1);border-radius:4px">';
-    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:2px">IBC POLICY PROJECTION (WHOLE LIFE)</div>';
-    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
-    h+='<div style="font-size:11px;color:var(--mu)">Premium: '+fmt(_ibcPrem)+'/mo · Loan rate: 5% · Growth: 4%</div>';
-    h+='<div style="font-family:var(--fd);font-size:14px;color:#A855F7">'+fmtK(_avData[_ibcTotalMonths])+'<span style="font-size:11px;color:var(--mu)"> AV at yr '+Math.round(_ibcTotalMonths/12)+'</span></div>';
-    h+='</div>';
-    var _iSvg='<svg viewBox="0 0 '+_iW+' '+_iH+'" style="width:100%;height:auto;display:block;max-height:200px">';
-    // Grid lines
-    for(var _ig=0;_ig<=4;_ig++){var _gv=_iMaxV*_ig/4;_iSvg+='<line x1="'+_iPL+'" y1="'+_iy(_gv)+'" x2="'+(_iW-_iPR)+'" y2="'+_iy(_gv)+'" stroke="rgba(168,85,247,.06)" stroke-width="0.5"/>';_iSvg+='<text x="'+(_iPL-4)+'" y="'+(_iy(_gv)+3)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(_gv))+'</text>';}
-    // CV shaded area (drops and recovers)
-    var _cvPts='';for(var _ic=0;_ic<=_ibcTotalMonths;_ic++)_cvPts+=_ix(_ic)+','+_iy(_cvData[_ic])+' ';
-    var _cvBotPts='';for(var _ic2=_ibcTotalMonths;_ic2>=0;_ic2--)_cvBotPts+=_ix(_ic2)+','+_iy(0)+' ';
-    _iSvg+='<polygon points="'+_cvPts+_cvBotPts+'" fill="rgba(34,197,94,.12)"/>';
-    // CV line
-    _iSvg+='<polyline points="'+_cvPts.trim()+'" fill="none" stroke="rgba(34,197,94,.7)" stroke-width="1.5"/>';
-    // AV line (solid, always rising)
-    var _avPts='';for(var _ia=0;_ia<=_ibcTotalMonths;_ia++)_avPts+=_ix(_ia)+','+_iy(_avData[_ia])+' ';
-    _iSvg+='<polyline points="'+_avPts.trim()+'" fill="none" stroke="#A855F7" stroke-width="2"/>';
-    // Milestones
-    _ibcMilestones.forEach(function(ms){
-      if(ms.month<=0||ms.month>=_ibcTotalMonths)return;
-      var msCol=ms.type==='payoff'?'rgba(249,115,22,.5)':ms.type==='recovery'?'rgba(34,197,94,.6)':'rgba(91,155,255,.5)';
-      _iSvg+='<line x1="'+_ix(ms.month)+'" y1="'+_iPT+'" x2="'+_ix(ms.month)+'" y2="'+(_iH-_iPB)+'" stroke="'+msCol+'" stroke-width="0.5" stroke-dasharray="2,2"/>';
-      _iSvg+='<text x="'+_ix(ms.month)+'" y="'+(_iPT-3)+'" fill="'+msCol+'" font-size="6" text-anchor="middle" font-family="var(--fh)">'+ms.label+'</text>';
-    });
-    // End labels
-    _iSvg+='<text x="'+(_iW-_iPR+4)+'" y="'+(_iy(_avData[_ibcTotalMonths])+3)+'" fill="#A855F7" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(_avData[_ibcTotalMonths])+'</text>';
-    _iSvg+='<text x="'+(_iW-_iPR+4)+'" y="'+(_iy(_cvData[_ibcTotalMonths])+3)+'" fill="rgba(34,197,94,.8)" font-size="8" font-family="var(--fh)" font-weight="700">'+fmtK(_cvData[_ibcTotalMonths])+'</text>';
-    // X axis labels (years)
-    var _ibcYrs=Math.round(_ibcTotalMonths/12);
-    for(var _yx=0;_yx<=_ibcYrs;_yx+=Math.max(1,Math.round(_ibcYrs/5))){_iSvg+='<text x="'+_ix(_yx*12)+'" y="'+(_iH-_iPB+14)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="middle" font-family="var(--fh)">Yr '+_yx+'</text>';}
-    _iSvg+='</svg>';
-    h+=_iSvg;
-    // Legend
-    h+='<div style="display:flex;gap:12px;font-size:11px;color:var(--mu);margin-top:4px">';
-    h+='<span><span style="display:inline-block;width:10px;height:2px;background:#A855F7;margin-right:3px;vertical-align:middle"></span>Accumulated Value</span>';
-    h+='<span><span style="display:inline-block;width:10px;height:8px;background:rgba(34,197,94,.2);border:1px solid rgba(34,197,94,.5);margin-right:3px;vertical-align:middle;border-radius:1px"></span>Cash Value (net of loans)</span>';
-    h+='</div></div>';
   }
   // Detailed mode: return/fee breakdown
   if(isD&&_cpTierHas('return_fee')&&['roth','401k','roth401k','invest','iul','wl','edu','trad_ira','solo401k','sep_ira'].indexOf(a.type)>=0&&a.amount>0){
@@ -24906,6 +25526,12 @@ function _cpDebtSimulate(debtArr,extraPmt){
     months++;
     ds.forEach(function(d){if(d.bal<=0)return;var interest=d.bal*d.rate;totalInt+=interest;d.bal+=interest;});
     ds.forEach(function(d){if(d.bal<=0)return;var pmt=Math.min(d.min,d.bal);d.bal-=pmt;if(d.bal<0.01){d.bal=0;freed+=d.oMin;}});
+    // Standard avalanche/snowball model: extraPmt is the EXTRA above minimums
+    // that the user is committing each month. Minimums are paid to every debt
+    // every month (above). Then extraPmt + freed minimums (from cleared debts)
+    // all flow to the priority debt (whichever is at index 0 of the input
+    // array — sorted by strategy upstream). Total monthly outflow = sum of
+    // active minimums + extraPmt, which stays constant as debts cascade.
     var extraLeft=extraPmt+freed;
     for(var i=0;i<ds.length;i++){if(ds[i].bal>0){var pay=Math.min(extraLeft,ds[i].bal);ds[i].bal-=pay;extraLeft-=pay;if(ds[i].bal<0.01){ds[i].bal=0;freed+=ds[i].oMin;}if(extraLeft<=0)break;}}
     ds.forEach(function(d){if(d.bal<0.01&&!d.paid){d.paid=true;d.paidMonth=months;order.push({name:d.name,month:months});}});
@@ -25096,6 +25722,32 @@ function _cpBuildTimeline(){
     });
   });
   horizon=Math.max(horizon,monthsElapsed+12);
+  // Helper: find the earliest start month of any phase strictly greater than p,
+  // looking at ALL CPLAN.allocations (not just the ones in the filtered `phases`
+  // array — which excludes phases whose only items are $0 protection actions).
+  // This prevents Phase 1 from defaulting to a 60-month "horizon" end when
+  // Phase 2 has a known start time but was filtered out for visual rendering.
+  function _earliestStartOfPhasesAbove(p){
+    var earliest=null;
+    if(sim&&sim.allocFuture){
+      CPLAN.allocations.forEach(function(a,idx){
+        var ap=(a.phase!=null)?a.phase:1;
+        if(ap<=p)return;
+        var af=sim.allocFuture[idx];
+        if(!af||af.startsMonth==null||af.startsMonth<0)return;
+        if(earliest==null||af.startsMonth<earliest)earliest=af.startsMonth;
+      });
+    }
+    // Also consult phaseStartByPhase (covers phases with explicit start set
+    // by the deferred E2 fallback below) for any phase number > p
+    Object.keys(phaseStartByPhase).forEach(function(k){
+      var pn=parseInt(k,10);
+      if(pn>p&&phaseStartByPhase[pn]!=null){
+        if(earliest==null||phaseStartByPhase[pn]<earliest)earliest=phaseStartByPhase[pn];
+      }
+    });
+    return earliest;
+  }
   for(var pi=0;pi<phases.length;pi++){
     var p=phases[pi];
     var nextP=phases[pi+1];
@@ -25115,10 +25767,20 @@ function _cpBuildTimeline(){
       var pStartForEnd=phaseStartByPhase[p]||0;
       phaseEndByPhase[p]=Math.max(lastMilMid+6,pStartForEnd+24);
     } else {
-      // Last phase only: extend to horizon (or past last milestone)
-      var lastMil=0;
-      (phaseMilestonesByPhase[p]||[]).forEach(function(mil){if(mil.month>lastMil)lastMil=mil.month;});
-      phaseEndByPhase[p]=Math.max(lastMil+6,horizon);
+      // Last phase. Before falling through to horizon, check if there's another
+      // phase ABOVE this one in CPLAN.allocations that was filtered out of the
+      // visible `phases` array (e.g., Phase 2 with only $0 protection items).
+      // If so, use its known start time as this phase's end — that's what the
+      // user expects when they see "Phase 2 Dec 2026" in the tab bar.
+      var nextStart=_earliestStartOfPhasesAbove(p);
+      if(nextStart!=null){
+        phaseEndByPhase[p]=nextStart;
+      } else {
+        // True last phase: extend to horizon (or past last milestone)
+        var lastMil=0;
+        (phaseMilestonesByPhase[p]||[]).forEach(function(mil){if(mil.month>lastMil)lastMil=mil.month;});
+        phaseEndByPhase[p]=Math.max(lastMil+6,horizon);
+      }
     }
   }
 
@@ -25133,7 +25795,7 @@ function _cpBuildTimeline(){
   // Stagger labels to avoid overlap (within a track)
   function _placeLabels(items,trackLeftPct,trackRightPct,minMo,maxMo){
     // items: [{month, label, color, icon, ...}]
-    // Returns enriched items with {pct, vOffset, dateLabel}
+    // Returns enriched items with {pct, vOffset, dateLabel, row}
     var spanMo=Math.max(1,maxMo-minMo);
     var spanPct=Math.max(1,trackRightPct-trackLeftPct);
     var withPct=items.map(function(it){
@@ -25141,15 +25803,32 @@ function _cpBuildTimeline(){
       pct=Math.min(trackRightPct-2,Math.max(trackLeftPct+2,pct));
       return Object.assign({},it,{pct:pct,dateLabel:_tlFmt(it.month)});
     });
-    // Sort by pct
+    // Sort by pct then assign to first non-conflicting row.
+    // Fix: was 2 rows alternating; with 3 close milestones the 3rd would
+    // overlap the 1st. Now 3 rows (above-1, below-1, below-2) and we pick
+    // the first row where this label has clear horizontal space (>=10%).
     withPct.sort(function(a,b){return a.pct-b.pct;});
-    // Offset overlapping labels — alternate between two rows
-    var lastPctRow=[null,null];// last pct in row 0 / row 1
+    var ROW_COUNT=3;
+    var MIN_GAP=10;// percent
+    var lastPctByRow=new Array(ROW_COUNT).fill(null);
     withPct.forEach(function(it){
       var row=0;
-      if(lastPctRow[0]!=null && (it.pct-lastPctRow[0])<11)row=1;
-      if(row===1 && lastPctRow[1]!=null && (it.pct-lastPctRow[1])<11)row=0;// fall back
-      lastPctRow[row]=it.pct;
+      for(var ri=0;ri<ROW_COUNT;ri++){
+        if(lastPctByRow[ri]==null||(it.pct-lastPctByRow[ri])>=MIN_GAP){
+          row=ri;
+          break;
+        }
+        // If we exhausted all rows, pick the row with the most space left
+        if(ri===ROW_COUNT-1){
+          var bestRow=0,bestGap=-Infinity;
+          for(var rj=0;rj<ROW_COUNT;rj++){
+            var gap=lastPctByRow[rj]==null?Infinity:(it.pct-lastPctByRow[rj]);
+            if(gap>bestGap){bestGap=gap;bestRow=rj;}
+          }
+          row=bestRow;
+        }
+      }
+      lastPctByRow[row]=it.pct;
       it.row=row;
     });
     return withPct;
@@ -25240,7 +25919,7 @@ function _cpBuildTimeline(){
       if(monthsElapsed>=visMin&&monthsElapsed<=visMax){
         yahPct=3+((monthsElapsed-visMin)/Math.max(1,visMax-visMin))*94;
       }
-      // ── Top label rows (above bar) ──
+      // ── Top label row (above bar) — only row 0 ──
       h+='<div style="position:relative;height:28px;margin:0 6px">';
       placed.forEach(function(it){
         if(it.row!==0)return;
@@ -25275,7 +25954,7 @@ function _cpBuildTimeline(){
         h+='<div style="position:absolute;left:'+yahPct+'%;top:50%;transform:translate(-50%,-50%) rotate(45deg);width:14px;height:14px;background:#5B9BFF;border:2px solid var(--bg-card);box-shadow:0 0 0 2px #5B9BFF,0 0 12px rgba(91,155,255,.6);z-index:3"></div>';
       }
       h+='</div>';
-      // ── Bottom label rows (below bar) ──
+      // ── Bottom label rows (below bar) — rows 1 and 2 stacked ──
       h+='<div style="position:relative;height:28px;margin:0 6px;margin-top:4px">';
       placed.forEach(function(it){
         if(it.row!==1)return;
@@ -25285,6 +25964,19 @@ function _cpBuildTimeline(){
         h+='</div>';
       });
       h+='</div>';
+      // Row 2: only render if any items live there (extra row of clearance)
+      var hasRow2=placed.some(function(it){return it.row===2;});
+      if(hasRow2){
+        h+='<div style="position:relative;height:28px;margin:0 6px;margin-top:2px">';
+        placed.forEach(function(it){
+          if(it.row!==2)return;
+          h+='<div style="position:absolute;left:'+it.pct+'%;top:0;transform:translateX(-50%);text-align:center;max-width:140px">';
+          h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
+          h+='<div style="font-size:10px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
+          h+='</div>';
+        });
+        h+='</div>';
+      }
       h+='</div>';// phase block
     });
   }
@@ -27235,22 +27927,64 @@ function _cpCalcDebtPlan(debts,extra,method){
   var totalMin=debts.reduce(function(s,d){return s+(d.min||0);},0);
   if(totalMin<=0)return{months:0,interest:0,intSaved:0,order:[],perDebt:[]};
   function simulate(debtArr,extraPmt){
-    var ds=debtArr.map(function(d,i){return{name:d.name||('Debt '+(i+1)),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,min:Math.max(parseFloat(d.min)||0,10),paid:false,paidMonth:0};});
-    var months=0,totalInt=0,order=[];
+    var ds=debtArr.map(function(d,i){return{name:d.name||('Debt '+(i+1)),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,min:Math.max(parseFloat(d.min)||0,10),oMin:Math.max(parseFloat(d.min)||0,10),paid:false,paidMonth:0};});
+    var months=0,totalInt=0,order=[],freed=0;
     while(ds.some(function(d){return d.bal>0.01;})&&months<600){
       months++;
       ds.forEach(function(d){if(d.bal<=0)return;var interest=d.bal*d.rate;totalInt+=interest;d.bal+=interest;});
-      ds.forEach(function(d){if(d.bal<=0)return;var pmt=Math.min(d.min,d.bal);d.bal-=pmt;if(d.bal<0.01)d.bal=0;});
-      var extraLeft=extraPmt;
-      for(var i=0;i<ds.length;i++){if(ds[i].bal>0){var pay=Math.min(extraLeft,ds[i].bal);ds[i].bal-=pay;extraLeft-=pay;if(ds[i].bal<0.01)ds[i].bal=0;if(extraLeft<=0)break;}}
+      ds.forEach(function(d){if(d.bal<=0)return;var pmt=Math.min(d.min,d.bal);d.bal-=pmt;if(d.bal<0.01){d.bal=0;freed+=d.oMin;}});
+      // Standard cascade: extra + freed-mins flow to priority debt (index 0
+      // of remaining unpaid debts in input order).
+      var extraLeft=extraPmt+freed;
+      for(var i=0;i<ds.length;i++){if(ds[i].bal>0){var pay=Math.min(extraLeft,ds[i].bal);ds[i].bal-=pay;extraLeft-=pay;if(ds[i].bal<0.01){ds[i].bal=0;freed+=ds[i].oMin;}if(extraLeft<=0)break;}}
       ds.forEach(function(d){if(d.bal<0.01&&!d.paid){d.paid=true;d.paidMonth=months;order.push({name:d.name,month:months});}});
     }
     return{months:months,interest:Math.round(totalInt),order:order,perDebt:ds};
   }
+  // Permutations helper — capped at 5 debts to keep brute force fast (120 sims)
+  function permute(arr){
+    if(arr.length<=1)return [arr.slice()];
+    if(arr.length>5)return [arr.slice()];
+    var result=[];
+    for(var i=0;i<arr.length;i++){
+      var rest=arr.slice(0,i).concat(arr.slice(i+1));
+      permute(rest).forEach(function(p){result.push([arr[i]].concat(p));});
+    }
+    return result;
+  }
+  // Hybrid = try EVERY ordering, pick the one that finishes soonest (with
+  // lowest interest as tiebreaker). If the best hybrid order is no better
+  // than avalanche or snowball, return an N/A marker — per spec, hybrid
+  // only "exists" when it actually beats both pure strategies.
+  if(method==='hybrid'){
+    var avalSorted=debts.slice().sort(function(a,b){return(parseFloat(b.rate)||0)-(parseFloat(a.rate)||0);});
+    var snowSorted=debts.slice().sort(function(a,b){return(parseFloat(a.balance)||0)-(parseFloat(b.balance)||0);});
+    var avalSim=simulate(avalSorted,extra||0);
+    var snowSim=simulate(snowSorted,extra||0);
+    var perms=permute(debts);
+    var best=null;
+    perms.forEach(function(p){
+      var s=simulate(p,extra||0);
+      if(!best||s.months<best.months||(s.months===best.months&&s.interest<best.interest)){
+        best=s;
+        best._hybridOrder=p.map(function(d){return d.name||'';});
+      }
+    });
+    // Compare: does best hybrid permutation beat the better of avalanche/snowball?
+    var bestPure=avalSim.months<snowSim.months?avalSim:(avalSim.months>snowSim.months?snowSim:(avalSim.interest<=snowSim.interest?avalSim:snowSim));
+    var beats=(best.months<bestPure.months)||(best.months===bestPure.months&&best.interest<bestPure.interest);
+    if(!beats){
+      // Hybrid offers no improvement — return N/A signal so UI can show "N/A".
+      return{months:0,interest:0,intSaved:0,order:[],perDebt:[],_naReason:'No ordering finishes faster or cheaper than avalanche/snowball'};
+    }
+    var baseSim=simulate(avalSorted,0);// baseline = minimums only with avalanche order (consistent reference)
+    best.intSaved=Math.max(0,baseSim.interest-best.interest);
+    return best;
+  }
+  // Avalanche / snowball: single sort, single simulate
   var sorted=debts.slice();
   if(method==='avalanche')sorted.sort(function(a,b){return(parseFloat(b.rate)||0)-(parseFloat(a.rate)||0);});
   else if(method==='snowball')sorted.sort(function(a,b){return(parseFloat(a.balance)||0)-(parseFloat(b.balance)||0);});
-  else if(method==='hybrid')sorted.sort(function(a,b){var ab=parseFloat(a.balance)||0,bb=parseFloat(b.balance)||0,ar=parseFloat(a.rate)||0,br=parseFloat(b.rate)||0;return(br*bb)-(ar*ab);});
   var base=simulate(sorted,0),opt=simulate(sorted,extra||0);
   opt.intSaved=Math.max(0,base.interest-opt.interest);
   return opt;
@@ -27618,6 +28352,9 @@ function _cpCalcIBCDebt(debts,budget){
   ds.sort(function(a,b){return b.rate-a.rate;});
   var vehicle=0,totalDebtInt=0,totalLoanInt=0,payoffLog=[],origFreeMonth=null,month=0;
   var totalLoanBalance=0;
+  // Per-month time series for the chart — kept in sync with this sim's
+  // anniversary-based growth and simple loan interest.
+  var series=[];// [{month, av, cv, loanBal, freedMins}]
   var totalLoanFreedMins=0;
   // Track CV at last anniversary (stable until next anniversary) and premium-since-last-anniv.
   // Inter-anniversary "effective CV" for loan availability = lastAnnivCV + premiumSinceAnniv.
@@ -27684,17 +28421,51 @@ function _cpCalcIBCDebt(debts,budget){
     // Step 6: track milestones. origFreeMonth = original debts gone.
     var origLeft=ds.some(function(d2){return d2.bal>0.01;});
     if(!origLeft&&origFreeMonth===null)origFreeMonth=month;
+    // Snapshot per-month state for the chart. CV (cash value) is the
+    // "what you can take out today" figure: vehicle minus outstanding loans.
+    series.push({
+      month:month,
+      av:Math.round(vehicle),
+      cv:Math.round(Math.max(0,vehicle-totalLoanBalance)),
+      loanBal:Math.round(totalLoanBalance),
+      freedMins:Math.round(totalLoanFreedMins),
+      premiumSinceAnniv:Math.round(premiumSinceAnniv)
+    });
     if(!origLeft&&totalLoanBalance<=0)break;
+  }
+  // Capture the moment all debts AND loan were cleared (before trail).
+  var fullFreeMonth=month;
+  // Continue tracking series for ~24 more months past full debt-free so the
+  // chart shows the post-debt phase where premium continues, CV keeps growing,
+  // and the user has a permanent asset.
+  var trailMonths=24;
+  for(var _t=0;_t<trailMonths;_t++){
+    month++;
+    premiumSinceAnniv += budget;
+    vehicle = lastAnnivCV + premiumSinceAnniv;
+    if(month % 12 === 0){
+      var pyT=month/12;
+      var acT=_ibcWLAnnualCredit(ibcParams, pyT, lastAnnivCV, 0);
+      var effT=_ibcYearFactor(ibcParams.cvEfficiencyYr, pyT, 1.0);
+      lastAnnivCV = lastAnnivCV + premiumSinceAnniv*effT + acT.breakdown.guaranteedGrowth + acT.breakdown.dividend;
+      premiumSinceAnniv = 0;
+      vehicle = lastAnnivCV;
+    }
+    series.push({
+      month:month,av:Math.round(vehicle),cv:Math.round(vehicle),
+      loanBal:0,freedMins:0,premiumSinceAnniv:Math.round(premiumSinceAnniv)
+    });
   }
   return{
     eligible:true,
-    months:origFreeMonth||month,
-    fullFreeMonth:month,
+    months:origFreeMonth||fullFreeMonth,
+    fullFreeMonth:fullFreeMonth,
     interest:Math.round(totalDebtInt+totalLoanInt),
     vehicle:Math.round(vehicle),
     budget:budget,
     payoffLog:payoffLog,
     intSaved:0,
+    series:series,
     _totalLoanInterest:Math.round(totalLoanInt),
     _totalDebtInterest:Math.round(totalDebtInt),
     _totalPremiumsPaid:Math.round(budget*month)
@@ -27718,20 +28489,31 @@ function _cpRenderDebtEngine(debtAlloc,idx){
   var ibcBudget=extra>0?extra:Math.max(50,Math.min(Math.round((CPLAN.surplus||200)*0.20/50)*50,500));
   var ibc=_cpCalcIBCDebt(debts,ibcBudget);
 
-  // Find best (lowest interest)
+  // Find best (lowest interest) — skip hybrid if it returned N/A
   var plans=[
     {key:'avalanche',label:'Avalanche',note:'Highest rate first',data:avalanche,icon:'📐'},
     {key:'snowball',label:'Snowball',note:'Smallest balance first',data:snowball,icon:'⛄'},
-    {key:'hybrid',label:'Hybrid',note:'Balanced approach',data:hybrid,icon:'⚖️'}
+    {key:'hybrid',label:'Hybrid',note:'Tries every order',data:hybrid,icon:'⚖️'}
   ];
   var bestKey='avalanche';var bestInt=avalanche.interest;
-  plans.forEach(function(p){if(p.data.interest<bestInt){bestInt=p.data.interest;bestKey=p.key;}});
+  plans.forEach(function(p){if(p.data&&!p.data._naReason&&p.data.interest>0&&p.data.interest<bestInt){bestInt=p.data.interest;bestKey=p.key;}});
 
   if(!isD){
     // ── GUIDED: comparison cards with best-fit badge ──
     h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px">';
     plans.forEach(function(p){
-      var isBest=p.key===bestKey;var sel=CPLAN.debtStrategy===p.key;
+      var isNA=p.data&&p.data._naReason;
+      var isBest=!isNA&&p.key===bestKey;var sel=!isNA&&CPLAN.debtStrategy===p.key;
+      // N/A card — clickable disabled, muted styling, explains why
+      if(isNA){
+        h+='<div title="'+p.data._naReason+'" style="padding:10px;text-align:center;border-radius:2px;border:1px solid var(--bd);background:rgba(100,116,139,.04);position:relative;opacity:.6">';
+        h+='<div style="font-size:16px;margin-bottom:4px">'+p.icon+'</div>';
+        h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--mu)">'+p.label+'</div>';
+        h+='<div style="font-family:var(--fd);font-size:20px;color:var(--mu)">N/A</div>';
+        h+='<div style="font-size:11px;color:var(--mu);line-height:1.3;margin-top:4px">No improvement over avalanche or snowball</div>';
+        h+='</div>';
+        return;
+      }
       h+='<div onclick="CPLAN.debtStrategy=\''+p.key+'\';_cpRender()" style="padding:10px;text-align:center;cursor:pointer;border-radius:2px;border:1px solid '+(sel?'rgba(249,115,22,.5)':isBest?'rgba(34,197,94,.3)':'var(--bd)')+';background:'+(sel?'rgba(249,115,22,.1)':isBest?'rgba(34,197,94,.04)':'transparent')+';position:relative">';
       if(isBest)h+='<div style="position:absolute;top:3px;right:3px;font-size:9px;font-family:var(--fh);font-weight:700;color:var(--gr);background:rgba(34,197,94,.12);padding:1px 5px;border-radius:2px;letter-spacing:.06em">BEST FIT</div>';
       h+='<div style="font-size:16px;margin-bottom:4px">'+p.icon+'</div>';
