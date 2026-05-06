@@ -23467,15 +23467,21 @@ function _cpShowApproachFork(){
       // returns for Traditional/Hybrid plans but the prior strategy fork silently
       // dropped — making Traditional's projected retirement value undercount by
       // ~50% and showing wildly wrong gross/tax/net comparisons.
-      var _retVehiclesAppr=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'];
+      // Include every non-debt allocation type so totals match the chart endpoint.
+      // Without 'edu', 'ef', 'custom', 'rollover' here, those balances would land
+      // in retVal (which sums everything via allocEndBalances) but get silently
+      // dropped from the tax bucket map below — making tax math NaN-prone.
+      var _retVehiclesAppr=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest','edu','ef','custom','rollover','protection'];
       var _apprStratMap={'roth_ira':'roth','roth_401k':'roth401k','401k':'401k','traditional_401k':'401k','traditional_ira':'trad_ira','solo_401k':'solo401k','sep_ira':'sep_ira','iul':'iul','whole_life':'wl','ibc_wl':'ibc','ibc_iul':'ibc','ibc':'ibc','hsa':'hsa','invest':'invest','taxable_brokerage':'invest','brokerage':'invest','index_funds':'invest'};
       // Per-type tax bucket for the weighted retirement-income tax calc:
-      //   ord  → ordinary income (full retirement bracket %): Trad 401k/IRA/Solo/SEP
+      //   ord  → ordinary income (full retirement bracket %): Trad 401k/IRA/Solo/SEP, traditional rollovers
       //   ltcg → long-term capital gains (15% — typical retiree bracket): taxable brokerage
-      //   free → no tax: Roth, Roth 401(k), HSA (assumed medical use), IUL/WL/IBC policy loans
+      //   free → no tax at withdrawal: Roth, Roth 401(k), HSA (medical), IUL/WL/IBC policy loans,
+      //          529 (education-qualified), Emergency Fund (cash), custom goal funds (cash)
       var _apprTaxBucket={
-        '401k':'ord','trad_ira':'ord','solo401k':'ord','sep_ira':'ord',
+        '401k':'ord','trad_ira':'ord','solo401k':'ord','sep_ira':'ord','rollover':'ord',
         'roth':'free','roth401k':'free','hsa':'free','iul':'free','wl':'free','ibc':'free',
+        'edu':'free','ef':'free','custom':'free',
         'invest':'ltcg'
       };
       // Try the cascade-aware simulation first. It honors phase transitions:
@@ -23522,13 +23528,16 @@ function _cpShowApproachFork(){
       // Sustainability: prefer sim's projRetIncome (already cascade-aware + uses
       // dynamic mortality from _cpYearsInRetirement). Fall back to PMT formula
       // with the same dynamic mortality so the answer is consistent either way.
+      // _apprPMTfactor is always declared here (not inside the else-if) because
+      // _bkInc below references it for both sim and fallback paths to convert
+      // bucket end-balances → monthly income.
+      var _yrsInRet=_cpYearsInRetirement();
+      var _apprR=0.01/12,_apprN=_yrsInRet*12;
+      var _apprPMTfactor=_apprR/(1-Math.pow(1+_apprR,-_apprN));
       var retInc;
       if(_simBased&&_simBased.retIncome>0){
         retInc=_simBased.retIncome;
       } else if(_apprRetVal>0){
-        var _yrsInRet=_cpYearsInRetirement();
-        var _apprR=0.01/12,_apprN=_yrsInRet*12;
-        var _apprPMTfactor=_apprR/(1-Math.pow(1+_apprR,-_apprN));
         retInc=Math.round(_apprRetVal*_apprPMTfactor);
       } else {
         retInc=hl.projected_monthly_income||0;
@@ -23791,25 +23800,43 @@ function _cpProjectApproachWithSim(approachData){
     _cpConvertAIRecs(approachData);
     // Run cascade-aware simulation. Writes results to CPLAN._sim.
     var sim=_cpRunSimulation();
-    if(sim&&sim.projRetValue>0){
-      // Capture per-allocation end balances from allocSeries for tax-bucket categorization
+    if(sim){
+      // Capture per-allocation end balances. We sum ALL non-debt allocation
+      // balances (not just retirement-only) to match what the user sees on the
+      // plan-view chart, which shows TOTAL net worth at retirement. Including
+      // taxable brokerage / EF / vacation goal here is critical: in Hybrid and
+      // Traditional approaches the AI commonly puts $1-3M of retirement-age
+      // wealth into a Taxable Investment Account. If we only summed
+      // sim.projRetValue (retirement-only), the fork would undercount the
+      // approach by exactly that amount and show ~$2.2M when the actual chart
+      // line was reading $5.8M.
       var _yrsToRet=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
       var allocEndBalances=[];
+      var totalEndBalance=0;
       if(sim.allocSeries){
         CPLAN.allocations.forEach(function(a,i){
-          if(a.type==='debt')return;
-          if(!a.amount||a.amount<=0)return;
+          if(a.type==='debt')return;          // debt is already netted into allocations via cascade
+          if(!a.amount||a.amount<=0)return;   // no funding → no balance to track
           var key=a.type+'_'+i;
           var series=sim.allocSeries[key];
           if(series&&series.length){
             var endIdx=Math.min(_yrsToRet,series.length-1);
-            allocEndBalances.push({type:a.type,strategy:a.type,endBal:series[endIdx]||0});
+            var endBal=series[endIdx]||0;
+            if(endBal>0){
+              allocEndBalances.push({type:a.type,strategy:a.type,endBal:endBal});
+              totalEndBalance+=endBal;
+            }
           }
         });
       }
+      // Sustainable monthly income from the FULL endpoint balance using the
+      // dynamic mortality (PFOS Main retLifeExp − retirementAge). Uses the same
+      // PMT formula as the rest of the platform for consistency.
+      var _yrsInRet2=_cpYearsInRetirement();
+      var _retIncomeFromTotal=Math.round(_cpSustainableMonthly(totalEndBalance,_yrsInRet2,0.01));
       result={
-        retValue:sim.projRetValue||0,
-        retIncome:sim.projRetIncome||0,
+        retValue: totalEndBalance>0 ? Math.round(totalEndBalance) : (sim.projRetValue||0),
+        retIncome: _retIncomeFromTotal>0 ? _retIncomeFromTotal : (sim.projRetIncome||0),
         allocEndBalances:allocEndBalances,
         debtFreeMonth:sim.debtFreeMonth||0,
         events:(sim.events||[]).slice(),
@@ -27976,7 +28003,9 @@ function _cpSustainableMonthly(balance,yearsInRet,realAnnualReturn){
 function _cpRenderIncomeReplacement(){
   var el=document.getElementById('cplanIncomeReplace');if(!el)return;
   if(CPLAN.income<=0){el.innerHTML='';return;}
-  var _retVehicles=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
+  // Retirement assets include taxable brokerage — see comment in _cpRunSimulation
+  // (search "Track retirement-only assets") for the rationale.
+  var _retVehicles=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'];
   // Phase 2: target is the user's stated retirement income (today's $/mo), not 4% rule.
   // Use simulation's retirement-only data if available
   var retIncome=0;
@@ -31413,8 +31442,15 @@ function _cpRunSimulation(){
       var key=a.type+'_'+idx;
       if(allocSeries[key])allocSeries[key].push(Math.round(bal));
       totalAssets+=bal;
-      // Track retirement-only assets separately
-      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'].indexOf(a.type)>=0){
+      // Track retirement-only assets separately. Taxable brokerage ('invest')
+      // IS counted as a retirement asset because in real-world planning that
+      // account is sold at LTCG rates, harvested for dividends, or used as
+      // an early-retirement bridge to Social Security / 59½. Excluding it
+      // made the Retirement view show ~half the actual retirement wealth and
+      // visibly disagree with the Net Worth view for plans that put $2-3M
+      // into taxable brokerage by age 65. EF / 529 / vacation goals stay
+      // excluded — those are specific-purpose buckets, not retirement income.
+      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'].indexOf(a.type)>=0){
         if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
         _retOnlyByYear[yr]+=bal;
       }
@@ -31437,7 +31473,11 @@ function _cpRunSimulation(){
       _homeEq=Math.max(0,_curHomeVal-_remMortgage);
     }
     netWorthData.push(Math.round(totalAssets+unBal-remHi-remLo+_homeEq));
-    // Retirement-only projection (excludes edu, invest bridge, EF, custom goals, home equity)
+    // Retirement projection includes all income-producing assets at retirement:
+    // tax-advantaged retirement accounts AND taxable brokerage (sold at LTCG /
+    // harvested for dividends / used as Roth-conversion ladder source).
+    // Excludes EF (cash buffer), custom goals (specific-purpose), 529 (education),
+    // and home equity (illiquid until sold).
     retirementData.push(Math.round(_retOnlyByYear[yr]||0));
   }
 
@@ -31511,8 +31551,34 @@ function _cpRenderChart(targetId){
   var sim=CPLAN._sim;
   var baselineData,totalData,rawSeries;
   if(sim&&sim.netWorth&&sim.netWorth.length>0){
-    baselineData=sim.baseline;
     totalData=_isRetView?(sim.retirement||sim.netWorth):sim.netWorth;
+    if(_isRetView){
+      // Retirement-view baseline = "do nothing on retirement contributions":
+      // existing retirement-account balances AND existing taxable brokerage
+      // balance compounding at a moderate unmanaged-market rate (5% net of
+      // typical drag), with ZERO new contributions. Both count because both
+      // are real-world retirement income sources — taxable brokerage is sold
+      // at LTCG rates / harvested for dividends, retirement accounts produce
+      // ordinary or tax-free income depending on type.
+      //
+      // Bug this fixes: previously both views shared sim.baseline, which
+      // computes "passive cash savings + debt amortization" — about $2M
+      // for a typical user with $5K/mo surplus over 30 years. Comparing
+      // that cash baseline against retirement-only data made "Do nothing"
+      // look almost as good as "Plan" in the retirement view, suggesting
+      // the user could skip retirement planning and still be fine.
+      var _rawSrcRet=(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)||{};
+      var _existingRetBal=(_rawSrcRet.retAccounts||[]).reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+      var _existingInvestBal=parseFloat((_rawSrcRet.assets&&_rawSrcRet.assets.invest)||0);
+      var _existingRetSeed=_existingRetBal+_existingInvestBal;
+      var _retBaseRate=0.05;// unmanaged net rate after typical drag/fees
+      baselineData=[];
+      for(var _ry=0;_ry<=sim.netWorth.length-1;_ry++){
+        baselineData.push(Math.round(_existingRetSeed*Math.pow(1+_retBaseRate,_ry)));
+      }
+    } else {
+      baselineData=sim.baseline;
+    }
     // Build rawSeries from sim.allocSeries for displacement bands
     rawSeries={};
     active.forEach(function(a,aIdx){
@@ -31629,9 +31695,14 @@ function _cpRenderChart(targetId){
   var dA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
   if(dA&&CPLAN.totalDebt>0){var dYr=Math.ceil(Math.ceil(CPLAN.totalDebt/(dA.amount+CPLAN.debtMin))/12);if(dYr>0&&dYr<years){svg+='<line x1="'+x(dYr)+'" y1="'+padT+'" x2="'+x(dYr)+'" y2="'+(H-padB)+'" stroke="rgba(249,115,22,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(dYr)+'" y="'+(padT-3)+'" fill="rgba(249,115,22,.6)" font-size="7" text-anchor="middle" font-family="var(--fh)">Debt free</text>';}}
   if(_cpTierHas('milestones_extra')){
-  for(var m100=1;m100<=years;m100++){if(totalData[m100]>=100000&&(m100===1||totalData[m100-1]<100000)){svg+='<line x1="'+x(m100)+'" y1="'+padT+'" x2="'+x(m100)+'" y2="'+(H-padB)+'" stroke="rgba(91,155,255,.2)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(m100)+'" y="'+(H-padB+10)+'" fill="rgba(91,155,255,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">$100k</text>';break;}}
+  // $100k and FI milestone labels live BELOW the Age labels (y = H-padB+22) so
+  // they don't visually overlap with the Age tick row at y = H-padB+14.
+  // Previous y-offset of +10 placed them inside the same band as Age 38 etc.,
+  // making the labels look misaligned with the x-axis even though their
+  // x-positions were correct.
+  for(var m100=1;m100<=years;m100++){if(totalData[m100]>=100000&&(m100===1||totalData[m100-1]<100000)){svg+='<line x1="'+x(m100)+'" y1="'+padT+'" x2="'+x(m100)+'" y2="'+(H-padB)+'" stroke="rgba(91,155,255,.2)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(m100)+'" y="'+(H-padB+22)+'" fill="rgba(91,155,255,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">$100k</text>';break;}}
   var fiTarget=CPLAN.expenses*12*25;
-  if(fiTarget>0){for(var mFI=1;mFI<=years;mFI++){if(totalData[mFI]>=fiTarget&&(mFI===1||totalData[mFI-1]<fiTarget)){svg+='<line x1="'+x(mFI)+'" y1="'+padT+'" x2="'+x(mFI)+'" y2="'+(H-padB)+'" stroke="rgba(168,85,247,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(mFI)+'" y="'+(H-padB+10)+'" fill="rgba(168,85,247,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">FI</text>';break;}}}
+  if(fiTarget>0){for(var mFI=1;mFI<=years;mFI++){if(totalData[mFI]>=fiTarget&&(mFI===1||totalData[mFI-1]<fiTarget)){svg+='<line x1="'+x(mFI)+'" y1="'+padT+'" x2="'+x(mFI)+'" y2="'+(H-padB)+'" stroke="rgba(168,85,247,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(mFI)+'" y="'+(H-padB+22)+'" fill="rgba(168,85,247,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">FI</text>';break;}}}
   }
   svg+='</svg>';
   // Store chart data for hover interactivity
@@ -31667,7 +31738,7 @@ function _cpRenderChart(targetId){
         });
         tipH+='<div style="border-top:1px solid rgba(100,116,139,.15);margin-top:4px;padding-top:4px">';
         tipH+='<div style="color:var(--gr);font-size:12px">Plan: <strong>'+fmtK(pv2)+'</strong></div>';
-        tipH+='<div style="color:var(--mu);font-size:11px">Do nothing: '+fmtK(bv2)+'</div>';
+        tipH+='<div style="color:var(--mu);font-size:11px">'+(_isRetView?'No new contributions':'Do nothing')+': '+fmtK(bv2)+'</div>';
         tipH+='<div style="color:'+(diff3>=0?'var(--gr)':'var(--rd)')+';font-size:12px;font-weight:700">'+(diff3>=0?'+':'')+fmtK(diff3)+'</div></div>';
         tip.innerHTML=tipH;
         var tipX=Math.min(px,svgW-160);tip.style.left=tipX+'px';tip.style.top='4px';tip.style.display='block';
@@ -31679,7 +31750,7 @@ function _cpRenderChart(targetId){
     wrap.addEventListener('mouseleave',function(){if(tip)tip.style.display='none';if(vLine)vLine.style.display='none';});
   },100);
   svg+='<div style="display:flex;flex-wrap:wrap;gap:8px;justify-content:center;font-size:12px;color:var(--mu);margin-top:6px">';
-  svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:rgba(100,116,139,.4);margin-right:4px;vertical-align:middle;border-top:1px dashed rgba(100,116,139,.5)"></span>Do nothing ('+fmtK(baselineData[years])+')</span>';
+  svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:rgba(100,116,139,.4);margin-right:4px;vertical-align:middle;border-top:1px dashed rgba(100,116,139,.5)"></span>'+(_isRetView?'No new contributions':'Do nothing')+' ('+fmtK(baselineData[years])+')</span>';
   // H2: Per-vehicle legend only when displacement bands are rendered (Pro+).
   // Without the bands, the legend wouldn't match the chart (which shows a single
   // combined gradient), so lower tiers get a single combined entry instead.
