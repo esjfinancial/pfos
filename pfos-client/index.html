@@ -22908,9 +22908,15 @@ function _cpConvertAIRecs(aiData){
     // down payment, etc.) that AI categorized as section='investment' or
     // section='tax' (both default to 'invest' in secMap → taxable brokerage
     // card). Routes them to 'custom' so they render in the Custom Goal card.
-    // Runs BEFORE title-to-invest so a "Vacation Fund" title doesn't get
-    // re-caught by an unrelated "fund" keyword in title-to-invest.
-    else if(/vacation|wedding|honeymoon|cruise|down ?payment|home purchase|new car\b|car fund|baby fund|gift fund|graduation fund|sinking fund|saving[s]? goal|goal fund|short.?term goal/.test(_tl))map.type='custom';
+    // GUARD: only fires when map.type is already 'invest' or 'custom' — so a
+    // Roth/401k/IUL/etc. allocation with a vague "Savings Goal"-style title
+    // doesn't get demoted to a 0%-growth custom card. KEYWORDS limited to
+    // specific named purposes (no generic "savings goal" / "goal fund" /
+    // "short-term goal" — those phrases appear in legitimate retirement
+    // titles like "Retirement Savings Goal" and produced a 50% projection
+    // collapse by routing them to type='custom' which has 0% growth rate.)
+    else if(/vacation|wedding|honeymoon|cruise|down ?payment|home purchase|new car\b|car fund|baby fund|gift fund|graduation fund|sinking fund/.test(_tl)
+            && (map.type==='invest'||map.type==='custom'))map.type='custom';
     // Title-to-invest override: ONLY apply when strategy field doesn't already
     // pin to a specific tax-advantaged vehicle. Without this guard, an AI rec
     // with strategy='roth_ira' but title="Roth IRA Index Fund Allocation" would
@@ -22931,15 +22937,16 @@ function _cpConvertAIRecs(aiData){
     amt=Math.min(amt,Math.max(0,pool-usedPool));
     // Force protection/insurance items to $0 — premiums require real quotes, never estimate
     if(map.type==='protection')amt=0;
-    // Force estate-section items to $0 — basic estate documents (will, trust, POA,
-    // beneficiary designations, healthcare directive, guardianship) are one-time
-    // legal setups, not recurring monthly costs. PP5 below also catches title-keyword
-    // cases (custom + 'estate'/'will'/'trust' in customName), but section='estate' is
-    // the authoritative AI signal regardless of how the title is worded — handles AI
-    // titles like "Foundational Legal Documents" that don't carry a keyword PP5 sees.
-    // Without this force, the AI's monthly_cost on estate items consumes deployable
-    // pool that should be flowing to growth vehicles.
-    if(r.section==='estate')amt=0;
+    // Force action-only strategies to $0. The AI is explicitly told in the
+    // edge-function prompt that these strategies are monthly_cost=0 (line 677:
+    // "Do NOT cascade to action-only items (protection, estate, tax review)";
+    // line 701: "Roth conversion strategies (rollover_*) ... monthly_cost MUST
+    // be 0"; line 680: protection rules are action-only). When the AI returns
+    // monthly_cost>0 for one of these anyway, we force to 0 here. Strategy
+    // field is the canonical signal — the AI's whitelist keys are deterministic,
+    // unlike titles which the AI generates freely.
+    var _actionOnlyStrats={estate_planning:1,protection_review:1,term_life:1,rollover_myga:1,rollover_fia:1,rollover_roth_conversion:1};
+    if(_actionOnlyStrats[r.strategy])amt=0;
     var reason=r.recommendation||'';
     if(r.outcome)reason+='\n📊 '+r.outcome;
     if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
@@ -23117,7 +23124,11 @@ function _cpConvertAIRecs(aiData){
     }
   });
 
-  // Fix PP5: Estate planning force $0 — if AI assigned monthly cost to estate items
+  // Fix PP5: Estate planning force $0 — if AI assigned monthly cost to estate items.
+  // Primary defense is now the strategy-based _actionOnlyStrats check in the
+  // conversion loop above (catches strategy='estate_planning' regardless of title).
+  // PP5 stays as a tertiary safety net for cases where the AI ignored the canonical
+  // strategy key but used estate-keyword titles like "Will and Trust Setup".
   CPLAN.allocations.forEach(function(a){
     if(a.type==='custom'&&a.customName){
       var nm=a.customName.toLowerCase();
