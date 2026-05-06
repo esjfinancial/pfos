@@ -1965,8 +1965,14 @@ var _STATE_TAX_RATES={
   VT:0.06,WI:0.05,WV:0.055,PR:0.06
 };
 function _stateTaxRate(state){
-  if(!state)return 0.05; // safe US-average fallback when state isn't set yet
+  // When state isn't set, default to 0%. Under-stating tax is better than
+  // over-stating gross — a too-high gross figure cascades into wrong 401k
+  // match expectations, wrong protection coverage, etc. Once the user picks
+  // their actual state, the rate updates correctly.
+  if(!state)return 0;
   var r=_STATE_TAX_RATES[(state||'').toUpperCase()];
+  // Unknown state code: fall back to 5% (US average) rather than 0 — better
+  // than nothing if there's typo or a non-standard code.
   return (r===undefined)?0.05:r;
 }
 // Estimate annual federal income tax using 2026 progressive brackets — same
@@ -5164,27 +5170,40 @@ function _syncRetAcctFromIncomeSource(srcIdx){
     }
   }
   if(existingIdx>=0){
-    // Update existing (linked or just-adopted) account
+    // Update existing (linked or just-adopted) account.
+    // Track whether anything actually changed — if not, skip the re-render
+    // so we don't destroy an input the user is currently typing in.
     var existing=S.retAccounts[existingIdx];
+    var changed=false;
     // Respect manual edits: if the user explicitly typed a contrib value
     // on the retirement card, don't overwrite it on auto-sync. They can
     // press "🔄 Re-sync from income" or change contribPct to opt back in.
-    if(!existing._userEditedContrib){
+    if(!existing._userEditedContrib&&existing.contrib!==monthlyContrib){
       existing.contrib=monthlyContrib;
+      changed=true;
     }
     // matchPct is a property of the employer plan, not user-driven, so
     // always keep it in sync.
-    existing.matchPct=matchPct;
+    if(existing.matchPct!==matchPct){
+      existing.matchPct=matchPct;
+      changed=true;
+    }
     // Always recompute contribPct from real gross so the "% of gross" UI
     // reads correctly even if the dollar amount was manually edited.
     var monthlyGross=_incSrcMonthlyGross(src);
     if(monthlyGross>0){
       var actualContrib=existing.contrib||monthlyContrib;
-      existing.contribPct=Math.round((actualContrib/monthlyGross)*100*10)/10;
+      var newPct=Math.round((actualContrib/monthlyGross)*100*10)/10;
+      if(existing.contribPct!==newPct){
+        existing.contribPct=newPct;
+        changed=true;
+      }
     }
-    S._touched.retAccounts=true;
-    renderRetAccounts();
-    if(!existing._userEditedContrib)_showAutoSyncBanner('updated');
+    if(changed){
+      S._touched.retAccounts=true;
+      renderRetAccounts();
+      if(!existing._userEditedContrib)_showAutoSyncBanner('updated');
+    }
   } else {
     // Create new linked 401k account
     var newAcct={
@@ -5243,19 +5262,19 @@ function updRetAccount(i,field,val){
   // returnPct: store null for empty so 0% can be distinguished from "not entered"
   if(field==='returnPct'){
     S.retAccounts[i][field]=val===''||val===null?null:parseFloat(val);
+  } else if(field==='contribCommit'){
+    // Fired on `change` (blur with change). Marks the value as a deliberate
+    // user edit so the income → retirement auto-sync respects it. Cleared
+    // when contribPct is edited (which then drives contrib programmatically)
+    // or when the "🔄 Re-sync" button is pressed.
+    S.retAccounts[i].contrib=pf(val);
+    S.retAccounts[i]._userEditedContrib=true;
   } else {
     S.retAccounts[i][field]=['balance','contrib','matchPct','contribPct'].indexOf(field)!==-1?(pf(val)):val;
   }
-  // Mark direct user edits to contrib so the income → retirement auto-sync
-  // won't overwrite them. Cleared by the "Re-sync from income" button or by
-  // changing contribPct (which then drives contrib programmatically).
-  if(field==='contrib'){
-    S.retAccounts[i]._userEditedContrib=true;
-  }
-  // Sync: when contribPct changes, update dollar contribution
-  // Fix: use incGross (real W-2 gross) for the pct calculation, not c.inc
-  // (take-home). 401k contribution % is a percentage of gross by definition,
-  // so the old code under-stated by ~25-30% for typical W-2 earners.
+  // Sync: when contribPct changes, update dollar contribution.
+  // Uses incGross (real W-2 gross) for the pct calculation, not c.inc
+  // (take-home). 401k contribution % is a percentage of gross by definition.
   if(field==='contribPct'){
     var _c=S.calcs||{};
     var _base=_c.incGross||_c.inc||0;
@@ -5352,7 +5371,7 @@ function renderRetAccounts(){
       +'</div>'
       +'<div class="row">'
       +'<div class="fi"><label class="lb">Current Balance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="updRetAccount('+i+',\'balance\',this.value)" style="padding-left:22px"></div></div>'
-      +(rt.allowContrib?'<div class="fi"><label class="lb">'+(isPension?'Est. Monthly Benefit':'Monthly Contribution')+'</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="retContrib_'+i+'" type="number" placeholder="0" value="'+(a.contrib||'')+'" oninput="updRetAccount('+i+',\'contrib\',this.value)" style="padding-left:22px"></div>'
+      +(rt.allowContrib?'<div class="fi"><label class="lb">'+(isPension?'Est. Monthly Benefit':'Monthly Contribution')+'</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="retContrib_'+i+'" type="number" placeholder="0" value="'+(a.contrib||'')+'" oninput="updRetAccount('+i+',\'contrib\',this.value)" onchange="updRetAccount('+i+',\'contribCommit\',this.value)" style="padding-left:22px"></div>'
         +(_retLinkBadge(a,i))
         +'</div>':'')
       +'</div>'
@@ -6354,18 +6373,12 @@ function calc(){
   syncFields();
   var totEl=document.getElementById('expTotal'); if(totEl) totEl.textContent=fmt(baseExp)+'/mo total';
 
-  // Fix #3: pass — for any detailed-mode income source with a 401k deduction,
-  // make sure the matching retirement account is in sync. Runs at most once
-  // per second to avoid thrashing during rapid edits. Catches the case where
-  // a user previously had a stale retirement-card 401k from old data.
-  if(!S._lastRetSync||Date.now()-S._lastRetSync>1000){
-    S._lastRetSync=Date.now();
-    (S.incomeSources||[]).forEach(function(src,i){
-      if(_incSrcMode(src)==='detailed'&&parseFloat(src.deduction_401k)>0){
-        try{_syncRetAcctFromIncomeSource(i);}catch(e){console.warn('ret sync skipped:',e);}
-      }
-    });
-  }
+  // Note: previously had a calc-time auto-sync pass that pulled retirement
+  // 401k contributions from income source values on every calc. That was
+  // too aggressive — it tore down inputs the user was typing into. The
+  // on-change sync (debounced 1.5s in updIncome) handles legitimate updates,
+  // and the link badge under the retirement contrib field shows mismatches
+  // with a one-click "🔄 Re-sync" button when reconciliation is needed.
 
   // Sync to platform
   clearTimeout(S._syncTimer);
