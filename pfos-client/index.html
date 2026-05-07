@@ -20520,6 +20520,9 @@ function _cpEnsurePlanLoaded(){
   if(CPLAN.allocations&&CPLAN.allocations.length&&CPLAN._sim)return true;
   var saved=APP._portalFd&&APP._portalFd.allocation_plan;
   if(!saved||!saved.allocations||!saved.allocations.length)return false;
+  // Legacy total-semantics → extras-semantics migration. No-op if the plan was
+  // already saved under the new format. See _cpMigrateAllocationsToExtras.
+  if(typeof _cpMigrateAllocationsToExtras==='function')_cpMigrateAllocationsToExtras(saved);
   CPLAN.allocations=JSON.parse(JSON.stringify(saved.allocations));
   if(saved.debtStrategy)CPLAN.debtStrategy=saved.debtStrategy;
   if(saved.approaches)CPLAN._approaches=saved.approaches;
@@ -20601,6 +20604,143 @@ function _trackFindAccount(a){
   if(a.type==='protection'||a.type==='wl'||a.type==='iul'||a.type==='ibc'){var m2=(S.policies||[]).find(function(p){return(p.type||'').toLowerCase().indexOf(a.type)>=0;});return m2?{source:'policies',data:m2,label:(m2.company||'')+' '+(m2.type||'')}:null;}
   if(a.type==='edu'){var m3=(S.retAccounts||[]).find(function(r){return(r.type||'').toLowerCase().indexOf('529')>=0;});return m3?{source:'retAccounts',data:m3,label:(m3.provider||'')+' 529'}:null;}
   return null;
+}
+// ── Match an allocation to existing real-world accounts ────────────────────
+// Returns aggregated {currentBalance, currentContrib, sourceLabel} across all
+// accounts that match this allocation's type and owner. Used by:
+//   - the recommendation card UI to show "Currently $X + Extra $Y" so users
+//     understand their slider amount is ON TOP of what they're already doing
+//   - the simulation engine to seed each allocation's projection from real
+//     existing balance and add real existing contribution to the monthly flow
+//   - the slider IRS-cap math to enforce (currentContrib + extra) <= IRS limit
+//
+// Matching is type-strict (no substring matching like _trackFindAccount uses)
+// to avoid '401k' allocation accidentally pulling from 'roth401k_current' or
+// '401k_old' (the latter has frozen contribs and shouldn't drive new-money math).
+//
+// Owner routing: 'self' reads from S.retAccounts/policies; 'spouse' reads from
+// CPLAN._partner. Joint allocations (joint EF, 529) use 'self' source — those
+// allocation types are handled by other systems and skipped here.
+//
+// Skipped types (return zeros): 'ef' (existing CPLAN.efBal/efTarget logic
+// handles it), 'debt'/'protection'/'rollover'/'custom' (not contribution-style),
+// 'hsa' (HSA isn't in retAccounts; standalone widget data isn't persisted in a
+// matcher-readable form yet — falls back to zero-seed, same as new accounts).
+//
+// 401k/403b/tsp_current are grouped under '401k' allocation since they share
+// the IRS elective-deferral limit and the AI's '401k' rec is shorthand for
+// "your employer-sponsored elective deferral plan" regardless of name.
+//
+// DEPENDENCY: type strings here mirror RET_TYPES.val in pfos-main.html
+// (around line 4934). If a new RET_TYPE entry is added there, add the
+// corresponding case in _retMatchTypes below.
+function _cpMatchExisting(a){
+  if(!a)return{currentBalance:0,currentContrib:0,sourceLabel:''};
+  if(a.type==='ef'||a.type==='debt'||a.type==='protection'||a.type==='rollover'||a.type==='custom'||a.type==='hsa'){
+    return{currentBalance:0,currentContrib:0,sourceLabel:''};
+  }
+  var owner=a.owner||'self';
+  var rawS=(APP._portalFd&&APP._portalFd.S)||{};
+  var retAccts=[],policies=[],ibcPolicies=[],assets={},children=[];
+  if(owner==='spouse'&&CPLAN._partner){
+    retAccts=CPLAN._partner.retAccounts||[];
+    policies=CPLAN._partner.policies||[];
+    // partner ibcPolicies/assets/children not in our partner data model; fall through to zeros
+  } else {
+    retAccts=rawS.retAccounts||[];
+    policies=rawS.policies||rawS.insurancePolicies||[];
+    ibcPolicies=rawS.ibcPolicies||[];
+    assets=rawS.assets||{};
+    children=rawS.children||[];
+  }
+  var bal=0,contrib=0,labels=[];
+  function _retMatchTypes(allocType){
+    if(allocType==='roth')return['roth_ira'];
+    if(allocType==='401k')return['401k_current','403b_current','tsp_current'];
+    if(allocType==='roth401k')return['roth401k_current'];
+    if(allocType==='trad_ira')return['trad_ira'];
+    if(allocType==='solo401k')return['solo_401k','roth_solo_401k'];
+    if(allocType==='sep_ira')return['sep_ira'];
+    return[];
+  }
+  if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira'].indexOf(a.type)>=0){
+    var matchTypes=_retMatchTypes(a.type);
+    retAccts.forEach(function(r){
+      if(matchTypes.indexOf(r.type)>=0){
+        bal+=parseFloat(r.balance)||0;
+        contrib+=parseFloat(r.contrib)||0;
+        var lbl=r.provider||r.label||'';
+        if(lbl)labels.push(lbl);
+      }
+    });
+  }
+  if(a.type==='iul'||a.type==='wl'||a.type==='ibc'){
+    policies.forEach(function(p){
+      var pType=(p.type||'').toLowerCase();
+      var pIbc=p.ibcFlag==='yes';
+      var matches=false;
+      if(a.type==='iul')matches=(pType.indexOf('iul')>=0||pType.indexOf('indexed universal')>=0)&&!pIbc;
+      else if(a.type==='wl')matches=pType==='whole life'&&!pIbc;
+      else if(a.type==='ibc')matches=pIbc;
+      if(matches){
+        bal+=parseFloat(p.cashValue)||0;
+        contrib+=parseFloat(p.premium)||0;
+        if(p.company)labels.push(p.company);
+      }
+    });
+    if(a.type==='ibc'&&owner!=='spouse'){
+      ibcPolicies.forEach(function(p){
+        bal+=parseFloat(p.cashValue)||0;
+        // ibcPolicies have no separate premium field; whole-life premium captured above
+      });
+    }
+  }
+  if(a.type==='invest'&&owner!=='spouse'){
+    bal+=parseFloat(assets.invest)||0;
+    // No persistent monthly contribution field for taxable brokerage — falls through to 0
+  }
+  if(a.type==='edu'){
+    children.forEach(function(c){
+      contrib+=parseFloat(c.contrib)||0;
+    });
+  }
+  return{
+    currentBalance:Math.round(bal),
+    currentContrib:Math.round(contrib),
+    sourceLabel:labels.slice(0,2).join(', ')
+  };
+}
+// ── Migrate legacy "total" semantics to "extras" on load ───────────────────
+// Plans saved BEFORE the extras-semantics rollout stored a.amount as the TOTAL
+// monthly contribution including the user's existing real-world contribution.
+// New code treats a.amount as the EXTRA on top of current. To avoid silently
+// double-counting on legacy plans, this helper subtracts each allocation's
+// matched current contribution from a.amount on load — only when the plan
+// lacks the _extrasSemantics flag (which cplanSave now stamps on every save).
+//
+// Safe properties:
+// - Idempotent: once a plan is migrated and re-saved with the flag, subsequent
+//   loads skip the conversion entirely.
+// - Allocations with no matching account (sourceLabel empty, currentContrib=0)
+//   are left untouched — their a.amount was the same in either semantics.
+// - Floors at 0 — never produces negative extras.
+//
+// Call once per load: pass in the freshly-loaded plan object before assigning
+// to CPLAN.allocations. Mutates the plan in place (and returns it for chaining).
+function _cpMigrateAllocationsToExtras(plan){
+  if(!plan||!plan.allocations||!plan.allocations.length)return plan;
+  if(plan._extrasSemantics)return plan;// already in new format
+  plan.allocations.forEach(function(a){
+    if(!a||typeof a.amount!=='number'||a.amount<=0)return;
+    if(typeof _cpMatchExisting!=='function')return;
+    var m=_cpMatchExisting(a);
+    var cur=parseFloat(m&&m.currentContrib)||0;
+    if(cur>0){
+      a.amount=Math.max(0,Math.round(a.amount-cur));
+    }
+  });
+  plan._extrasSemantics=true;// stamp so subsequent loads skip
+  return plan;
 }
 function _trackComplete(idx){
   var a=CPLAN.allocations[idx];if(!a)return;
@@ -22759,6 +22899,7 @@ function _cpStartAIRec(){
     // Try to show existing saved plan instead of dead-end
     var savedPlan=APP._portalFd&&APP._portalFd.allocation_plan;
     if(savedPlan&&savedPlan.allocations&&savedPlan.allocations.length){
+      if(typeof _cpMigrateAllocationsToExtras==='function')_cpMigrateAllocationsToExtras(savedPlan);
       CPLAN.allocations=JSON.parse(JSON.stringify(savedPlan.allocations));
       if(savedPlan.debtStrategy)CPLAN.debtStrategy=savedPlan.debtStrategy;
       if(savedPlan.planMode)CPLAN.planMode=savedPlan.planMode;
@@ -22864,12 +23005,35 @@ function _cpConvertAIRecs(aiData){
   var sortedRecs=aiData.recommendations.slice().sort(function(a2,b2){var p2={high:0,medium:1,low:2};return(p2[a2.priority]||1)-(p2[b2.priority]||1);});
   sortedRecs.forEach(function(r){
     var map=secMap[r.section]||{type:'custom',phase:3};
-    if(r.strategy && !_sectionLocked[r.section]){var _sm=stratMap[r.strategy];if(!_sm){for(var _si=0;_si<_stratKeys.length;_si++){if(r.strategy.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}}}if(_sm)map.type=_sm.type;}
+    // FIX 2: lowercase the strategy field BEFORE stratMap lookup. The server's whitelist
+    // enforcement compares case-insensitively but writes back the AI's original casing
+    // for in-band recs. Without normalization here, an AI emitting 'Roth_IRA' (capital)
+    // would miss the case-sensitive stratMap key and fall through to section default.
+    var _stratLower=(r.strategy||'').toLowerCase();
+    // FIX 1: track whether r.strategy resolved to an EXPLICIT stratMap entry. Used
+    // below to prevent title-based vehicle overrides from clobbering an explicit
+    // strategy when title and strategy disagree. Empty / unrecognized / fuzzy-only
+    // matches don't count as explicit — the title override is then a safety net.
+    var _stratExplicit=false;
+    if(_stratLower && !_sectionLocked[r.section]){
+      var _sm=stratMap[_stratLower];
+      if(_sm){_stratExplicit=true;}
+      else{
+        for(var _si=0;_si<_stratKeys.length;_si++){
+          if(_stratLower.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}
+        }
+      }
+      if(_sm)map.type=_sm.type;
+    }
     // Title-based type override — safety net when AI strategy string doesn't match
     var _tl=(r.title||'').toLowerCase();
     // EF safety net: if title clearly says "emergency fund" or "emergency reserve",
     // force type='ef' regardless of section/strategy. Catches the case where the AI
     // categorized it differently (e.g., section='general' with strategy='savings').
+    // EF and education detection (below) are UNIVERSAL safety nets — they fire even
+    // when strategy is explicit, because emergency-fund and education titles are
+    // semantically unambiguous and should always route correctly. Other vehicle-type
+    // title overrides defer to an explicit strategy (FIX 1).
     var _isEFTitle=_tl.indexOf('emergency fund')>=0||_tl.indexOf('emergency reserve')>=0||_tl.indexOf('emergency savings')>=0;
     if(_isEFTitle){
       map.type='ef';
@@ -22885,31 +23049,47 @@ function _cpConvertAIRecs(aiData){
       else if(_tl.indexOf('utma')>=0||_tl.indexOf('ugma')>=0)r._eduVeh='utma';
       else r._eduVeh='529';
     }
-    else if(_tl.indexOf('roth ira')>=0&&map.type!=='roth')map.type='roth';
-    else if(_tl.indexOf('401k')>=0||_tl.indexOf('401(k)')>=0){if(_tl.indexOf('roth 401')>=0)map.type='roth401k';else if(_tl.indexOf('solo')>=0)map.type='solo401k';else map.type='401k';}
-    else if(_tl.indexOf('hsa')>=0)map.type='hsa';
-    else if(_tl.indexOf('sep ira')>=0||_tl.indexOf('sep-ira')>=0)map.type='sep_ira';
-    else if(_tl.indexOf('traditional ira')>=0)map.type='trad_ira';
-    else if(_tl.indexOf('iul')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='iul';
-    else if(_tl.indexOf('whole life')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='wl';
-    else if(_tl.indexOf('ibc')>=0||_tl.indexOf('infinite banking')>=0)map.type='ibc';
+    // FIX 1: vehicle-type title overrides skip when strategy is explicit. The AI's
+    // explicit strategy (server-whitelisted) is more reliable than freeform title
+    // keyword matching for routing. Without this guard, AI returning
+    // {strategy:'whole_life', title:'Maximize Roth IRA Contribution'} would have
+    // title clobber strategy → type='roth', and the matcher would then pull from
+    // the wrong real-world account ("Currently $X" line and projection seed both
+    // wrong). EF and education detection above remain universal — those titles
+    // are unambiguous safety nets.
+    else if(!_stratExplicit&&_tl.indexOf('roth ira')>=0&&map.type!=='roth')map.type='roth';
+    else if(!_stratExplicit&&(_tl.indexOf('401k')>=0||_tl.indexOf('401(k)')>=0)){if(_tl.indexOf('roth 401')>=0)map.type='roth401k';else if(_tl.indexOf('solo')>=0)map.type='solo401k';else map.type='401k';}
+    else if(!_stratExplicit&&_tl.indexOf('hsa')>=0)map.type='hsa';
+    else if(!_stratExplicit&&(_tl.indexOf('sep ira')>=0||_tl.indexOf('sep-ira')>=0))map.type='sep_ira';
+    else if(!_stratExplicit&&_tl.indexOf('traditional ira')>=0)map.type='trad_ira';
+    else if(!_stratExplicit&&_tl.indexOf('iul')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='iul';
+    else if(!_stratExplicit&&_tl.indexOf('whole life')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='wl';
+    else if(!_stratExplicit&&(_tl.indexOf('ibc')>=0||_tl.indexOf('infinite banking')>=0))map.type='ibc';
     // Title-to-invest override: ONLY apply when strategy field doesn't already
     // pin to a specific tax-advantaged vehicle. Without this guard, an AI rec
     // with strategy='roth_ira' but title="Roth IRA Index Fund Allocation" would
     // get force-mapped to type='invest' (taxable brokerage) by the title match
     // on "index fund", incorrectly classifying tax-advantaged Roth dollars as
-    // taxable LTCG buckets in the strategy fork's tax breakdown.
-    else if((_tl.indexOf('taxable invest')>=0||_tl.indexOf('investment account')>=0||_tl.indexOf('brokerage')>=0||_tl.indexOf('index fund')>=0||_tl.indexOf('reit')>=0)
+    // taxable LTCG buckets in the strategy fork's tax breakdown. The
+    // !_stratExplicit guard from FIX 1 strengthens this further (the existing
+    // map.type guard remains as defense-in-depth for fuzzy-only matches).
+    else if(!_stratExplicit&&(_tl.indexOf('taxable invest')>=0||_tl.indexOf('investment account')>=0||_tl.indexOf('brokerage')>=0||_tl.indexOf('index fund')>=0||_tl.indexOf('reit')>=0)
             && ['roth','roth401k','401k','hsa','iul','wl','ibc','trad_ira','solo401k','sep_ira','edu'].indexOf(map.type)<0){
       map.type='invest';
     }
-    else if(_tl.indexOf('term life')>=0||_tl.indexOf('disability')>=0||_tl.indexOf('umbrella')>=0)map.type='protection';
-    else if(_tl.indexOf('estate')>=0||_tl.indexOf('will')>=0||_tl.indexOf('trust')>=0||_tl.indexOf('beneficiary')>=0)map.type='custom';
+    else if(!_stratExplicit&&(_tl.indexOf('term life')>=0||_tl.indexOf('disability')>=0||_tl.indexOf('umbrella')>=0))map.type='protection';
+    else if(!_stratExplicit&&(_tl.indexOf('estate')>=0||_tl.indexOf('will')>=0||_tl.indexOf('trust')>=0||_tl.indexOf('beneficiary')>=0))map.type='custom';
     var phase=r.phase||map.phase;
     var amt=r.monthly_cost||0;
-    if(amt===0&&r.section!=='protection'&&r.section!=='estate'&&r.section!=='general'){
-      amt=Math.round(Math.max(0,pool-usedPool)/Math.max(1,sortedRecs.length-CPLAN.allocations.length));
-    }
+    // Respect AI's $0 intent. A $0 rec is an informational placeholder, an action item,
+    // or a deferred strategy — the AI did not forget to populate it. Pool gaps (when the
+    // AI under-deploys) are handled by server-side under-deployment correction in the
+    // edge function before the response arrives, which routes the gap to the largest
+    // absorbing vehicle (insurance > taxable brokerage > custom goal > EF). Frontend
+    // auto-fill of $0 recs caused over-allocation (assigned dollars to recs the AI did
+    // not intend to fund) and forced the over-deployment correction to scale OTHER recs
+    // down proportionally — a cascading mismatch the user could see as fund amounts
+    // drifting from what the plan card text described.
     amt=Math.min(amt,Math.max(0,pool-usedPool));
     // Force protection/insurance items to $0 — premiums require real quotes, never estimate
     if(map.type==='protection')amt=0;
@@ -23579,9 +23759,18 @@ function _cpShowApproachFork(){
       h+='<div style="padding:30px 0"><div style="width:32px;height:32px;border:3px solid rgba(91,155,255,.1);border-top:3px solid '+cd.color+';border-radius:50%;animation:spin 1s linear infinite;margin:0 auto 12px"></div>';
       h+='<div style="font-size:13px;color:var(--mu)">Analyzing...</div></div>';
     } else if(failed){
-      // Failed state
+      // Failed state — surface the specific error reason so the user understands
+      // whether to retry (truncation/parse usually transient) or check their data.
+      var _aErr=(CPLAN._approachErrors||{})[cd.key];
+      var _aErrMsg=_aErr?(
+        _aErr.code==='truncated'?'Response was too long for this complex plan. Retrying often works.':
+        _aErr.code==='parse_failed'?'AI returned an unreadable response. Retry usually works.':
+        _aErr.code==='network'?'Network error contacting the planning engine.':
+        _aErr.message||'Generation failed'
+      ):'Generation failed';
       h+='<div style="padding:20px 0"><div style="font-size:24px;margin-bottom:8px">⚠️</div>';
-      h+='<div style="font-size:13px;color:var(--rd);margin-bottom:12px">Generation failed</div>';
+      h+='<div style="font-size:13px;color:var(--rd);margin-bottom:6px;font-weight:700">Generation failed</div>';
+      h+='<div style="font-size:11px;color:var(--mu);margin-bottom:12px;line-height:1.4;padding:0 8px">'+_aErrMsg+'</div>';
       h+='<button onclick="_cpRetryApproach(\''+cd.key+'\')" style="padding:6px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:3px;min-height:32px">Retry</button></div>';
     } else {
       // Success — show data with tax breakdown
@@ -23813,21 +24002,33 @@ function _cpRetryApproach(key){
   var rawS=(fd&&fd.S)||{};
   var flags=_cpExtractRedFlags();
   var prevPlan=(fd&&fd.allocation_plan)||null;
-  var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:rawS.householdType||'individual',previousPlan:prevPlan};
+  var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:rawS.householdType||'individual',previousPlan:prevPlan,breathingPct:(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)};
   // Snapshot inputs at retry time
   var _genSurplus=CPLAN.surplus||0,_genIncome=CPLAN.income||0,_genAge=CPLAN.age||0;
   // Phase D: forward partner data so AI can produce owner-tagged recs
   _cpLoadPartnerForAI().then(function(partnerInfo){
     if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
+    if(!CPLAN._approachErrors)CPLAN._approachErrors={};
     delete CPLAN._approaches[key];// Set back to loading
+    delete CPLAN._approachErrors[key];// Clear prior error if any
     _cpShowApproachFork();
     db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:key})})
     .then(function(r){
       var rec=r.data&&r.data.recommendations?r.data:null;
-      if(rec){rec._genMeta={surplus:_genSurplus,income:_genIncome,age:_genAge,generatedAt:Date.now()};}
+      if(rec){
+        rec._genMeta={surplus:_genSurplus,income:_genIncome,age:_genAge,generatedAt:Date.now()};
+        delete CPLAN._approachErrors[key];
+      }
+      else{
+        var _err=(r&&r.data)||{};
+        CPLAN._approachErrors[key]={code:_err.errorCode||'unknown',message:_err.error||'Generation failed'};
+      }
       CPLAN._approaches[key]=rec;
     })
-    .catch(function(){CPLAN._approaches[key]=null;})
+    .catch(function(e){
+      CPLAN._approachErrors[key]={code:'network',message:(e&&e.message)||'Network error'};
+      CPLAN._approaches[key]=null;
+    })
     .then(function(){_cpShowApproachFork();});
   });
 }
@@ -23854,6 +24055,10 @@ async function _cpLoadPartnerForAI(){
     var pRawS=pFd.S||{};
     var pProfile=pRawS.profile||{};
     var pInc=pCalcs.inc||pCalcs.income||(pRawS.incomeSources?pRawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0):0);
+    // Gross income for IRS phase-outs / tax bracket / employer-match calcs in the
+    // edge function. Computed by partner's own calc() via _estimateGrossFromNet and
+    // stored as pCalcs.incGross. Falls back to take-home for old saved profiles.
+    var pIncGross=pCalcs.incGross||pCalcs.inc||pInc;
     var pExp=pCalcs.baseExp||pCalcs.expenses||0;
     if(!pExp&&pRawS.expData)Object.keys(pRawS.expData).forEach(function(k){pExp+=(parseFloat((pRawS.expData[k]||{}).amount)||0);});
     var pPlan=(pProfRes&&pProfRes.data&&pProfRes.data.allocation_plan)||{};
@@ -23868,6 +24073,7 @@ async function _cpLoadPartnerForAI(){
       ssBenefit:parseFloat(pProfile.ssBenefit)||0,
       retirementIncome:parseFloat(pProfile.retIncome)||0,
       income:pInc,
+      incomeGross:pIncGross,
       expenses:pExp,
       surplus:Math.max(0,pInc-pExp),
       employer:pRawS.employer||pProfile.employer||'',
@@ -23899,7 +24105,7 @@ function _cpDoAIGenerate(){
   var rawS=(fd&&fd.S)||{};
   var flags=_cpExtractRedFlags();
   var prevPlan=(fd&&fd.allocation_plan)||null;
-  var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:rawS.householdType||'individual',previousPlan:prevPlan};
+  var baseBody={clientData:rawS,calcs:c,riskProfile:CPLAN.riskProfile||'moderate',existingFlags:flags.map(function(f){return{title:f.title,severity:f.type};}),householdType:rawS.householdType||'individual',previousPlan:prevPlan,breathingPct:(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)};
   // Phase D: forward partner data so AI can produce owner-tagged recs
   _cpLoadPartnerForAI().then(function(partnerInfo){
     if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
@@ -23913,13 +24119,28 @@ function _cpDoAIGenerate(){
     var _genIncome=CPLAN.income||0;
     var _genAge=CPLAN.age||0;
     var _apDone=0;
+    if(!CPLAN._approachErrors)CPLAN._approachErrors={};
     ['traditional','tax_free','hybrid'].forEach(function(ap){
       db.functions.invoke('generate-recommendations',{body:Object.assign({},baseBody,{approach:ap})})
       .then(function(r){
         var rec=r.data&&r.data.recommendations?r.data:null;
-        if(rec){rec._genMeta={surplus:_genSurplus,income:_genIncome,age:_genAge,generatedAt:Date.now()};}
+        if(rec){
+          rec._genMeta={surplus:_genSurplus,income:_genIncome,age:_genAge,generatedAt:Date.now()};
+          delete CPLAN._approachErrors[ap];
+        }
+        else{
+          // No recommendations on the response — capture error context so the approach
+          // card can show a real reason instead of a silent broken state. Edge function
+          // returns errorCode 'truncated' (response hit max_tokens) or 'parse_failed'
+          // (JSON couldn't be parsed). Both are usually transient — a retry often works.
+          // _approaches[ap] stays null so the existing all-failed fall-through still fires;
+          // _approachErrors[ap] carries the diagnostic the UI can render on the loading card.
+          var _err=(r&&r.data)||{};
+          CPLAN._approachErrors[ap]={code:_err.errorCode||'unknown',message:_err.error||'Generation failed'};
+        }
         CPLAN._approaches[ap]=rec;
-      }).catch(function(){
+      }).catch(function(e){
+        CPLAN._approachErrors[ap]={code:'network',message:(e&&e.message)||'Network error'};
         CPLAN._approaches[ap]=null;
       }).then(function(){
         _apDone++;
@@ -24912,6 +25133,36 @@ function _cpBuildCard(a,idx,isUnassigned){
   // Slider + manual input — hide for action-only items
   if(!_isActionOnly){
   var _slMax=_cpSliderMax(a.type,idx);
+  // ── Existing-account context line ─────────────────────────────────────
+  // Show "Currently $X/mo + Extra $Y/mo = $Z/mo total" when the user already
+  // has matching account(s) with a current contribution. The slider amount
+  // (a.amount) is now the EXTRA on top of what they're already doing — see
+  // _cpMatchExisting and the AI prompt's "additional contribution" semantics.
+  // For accounts with a balance but no current monthly contribution (e.g., a
+  // dormant Roth IRA, or taxable brokerage), we show only the existing balance
+  // so users see their starting point. New accounts (no match) show nothing,
+  // preserving the original UI.
+  var _match=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0,sourceLabel:''};
+  if(_match.currentContrib>0||_match.currentBalance>0){
+    var _total=(_match.currentContrib||0)+(parseFloat(a.amount)||0);
+    h+='<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0;padding:8px 10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:3px;font-size:12px">';
+    if(_match.currentContrib>0){
+      h+='<span style="color:var(--mu)">Currently:</span> <span style="font-family:var(--fd);color:var(--wh);font-weight:600">'+fmt(_match.currentContrib)+'/mo</span>';
+      h+='<span style="color:var(--mu)">+ Extra:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+color+';font-weight:600">'+fmt(a.amount)+'/mo</span>';
+      h+='<span style="color:var(--mu)">= Total:</span> <span id="cpTotal'+idx+'" style="font-family:var(--fd);color:var(--gr);font-weight:700">'+fmt(_total)+'/mo</span>';
+    } else {
+      // Balance present but no current monthly contribution — show as starting point
+      h+='<span style="color:var(--mu)">No current contribution</span>';
+      h+='<span style="color:var(--mu)">· Extra:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+color+';font-weight:600">'+fmt(a.amount)+'/mo</span>';
+    }
+    if(_match.currentBalance>0){
+      h+='<span style="color:var(--mu);margin-left:auto">Existing balance: <span style="color:var(--wh);font-family:var(--fd)">'+fmtK(_match.currentBalance)+'</span></span>';
+    }
+    if(_match.sourceLabel){
+      h+='<div style="flex-basis:100%;font-size:10px;color:var(--mu);margin-top:2px">at '+_match.sourceLabel+'</div>';
+    }
+    h+='</div>';
+  }
   // P4: Insurance premium lock. Once a permanent-insurance allocation is marked
   // Done (the user opened the policy), the premium becomes LOCKED — it cannot
   // be increased. The user can only decrease it (effectively surrendering the
@@ -27377,12 +27628,26 @@ function _cpSliderMax(type,idx){
   // changes — making sliders appear "linked" even though their `value` was unchanged.
   // The cap NOTE (_cpEffectiveCapNote) still shows the live pool-aware available so
   // the user knows how much room remains.
+  //
+  // EXTRAS SEMANTICS: a.amount is the EXTRA contribution beyond what the user is
+  // already doing. The IRS limit applies to TOTAL contribution (current + extra),
+  // so the EXTRA can only go up to (IRS_max − currentContrib). Subtracting the
+  // user's existing contribution here keeps the slider from letting them push
+  // total contribution past the legal limit.
   var surplus=CPLAN.surplus||0;
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
   var budgetCap=Math.round(surplus*(1-brPct));
   // Floor of $100 so sliders are always usable even on very small surpluses
   if(budgetCap<100)budgetCap=Math.max(100,Math.min(surplus||100,15000));
-  return Math.max(0,Math.round(Math.min(irsMax,budgetCap)));
+  // Subtract current contribution if there's an existing matching account.
+  // Guarded against undefined idx and missing helper for early-init contexts.
+  var _curContrib=0;
+  if(typeof idx==='number'&&CPLAN.allocations&&CPLAN.allocations[idx]&&typeof _cpMatchExisting==='function'){
+    var _m=_cpMatchExisting(CPLAN.allocations[idx]);
+    _curContrib=parseFloat(_m&&_m.currentContrib)||0;
+  }
+  var _irsExtra=Math.max(0,irsMax-_curContrib);
+  return Math.max(0,Math.round(Math.min(_irsExtra,budgetCap)));
 }
 function _cpIRSNote(type){
   var age=CPLAN.age||30;var is50=age>=50;var is55=age>=55;var is60_63=age>=60&&age<=63;
@@ -29651,6 +29916,7 @@ function initClientPlan(){
     try{var backup=localStorage.getItem('pfos_plan_backup');if(backup){var parsed=JSON.parse(backup);if(parsed&&parsed.allocations&&parsed.allocations.length)loadedPlan=parsed;}}catch(e){}
   }
   if(loadedPlan&&loadedPlan.allocations&&loadedPlan.allocations.length){
+    if(typeof _cpMigrateAllocationsToExtras==='function')_cpMigrateAllocationsToExtras(loadedPlan);
     CPLAN.allocations=JSON.parse(JSON.stringify(loadedPlan.allocations));
     if(loadedPlan.debtStrategy)CPLAN.debtStrategy=loadedPlan.debtStrategy;
     if(loadedPlan.riskProfile)CPLAN.riskProfile=loadedPlan.riskProfile;
@@ -31546,6 +31812,27 @@ function _cpRunSimulation(){
   // Used below to substitute actual contributions (from check-ins) for past months.
   var _monthsElapsed=_cpMonthsElapsed();
 
+  // ── Existing real-world balances and monthly contributions ─────────────
+  // Computed once per simulation (outside the year loop). For each allocation
+  // that has a matching real-world account, _curBalanceByIdx[idx] is the seed
+  // balance the projection compounds from, and _curContribByIdx[idx] is the
+  // existing monthly contribution that flows alongside the AI's recommended
+  // EXTRA each month. Allocations with no match (new accounts, brand-new
+  // strategies) get 0/0 — same behavior as before this change.
+  //
+  // Existing contributions are gated by retirement only (no income → no
+  // contribution). They are NOT gated by the tracking-complete flag or by
+  // _cpIsTrackable — that gate is for the AI's recommended extra; the user's
+  // existing real-world contribution is already happening regardless of
+  // whether they've marked the card "Done."
+  var _curBalanceByIdx={},_curContribByIdx={};
+  CPLAN.allocations.forEach(function(a,idx){
+    if(a.type==='debt'){_curBalanceByIdx[idx]=0;_curContribByIdx[idx]=0;return;}
+    var _m=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0};
+    _curBalanceByIdx[idx]=parseFloat(_m&&_m.currentBalance)||0;
+    _curContribByIdx[idx]=parseFloat(_m&&_m.currentContrib)||0;
+  });
+
   for(var yr=0;yr<=years;yr++){
     // Baseline: idle cash at 0%, ALL debt with min payments only
     var baseCash=CPLAN.surplus*12*yr;
@@ -31566,7 +31853,7 @@ function _cpRunSimulation(){
     var balByIdx={};                       // running balance per alloc, persists across months within this year
     var unBalAccum=0;                      // running unallocated surplus (0% growth, just stacks)
     var growthIdxList=[];                  // alloc indices we walk per month (skip debt)
-    CPLAN.allocations.forEach(function(a,idx){if(a.type!=='debt'){growthIdxList.push(idx);balByIdx[idx]=0;}});
+    CPLAN.allocations.forEach(function(a,idx){if(a.type!=='debt'){growthIdxList.push(idx);balByIdx[idx]=_curBalanceByIdx[idx]||0;}});
     var monthlySurplus=CPLAN.surplus||0;
     // Phase D multi-partner: precompute per-allocation retirement-month and spousal IRA flags
     // so the inner monthly loop doesn't recompute these for every (yr, m, idx) triple.
@@ -31629,6 +31916,25 @@ function _cpRunSimulation(){
             }
           });
         }
+        // ── Existing real-world contribution ──────────────────────────────
+        // The user's pre-plan baseline contribution flows alongside the AI's
+        // recommended extra. Subject to retirement gating only — no income →
+        // no contribution. Spousal IRA exception mirrors the monthlyAmt logic
+        // above (working partner's earned income can continue funding a
+        // retired partner's spousal IRA up to their remaining income cap).
+        // NOT gated by tracking-complete or goal-met because the existing
+        // baseline is already happening in real life regardless of whether
+        // the user has marked the AI's recommendation card "Done." See
+        // _cpMatchExisting for owner-aware aggregation across real accounts.
+        var _curC=_curContribByIdx[idx]||0;
+        if(_curC>0&&_rc&&m>_rc.retMonth){
+          if(_rc.spousalEligible&&m<=_rc.otherRetMonth){
+            _curC=Math.min(_curC,_rc.spousalCap);
+          } else {
+            _curC=0;
+          }
+        }
+        effectiveAmt+=_curC;
         var contrib=effectiveAmt*cf;
         balByIdx[idx]=(balByIdx[idx]+contrib)*(1+(rate/12));
         monthDeployed+=effectiveAmt;
@@ -31805,8 +32111,17 @@ function _cpRenderChart(targetId){
       var total=0;
       active.forEach(function(a){
         if(a.type==='debt'){rawSeries[a.type].push(0);return;}// Debt value handled by -remDebt
-        var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var bal=0;
-        for(var y2=1;y2<=yr;y2++){var c2=(a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target?0:a.amount*12*cf;bal=(bal+c2)*(1+rate);}
+        var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);
+        // Match existing real-world balance + contribution so the fallback chart
+        // stays in step with the main simulation. Fallback runs when the full
+        // _cpRunSimulation hasn't populated CPLAN._sim yet (early-render path).
+        var _mFb=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0};
+        var bal=parseFloat(_mFb&&_mFb.currentBalance)||0;
+        var _curCFb=parseFloat(_mFb&&_mFb.currentContrib)||0;
+        for(var y2=1;y2<=yr;y2++){
+          var _annTarget=(a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target?0:(a.amount+_curCFb)*12*cf;
+          bal=(bal+_annTarget)*(1+rate);
+        }
         rawSeries[a.type].push(Math.round(bal));total+=bal;
       });
       var remDebt=CPLAN.totalDebt;
@@ -32168,6 +32483,15 @@ function _cpSlide(i,v){
   // 1. Update amount display
   var amtEl=document.getElementById('cpAmt'+i);
   if(amtEl)amtEl.textContent=fmt(a.amount);
+  // 1a. Update existing-account context line ("Currently $X + Extra $Y = $Z total")
+  // when present. Slider drives the EXTRA value; total = currentContrib + extra.
+  var extraEl=document.getElementById('cpExtra'+i);
+  if(extraEl)extraEl.textContent=fmt(a.amount)+'/mo';
+  var totalEl=document.getElementById('cpTotal'+i);
+  if(totalEl){
+    var _matchSlide=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentContrib:0};
+    totalEl.textContent=fmt((parseInt(_matchSlide.currentContrib)||0)+(parseInt(a.amount)||0))+'/mo';
+  }
   // 1b. Update reason text — interpolate {{AMOUNT}} with the live a.amount so
   // body prose stays in sync with the slider (no more stale "$291/mo" text).
   var reasonEl=document.getElementById('cpReason'+i);
@@ -33159,6 +33483,14 @@ function _cpEnforce(opts){
     var irsTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'];
     if(irsTypes.indexOf(a.type)>=0){
       var max=_cpIRSMax(a.type,a);
+      // Extras semantics: a.amount is the EXTRA on top of currentContrib, so the
+      // legal cap on a.amount = IRS_max − currentContrib. Falls back to plain IRS
+      // max when no matching account exists or the matcher is unavailable.
+      if(typeof _cpMatchExisting==='function'){
+        var _m=_cpMatchExisting(a);
+        var _curC=parseFloat(_m&&_m.currentContrib)||0;
+        max=Math.max(0,max-_curC);
+      }
       if(a.amount>max)a.amount=max;
     }
   });
@@ -33263,7 +33595,11 @@ function cplanSave(){
     planStartDate:CPLAN._planStartDate||null,
     originalProjection:CPLAN._originalProjection||null,
     // Phase B: persist user-committed catch-up boosts (one-time top-ups for missed months)
-    catchUpBoosts:CPLAN._catchUpBoosts||[]
+    catchUpBoosts:CPLAN._catchUpBoosts||[],
+    // EXTRAS SEMANTICS marker. Set on every save under the new system. Plans saved
+    // before this flag existed are treated as legacy "total" semantics and migrated
+    // on load — see _cpMigrateAllocationsToExtras.
+    _extrasSemantics:true
   };
   // Always save to localStorage as backup
   try{localStorage.setItem('pfos_plan_backup',JSON.stringify(plan));}catch(e){}
