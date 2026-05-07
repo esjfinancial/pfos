@@ -22961,15 +22961,7 @@ function _cpConvertAIRecs(aiData){
     // distinguish Policy #1 vs Policy #2 vs Policy #N within the same purpose lane.
     var _isInsurance=(map.type==='iul'||map.type==='wl'||map.type==='ibc'||(map.type==='edu'&&(r._eduVeh==='wl'||r._eduVeh==='iul')));
     var _policyId=_isInsurance?('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)):null;
-    // Tax-Free 401(k) match cap: capture the AI-emitted (server-FIX-2-enforced) match-dollar
-    // amount as a soft cap so the simulation cascade's BOOST/UNFUNDED/OVERFLOW passes don't
-    // refill the 401(k) past match into pre-tax dollars. Tax-Free's "401(k) at match level
-    // only" rule is a hard server-side constraint at conversion time; without this, the
-    // cascade would honor _cpIRSMax's full IRS limit ($24,500/yr → $2,042/mo) and silently
-    // bloat the 401(k), contradicting the approach's tax-bucket discipline. Stored
-    // unconditionally; only consulted by _cpIRSMax when CPLAN._selectedApproach==='tax_free'.
-    var _txFreeMatchCap=(map.type==='401k'&&CPLAN._selectedApproach==='tax_free')?amt:null;
-    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,_taxFreeMatchCap:_txFreeMatchCap});
+    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null});
     usedPool+=amt;
   });
 
@@ -27259,15 +27251,6 @@ function _cpIRSMax(type,allocOrOwner){
   else if(type==='401k'||type==='roth401k'){
     var k401Catchup=is60_63?11250:(is50?8000:0);
     monthlyMax=Math.round((24500+k401Catchup)/12);
-    // Tax-Free approach respects the match-only cap. The _taxFreeMatchCap field is set
-    // on the allocation at _cpConvertAIRecs time when type==='401k' AND approach was
-    // tax_free at conversion. Re-checking CPLAN._selectedApproach here keeps the cap
-    // dynamic — if the user switches approach away from tax_free post-conversion the
-    // cap lifts back to the IRS limit. Only applies to 'traditional' 401(k); roth401k
-    // is allowed to fill to its IRS cap in tax_free per the deployment ladder.
-    if(type==='401k'&&alloc&&alloc._taxFreeMatchCap!=null&&CPLAN._selectedApproach==='tax_free'){
-      monthlyMax=Math.min(monthlyMax,alloc._taxFreeMatchCap);
-    }
   }
   else if(type==='trad_ira'||type==='ira')monthlyMax=Math.round((is50?8600:7500)/12);
   else if(type==='solo401k'){
@@ -31379,7 +31362,7 @@ function _cpRunSimulation(){
       // funding of currently-$0 insurance allocations (Phase 2 starter pattern),
       // which doesn't violate the lock since the policy hasn't been issued yet.
       var growth=CPLAN.allocations.map(function(a5,i5){return{a:a5,i:i5};})
-        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','invest','edu','trad_ira','solo401k','sep_ira','hsa'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner)&&!x.a._hdhpGated;})
+        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','invest','edu','trad_ira','solo401k','sep_ira','hsa'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
         .sort(function(a6,b6){return(a6.a.phase||99)-(b6.a.phase||99);});
       if(growth.length>0){
         // BUG FIX: proportions must be computed against INITIAL freed, not the
@@ -31442,7 +31425,6 @@ function _cpRunSimulation(){
           if(allocAmounts[x.i]>0||x.a._completed)return false;
           if(x.a.type==='protection')return false;
           if(x.a.type==='custom'&&(!x.a.target||x.a.target<=0))return false;
-          if(x.a._hdhpGated)return false;// HSA awaiting HDHP enrollment confirmation — action-only, $0 by design
           if(!_cascadeOwnerOK(x.a.owner))return false;// Phase D: hybrid owner gate
           return['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;
         })
@@ -31503,8 +31485,6 @@ function _cpRunSimulation(){
           .filter(function(x){
             if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection')return false;
             if(x.a.type==='iul'||x.a.type==='wl'||x.a.type==='ibc')return false; // fixed premium
-            if(x.a.type==='custom')return false; // action-only items (estate-keyword PP5'd to amount=0) and target-bounded goals (vacation, down payment, etc.) — both have Infinity IRS headroom and would otherwise consume ALL leftover. Mirrors UNFUNDED pass type-whitelist which also excludes 'custom'.
-            if(x.a._hdhpGated)return false;// HSA awaiting HDHP enrollment confirmation — action-only, $0 by design
             if(!_cascadeOwnerOK(x.a.owner))return false;
             var irsMax=_cpIRSMax(x.a.type,x.a);
             return (irsMax-allocAmounts[x.i])>0;
