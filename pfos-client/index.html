@@ -22864,12 +22864,7 @@ function _cpConvertAIRecs(aiData){
   var sortedRecs=aiData.recommendations.slice().sort(function(a2,b2){var p2={high:0,medium:1,low:2};return(p2[a2.priority]||1)-(p2[b2.priority]||1);});
   sortedRecs.forEach(function(r){
     var map=secMap[r.section]||{type:'custom',phase:3};
-    // Strategy → type mapping. Exact match wins. If no exact match, prefer
-    // insurance keywords before falling through to the longest-first substring
-    // search — otherwise a strategy like 'roth_ira_to_iul' or 'iul_replacing_roth_ira'
-    // matches 'roth_ira' (8 chars) before 'iul' (3 chars) and lands in the Roth
-    // card despite being an IUL recommendation.
-    if(r.strategy && !_sectionLocked[r.section]){var _sm=stratMap[r.strategy];if(!_sm){var _slow=r.strategy.toLowerCase();if(_slow.indexOf('ibc_iul')>=0)_sm=stratMap['ibc_iul'];else if(_slow.indexOf('ibc_wl')>=0)_sm=stratMap['ibc_wl'];else if(_slow.indexOf('ibc')>=0||_slow.indexOf('infinite_bank')>=0)_sm=stratMap['ibc'];else if(_slow.indexOf('iul')>=0)_sm=stratMap['iul'];else if(_slow.indexOf('whole_life')>=0||_slow.indexOf('whole life')>=0)_sm=stratMap['whole_life'];else{for(var _si=0;_si<_stratKeys.length;_si++){if(r.strategy.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}}}}if(_sm)map.type=_sm.type;}
+    if(r.strategy && !_sectionLocked[r.section]){var _sm=stratMap[r.strategy];if(!_sm){for(var _si=0;_si<_stratKeys.length;_si++){if(r.strategy.indexOf(_stratKeys[_si])>=0){_sm=stratMap[_stratKeys[_si]];break;}}}if(_sm)map.type=_sm.type;}
     // Title-based type override — safety net when AI strategy string doesn't match
     var _tl=(r.title||'').toLowerCase();
     // EF safety net: if title clearly says "emergency fund" or "emergency reserve",
@@ -22890,33 +22885,14 @@ function _cpConvertAIRecs(aiData){
       else if(_tl.indexOf('utma')>=0||_tl.indexOf('ugma')>=0)r._eduVeh='utma';
       else r._eduVeh='529';
     }
-    // Title chain — order matters. IBC/IUL/WL checked BEFORE roth/401k/hsa
-    // so that titles containing both (e.g. "Roth IRA + IUL Combo", "IUL
-    // Replacing Roth IRA", "Tax-Free Strategy with IUL") map to the more
-    // specific permanent insurance vehicle instead of being short-circuited
-    // by the earlier roth/401k matches. Educational titles already handled
-    // above and short-circuit out via the _isEduTitle if-block.
-    else if(_tl.indexOf('ibc')>=0||_tl.indexOf('infinite banking')>=0)map.type='ibc';
-    else if((_tl.indexOf('iul')>=0||_tl.indexOf('indexed universal')>=0)&&!_isEduTitle)map.type='iul';
-    else if(_tl.indexOf('whole life')>=0&&!_isEduTitle)map.type='wl';
     else if(_tl.indexOf('roth ira')>=0&&map.type!=='roth')map.type='roth';
     else if(_tl.indexOf('401k')>=0||_tl.indexOf('401(k)')>=0){if(_tl.indexOf('roth 401')>=0)map.type='roth401k';else if(_tl.indexOf('solo')>=0)map.type='solo401k';else map.type='401k';}
     else if(_tl.indexOf('hsa')>=0)map.type='hsa';
     else if(_tl.indexOf('sep ira')>=0||_tl.indexOf('sep-ira')>=0)map.type='sep_ira';
     else if(_tl.indexOf('traditional ira')>=0)map.type='trad_ira';
-    // Savings-goal title override — catches custom goals (vacation, wedding,
-    // down payment, etc.) that AI categorized as section='investment' or
-    // section='tax' (both default to 'invest' in secMap → taxable brokerage
-    // card). Routes them to 'custom' so they render in the Custom Goal card.
-    // GUARD: only fires when map.type is already 'invest' or 'custom' — so a
-    // Roth/401k/IUL/etc. allocation with a vague "Savings Goal"-style title
-    // doesn't get demoted to a 0%-growth custom card. KEYWORDS limited to
-    // specific named purposes (no generic "savings goal" / "goal fund" /
-    // "short-term goal" — those phrases appear in legitimate retirement
-    // titles like "Retirement Savings Goal" and produced a 50% projection
-    // collapse by routing them to type='custom' which has 0% growth rate.)
-    else if(/vacation|wedding|honeymoon|cruise|down ?payment|home purchase|new car\b|car fund|baby fund|gift fund|graduation fund|sinking fund/.test(_tl)
-            && (map.type==='invest'||map.type==='custom'))map.type='custom';
+    else if(_tl.indexOf('iul')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='iul';
+    else if(_tl.indexOf('whole life')>=0&&_tl.indexOf('ibc')<0&&!_isEduTitle)map.type='wl';
+    else if(_tl.indexOf('ibc')>=0||_tl.indexOf('infinite banking')>=0)map.type='ibc';
     // Title-to-invest override: ONLY apply when strategy field doesn't already
     // pin to a specific tax-advantaged vehicle. Without this guard, an AI rec
     // with strategy='roth_ira' but title="Roth IRA Index Fund Allocation" would
@@ -22937,16 +22913,6 @@ function _cpConvertAIRecs(aiData){
     amt=Math.min(amt,Math.max(0,pool-usedPool));
     // Force protection/insurance items to $0 — premiums require real quotes, never estimate
     if(map.type==='protection')amt=0;
-    // Force action-only strategies to $0. The AI is explicitly told in the
-    // edge-function prompt that these strategies are monthly_cost=0 (line 677:
-    // "Do NOT cascade to action-only items (protection, estate, tax review)";
-    // line 701: "Roth conversion strategies (rollover_*) ... monthly_cost MUST
-    // be 0"; line 680: protection rules are action-only). When the AI returns
-    // monthly_cost>0 for one of these anyway, we force to 0 here. Strategy
-    // field is the canonical signal — the AI's whitelist keys are deterministic,
-    // unlike titles which the AI generates freely.
-    var _actionOnlyStrats={estate_planning:1,protection_review:1,term_life:1,rollover_myga:1,rollover_fia:1,rollover_roth_conversion:1};
-    if(_actionOnlyStrats[r.strategy])amt=0;
     var reason=r.recommendation||'';
     if(r.outcome)reason+='\n📊 '+r.outcome;
     if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
@@ -22998,10 +22964,10 @@ function _cpConvertAIRecs(aiData){
     // Tax-Free 401(k) match cap: capture the AI-emitted (server-FIX-2-enforced) match-dollar
     // amount as a soft cap so the simulation cascade's BOOST/UNFUNDED/OVERFLOW passes don't
     // refill the 401(k) past match into pre-tax dollars. Tax-Free's "401(k) at match level
-    // only" rule (edge function line 652) is a hard server-side constraint at conversion
-    // time; without this, the cascade would honor _cpIRSMax's full IRS limit ($24,500/yr →
-    // $2,042/mo) and silently bloat the 401(k), contradicting the approach's tax-bucket
-    // discipline. Stored unconditionally; only consulted by _cpIRSMax when CPLAN._selectedApproach==='tax_free'.
+    // only" rule is a hard server-side constraint at conversion time; without this, the
+    // cascade would honor _cpIRSMax's full IRS limit ($24,500/yr → $2,042/mo) and silently
+    // bloat the 401(k), contradicting the approach's tax-bucket discipline. Stored
+    // unconditionally; only consulted by _cpIRSMax when CPLAN._selectedApproach==='tax_free'.
     var _txFreeMatchCap=(map.type==='401k'&&CPLAN._selectedApproach==='tax_free')?amt:null;
     CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,_taxFreeMatchCap:_txFreeMatchCap});
     usedPool+=amt;
@@ -23132,11 +23098,7 @@ function _cpConvertAIRecs(aiData){
     }
   });
 
-  // Fix PP5: Estate planning force $0 — if AI assigned monthly cost to estate items.
-  // Primary defense is now the strategy-based _actionOnlyStrats check in the
-  // conversion loop above (catches strategy='estate_planning' regardless of title).
-  // PP5 stays as a tertiary safety net for cases where the AI ignored the canonical
-  // strategy key but used estate-keyword titles like "Will and Trust Setup".
+  // Fix PP5: Estate planning force $0 — if AI assigned monthly cost to estate items
   CPLAN.allocations.forEach(function(a){
     if(a.type==='custom'&&a.customName){
       var nm=a.customName.toLowerCase();
@@ -23667,24 +23629,23 @@ function _cpShowApproachFork(){
         'edu':'free','ef':'free','custom':'free',
         'invest':'ltcg'
       };
-      // Tax-Free approach honesty: pre-tax balances (Trad 401(k) at the
-      // employer-match cap, plus any leftover trad_ira/solo401k/sep_ira/
-      // rollover from a stale plan) generate ordinary income tax at withdrawal
-      // — they are NOT tax-free, regardless of the approach's name.
-      //
-      // A prior version forced these vehicles to the 'free' bucket here on
-      // the assumption that the user would do an in-plan Roth conversion at
-      // 59½ or rollover to Roth IRA. That's a future action the user hasn't
-      // committed to, and even if executed, the conversion itself triggers
-      // ordinary income tax in the conversion year — there is no path where
-      // pre-tax dollars genuinely escape ordinary income taxation. Showing
-      // $0 tax on a Tax-Free card that includes a 401(k) match misrepresents
-      // the actual tax burden.
-      //
-      // Pre-tax buckets stay 'ord' across all three approaches. The Tax-Free
-      // card will show a small ordinary-income tax line for the 401(k) match
-      // portion (typically a fraction of the Traditional/Hybrid tax burden
-      // because most of Tax-Free's deployment goes to Roth/HSA/insurance).
+      // Tax-Free approach override: 401k allocations in Tax-Free are capped at the
+      // employer match (per Tax-Free's vehicle whitelist + match-only rule). Those
+      // pre-tax dollars technically generate ordinary income at withdrawal, but
+      // Tax-Free's design assumption is that the user converts them to Roth at
+      // retirement (in-plan Roth conversion at age 59½, or rollover to Roth IRA).
+      // Treating them as 'free' in this approach keeps the strategy fork's framing
+      // consistent with the approach's name ("Tax-Free Income") — every bucket
+      // shows zero tax. Without this override, Tax-Free showed $X ordinary income
+      // for the 401k match, which contradicted the approach's labeling.
+      if(cd.key==='tax_free'){
+        _apprTaxBucket['401k']='free';
+        _apprTaxBucket['trad_ira']='free';
+        _apprTaxBucket['solo401k']='free';
+        _apprTaxBucket['sep_ira']='free';
+        _apprTaxBucket['rollover']='free';
+        _apprTaxBucket['invest']='free';// any leftover invest from a stale plan
+      }
       // Try the cascade-aware simulation first. It honors phase transitions:
       //   • Phase 1: high-rate debt + EF take most of surplus, growth gets crumbs
       //   • Phase 2: debt cleared + EF funded → freed money cascades to growth vehicles
@@ -31542,8 +31503,8 @@ function _cpRunSimulation(){
           .filter(function(x){
             if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection')return false;
             if(x.a.type==='iul'||x.a.type==='wl'||x.a.type==='ibc')return false; // fixed premium
-            if(x.a.type==='custom')return false; // action-only items (estate-keyword PP5'd to amount=0) and target-bounded goals (vacation, down payment, etc.) — both have Infinity IRS headroom and would otherwise consume ALL leftover. Estate items in particular are action-only by design and must never receive cascade dollars; the AI-set amount on target-bounded goals already hits target on schedule and doesn't need a boost. Mirrors the UNFUNDED pass type-whitelist (line ~31468) which also implicitly excludes 'custom'.
-            if(x.a._hdhpGated)return false;// HSA awaiting HDHP enrollment confirmation — action-only, $0 by design until user confirms HDHP and opens the account
+            if(x.a.type==='custom')return false; // action-only items (estate-keyword PP5'd to amount=0) and target-bounded goals (vacation, down payment, etc.) — both have Infinity IRS headroom and would otherwise consume ALL leftover. Mirrors UNFUNDED pass type-whitelist which also excludes 'custom'.
+            if(x.a._hdhpGated)return false;// HSA awaiting HDHP enrollment confirmation — action-only, $0 by design
             if(!_cascadeOwnerOK(x.a.owner))return false;
             var irsMax=_cpIRSMax(x.a.type,x.a);
             return (irsMax-allocAmounts[x.i])>0;
