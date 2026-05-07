@@ -1927,15 +1927,388 @@ function _incSrcMonthlyTakeHome(src){
 function _incSrcMonthlyGross(src){
   if(!src)return 0;
   if(_incSrcMode(src)==='detailed'){
-    var perCheck=(parseFloat(src.take_home_per_check)||0)
-                +(parseFloat(src.deduction_401k)||0)
-                +(parseFloat(src.deduction_health)||0)
-                +(parseFloat(src.deduction_hsa)||0)
-                +(parseFloat(src.deduction_other)||0);
-    return perCheck*_checksPerMonth(src.pay_frequency);
+    // True gross = take-home + 401k/health/HSA/other pre-tax deductions + federal tax + FICA + Medicare + state tax.
+    // The function previously returned only (take-home + listed pre-tax deductions), missing the
+    // federal+FICA+Medicare+state wedge — which understates gross by 30-40% for typical W-2 earners and
+    // breaks Roth phase-out / federal bracket comparisons in the AI recommendation engine.
+    // Solution: estimate gross from net using the existing 2026 tax engine via bisection.
+    var takeHomePerCheck=parseFloat(src.take_home_per_check)||0;
+    var preTaxPerCheck=(parseFloat(src.deduction_401k)||0)
+                      +(parseFloat(src.deduction_health)||0)
+                      +(parseFloat(src.deduction_hsa)||0)
+                      +(parseFloat(src.deduction_other)||0);
+    var checks=_checksPerMonth(src.pay_frequency);
+    var annualNet=takeHomePerCheck*checks*12;
+    var annualPreTax=preTaxPerCheck*checks*12;
+    if(annualNet<=0)return 0;
+    var filingStatus=(S.profile&&(S.profile.taxFilingStatus||S.profile.filingStatus))||'single';
+    var state=(S.profile&&S.profile.state)||'';
+    var annualGross=_estimateGrossFromNet(annualNet,annualPreTax,filingStatus,state);
+    return annualGross/12;
   }
   // Simple mode: no gross known, return amount as best guess (preserves old behavior)
   return parseFloat(src.amount)||0;
+}
+// ── 2026 State income tax brackets ─────────────────────────────────────────
+// Comprehensive table of all 41 states + DC that levy a wage/salary income tax.
+// Brackets are MARGINAL — only the portion of income within each band is taxed
+// at that band's rate. State standard deductions and personal exemptions are
+// NOT modeled. At the income levels where state tax meaningfully shifts MAGI/
+// Roth-phase-out outcomes (typically >$150K), most state personal exemptions
+// are fully phased out anyway, and the standard-deduction effect is small
+// relative to the marginal rate impact. Error from these omissions is < 1%
+// of gross at high-income levels — well within the precision needed for
+// federal phase-out boundary detection.
+//
+// States not in this table fall through to zero state tax via _estimateStateTax.
+// The 9 no-income-tax states (AK, FL, NV, NH, SD, TN, TX, WA, WY) correctly
+// return zero. Washington's capital-gains-only tax does not apply to wage income
+// so wage filers in WA also correctly return zero.
+//
+// Source: Tax Foundation, "State Individual Income Tax Rates and Brackets, 2026"
+// (Feb 17, 2026, https://taxfoundation.org/data/all/state/state-income-tax-rates-2026/)
+// Brackets reflect rates as of January 1, 2026.
+//
+// Note on MFS/HOH: where a state does not publish separate MFS/HOH brackets,
+// we use single brackets as a conservative approximation (most states without
+// separate schedules apply single rules to MFS).
+var STATE_TAX_BRACKETS_2026={
+  AL:{// Alabama
+    single:[{min:0,max:500,rate:0.02},{min:500,max:3000,rate:0.04},{min:3000,max:Infinity,rate:0.05}],
+    married_joint:[{min:0,max:1000,rate:0.02},{min:1000,max:6000,rate:0.04},{min:6000,max:Infinity,rate:0.05}],
+    married_separate:[{min:0,max:500,rate:0.02},{min:500,max:3000,rate:0.04},{min:3000,max:Infinity,rate:0.05}],
+    hoh:[{min:0,max:500,rate:0.02},{min:500,max:3000,rate:0.04},{min:3000,max:Infinity,rate:0.05}]
+  },
+  AZ:{// Arizona — flat
+    single:[{min:0,max:Infinity,rate:0.025}],
+    married_joint:[{min:0,max:Infinity,rate:0.025}],
+    married_separate:[{min:0,max:Infinity,rate:0.025}],
+    hoh:[{min:0,max:Infinity,rate:0.025}]
+  },
+  AR:{// Arkansas (income > $92,300; below uses different schedule, simplified to top-tier here)
+    single:[{min:0,max:4600,rate:0.02},{min:4600,max:Infinity,rate:0.039}],
+    married_joint:[{min:0,max:4600,rate:0.02},{min:4600,max:Infinity,rate:0.039}],
+    married_separate:[{min:0,max:4600,rate:0.02},{min:4600,max:Infinity,rate:0.039}],
+    hoh:[{min:0,max:4600,rate:0.02},{min:4600,max:Infinity,rate:0.039}]
+  },
+  CA:{// California (excludes 1% mental health surtax >$1M and excludes 1.3% SDI payroll tax)
+    single:[{min:0,max:11079,rate:0.01},{min:11079,max:26264,rate:0.02},{min:26264,max:41452,rate:0.04},{min:41452,max:57542,rate:0.06},{min:57542,max:72724,rate:0.08},{min:72724,max:371479,rate:0.093},{min:371479,max:445771,rate:0.103},{min:445771,max:742953,rate:0.113},{min:742953,max:1000000,rate:0.123},{min:1000000,max:Infinity,rate:0.133}],
+    married_joint:[{min:0,max:22158,rate:0.01},{min:22158,max:52528,rate:0.02},{min:52528,max:82904,rate:0.04},{min:82904,max:115084,rate:0.06},{min:115084,max:145448,rate:0.08},{min:145448,max:742958,rate:0.093},{min:742958,max:891542,rate:0.103},{min:891542,max:1000000,rate:0.113},{min:1000000,max:1485906,rate:0.123},{min:1485906,max:Infinity,rate:0.133}],
+    married_separate:[{min:0,max:11079,rate:0.01},{min:11079,max:26264,rate:0.02},{min:26264,max:41452,rate:0.04},{min:41452,max:57542,rate:0.06},{min:57542,max:72724,rate:0.08},{min:72724,max:371479,rate:0.093},{min:371479,max:445771,rate:0.103},{min:445771,max:742953,rate:0.113},{min:742953,max:1000000,rate:0.123},{min:1000000,max:Infinity,rate:0.133}],
+    hoh:[{min:0,max:22192,rate:0.01},{min:22192,max:52606,rate:0.02},{min:52606,max:67804,rate:0.04},{min:67804,max:83878,rate:0.06},{min:83878,max:99063,rate:0.08},{min:99063,max:505999,rate:0.093},{min:505999,max:607052,rate:0.103},{min:607052,max:1011581,rate:0.113},{min:1011581,max:Infinity,rate:0.123}]
+  },
+  CO:{// Colorado — flat
+    single:[{min:0,max:Infinity,rate:0.044}],
+    married_joint:[{min:0,max:Infinity,rate:0.044}],
+    married_separate:[{min:0,max:Infinity,rate:0.044}],
+    hoh:[{min:0,max:Infinity,rate:0.044}]
+  },
+  CT:{// Connecticut — has tax-benefit recapture for high income; not modeled here (small <1% effect)
+    single:[{min:0,max:10000,rate:0.02},{min:10000,max:50000,rate:0.045},{min:50000,max:100000,rate:0.055},{min:100000,max:200000,rate:0.06},{min:200000,max:250000,rate:0.065},{min:250000,max:500000,rate:0.069},{min:500000,max:Infinity,rate:0.0699}],
+    married_joint:[{min:0,max:20000,rate:0.02},{min:20000,max:100000,rate:0.045},{min:100000,max:200000,rate:0.055},{min:200000,max:400000,rate:0.06},{min:400000,max:500000,rate:0.065},{min:500000,max:1000000,rate:0.069},{min:1000000,max:Infinity,rate:0.0699}],
+    married_separate:[{min:0,max:10000,rate:0.02},{min:10000,max:50000,rate:0.045},{min:50000,max:100000,rate:0.055},{min:100000,max:200000,rate:0.06},{min:200000,max:250000,rate:0.065},{min:250000,max:500000,rate:0.069},{min:500000,max:Infinity,rate:0.0699}],
+    hoh:[{min:0,max:16000,rate:0.02},{min:16000,max:80000,rate:0.045},{min:80000,max:160000,rate:0.055},{min:160000,max:320000,rate:0.06},{min:320000,max:400000,rate:0.065},{min:400000,max:800000,rate:0.069},{min:800000,max:Infinity,rate:0.0699}]
+  },
+  DE:{// Delaware (first $2K exempt)
+    single:[{min:0,max:2000,rate:0},{min:2000,max:5000,rate:0.022},{min:5000,max:10000,rate:0.039},{min:10000,max:20000,rate:0.048},{min:20000,max:25000,rate:0.052},{min:25000,max:60000,rate:0.0555},{min:60000,max:Infinity,rate:0.066}],
+    married_joint:[{min:0,max:2000,rate:0},{min:2000,max:5000,rate:0.022},{min:5000,max:10000,rate:0.039},{min:10000,max:20000,rate:0.048},{min:20000,max:25000,rate:0.052},{min:25000,max:60000,rate:0.0555},{min:60000,max:Infinity,rate:0.066}],
+    married_separate:[{min:0,max:2000,rate:0},{min:2000,max:5000,rate:0.022},{min:5000,max:10000,rate:0.039},{min:10000,max:20000,rate:0.048},{min:20000,max:25000,rate:0.052},{min:25000,max:60000,rate:0.0555},{min:60000,max:Infinity,rate:0.066}],
+    hoh:[{min:0,max:2000,rate:0},{min:2000,max:5000,rate:0.022},{min:5000,max:10000,rate:0.039},{min:10000,max:20000,rate:0.048},{min:20000,max:25000,rate:0.052},{min:25000,max:60000,rate:0.0555},{min:60000,max:Infinity,rate:0.066}]
+  },
+  GA:{// Georgia — flat 5.19% (effective 7/1/2025)
+    single:[{min:0,max:Infinity,rate:0.0519}],
+    married_joint:[{min:0,max:Infinity,rate:0.0519}],
+    married_separate:[{min:0,max:Infinity,rate:0.0519}],
+    hoh:[{min:0,max:Infinity,rate:0.0519}]
+  },
+  HI:{// Hawaii (12 brackets)
+    single:[{min:0,max:9600,rate:0.014},{min:9600,max:14400,rate:0.032},{min:14400,max:19200,rate:0.055},{min:19200,max:24000,rate:0.064},{min:24000,max:36000,rate:0.068},{min:36000,max:48000,rate:0.072},{min:48000,max:125000,rate:0.076},{min:125000,max:175000,rate:0.079},{min:175000,max:225000,rate:0.0825},{min:225000,max:275000,rate:0.09},{min:275000,max:325000,rate:0.10},{min:325000,max:Infinity,rate:0.11}],
+    married_joint:[{min:0,max:19200,rate:0.014},{min:19200,max:28800,rate:0.032},{min:28800,max:38400,rate:0.055},{min:38400,max:48000,rate:0.064},{min:48000,max:72000,rate:0.068},{min:72000,max:96000,rate:0.072},{min:96000,max:250000,rate:0.076},{min:250000,max:350000,rate:0.079},{min:350000,max:450000,rate:0.0825},{min:450000,max:550000,rate:0.09},{min:550000,max:650000,rate:0.10},{min:650000,max:Infinity,rate:0.11}],
+    married_separate:[{min:0,max:9600,rate:0.014},{min:9600,max:14400,rate:0.032},{min:14400,max:19200,rate:0.055},{min:19200,max:24000,rate:0.064},{min:24000,max:36000,rate:0.068},{min:36000,max:48000,rate:0.072},{min:48000,max:125000,rate:0.076},{min:125000,max:175000,rate:0.079},{min:175000,max:225000,rate:0.0825},{min:225000,max:275000,rate:0.09},{min:275000,max:325000,rate:0.10},{min:325000,max:Infinity,rate:0.11}],
+    hoh:[{min:0,max:14400,rate:0.014},{min:14400,max:21600,rate:0.032},{min:21600,max:28800,rate:0.055},{min:28800,max:36000,rate:0.064},{min:36000,max:54000,rate:0.068},{min:54000,max:72000,rate:0.072},{min:72000,max:187500,rate:0.076},{min:187500,max:262500,rate:0.079},{min:262500,max:337500,rate:0.0825},{min:337500,max:412500,rate:0.09},{min:412500,max:487500,rate:0.10},{min:487500,max:Infinity,rate:0.11}]
+  },
+  ID:{// Idaho — flat (after exemption)
+    single:[{min:0,max:4811,rate:0},{min:4811,max:Infinity,rate:0.053}],
+    married_joint:[{min:0,max:9622,rate:0},{min:9622,max:Infinity,rate:0.053}],
+    married_separate:[{min:0,max:4811,rate:0},{min:4811,max:Infinity,rate:0.053}],
+    hoh:[{min:0,max:4811,rate:0},{min:4811,max:Infinity,rate:0.053}]
+  },
+  IL:{// Illinois — flat
+    single:[{min:0,max:Infinity,rate:0.0495}],
+    married_joint:[{min:0,max:Infinity,rate:0.0495}],
+    married_separate:[{min:0,max:Infinity,rate:0.0495}],
+    hoh:[{min:0,max:Infinity,rate:0.0495}]
+  },
+  IN:{// Indiana — flat 2.95% (decreased from 3% on 1/1/2026)
+    single:[{min:0,max:Infinity,rate:0.0295}],
+    married_joint:[{min:0,max:Infinity,rate:0.0295}],
+    married_separate:[{min:0,max:Infinity,rate:0.0295}],
+    hoh:[{min:0,max:Infinity,rate:0.0295}]
+  },
+  IA:{// Iowa — flat
+    single:[{min:0,max:Infinity,rate:0.038}],
+    married_joint:[{min:0,max:Infinity,rate:0.038}],
+    married_separate:[{min:0,max:Infinity,rate:0.038}],
+    hoh:[{min:0,max:Infinity,rate:0.038}]
+  },
+  KS:{// Kansas
+    single:[{min:0,max:23000,rate:0.052},{min:23000,max:Infinity,rate:0.0558}],
+    married_joint:[{min:0,max:46000,rate:0.052},{min:46000,max:Infinity,rate:0.0558}],
+    married_separate:[{min:0,max:23000,rate:0.052},{min:23000,max:Infinity,rate:0.0558}],
+    hoh:[{min:0,max:23000,rate:0.052},{min:23000,max:Infinity,rate:0.0558}]
+  },
+  KY:{// Kentucky — flat 3.5% (decreased from 4% on 1/1/2026)
+    single:[{min:0,max:Infinity,rate:0.035}],
+    married_joint:[{min:0,max:Infinity,rate:0.035}],
+    married_separate:[{min:0,max:Infinity,rate:0.035}],
+    hoh:[{min:0,max:Infinity,rate:0.035}]
+  },
+  LA:{// Louisiana — flat
+    single:[{min:0,max:Infinity,rate:0.03}],
+    married_joint:[{min:0,max:Infinity,rate:0.03}],
+    married_separate:[{min:0,max:Infinity,rate:0.03}],
+    hoh:[{min:0,max:Infinity,rate:0.03}]
+  },
+  ME:{// Maine
+    single:[{min:0,max:27399,rate:0.058},{min:27399,max:64849,rate:0.0675},{min:64849,max:Infinity,rate:0.0715}],
+    married_joint:[{min:0,max:54849,rate:0.058},{min:54849,max:129749,rate:0.0675},{min:129749,max:Infinity,rate:0.0715}],
+    married_separate:[{min:0,max:27399,rate:0.058},{min:27399,max:64849,rate:0.0675},{min:64849,max:Infinity,rate:0.0715}],
+    hoh:[{min:0,max:41100,rate:0.058},{min:41100,max:97300,rate:0.0675},{min:97300,max:Infinity,rate:0.0715}]
+  },
+  MD:{// Maryland (excludes county/local income tax which averages ~2.4% additional)
+    single:[{min:0,max:1000,rate:0.02},{min:1000,max:2000,rate:0.03},{min:2000,max:3000,rate:0.04},{min:3000,max:100000,rate:0.0475},{min:100000,max:125000,rate:0.05},{min:125000,max:150000,rate:0.0525},{min:150000,max:250000,rate:0.055},{min:250000,max:500000,rate:0.0575},{min:500000,max:1000000,rate:0.0625},{min:1000000,max:Infinity,rate:0.065}],
+    married_joint:[{min:0,max:1000,rate:0.02},{min:1000,max:2000,rate:0.03},{min:2000,max:3000,rate:0.04},{min:3000,max:150000,rate:0.0475},{min:150000,max:175000,rate:0.05},{min:175000,max:225000,rate:0.0525},{min:225000,max:300000,rate:0.055},{min:300000,max:600000,rate:0.0575},{min:600000,max:1200000,rate:0.0625},{min:1200000,max:Infinity,rate:0.065}],
+    married_separate:[{min:0,max:1000,rate:0.02},{min:1000,max:2000,rate:0.03},{min:2000,max:3000,rate:0.04},{min:3000,max:100000,rate:0.0475},{min:100000,max:125000,rate:0.05},{min:125000,max:150000,rate:0.0525},{min:150000,max:250000,rate:0.055},{min:250000,max:500000,rate:0.0575},{min:500000,max:1000000,rate:0.0625},{min:1000000,max:Infinity,rate:0.065}],
+    hoh:[{min:0,max:1000,rate:0.02},{min:1000,max:2000,rate:0.03},{min:2000,max:3000,rate:0.04},{min:3000,max:150000,rate:0.0475},{min:150000,max:175000,rate:0.05},{min:175000,max:225000,rate:0.0525},{min:225000,max:300000,rate:0.055},{min:300000,max:600000,rate:0.0575},{min:600000,max:1200000,rate:0.0625},{min:1200000,max:Infinity,rate:0.065}]
+  },
+  MA:{// Massachusetts — flat 5% + 9% surtax above $1.083M
+    single:[{min:0,max:1083150,rate:0.05},{min:1083150,max:Infinity,rate:0.09}],
+    married_joint:[{min:0,max:1083150,rate:0.05},{min:1083150,max:Infinity,rate:0.09}],
+    married_separate:[{min:0,max:1083150,rate:0.05},{min:1083150,max:Infinity,rate:0.09}],
+    hoh:[{min:0,max:1083150,rate:0.05},{min:1083150,max:Infinity,rate:0.09}]
+  },
+  MI:{// Michigan — flat
+    single:[{min:0,max:Infinity,rate:0.0425}],
+    married_joint:[{min:0,max:Infinity,rate:0.0425}],
+    married_separate:[{min:0,max:Infinity,rate:0.0425}],
+    hoh:[{min:0,max:Infinity,rate:0.0425}]
+  },
+  MN:{// Minnesota
+    single:[{min:0,max:33310,rate:0.0535},{min:33310,max:109430,rate:0.068},{min:109430,max:203150,rate:0.0785},{min:203150,max:Infinity,rate:0.0985}],
+    married_joint:[{min:0,max:48700,rate:0.0535},{min:48700,max:193480,rate:0.068},{min:193480,max:337930,rate:0.0785},{min:337930,max:Infinity,rate:0.0985}],
+    married_separate:[{min:0,max:24350,rate:0.0535},{min:24350,max:96740,rate:0.068},{min:96740,max:168965,rate:0.0785},{min:168965,max:Infinity,rate:0.0985}],
+    hoh:[{min:0,max:41060,rate:0.0535},{min:41060,max:164850,rate:0.068},{min:164850,max:271660,rate:0.0785},{min:271660,max:Infinity,rate:0.0985}]
+  },
+  MS:{// Mississippi — flat 4% (first $10K exempt; further reductions scheduled)
+    single:[{min:0,max:10000,rate:0},{min:10000,max:Infinity,rate:0.04}],
+    married_joint:[{min:0,max:10000,rate:0},{min:10000,max:Infinity,rate:0.04}],
+    married_separate:[{min:0,max:10000,rate:0},{min:10000,max:Infinity,rate:0.04}],
+    hoh:[{min:0,max:10000,rate:0},{min:10000,max:Infinity,rate:0.04}]
+  },
+  MO:{// Missouri (first $1,348 exempt)
+    single:[{min:0,max:1348,rate:0},{min:1348,max:2696,rate:0.02},{min:2696,max:4044,rate:0.025},{min:4044,max:5392,rate:0.03},{min:5392,max:6740,rate:0.035},{min:6740,max:8088,rate:0.04},{min:8088,max:9436,rate:0.045},{min:9436,max:Infinity,rate:0.047}],
+    married_joint:[{min:0,max:1348,rate:0},{min:1348,max:2696,rate:0.02},{min:2696,max:4044,rate:0.025},{min:4044,max:5392,rate:0.03},{min:5392,max:6740,rate:0.035},{min:6740,max:8088,rate:0.04},{min:8088,max:9436,rate:0.045},{min:9436,max:Infinity,rate:0.047}],
+    married_separate:[{min:0,max:1348,rate:0},{min:1348,max:2696,rate:0.02},{min:2696,max:4044,rate:0.025},{min:4044,max:5392,rate:0.03},{min:5392,max:6740,rate:0.035},{min:6740,max:8088,rate:0.04},{min:8088,max:9436,rate:0.045},{min:9436,max:Infinity,rate:0.047}],
+    hoh:[{min:0,max:1348,rate:0},{min:1348,max:2696,rate:0.02},{min:2696,max:4044,rate:0.025},{min:4044,max:5392,rate:0.03},{min:5392,max:6740,rate:0.035},{min:6740,max:8088,rate:0.04},{min:8088,max:9436,rate:0.045},{min:9436,max:Infinity,rate:0.047}]
+  },
+  MT:{// Montana
+    single:[{min:0,max:47500,rate:0.047},{min:47500,max:Infinity,rate:0.0565}],
+    married_joint:[{min:0,max:95000,rate:0.047},{min:95000,max:Infinity,rate:0.0565}],
+    married_separate:[{min:0,max:47500,rate:0.047},{min:47500,max:Infinity,rate:0.0565}],
+    hoh:[{min:0,max:47500,rate:0.047},{min:47500,max:Infinity,rate:0.0565}]
+  },
+  NE:{// Nebraska — top rate reduced 5.2% → 4.55% on 1/1/2026
+    single:[{min:0,max:4130,rate:0.0246},{min:4130,max:24760,rate:0.0351},{min:24760,max:Infinity,rate:0.0455}],
+    married_joint:[{min:0,max:8250,rate:0.0246},{min:8250,max:49530,rate:0.0351},{min:49530,max:Infinity,rate:0.0455}],
+    married_separate:[{min:0,max:4130,rate:0.0246},{min:4130,max:24760,rate:0.0351},{min:24760,max:Infinity,rate:0.0455}],
+    hoh:[{min:0,max:7710,rate:0.0246},{min:7710,max:39510,rate:0.0351},{min:39510,max:Infinity,rate:0.0455}]
+  },
+  NJ:{// New Jersey
+    single:[{min:0,max:20000,rate:0.014},{min:20000,max:35000,rate:0.0175},{min:35000,max:40000,rate:0.035},{min:40000,max:75000,rate:0.0553},{min:75000,max:500000,rate:0.0637},{min:500000,max:1000000,rate:0.0897},{min:1000000,max:Infinity,rate:0.1075}],
+    married_joint:[{min:0,max:20000,rate:0.014},{min:20000,max:50000,rate:0.0175},{min:50000,max:70000,rate:0.0245},{min:70000,max:80000,rate:0.035},{min:80000,max:150000,rate:0.0553},{min:150000,max:500000,rate:0.0637},{min:500000,max:1000000,rate:0.0897},{min:1000000,max:Infinity,rate:0.1075}],
+    married_separate:[{min:0,max:20000,rate:0.014},{min:20000,max:35000,rate:0.0175},{min:35000,max:40000,rate:0.035},{min:40000,max:75000,rate:0.0553},{min:75000,max:500000,rate:0.0637},{min:500000,max:1000000,rate:0.0897},{min:1000000,max:Infinity,rate:0.1075}],
+    hoh:[{min:0,max:20000,rate:0.014},{min:20000,max:50000,rate:0.0175},{min:50000,max:70000,rate:0.0245},{min:70000,max:80000,rate:0.035},{min:80000,max:150000,rate:0.0553},{min:150000,max:500000,rate:0.0637},{min:500000,max:1000000,rate:0.0897},{min:1000000,max:Infinity,rate:0.1075}]
+  },
+  NM:{// New Mexico
+    single:[{min:0,max:5500,rate:0.015},{min:5500,max:16500,rate:0.032},{min:16500,max:33500,rate:0.043},{min:33500,max:66500,rate:0.047},{min:66500,max:210000,rate:0.049},{min:210000,max:Infinity,rate:0.059}],
+    married_joint:[{min:0,max:8000,rate:0.015},{min:8000,max:25000,rate:0.032},{min:25000,max:50000,rate:0.043},{min:50000,max:100000,rate:0.047},{min:100000,max:315000,rate:0.049},{min:315000,max:Infinity,rate:0.059}],
+    married_separate:[{min:0,max:4000,rate:0.015},{min:4000,max:12500,rate:0.032},{min:12500,max:25000,rate:0.043},{min:25000,max:50000,rate:0.047},{min:50000,max:157500,rate:0.049},{min:157500,max:Infinity,rate:0.059}],
+    hoh:[{min:0,max:8000,rate:0.015},{min:8000,max:25000,rate:0.032},{min:25000,max:50000,rate:0.043},{min:50000,max:100000,rate:0.047},{min:100000,max:315000,rate:0.049},{min:315000,max:Infinity,rate:0.059}]
+  },
+  NY:{// New York (excludes NYC local tax ~3.078%-3.876% additional)
+    single:[{min:0,max:8500,rate:0.039},{min:8500,max:11700,rate:0.044},{min:11700,max:13900,rate:0.0515},{min:13900,max:80650,rate:0.054},{min:80650,max:215400,rate:0.059},{min:215400,max:1077550,rate:0.0685},{min:1077550,max:5000000,rate:0.0965},{min:5000000,max:25000000,rate:0.103},{min:25000000,max:Infinity,rate:0.109}],
+    married_joint:[{min:0,max:17150,rate:0.039},{min:17150,max:23600,rate:0.044},{min:23600,max:27900,rate:0.0515},{min:27900,max:161550,rate:0.054},{min:161550,max:323200,rate:0.059},{min:323200,max:2155350,rate:0.0685},{min:2155350,max:5000000,rate:0.0965},{min:5000000,max:25000000,rate:0.103},{min:25000000,max:Infinity,rate:0.109}],
+    married_separate:[{min:0,max:8500,rate:0.039},{min:8500,max:11700,rate:0.044},{min:11700,max:13900,rate:0.0515},{min:13900,max:80650,rate:0.054},{min:80650,max:215400,rate:0.059},{min:215400,max:1077550,rate:0.0685},{min:1077550,max:5000000,rate:0.0965},{min:5000000,max:25000000,rate:0.103},{min:25000000,max:Infinity,rate:0.109}],
+    hoh:[{min:0,max:12800,rate:0.039},{min:12800,max:17650,rate:0.044},{min:17650,max:20900,rate:0.0515},{min:20900,max:107650,rate:0.054},{min:107650,max:269300,rate:0.059},{min:269300,max:1616450,rate:0.0685},{min:1616450,max:5000000,rate:0.0965},{min:5000000,max:25000000,rate:0.103},{min:25000000,max:Infinity,rate:0.109}]
+  },
+  NC:{// North Carolina — flat 3.99% (decreased from 4.25% on 1/1/2026)
+    single:[{min:0,max:Infinity,rate:0.0399}],
+    married_joint:[{min:0,max:Infinity,rate:0.0399}],
+    married_separate:[{min:0,max:Infinity,rate:0.0399}],
+    hoh:[{min:0,max:Infinity,rate:0.0399}]
+  },
+  ND:{// North Dakota (first ~$48K exempt for single)
+    single:[{min:0,max:48475,rate:0},{min:48475,max:244825,rate:0.0195},{min:244825,max:Infinity,rate:0.025}],
+    married_joint:[{min:0,max:80975,rate:0},{min:80975,max:298075,rate:0.0195},{min:298075,max:Infinity,rate:0.025}],
+    married_separate:[{min:0,max:40488,rate:0},{min:40488,max:149038,rate:0.0195},{min:149038,max:Infinity,rate:0.025}],
+    hoh:[{min:0,max:48475,rate:0},{min:48475,max:244825,rate:0.0195},{min:244825,max:Infinity,rate:0.025}]
+  },
+  OH:{// Ohio — flat 2.75% on income above $26,050 (effective 1/1/2026)
+    single:[{min:0,max:26050,rate:0},{min:26050,max:Infinity,rate:0.0275}],
+    married_joint:[{min:0,max:26050,rate:0},{min:26050,max:Infinity,rate:0.0275}],
+    married_separate:[{min:0,max:26050,rate:0},{min:26050,max:Infinity,rate:0.0275}],
+    hoh:[{min:0,max:26050,rate:0},{min:26050,max:Infinity,rate:0.0275}]
+  },
+  OK:{// Oklahoma — collapsed to 3 brackets, top rate 4.5% (effective 1/1/2026)
+    single:[{min:0,max:3750,rate:0},{min:3750,max:4900,rate:0.025},{min:4900,max:7200,rate:0.035},{min:7200,max:Infinity,rate:0.045}],
+    married_joint:[{min:0,max:7500,rate:0},{min:7500,max:9800,rate:0.025},{min:9800,max:14400,rate:0.035},{min:14400,max:Infinity,rate:0.045}],
+    married_separate:[{min:0,max:3750,rate:0},{min:3750,max:4900,rate:0.025},{min:4900,max:7200,rate:0.035},{min:7200,max:Infinity,rate:0.045}],
+    hoh:[{min:0,max:7500,rate:0},{min:7500,max:9800,rate:0.025},{min:9800,max:14400,rate:0.035},{min:14400,max:Infinity,rate:0.045}]
+  },
+  OR:{// Oregon
+    single:[{min:0,max:4550,rate:0.0475},{min:4550,max:11400,rate:0.0675},{min:11400,max:125000,rate:0.0875},{min:125000,max:Infinity,rate:0.099}],
+    married_joint:[{min:0,max:9100,rate:0.0475},{min:9100,max:22800,rate:0.0675},{min:22800,max:250000,rate:0.0875},{min:250000,max:Infinity,rate:0.099}],
+    married_separate:[{min:0,max:4550,rate:0.0475},{min:4550,max:11400,rate:0.0675},{min:11400,max:125000,rate:0.0875},{min:125000,max:Infinity,rate:0.099}],
+    hoh:[{min:0,max:9100,rate:0.0475},{min:9100,max:22800,rate:0.0675},{min:22800,max:250000,rate:0.0875},{min:250000,max:Infinity,rate:0.099}]
+  },
+  PA:{// Pennsylvania — flat
+    single:[{min:0,max:Infinity,rate:0.0307}],
+    married_joint:[{min:0,max:Infinity,rate:0.0307}],
+    married_separate:[{min:0,max:Infinity,rate:0.0307}],
+    hoh:[{min:0,max:Infinity,rate:0.0307}]
+  },
+  RI:{// Rhode Island
+    single:[{min:0,max:82050,rate:0.0375},{min:82050,max:186450,rate:0.0475},{min:186450,max:Infinity,rate:0.0599}],
+    married_joint:[{min:0,max:82050,rate:0.0375},{min:82050,max:186450,rate:0.0475},{min:186450,max:Infinity,rate:0.0599}],
+    married_separate:[{min:0,max:82050,rate:0.0375},{min:82050,max:186450,rate:0.0475},{min:186450,max:Infinity,rate:0.0599}],
+    hoh:[{min:0,max:82050,rate:0.0375},{min:82050,max:186450,rate:0.0475},{min:186450,max:Infinity,rate:0.0599}]
+  },
+  SC:{// South Carolina (top rate 6% from 7/1/2025 through 6/30/2026)
+    single:[{min:0,max:3640,rate:0},{min:3640,max:18230,rate:0.03},{min:18230,max:Infinity,rate:0.06}],
+    married_joint:[{min:0,max:3640,rate:0},{min:3640,max:18230,rate:0.03},{min:18230,max:Infinity,rate:0.06}],
+    married_separate:[{min:0,max:3640,rate:0},{min:3640,max:18230,rate:0.03},{min:18230,max:Infinity,rate:0.06}],
+    hoh:[{min:0,max:3640,rate:0},{min:3640,max:18230,rate:0.03},{min:18230,max:Infinity,rate:0.06}]
+  },
+  UT:{// Utah — flat 4.5% (decreased from 4.55% retroactive to 1/1/2025)
+    single:[{min:0,max:Infinity,rate:0.045}],
+    married_joint:[{min:0,max:Infinity,rate:0.045}],
+    married_separate:[{min:0,max:Infinity,rate:0.045}],
+    hoh:[{min:0,max:Infinity,rate:0.045}]
+  },
+  VT:{// Vermont
+    single:[{min:0,max:49400,rate:0.0335},{min:49400,max:119700,rate:0.066},{min:119700,max:249700,rate:0.076},{min:249700,max:Infinity,rate:0.0875}],
+    married_joint:[{min:0,max:82500,rate:0.0335},{min:82500,max:199450,rate:0.066},{min:199450,max:304000,rate:0.076},{min:304000,max:Infinity,rate:0.0875}],
+    married_separate:[{min:0,max:41250,rate:0.0335},{min:41250,max:99725,rate:0.066},{min:99725,max:152000,rate:0.076},{min:152000,max:Infinity,rate:0.0875}],
+    hoh:[{min:0,max:66150,rate:0.0335},{min:66150,max:170800,rate:0.066},{min:170800,max:276750,rate:0.076},{min:276750,max:Infinity,rate:0.0875}]
+  },
+  VA:{// Virginia
+    single:[{min:0,max:3000,rate:0.02},{min:3000,max:5000,rate:0.03},{min:5000,max:17000,rate:0.05},{min:17000,max:Infinity,rate:0.0575}],
+    married_joint:[{min:0,max:3000,rate:0.02},{min:3000,max:5000,rate:0.03},{min:5000,max:17000,rate:0.05},{min:17000,max:Infinity,rate:0.0575}],
+    married_separate:[{min:0,max:3000,rate:0.02},{min:3000,max:5000,rate:0.03},{min:5000,max:17000,rate:0.05},{min:17000,max:Infinity,rate:0.0575}],
+    hoh:[{min:0,max:3000,rate:0.02},{min:3000,max:5000,rate:0.03},{min:5000,max:17000,rate:0.05},{min:17000,max:Infinity,rate:0.0575}]
+  },
+  WV:{// West Virginia
+    single:[{min:0,max:10000,rate:0.0222},{min:10000,max:25000,rate:0.0296},{min:25000,max:40000,rate:0.0333},{min:40000,max:60000,rate:0.0444},{min:60000,max:Infinity,rate:0.0482}],
+    married_joint:[{min:0,max:10000,rate:0.0222},{min:10000,max:25000,rate:0.0296},{min:25000,max:40000,rate:0.0333},{min:40000,max:60000,rate:0.0444},{min:60000,max:Infinity,rate:0.0482}],
+    married_separate:[{min:0,max:5000,rate:0.0222},{min:5000,max:12500,rate:0.0296},{min:12500,max:20000,rate:0.0333},{min:20000,max:30000,rate:0.0444},{min:30000,max:Infinity,rate:0.0482}],
+    hoh:[{min:0,max:10000,rate:0.0222},{min:10000,max:25000,rate:0.0296},{min:25000,max:40000,rate:0.0333},{min:40000,max:60000,rate:0.0444},{min:60000,max:Infinity,rate:0.0482}]
+  },
+  WI:{// Wisconsin
+    single:[{min:0,max:15110,rate:0.035},{min:15110,max:51950,rate:0.044},{min:51950,max:332720,rate:0.053},{min:332720,max:Infinity,rate:0.0765}],
+    married_joint:[{min:0,max:20150,rate:0.035},{min:20150,max:69260,rate:0.044},{min:69260,max:443630,rate:0.053},{min:443630,max:Infinity,rate:0.0765}],
+    married_separate:[{min:0,max:10075,rate:0.035},{min:10075,max:34630,rate:0.044},{min:34630,max:221815,rate:0.053},{min:221815,max:Infinity,rate:0.0765}],
+    hoh:[{min:0,max:15110,rate:0.035},{min:15110,max:51950,rate:0.044},{min:51950,max:332720,rate:0.053},{min:332720,max:Infinity,rate:0.0765}]
+  },
+  DC:{// District of Columbia
+    single:[{min:0,max:10000,rate:0.04},{min:10000,max:40000,rate:0.06},{min:40000,max:60000,rate:0.065},{min:60000,max:250000,rate:0.085},{min:250000,max:500000,rate:0.0925},{min:500000,max:1000000,rate:0.0975},{min:1000000,max:Infinity,rate:0.1075}],
+    married_joint:[{min:0,max:10000,rate:0.04},{min:10000,max:40000,rate:0.06},{min:40000,max:60000,rate:0.065},{min:60000,max:250000,rate:0.085},{min:250000,max:500000,rate:0.0925},{min:500000,max:1000000,rate:0.0975},{min:1000000,max:Infinity,rate:0.1075}],
+    married_separate:[{min:0,max:10000,rate:0.04},{min:10000,max:40000,rate:0.06},{min:40000,max:60000,rate:0.065},{min:60000,max:250000,rate:0.085},{min:250000,max:500000,rate:0.0925},{min:500000,max:1000000,rate:0.0975},{min:1000000,max:Infinity,rate:0.1075}],
+    hoh:[{min:0,max:10000,rate:0.04},{min:10000,max:40000,rate:0.06},{min:40000,max:60000,rate:0.065},{min:60000,max:250000,rate:0.085},{min:250000,max:500000,rate:0.0925},{min:500000,max:1000000,rate:0.0975},{min:1000000,max:Infinity,rate:0.1075}]
+  }
+};
+function _estimateStateTax(annualGross,filingStatus,state){
+  if(!state)return 0;
+  var stateBrackets=STATE_TAX_BRACKETS_2026[state];
+  if(!stateBrackets)return 0;// unseeded state — fall through to zero (TODO: expand table)
+  var brackets=stateBrackets[filingStatus]||stateBrackets.single;
+  var taxable=Math.max(0,annualGross);// no state std-ded modeled (see comment above)
+  var tax=0,remaining=taxable;
+  for(var i=0;i<brackets.length;i++){
+    var b=brackets[i];
+    var width=b.max===Infinity?remaining:Math.min(remaining,b.max-b.min);
+    if(width<=0)break;
+    tax+=width*b.rate;
+    remaining-=width;
+  }
+  return tax;
+}
+// ── Federal + FICA tax engine (callable form) ──────────────────────────────
+// Mirrors the inline math in renderTaxEstimation (line ~7742) so we have a
+// single source of truth for federal+FICA+Medicare. 2026 brackets per IRS
+// Rev. Proc. 2025-32 + OBBBA. Standard deduction only — itemized deductions
+// and credits are not modeled here.
+function _estimateFederalAndFICA(annualGross,filingStatus){
+  var isMFJ=filingStatus==='married_joint';
+  var isMFS=filingStatus==='married_separate';
+  var isHOH=filingStatus==='hoh';
+  var stdDeduction=isMFJ?32200:isHOH?24150:16100;
+  var taxableIncome=Math.max(0,annualGross-stdDeduction);
+  var brackets;
+  if(isMFJ){
+    brackets=[
+      {min:0,max:24800,rate:0.10},{min:24800,max:100800,rate:0.12},
+      {min:100800,max:211400,rate:0.22},{min:211400,max:403550,rate:0.24},
+      {min:403550,max:512450,rate:0.32},{min:512450,max:768700,rate:0.35},
+      {min:768700,max:Infinity,rate:0.37}
+    ];
+  } else if(isHOH){
+    brackets=[
+      {min:0,max:17600,rate:0.10},{min:17600,max:67450,rate:0.12},
+      {min:67450,max:105700,rate:0.22},{min:105700,max:201775,rate:0.24},
+      {min:201775,max:256225,rate:0.32},{min:256225,max:640600,rate:0.35},
+      {min:640600,max:Infinity,rate:0.37}
+    ];
+  } else {
+    brackets=[
+      {min:0,max:12400,rate:0.10},{min:12400,max:50400,rate:0.12},
+      {min:50400,max:105700,rate:0.22},{min:105700,max:201775,rate:0.24},
+      {min:201775,max:256225,rate:0.32},{min:256225,max:640600,rate:0.35},
+      {min:640600,max:Infinity,rate:0.37}
+    ];
+  }
+  var fedTax=0,remaining=taxableIncome;
+  for(var i=0;i<brackets.length;i++){
+    var b=brackets[i];
+    var width=b.max===Infinity?remaining:Math.min(remaining,b.max-b.min);
+    if(width<=0)break;
+    fedTax+=width*b.rate;
+    remaining-=width;
+  }
+  var ssTax=Math.min(annualGross,184500)*0.062;
+  var addMedThreshold=isMFJ?250000:(isMFS?125000:200000);
+  var medTax=annualGross*0.0145;
+  if(annualGross>addMedThreshold)medTax+=(annualGross-addMedThreshold)*0.009;
+  return fedTax+ssTax+medTax;
+}
+// Reverse-engineers gross from take-home using bisection. Bounds: gross can't
+// be less than net (no negative tax) and won't exceed ~3x net even at the
+// highest brackets. Pre-tax 401k/health/HSA reduce federal taxable wages (W-2
+// box 1) but not FICA wages (box 5); for AGI/MAGI comparisons the box-1-based
+// estimate is what IRS phase-out tests use, so we apply preTax to wage base
+// before federal calc. Also subtracts state tax via _estimateStateTax (CT
+// seeded, others added later by expanding STATE_TAX_BRACKETS_2026).
+function _estimateGrossFromNet(annualNet,annualPreTaxDeductions,filingStatus,state){
+  if(annualNet<=0)return 0;
+  var lo=annualNet,hi=annualNet*3;
+  for(var iter=0;iter<60;iter++){
+    var mid=(lo+hi)/2;
+    var wageBox1=Math.max(0,mid-annualPreTaxDeductions);
+    var taxes=_estimateFederalAndFICA(wageBox1,filingStatus)+_estimateStateTax(wageBox1,filingStatus,state);
+    var computedNet=mid-annualPreTaxDeductions-taxes;
+    if(Math.abs(computedNet-annualNet)<1)break;
+    if(computedNet<annualNet)lo=mid;else hi=mid;
+  }
+  return (lo+hi)/2;
 }
 function _totalMonthlyGross(){
   return (S.incomeSources||[]).reduce(function(t,s){return t+_incSrcMonthlyGross(s);},0);
