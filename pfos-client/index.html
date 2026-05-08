@@ -24759,11 +24759,21 @@ function _cpRenderPlanV2(){
     return items.some(function(a){return a.amount>0||a.type!=='protection';});
   }
   var _availablePhases=[1];// Phase 1 always exists
-  // Phase 2 exists if: simulation has cascade events OR allocations assigned to Phase 2
-  if(_simEvents.length>0||(_allocPhases[2]&&_phaseHasContent(2)))_availablePhases.push(2);
-  // Phase 3+ only if they have meaningful content
-  if(_allocPhases[3]&&_phaseHasContent(3))_availablePhases.push(3);
-  if(_allocPhases[4]&&_phaseHasContent(4))_availablePhases.push(4);
+  // Each cascade event creates a timeline stage. Event 0 (first completion) → Phase 2,
+  // Event 1 (second completion) → Phase 3, etc. Per the AI prompt (edge fn line 696),
+  // phases 2/3/4 from the AI represent ONLY genuinely new vehicles, not "Increase X"
+  // — the cascade engine handles redistribution of freed money, and each stage shows
+  // the cumulative state after one more completion. Without driving phases 2+ off
+  // _simEvents, plans whose AI-emitted recommendations all sit in Phase 1 (the typical
+  // case for a balanced plan) only ever get a Phase 1 + Phase 2 view, even when two
+  // or more goals complete on different timelines.
+  for(var _evi=0;_evi<_simEvents.length;_evi++){
+    var _evPhase=_evi+2;// Event 0 → Phase 2, Event 1 → Phase 3, ...
+    if(_availablePhases.indexOf(_evPhase)<0)_availablePhases.push(_evPhase);
+  }
+  // Plus any AI-assigned phase with content not already covered by a cascade stage —
+  // keeps action-only Phase 4 ("Optimization") items visible when the AI puts them there.
+  [2,3,4].forEach(function(pn){if(_availablePhases.indexOf(pn)<0&&_allocPhases[pn]&&_phaseHasContent(pn))_availablePhases.push(pn);});
   // Support additional phases beyond 4 only if items exist with content
   Object.keys(_allocPhases).forEach(function(k){var pn=parseInt(k);if(pn>4&&_availablePhases.indexOf(pn)<0&&_phaseHasContent(pn))_availablePhases.push(pn);});
   _availablePhases.sort(function(a,b){return a-b;});
@@ -24982,15 +24992,24 @@ function _cpRenderPlanV2(){
           h+='</div>';
         }
 
-        // Completing items get grayed wrapper. Two paths:
-        //   1) Phase N>1 view + item is debt/EF/custom-with-target → grayed by definition
-        //      (Phase 2+ exists *because* Phase 1 things complete; their entries should
-        //      visually reflect that.) Fix #3: previously gated on _sim.fullFundingMonth>0
-        //      which meant "all phases started" — wrong field — so EFs in Phase 2 view
-        //      stayed live. Now we gray them in any non-Phase-1 tab.
-        //   2) Item is already directly marked _completed (user-confirmed completion) —
-        //      grayed in any tab including Phase 1.
-        if((_activeTab>1&&isCompleting)||a._completed){
+        // Completing items get grayed wrapper. Three paths:
+        //   1) Item directly marked _completed → grayed everywhere (incl. Phase 1)
+        //   2) Phase N>1 view AND this completing item finished AT OR BEFORE the
+        //      current stage's trigger month → grayed (it's already done by the
+        //      time this stage starts). Per-allocation completion is recovered
+        //      from _simEvents using the allocIdx attached at simulation time
+        //      (events for ef/debt/custom/house all carry allocIdx).
+        //   3) Otherwise → render normally with phase-specific amount (still
+        //      active in this stage).
+        // Without the per-allocation gate, ALL completing items would be grayed
+        // in any non-Phase-1 tab — so in Phase 2 view (after EF complete, ~mo 4)
+        // a debt finishing at ~mo 8 would be incorrectly grayed alongside the EF.
+        var _completedByThisStage=false;
+        if(_activeTab>1&&isCompleting){
+          var _myEvent=_simEvents.find(function(ev){return ev.allocIdx===idx;});
+          if(_myEvent&&(_myEvent.month||0)<=_curTriggerMonth)_completedByThisStage=true;
+        }
+        if(_completedByThisStage||a._completed){
           h+='<div style="opacity:0.45;filter:grayscale(0.5)">';
           h+=_cpBuildCard(a,idx,false);
           h+='</div>';
@@ -25246,9 +25265,25 @@ function _cpBuildCard(a,idx,isUnassigned){
     // Cap slider max at the current amount — the user cannot go above this.
     _slMax=a.amount;
   }
+  // Slider operates on TOTAL contribution (currentContrib + a.amount) when
+  // there's a matching real-world account. When the user drags, _cpSlide
+  // receives the Total value, derives Extra = max(0, Total − currentContrib),
+  // and stores Extra on a.amount. Internal a.amount semantics ("Extra beyond
+  // what the user already does") stay unchanged everywhere downstream — the
+  // cascade engine, IRS cap math, deployment total, projection sim — all see
+  // Extra. This is purely a display + input adapter at the slider layer.
+  // The data-cpcurrent attribute carries currentContrib so _cpSlide can
+  // reverse-derive Extra during drag without re-running _cpMatchExisting on
+  // every input event (cheaper, avoids match-claim ledger churn).
+  // For allocations with no match (currentContrib=0), Total === Extra and
+  // behavior is identical to the prior render.
+  var _curContribSlide=parseInt((_match&&_match.currentContrib)||0)||0;
+  var _sliderTotal=_curContribSlide+(parseInt(a.amount)||0);
+  var _sliderTotalMax=_slMax+_curContribSlide;
+  var _sliderTotalMin=_curContribSlide;// can't slide below the user's current real-world contribution
   h+='<div style="display:flex;align-items:center;gap:8px;margin:4px 0">';
-  h+='<input type="range" data-cpidx="'+idx+'" min="0" max="'+_slMax+'" step="5" value="'+Math.min(a.amount,_slMax)+'" oninput="_cpSlide('+idx+',this.value);var _mi=document.getElementById(\'cpManual'+idx+'\');if(_mi){var _rv=String(this.value).replace(/\\B(?=(\\d{3})+(?!\\d))/g,\',\');_mi.value=_rv}" onchange="_cpSlideEnd()" style="flex:1;accent-color:'+color+';height:6px"'+(_premiumLocked?' title="Premium locked at $'+a.amount+'/mo — see lock icon"':'')+'>';
-  h+='<div class="inp-prefix" style="width:100px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" data-cpidx="'+idx+'" id="cpManual'+idx+'" value="'+a.amount+'" min="0" max="'+_slMax+'" step="5" oninput="var _raw=this.value.replace(/[^0-9]/g,\'\');_cpSlide('+idx+',_raw);var _sl=this.parentElement.previousElementSibling;if(_sl)_sl.value=_raw" style="padding-left:22px;min-height:32px;font-size:13px;width:100%"></div>';
+  h+='<input type="range" data-cpidx="'+idx+'" data-cpcurrent="'+_curContribSlide+'" min="'+_sliderTotalMin+'" max="'+_sliderTotalMax+'" step="5" value="'+Math.min(_sliderTotal,_sliderTotalMax)+'" oninput="_cpSlide('+idx+',this.value);var _mi=document.getElementById(\'cpManual'+idx+'\');if(_mi){var _rv=String(this.value).replace(/\\B(?=(\\d{3})+(?!\\d))/g,\',\');_mi.value=_rv}" onchange="_cpSlideEnd()" style="flex:1;accent-color:'+color+';height:6px"'+(_premiumLocked?' title="Premium locked at $'+a.amount+'/mo — see lock icon"':'')+'>';
+  h+='<div class="inp-prefix" style="width:100px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" data-cpidx="'+idx+'" data-cpcurrent="'+_curContribSlide+'" id="cpManual'+idx+'" value="'+_sliderTotal+'" min="'+_sliderTotalMin+'" max="'+_sliderTotalMax+'" step="5" oninput="var _raw=this.value.replace(/[^0-9]/g,\'\');_cpSlide('+idx+',_raw);var _sl=this.parentElement.previousElementSibling;if(_sl)_sl.value=_raw" style="padding-left:22px;min-height:32px;font-size:13px;width:100%"></div>';
   h+='</div>';
   if(_premiumLocked){
     h+='<div style="display:flex;align-items:center;gap:6px;margin-top:2px;padding:6px 8px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.18);border-radius:3px">';
@@ -31505,10 +31540,10 @@ function _cpRunSimulation(){
   var efRemaining=Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0));
   if(efA&&efRemaining>0){
     var efMo=Math.ceil(efRemaining/efA.amount);
-    events.push({month:efMo,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF funded'});
+    events.push({month:efMo,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF funded',allocIdx:CPLAN.allocations.indexOf(efA)});
   } else if(efA&&efRemaining<=0){
     // EF already funded — immediately free
-    events.push({month:0,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF already funded'});
+    events.push({month:0,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF already funded',allocIdx:CPLAN.allocations.indexOf(efA)});
   }
   // Debt completion — only accelerate high-rate debts (>10% APR). Same gate: extra
   // debt payment must be marked complete (user is actually paying extra each month).
@@ -31543,7 +31578,8 @@ function _cpRunSimulation(){
           label:'High-rate debt free — freed minimums repaying IBC policy loans',
           debtOrder:ibcSim.payoffLog.map(function(p){return{name:p.name,month:p.month};}),
           _ibcContinues:debtA.amount,
-          _ibcLoanRepayment:hiRateMin
+          _ibcLoanRepayment:hiRateMin,
+          allocIdx:CPLAN.allocations.indexOf(debtA)
         });
         // Event 2: at CV=AV recovery month — policy loans are paid off. Branch on user choice.
         //   'continue' (default): keep policy. Freed minimums redistribute to growth via cascade.
@@ -31597,7 +31633,8 @@ function _cpRunSimulation(){
             cascade:debtA.cascade,
             label:'High-rate debt free (instant CV=AV)',
             debtOrder:ibcSim.payoffLog.map(function(p){return{name:p.name,month:p.month};}),
-            _ibcContinues:debtA.amount
+            _ibcContinues:debtA.amount,
+            allocIdx:CPLAN.allocations.indexOf(debtA)
           });
         }
         // Per-debt milestones for the timeline view
@@ -31608,19 +31645,19 @@ function _cpRunSimulation(){
         // IBC ineligible (insufficient surplus). Fall back to standard avalanche timing
         // so the simulator still produces a sensible cascade.
         debtSim=_cpDebtSimulate(debtSorted,debtA.amount);
-        events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free (IBC ineligible — fell back to standard payoff)',debtOrder:debtSim.order});
+        events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free (IBC ineligible — fell back to standard payoff)',debtOrder:debtSim.order,allocIdx:CPLAN.allocations.indexOf(debtA)});
         debtSim.order.forEach(function(o){events.push({month:o.month,type:'debt_milestone',freed:0,cascade:'',label:o.name+' paid off'});});
       }
     } else {
       // Non-IBC: standard avalanche/snowball/hybrid math. Full debt allocation +
       // sum of high-rate minimums frees up at debt-free month for cascade redistribution.
       debtSim=_cpDebtSimulate(debtSorted,debtA.amount);
-      events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order});
+      events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,allocIdx:CPLAN.allocations.indexOf(debtA)});
       debtSim.order.forEach(function(o){events.push({month:o.month,type:'debt_milestone',freed:0,cascade:'',label:o.name+' paid off'});});
     }
   } else if(debtA&&hiRateDebts.length===0&&allDebts.length>0){
     // No high-rate debt — all debt is low-rate, don't accelerate. Free the debt allocation immediately.
-    events.push({month:0,type:'debt',freed:debtA.amount,cascade:debtA.cascade,label:'No high-rate debt — extra redirected to growth'});
+    events.push({month:0,type:'debt',freed:debtA.amount,cascade:debtA.cascade,label:'No high-rate debt — extra redirected to growth',allocIdx:CPLAN.allocations.indexOf(debtA)});
   }
   // Custom/house goal completions
   CPLAN.allocations.forEach(function(a,i){
@@ -31828,6 +31865,16 @@ function _cpRunSimulation(){
           .filter(function(x){
             if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection')return false;
             if(x.a.type==='iul'||x.a.type==='wl'||x.a.type==='ibc')return false; // fixed premium
+            // Action-only items must not absorb cascade overflow. The AI's
+            // PHASE STRUCTURE rule (edge fn line 698) says "Do NOT cascade to
+            // action-only items (protection, estate, tax review)". The
+            // type==='custom' check catches estate planning + advisor checklist
+            // entries; type==='rollover' catches Roth conversion strategies.
+            // The (target===0 && amount===0) check catches zero-funded $0
+            // action allocations regardless of type — they have no headroom
+            // to receive contributions in any meaningful sense.
+            if(x.a.type==='custom'||x.a.type==='rollover')return false;
+            if((!x.a.target||x.a.target===0)&&(parseFloat(x.a.amount)||0)===0)return false;
             if(!_cascadeOwnerOK(x.a.owner))return false;
             var irsMax=_cpIRSMax(x.a.type,x.a);
             return (irsMax-allocAmounts[x.i])>0;
@@ -32526,7 +32573,16 @@ function _cpSlide(i,v){
   // non-zero matcher data without inheriting claims from a prior render. The
   // single-card matcher calls below need their own clean cycle.
   if(typeof _cpResetMatchClaims==='function')_cpResetMatchClaims();
-  var _newAmt=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
+  // The incoming value is the slider/input TOTAL (currentContrib + Extra) when
+  // there's a matching real-world account, else just Extra (currentContrib=0).
+  // a.amount semantics stay "Extra" — derive that here from Total and store it.
+  // currentContrib is read from the data-cpcurrent attribute (set at render time
+  // from _cpMatchExisting) to avoid re-querying the matcher on every drag tick.
+  var _slidEl=document.querySelector('input[type="range"][data-cpidx="'+i+'"]')
+            ||document.getElementById('cpManual'+i);
+  var _curContrib=_slidEl?(parseInt(_slidEl.getAttribute('data-cpcurrent'))||0):0;
+  var _newTotal=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
+  var _newAmt=Math.max(0,_newTotal-_curContrib);// Extra = max(0, Total − currentContrib)
   var _a=CPLAN.allocations[i];
   // P4: if this is a Done insurance allocation, cap the new amount at the current
   // amount (no increases). Decreases are allowed (user can effectively surrender).
@@ -32553,10 +32609,11 @@ function _cpSlide(i,v){
   // and number input visually match a.amount. Without this, dragging past the
   // pool ceiling would leave the thumb at the user's drag position while the
   // amount stays clamped — a confusing disconnect.
+  // Slider operates in TOTAL space, so DOM value = currentContrib + Extra.
   var _draggedSl=document.querySelector('input[type="range"][data-cpidx="'+i+'"]');
-  if(_draggedSl)_draggedSl.value=CPLAN.allocations[i].amount;
+  if(_draggedSl)_draggedSl.value=_curContrib+CPLAN.allocations[i].amount;
   var _draggedMi=document.getElementById('cpManual'+i);
-  if(_draggedMi)_draggedMi.value=CPLAN.allocations[i].amount;
+  if(_draggedMi)_draggedMi.value=_curContrib+CPLAN.allocations[i].amount;
   _cpUpdateSliderCaps(i);                                   // refresh cap notes on others (max attrs are static, untouched)
   _cpMarkModified();
   // TARGETED update — only touch the elements that changed, don't rebuild the DOM
