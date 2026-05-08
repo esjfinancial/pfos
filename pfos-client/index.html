@@ -20634,12 +20634,63 @@ function _trackFindAccount(a){
 // DEPENDENCY: type strings here mirror RET_TYPES.val in pfos-main.html
 // (around line 4934). If a new RET_TYPE entry is added there, add the
 // corresponding case in _retMatchTypes below.
+// ── Match-claim ledger ─────────────────────────────────────────────────────
+// Tracks which (owner, allocation-type) buckets have already been claimed during
+// the current render or simulation cycle, and BY WHICH allocation index. Prevents
+// double-counting when multiple allocations point at the same set of real-world
+// accounts, while still allowing the same allocation to call _cpMatchExisting
+// multiple times within a render (e.g. once for the display line, once via
+// _cpSliderMax for the IRS cap math) and get the same answer both times.
+//
+// Why: _cpMatchExisting's job is "for THIS allocation, what's the user's existing
+// position in matching real-world accounts?". When the AI emits two recs of the
+// same vehicle key (e.g. two `401k` recs — one for match-capture, one for
+// "additional beyond match"), each calls _cpMatchExisting separately and gets
+// the SAME currentBalance/currentContrib returned. The simulation then seeds two
+// projection buckets with the same starting balance and adds the same monthly
+// contribution to each — doubling the projected retirement value.
+//
+// The right fix is server-side consolidation (see edge fn DUPLICATE
+// CONSOLIDATION block) so the AI's duplicate recs become one before the frontend
+// ever sees them. This claim ledger is defense-in-depth: if duplicates somehow
+// slip through (server consolidation crashed, an old cached plan loaded, the
+// user manually duplicated a card via _cpAdd), only the FIRST allocation pulling
+// from a given (owner, type) claims the existing balance/contribution. Later
+// allocations of the same type get zeros.
+//
+// Identification: the matcher uses CPLAN.allocations.indexOf(a) to determine the
+// allocation's identity within the current plan. The first index to touch a
+// (owner, type) bucket claims it for that index; subsequent calls from that
+// SAME index get the cached non-zero value; calls from a DIFFERENT index for
+// the same (owner, type) get zeros.
+//
+// Lifecycle: cycles are independent — _cpResetMatchClaims() can be called at
+// any time to reset and re-establish first-claim ordering for the next cycle.
+// Reset is called at the top of _cpRunSimulation, _cpRenderPlanV2, and
+// _cpSlide so each event starts fresh.
+var _cpMatchClaims = {};
+function _cpResetMatchClaims(){ _cpMatchClaims = {}; }
+
 function _cpMatchExisting(a){
   if(!a)return{currentBalance:0,currentContrib:0,sourceLabel:''};
   if(a.type==='ef'||a.type==='debt'||a.type==='protection'||a.type==='rollover'||a.type==='custom'||a.type==='hsa'){
     return{currentBalance:0,currentContrib:0,sourceLabel:''};
   }
   var owner=a.owner||'self';
+  // Identify this allocation by its array index. If the allocation isn't in
+  // CPLAN.allocations (rare — some test paths construct ad-hoc allocations),
+  // we use a synthetic identifier so the claim still works internally.
+  var _idx=(CPLAN.allocations||[]).indexOf(a);
+  var _aId=_idx>=0?_idx:('_anon_'+(a._policyId||(a.type+'_'+(a.amount||0))));
+  // Claim-ledger check: if this (owner, type) bucket has already been claimed
+  // by a DIFFERENT allocation in the current cycle, return zeros. The first
+  // allocation to claim it gets the full balance/contribution; same-allocation
+  // repeat calls within the cycle return the cached value (handled implicitly
+  // because the same _aId still owns the claim).
+  var _claimKey=owner+':'+a.type;
+  if(_cpMatchClaims[_claimKey]&&_cpMatchClaims[_claimKey]!==_aId){
+    return{currentBalance:0,currentContrib:0,sourceLabel:''};
+  }
   var rawS=(APP._portalFd&&APP._portalFd.S)||{};
   var retAccts=[],policies=[],ibcPolicies=[],assets={},children=[];
   if(owner==='spouse'&&CPLAN._partner){
@@ -20704,6 +20755,11 @@ function _cpMatchExisting(a){
       contrib+=parseFloat(c.contrib)||0;
     });
   }
+  // Claim this bucket so other allocations of the same (owner, type) get zeros
+  // for the rest of this cycle. Only set the claim when there was actually
+  // something to claim — a zero-balance, zero-contrib match shouldn't lock the
+  // bucket against another allocation that might find data.
+  if((bal>0||contrib>0)&&!_cpMatchClaims[_claimKey])_cpMatchClaims[_claimKey]=_aId;
   return{
     currentBalance:Math.round(bal),
     currentContrib:Math.round(contrib),
@@ -24410,6 +24466,11 @@ function _cpAutoSuggestV2(){
 // ── PLAN v2 RENDERER ──
 function _cpRenderPlanV2(){
   var root=document.getElementById('cplanRoot');if(!root)return;
+  // Reset the match-claim ledger at the start of every render cycle so first-
+  // claim ordering is re-established each render. Without this, claims from a
+  // prior render or simulation persist and zero out legitimate matches in the
+  // first cards rendered. See _cpMatchClaims comment block.
+  if(typeof _cpResetMatchClaims==='function')_cpResetMatchClaims();
   // ── Live data refresh: pull current balances from financial data ──
   try{
     var _liveS=(APP._portalFd&&APP._portalFd.S)||{};
@@ -31385,6 +31446,12 @@ function _cpRunSimulation(){
   var years=30;
   var maxMonths=years*12;
 
+  // Reset the match-claim ledger so this simulation cycle establishes its own
+  // first-claim ordering. Without this, claims from a prior render cycle would
+  // persist into the simulation's precompute loop and zero out legitimate
+  // allocation matches. See _cpMatchClaims comment block.
+  if(typeof _cpResetMatchClaims==='function')_cpResetMatchClaims();
+
   // ── Tracking gate (per-allocation) ─────────────────────────────────────
   // The gate's job is to keep the projection HONEST: contributions only count
   // once the user has actually opened the account and started funding it.
@@ -32455,6 +32522,10 @@ function _cpUpdateOverBudgetBanner(){
   if(propBtn){propBtn.disabled=false;propBtn.style.opacity='';propBtn.style.cursor='';}
 }
 function _cpSlide(i,v){
+  // Reset the match-claim ledger so this single-card update gets fresh
+  // non-zero matcher data without inheriting claims from a prior render. The
+  // single-card matcher calls below need their own clean cycle.
+  if(typeof _cpResetMatchClaims==='function')_cpResetMatchClaims();
   var _newAmt=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
   var _a=CPLAN.allocations[i];
   // P4: if this is a Done insurance allocation, cap the new amount at the current
