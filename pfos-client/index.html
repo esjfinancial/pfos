@@ -23399,19 +23399,46 @@ function _cpConvertAIRecs(aiData){
       _underlying='wl';
     }
     // ── IBC-as-debt-strategy flag ─────────────────────────────────────────
-    // When the AI emits an allocation with section='debt' AND a strategy that
-    // resolves to type='ibc' (ibc_wl / ibc_iul / ibc), section-lock keeps the
-    // type as 'debt' (section_locked has debt:true at line ~23190). But the
-    // semantic intent is "this card represents the IBC debt strategy" — a
-    // dual-purpose allocation that funds a real WL/IUL policy AND eliminates
-    // debt via policy loans. We tag _ibcDebtStrategy:true so:
-    //   1. The retirement-projection chart (line ~32503 filter) can include
-    //      this debt-typed allocation in the legend and series, since the
-    //      IBC policy IS a retirement asset post-debt-free.
-    //   2. The C6 phase-3+ transformation can identify these for correct
-    //      "Whole Life Policy — Continuation" rendering.
-    //   3. cplanSave persists the flag so it survives reload.
-    var _isIBCDebtStrat=(r.section==='debt'&&map.type==='debt'&&_strat&&(_strat==='ibc_wl'||_strat==='ibc_iul'||_strat==='ibc'));
+    // Identifies the allocation that represents the IBC debt-elimination
+    // strategy. We need this flag for THREE downstream consumers:
+    //   1. The retirement-projection chart (filter at line ~32697) so the
+    //      policy CV appears in the legend + series as a retirement asset.
+    //   2. The C6 phase-3+ transformation (line ~25431) to re-render the
+    //      card as "Whole Life Policy — Continuation" in Phase 3+.
+    //   3. cplanSave persistence (line ~34335) so the flag survives reload.
+    //   4. The simulator's debtA finder (line ~32012 in _cpRunSimulation)
+    //      which searches for `a.type === 'debt'` to identify the debt
+    //      allocation feeding the IBC sim. If our allocation isn't type='debt',
+    //      the simulator falls through to a non-IBC debt strategy and the
+    //      _ibcContinues event never fires — breaking the transformation.
+    //
+    // Detection: the AI might emit this allocation under any of several
+    // section/strategy permutations. Accept all of them:
+    //   (a) section='debt' + strategy=ibc_wl/ibc_iul/ibc — most direct, AI
+    //       categorizes as debt elimination
+    //   (b) Any section + strategy=ibc_wl/ibc_iul/ibc + AI's top-level
+    //       debtStrategy='ibc' — AI sets the top-level flag and emits an
+    //       insurance/retirement-section card whose strategy is IBC
+    //   (c) Title contains "ibc" or "infinite banking" + AI's top-level
+    //       debtStrategy='ibc' — last-resort heuristic for AI outputs that
+    //       drift on strategy field
+    var _isIBCStrat=(_strat==='ibc_wl'||_strat==='ibc_iul'||_strat==='ibc');
+    var _aiDebtStratIBC=(aiData.debtStrategy==='ibc');
+    var _titleIBC=(r.title||'').toLowerCase();
+    var _titleSaysIBC=_titleIBC.indexOf('ibc')>=0||_titleIBC.indexOf('infinite banking')>=0||(_titleIBC.indexOf('whole life')>=0&&(_titleIBC.indexOf('debt')>=0||_titleIBC.indexOf('elimination')>=0));
+    var _isIBCDebtStrat=(r.section==='debt'&&map.type==='debt'&&_isIBCStrat)
+                       ||(_aiDebtStratIBC&&_isIBCStrat)
+                       ||(_aiDebtStratIBC&&_titleSaysIBC);
+    // When flagged: CANONICALIZE this allocation to type='debt' so the
+    // simulator's `find(a.type==='debt')` picks it up and runs the IBC
+    // branch. Without this canonicalization, an AI emitting section='insurance'
+    // + strategy='ibc_wl' would produce a type='ibc' allocation that the
+    // simulator's debt path never sees — no _ibcContinues event, no Phase 3
+    // continuation card, no retirement-projection inclusion via the debt-
+    // strategy code path.
+    if(_isIBCDebtStrat&&map.type!=='debt'){
+      map.type='debt';
+    }
     // Wave 4 state machine: new allocations start in PROPOSED state. Insurance
     // products get a stable _policyId at creation so audits and snapshots can
     // distinguish Policy #1 vs Policy #2 vs Policy #N within the same purpose lane.
@@ -24590,7 +24617,13 @@ function _cpProjectApproachWithSim(approachData,approachKey){
       var totalEndBalance=0;
       if(sim.allocSeries){
         CPLAN.allocations.forEach(function(a,i){
-          if(a.type==='debt')return;          // debt is already netted into allocations via cascade
+          // Skip pure debt allocations — debt-elimination is netted into
+          // the simulation's cascade output via account contributions. But
+          // KEEP _ibcDebtStrategy allocations: those represent live WL/IUL
+          // policies whose CV is a real retirement asset at horizon. Without
+          // this exception, Tax-Free / Hybrid plans using IBC for debt see
+          // their strategy summary card undercount by the full policy CV.
+          if(a.type==='debt'&&!a._ibcDebtStrategy)return;
           if(!a.amount||a.amount<=0)return;   // no funding → no balance to track
           var key=a.type+'_'+i;
           var series=sim.allocSeries[key];
@@ -24598,7 +24631,13 @@ function _cpProjectApproachWithSim(approachData,approachKey){
             var endIdx=Math.min(_yrsToRet,series.length-1);
             var endBal=series[endIdx]||0;
             if(endBal>0){
-              allocEndBalances.push({type:a.type,strategy:a.type,endBal:endBal});
+              // For _ibcDebtStrategy allocations, label them as 'ibc' in
+              // allocEndBalances so the tax-bucket map (_apprTaxBucket)
+              // routes them to the 'free' bucket (tax-free via policy loans)
+              // rather than 'ord'. Without this remap they'd be ignored by
+              // _retVehiclesAppr filter (which doesn't include 'debt').
+              var _eType=(a.type==='debt'&&a._ibcDebtStrategy)?'ibc':a.type;
+              allocEndBalances.push({type:_eType,strategy:_eType,endBal:endBal});
               totalEndBalance+=endBal;
             }
           }
@@ -25388,6 +25427,50 @@ function _cpRenderPlanV2(){
         if(_activeTab>1&&isCompleting){
           var _myEvent=_simEvents.find(function(ev){return ev.allocIdx===idx;});
           if(_myEvent&&(_myEvent.month||0)<=_curTriggerMonth)_completedByThisStage=true;
+        }
+        // IBC debt strategy in Phase N+1: emit TWO cards instead of one.
+        //   Card 1: the ORIGINAL debt card, grayed out (debt is now paid off
+        //           via policy loans — historical context for the user)
+        //   Card 2: a NEW "Whole Life Policy — Continuation" card representing
+        //           the live policy, with the loan-repayment slider underneath
+        // Detection: matching event in _simEvents with _ibcContinues>0 + we're
+        // in Phase 2 or later. Both cards share the same a.amount but Card 2
+        // re-renders with overridden display fields.
+        var _ibcEmitContinuation=false;
+        var _ibcContEvent2=null;
+        if(CPLAN.debtStrategy==='ibc'&&a.type==='debt'&&_activeTab>1){
+          _ibcContEvent2=_simEvents.find(function(ev){return ev.allocIdx===idx&&ev._ibcContinues>0;});
+          if(_ibcContEvent2&&(_ibcContEvent2.month||0)<=_curTriggerMonth)_ibcEmitContinuation=true;
+        }
+        if(_ibcEmitContinuation){
+          // CARD 1: Original debt card, grayed out (debt eliminated milestone).
+          h+='<div style="opacity:0.45;filter:grayscale(0.5)">';
+          h+=_cpBuildCard(a,idx,false);
+          h+='</div>';
+          // CARD 2: NEW Whole Life Policy — Continuation card. Same a.amount
+          // (same premium ongoing), same idx (so slider edits map to the right
+          // allocation), but different display fields. Override-and-restore
+          // pattern: we mutate a in-place for the duration of the build, then
+          // restore so subsequent renders don't see the modifications.
+          var _recovEvent2=_simEvents.find(function(ev){return ev.allocIdx===idx&&ev._ibcRecovery;});
+          var _recovMonth2=_recovEvent2?_recovEvent2.month:null;
+          var _recovDate2=_recovMonth2?new Date(Date.now()+_recovMonth2*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'}):'a future month';
+          var _origType2=a.type;
+          var _origCustomName2=a.customName;
+          var _origReason2=a.reason;
+          var _origAmount2=a.amount;
+          a.type='ibc';
+          a.customName='Whole Life Policy — Continuation';
+          a.reason='Your high-rate debts are paid off via policy loans. Premium continues at the same amount as before. The freed debt minimums now flow toward repaying the policy loan — see the loan-repayment slider below to adjust how much per month, and the "paid off in ~X months" estimate. A new phase will appear around '+_recovDate2+' when the policy loans are fully repaid (CV=AV) and that money becomes available to redistribute to other growth allocations.';
+          // Phase-cumulative amount swap (same logic as the active-render branch)
+          if(phaseAmt!==a.amount)a.amount=phaseAmt;
+          h+=_cpBuildCard(a,idx,false);
+          // Restore
+          a.type=_origType2;
+          a.customName=_origCustomName2;
+          a.reason=_origReason2;
+          a.amount=_origAmount2;
+          return;// done with this allocation; both cards emitted
         }
         if(_completedByThisStage||a._completed){
           h+='<div style="opacity:0.45;filter:grayscale(0.5)">';
@@ -32885,7 +32968,15 @@ function _cpRenderChart(targetId){
     var vLine=document.getElementById(chartId+'_line');
     function showTip(e2){
       var rect=svgEl.getBoundingClientRect();
-      var px=(e2.touches?e2.touches[0].clientX:e2.clientX)-rect.left;
+      // Use clientX - rect.left for both mouse and touch (touch events don't have
+      // useful offsetX). This is the cursor's pixel offset from the SVG's left
+      // edge — same units as we set tip.style.left.
+      var px;
+      if(e2.touches&&e2.touches[0]){
+        px=e2.touches[0].clientX-rect.left;
+      } else {
+        px=e2.clientX-rect.left;
+      }
       var svgW=rect.width;var scaleX=600/svgW;// viewBox width
       var svgX=px*scaleX;
       // Hide tooltip + vertical line when cursor is outside the plot area
@@ -32902,6 +32993,16 @@ function _cpRenderChart(targetId){
       }
       var yr7=Math.round((svgX-padL)/(600-padL-padR)*years);
       yr7=Math.max(0,Math.min(years,yr7));
+      // Snap to the same 5-year tick spacing the X-axis uses (line ~32792
+      // emits labels at [0,5,10,15,20,25,30]). Without snapping, cursor at an
+      // unlabeled year (e.g. yr=2 = Age 40 between the visible Age 38 and
+      // Age 43 ticks) shows tooltip "Age 40" — which the user reads as wrong
+      // because no "Age 40" label appears on the chart and they're hovering
+      // over the area immediately right of "Age 38". Snapping aligns tooltip
+      // data with the nearest visible tick so cursor near Age 38 → "Age 38",
+      // cursor halfway between → "Age 43" (the next visible tick), etc.
+      yr7=Math.round(yr7/5)*5;
+      yr7=Math.max(0,Math.min(years,yr7));
       if(tip){
         var bv2=_chartBase[yr7]||0;var pv2=_chartPlan[yr7]||0;var diff3=pv2-bv2;
         var tipH='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:6px">Age '+(_chartUserAge+yr7)+'</div>';
@@ -32915,20 +33016,34 @@ function _cpRenderChart(targetId){
         tipH+='<div style="color:var(--mu);font-size:11px">'+(_isRetView?'No new contributions':'Do nothing')+': '+fmtK(bv2)+'</div>';
         tipH+='<div style="color:'+(diff3>=0?'var(--gr)':'var(--rd)')+';font-size:12px;font-weight:700">'+(diff3>=0?'+':'')+fmtK(diff3)+'</div></div>';
         tip.innerHTML=tipH;
-        // Clamp tooltip position to stay within the plot area pixel bounds on
-        // both sides. svgW is rendered width; padL/padR are viewBox-units that
-        // we scale into pixel units via (svgW/600). Without left clamp, when
-        // cursor is at the left edge of the plot area (svgX === padL+ε), the
-        // tooltip's `left` was `px ≈ padL*(svgW/600)` — visually that's the
-        // leftmost edge of the plot. Without right clamp (existing min behavior
-        // already clamps right), tooltip would clip past the right axis.
+        // CRITICAL: Position the tooltip card at the DATA POINT'S exact pixel X,
+        // not at the cursor's px. This way the tooltip card visually aligns with
+        // the age-axis tick whose data is being displayed inside the card. Maps
+        // viewBox x of the data point (x(yr7) = padL + yr7/years*cW in viewBox
+        // units) to pixel space via (svgW/600).
+        var _dataPointPxX=(padL+(yr7/years)*(600-padL-padR))*(svgW/600);
         var tipW=160;// approximate min-width per inline style above
         var padLpx=padL*(svgW/600);
         var padRpx=(600-padR)*(svgW/600);
-        var tipX=Math.max(padLpx,Math.min(px,padRpx-tipW));
+        // Anchor card just to the right of the data point (12px offset so the
+        // card doesn't sit ON the vertical line). If that would overflow the
+        // right edge, flip to the left side of the data point.
+        var tipX=_dataPointPxX+12;
+        if(tipX+tipW>padRpx)tipX=_dataPointPxX-tipW-12;
+        // Final clamp to plot area bounds
+        tipX=Math.max(padLpx,Math.min(tipX,padRpx-tipW));
         tip.style.left=tipX+'px';tip.style.top='4px';tip.style.display='block';
+        // Also position the vertical line at the data point's exact pixel X
+        // (NOT the cursor's px) so the line snaps to the actual data column.
+        // Without this, the cursor would point at one age but the displayed
+        // data and line would be at the nearest year boundary, creating visual
+        // misalignment that read as "tooltip data doesn't match cursor."
+        if(vLine){vLine.style.left=_dataPointPxX+'px';vLine.style.display='block';}
+      } else if(vLine){
+        // Fallback if tip element missing (shouldn't happen)
+        var _dpFB=(padL+(yr7/years)*(600-padL-padR))*(svgW/600);
+        vLine.style.left=_dpFB+'px';vLine.style.display='block';
       }
-      if(vLine){vLine.style.left=px+'px';vLine.style.display='block';}
     }
     svgEl.addEventListener('mousemove',showTip);
     svgEl.addEventListener('touchmove',function(e3){e3.preventDefault();showTip(e3);},{passive:false});
@@ -32990,7 +33105,16 @@ function _cpRenderOutcomes(){
 
   // ── 2. Projected Outcomes ──
   var nw5=-CPLAN.totalDebt,nw10=-CPLAN.totalDebt,nw20=-CPLAN.totalDebt,nw30=-CPLAN.totalDebt,retBal30=0;
-  active.forEach(function(a){var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var b5=0,b10=0,b20=0,b30=0;for(var y=1;y<=30;y++){var c2=a.amount*12*cf;if(y<=5)b5=(b5+c2)*(1+rate);if(y<=10)b10=(b10+c2)*(1+rate);if(y<=20)b20=(b20+c2)*(1+rate);b30=(b30+c2)*(1+rate);}nw5+=b5;nw10+=b10;nw20+=b20;nw30+=b30;if(a.type!=='ef'&&a.type!=='debt'&&a.type!=='house')retBal30+=b30;});
+  active.forEach(function(a){var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);var b5=0,b10=0,b20=0,b30=0;for(var y=1;y<=30;y++){var c2=a.amount*12*cf;if(y<=5)b5=(b5+c2)*(1+rate);if(y<=10)b10=(b10+c2)*(1+rate);if(y<=20)b20=(b20+c2)*(1+rate);b30=(b30+c2)*(1+rate);}nw5+=b5;nw10+=b10;nw20+=b20;nw30+=b30;
+    // Retirement subtotal: exclude EF (specific-purpose liquidity bucket), pure debt
+    // (debt-elimination doesn't produce a retirement balance), and house (owner-occupied
+    // primary doesn't liquidate for retirement income). Include _ibcDebtStrategy debt
+    // allocations — those are real WL/IUL policies whose CV is a retirement asset post-
+    // debt-free. Without this clause, Tax-Free / Hybrid plans using IBC for debt see
+    // their YR30 retirement balance and Sustainable Monthly Income figures undercount
+    // the entire policy CV (often $100K-$500K at horizon).
+    if((a.type!=='ef'&&a.type!=='debt'&&a.type!=='house')||a._ibcDebtStrategy)retBal30+=b30;
+  });
   // Phase 2: convert balance → sustainable monthly income (PMT, 25-yr, 1% real),
   // and frame against user's stated retirement income target instead of 4% rule.
   var _retSustained=Math.round(_cpSustainableMonthly(retBal30,_cpYearsInRetirement(),0.01));
