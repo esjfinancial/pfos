@@ -7909,6 +7909,76 @@ window.addEventListener('message',async function(e){
         }
         _prevMainState=JSON.parse(JSON.stringify(state));
       }catch(e4){}
+      // ── RULE 3 POLICY LOAN SYNC (Add Expense → Policy Loan path) ──────────
+      // When the user logs an expense in pfos-main with payment method "policy
+      // loan", pfos-main's PFOS_QUICK_ADD handler increments the matching
+      // S.policies[].loanBalance (and pushes to S.policies[].loans[]) — this
+      // happens at line 10501-10510 of pfos-main. That state arrives here via
+      // the PFOS_DATA_CHANGE payload above. The IBC card in pfos-client reads
+      // a.loanBalance off the CPLAN allocation, NOT off S.policies, so we need
+      // to propagate. Walk every iul/wl/ibc allocation in CPLAN.allocations,
+      // find its matching policy in state.policies/state.ibcPolicies by
+      // carrier+policy_number, and copy over the loanBalance + loans[] + 
+      // loanRate fields. The matching CPLAN allocation's monthlyLoanRepay
+      // (the user's repayment slider value) is preserved — that's their input,
+      // not something pfos-main owns.
+      try{
+        if(typeof CPLAN!=='undefined'&&CPLAN.allocations&&CPLAN.allocations.length>0){
+          var _allPolicies=[].concat(state.policies||[]).concat(state.ibcPolicies||[]);
+          var _ibcLikeTypes={iul:1,wl:1,ibc:1};
+          var _syncTouched=false;
+          CPLAN.allocations.forEach(function(_a){
+            if(!_ibcLikeTypes[_a.type])return;
+            // Find matching policy. Try in order:
+            //   1. _policyId match (set by _cpSubmitCompletion or AI conversion)
+            //   2. carrier+policyNumber pair
+            //   3. carrier-only fallback (still useful — 1 policy per carrier
+            //      is the typical case)
+            var _match=null;
+            if(_a._policyId)_match=_allPolicies.find(function(p){return p.id===_a._policyId||p._policyId===_a._policyId;});
+            if(!_match){
+              var _aCarrier=(_a._carrier||_a.provider||'').toLowerCase();
+              var _aPolNum=(_a._policyNumber||'').toLowerCase();
+              _match=_allPolicies.find(function(p){
+                var _pC=(p.company||p.carrier||'').toLowerCase();
+                var _pN=(p.policyNumber||p.policy_number||'').toLowerCase();
+                if(!_aCarrier&&!_aPolNum)return false;
+                if(_aPolNum&&_pN)return _aCarrier===_pC&&_aPolNum===_pN;
+                return _aCarrier===_pC;
+              });
+            }
+            if(!_match)return;
+            var _newLoanBalance=parseFloat(_match.loanBalance)||0;
+            var _curLoanBalance=parseFloat(_a.loanBalance)||0;
+            if(_newLoanBalance!==_curLoanBalance){
+              _a.loanBalance=_newLoanBalance;
+              _syncTouched=true;
+            }
+            // Mirror loans[] (the per-loan audit trail). Replace wholesale so
+            // pfos-main is the source of truth for which loans exist.
+            if(Array.isArray(_match.loans)){
+              var _matchLoansStr=JSON.stringify(_match.loans);
+              var _curLoansStr=JSON.stringify(_a.loans||[]);
+              if(_matchLoansStr!==_curLoansStr){
+                _a.loans=JSON.parse(_matchLoansStr);
+                _syncTouched=true;
+              }
+            }
+            // Carrier-side loan rate (if pfos-main has it from an annual review
+            // or manual entry, prefer that over the plan default).
+            if(_match.loanRate&&_match.loanRate>0&&_a.loanRate!==_match.loanRate){
+              _a.loanRate=parseFloat(_match.loanRate);
+              _syncTouched=true;
+            }
+          });
+          if(_syncTouched){
+            try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(_e1){}
+            try{if(typeof _cpRender==='function')_cpRender();}catch(_e2){}
+            try{if(typeof cplanSave==='function')cplanSave();}catch(_e3){}
+            console.log('[PFOS] Rule 3 policy-loan sync: CPLAN allocations updated from pfos-main');
+          }
+        }
+      }catch(_loanSyncErr){console.warn('Policy-loan sync from pfos-main:',_loanSyncErr);}
     }catch(err){ console.warn('Client auto-save:',err); }
   }
 });
@@ -20794,6 +20864,21 @@ function _cpMigrateAllocationsToExtras(plan){
     if(cur>0){
       a.amount=Math.max(0,Math.round(a.amount-cur));
     }
+    // After converting to extras semantics, re-apply IRS cap so legacy plans
+    // that were saved with TOTAL > IRS-limit-extras don't keep their illegal
+    // surplus after migration. Example: legacy saved 401k at $2,434 total
+    // ($553 current + $1,881 extra), migration produces a.amount = $1,881 which
+    // exceeds the $1,489 extras-headroom IRS cap (2042 - 553). Without this
+    // clamp the user sees "Total $2,434/mo" on a card whose IRS rule allows
+    // only $2,042/mo. Clamp here so PP9/Enforce don't have to catch every
+    // load path separately.
+    if(typeof _cpIRSMax==='function'){
+      var _irsTypes=['roth','401k','roth401k','trad_ira','ira','solo401k','sep_ira','hsa','coverdell'];
+      if(_irsTypes.indexOf(a.type)>=0){
+        var _cap=_cpIRSMax(a.type,a);
+        if(a.amount>_cap)a.amount=Math.max(0,_cap);
+      }
+    }
   });
   plan._extrasSemantics=true;// stamp so subsequent loads skip
   return plan;
@@ -21243,6 +21328,52 @@ async function _arHandleFile(file){
       if(ed2.declaredRate)updateData.current_declared_rate=ed2.declaredRate;
     }
     await db.from('policy_tracking').update(updateData).eq('id',_arPolicyId);
+    // RULE 5: yearly review actuals override simulator projections on the plan
+    // view. Find any matching CPLAN allocation (iul/wl/ibc) whose carrier+policy
+    // number ties to this tracked policy, and overwrite a.loanBalance and the
+    // sourceLabel-displayed balance fields with the statement actuals. Without
+    // this, an uploaded statement updates the policy_tracking DB row and the
+    // historical actuals table — but the plan view's IBC card keeps showing
+    // simulator-computed values, and the user sees a stale loan balance even
+    // after they confirmed the real number via their carrier statement.
+    if(typeof CPLAN!=='undefined'&&CPLAN.allocations&&data.extractedData){
+      var _arTP=(APP._trackedPolicies||[]).find(function(p){return p.id===_arPolicyId;});
+      if(_arTP){
+        var _arCarrier=(_arTP.carrier||'').toLowerCase();
+        var _arPolNum=(_arTP.policy_number||'').toLowerCase();
+        var _arPolType=(_arTP.policy_type||'').toLowerCase();
+        // Determine allocation type from tracked policy type. iul/iul-product →
+        // 'iul'; whole life → 'wl'; IBC-flagged → 'ibc'. The annual review can
+        // affect any of these.
+        var _arAllocTypes=['iul','wl','ibc'];
+        var _arEd=data.extractedData;
+        CPLAN.allocations.forEach(function(_alloc){
+          if(_arAllocTypes.indexOf(_alloc.type)<0)return;
+          // Match by carrier OR policy number. Tolerant — either match wins so
+          // partial data still flows through. Allocations created from the AI
+          // before any policy linkage exists won't match and won't be touched.
+          var _allocCarrier=(_alloc._carrier||_alloc.provider||'').toLowerCase();
+          var _allocPolNum=(_alloc._policyNumber||'').toLowerCase();
+          var _carrierMatch=_arCarrier&&_allocCarrier&&_allocCarrier===_arCarrier;
+          var _polNumMatch=_arPolNum&&_allocPolNum&&_allocPolNum===_arPolNum;
+          if(!_carrierMatch&&!_polNumMatch)return;
+          // Statement actuals override simulator values.
+          if(typeof _arEd.loanBalance==='number')_alloc.loanBalance=parseFloat(_arEd.loanBalance)||0;
+          if(typeof _arEd.cashValue==='number')_alloc._cashValue=parseFloat(_arEd.cashValue)||_alloc._cashValue;
+          if(typeof _arEd.deathBenefit==='number')_alloc._deathBenefit=parseFloat(_arEd.deathBenefit)||_alloc._deathBenefit;
+          // Mark the allocation so downstream code knows its values are from an
+          // actual statement, not a simulator projection. The plan-view UI can
+          // use this to display "from your Apr 2026 statement" or similar.
+          _alloc._lastActualsDate=new Date().toISOString().split('T')[0];
+          _alloc._actualsSource='annual_review';
+        });
+        // Re-run the simulation so projections forward from the new actuals,
+        // then re-render the plan view to pick up the updated card values.
+        try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(_e1){}
+        try{if(typeof _cpRender==='function')_cpRender();}catch(_e2){}
+        try{if(typeof cplanSave==='function')cplanSave();}catch(_e3){}
+      }
+    }
     // Refresh tracked policies
     APP._trackedPoliciesLoaded=false;
     _loadTrackedPolicies();
@@ -25136,10 +25267,15 @@ function _cpRenderPlanV2(){
             var _recovEvent=_simEvents.find(function(ev){return ev.allocIdx===idx&&ev._ibcRecovery;});
             var _recovMonth=_recovEvent?_recovEvent.month:null;
             var _recovDate=_recovMonth?new Date(Date.now()+_recovMonth*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'}):'a future month';
-            var _loanRepayAmt=_ibcContEvent._ibcLoanRepayment||0;
             a.type='ibc';
             a.customName='Whole Life Policy — Continuation';
-            a.reason='Your high-rate debts are paid off via policy loans. You\'ll continue paying $'+fmt(_origAmount)+'/mo as policy premium AND $'+fmt(_loanRepayAmt)+'/mo (the freed debt minimums) toward policy loan repayment until '+_recovDate+'. A new phase will appear at that point when the policy loans are fully repaid (CV=AV) and that $'+fmt(_loanRepayAmt)+'/mo of freed minimums becomes available to redistribute to other growth allocations.';
+            // Reason text intentionally omits specific dollar amounts because the
+            // existing loan-repayment UI section (rendered below the slider in
+            // _cpBuildCard when a.loanBalance > 0) now surfaces the outstanding
+            // balance, monthly repayment slider, and projected payoff timeline.
+            // Without omission, the dollar amounts would be stated twice and
+            // could drift out of sync if the user adjusts the repayment slider.
+            a.reason='Your high-rate debts are paid off via policy loans. Premium continues at the same amount as before. The freed debt minimums now flow toward repaying the policy loan — see the loan-repayment slider below to adjust how much per month, and the "paid off in ~X months" estimate. A new phase will appear around '+_recovDate+' when the policy loans are fully repaid (CV=AV) and that money becomes available to redistribute to other growth allocations.';
           }
           // Phase-cumulative amount swap (existing behavior)
           if(!_ibcContinuationActive && phaseAmt!==a.amount)a.amount=phaseAmt;
@@ -25341,12 +25477,39 @@ function _cpBuildCard(a,idx,isUnassigned){
   } else if(a.amount>0&&!_isActionOnly&&CPLAN._sim&&CPLAN._sim.allocFuture){
     var _af2=CPLAN._sim.allocFuture[idx];
     if(_af2&&_af2.boosts&&_af2.boosts.length>0&&_af2.futureAmount>a.amount){
-      var _firstBoost=_af2.boosts[0];
-      var _boostDate=new Date(_nowDate.getTime()+_firstBoost.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'});
-      var _cappedBoost=Math.min(_af2.futureAmount,_cpIRSMax(a.type,a));
-      h+='<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;margin-top:6px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.1);border-radius:3px">';
-      h+='<span style="font-size:13px">📈</span>';
-      h+='<div style="font-size:12px;color:#5B9BFF">'+fmt(a.amount)+'/mo now → '+fmt(_cappedBoost)+'/mo after '+_firstBoost.from+' ('+_boostDate+')</div></div>';
+      // Phase-scope: derive the current phase's trigger month (when this phase
+      // started) so we surface only the NEXT boost — not boosts[0], which is
+      // typically the EF cascade that already fired by Phase 2+. Without this
+      // scoping, the indicator perpetually claims "$X/mo now → $Y/mo after EF
+      // funded" even in Phase 3 where EF was already funded two phases ago.
+      // CPLAN._activePhaseTab holds the currently-viewed phase; we look up its
+      // trigger month from _sim.events (the same source _phaseTriggers uses in
+      // _cpRenderPlanV2). For Phase 1 view, the trigger month is 0 — so the
+      // indicator still reports boosts[0], preserving the pre-fix behavior.
+      var _activePhaseHere=parseInt(CPLAN._activePhaseTab)||1;
+      var _curPhaseTrigMonth=0;
+      if(_activePhaseHere>1&&CPLAN._sim.events&&CPLAN._sim.events.length){
+        var _phaseTrigEvents=CPLAN._sim.events.filter(function(e){return (e.freed>0||e._ibcContinues>0)&&e.type!=='debt_milestone'&&(e.month||0)>0;});
+        var _phaseEv=_phaseTrigEvents[_activePhaseHere-2];// event N → phase N+2
+        if(_phaseEv)_curPhaseTrigMonth=_phaseEv.month||0;
+      }
+      // Find the next boost strictly AFTER the current phase's trigger month.
+      // If none exists, hide the indicator entirely (all this allocation's
+      // boosts have already fired by the current phase view).
+      var _nextBoost=_af2.boosts.find(function(b){return (b.month||0)>_curPhaseTrigMonth;});
+      if(_nextBoost){
+        var _boostDate=new Date(_nowDate.getTime()+_nextBoost.month*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'});
+        // futureAmount is the FINAL post-all-cascades amount. For the next-boost
+        // display we want the amount AS OF that specific boost, not the final.
+        // Sum a.amount + every boost month <= _nextBoost.month for the more
+        // accurate next-phase target.
+        var _amtAtNextBoost=(parseFloat(a.amount)||0);
+        _af2.boosts.forEach(function(b){if((b.month||0)<=_nextBoost.month)_amtAtNextBoost+=(b.amount||0);});
+        var _cappedBoost=Math.min(_amtAtNextBoost,_cpIRSMax(a.type,a));
+        h+='<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;margin-top:6px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.1);border-radius:3px">';
+        h+='<span style="font-size:13px">📈</span>';
+        h+='<div style="font-size:12px;color:#5B9BFF">'+fmt(a.amount)+'/mo now → '+fmt(_cappedBoost)+'/mo after '+_nextBoost.from+' ('+_boostDate+')</div></div>';
+      }
     }
   }
   // ── Date range indicator for funded items ──
@@ -25673,23 +25836,41 @@ function _cpBuildCard(a,idx,isUnassigned){
       } catch(_chartErr){ /* fail silently — chart is enhancement, not core */ }
       
       // ── Active loan tracking + repayment slider + Add Loan button ──
+      // RULE: All policy loans against this policy roll into a SINGLE combined
+      // balance regardless of source (1 loan of $1K, 10 loans of $100, AI-
+      // emitted continuation loan + user-added Add Expense loan — all combined).
+      // Repayment is also a single combined number. The a.loans[] array is
+      // preserved for audit (each entry has purpose + originationDate so the
+      // user can see what individual loans were taken), but the active-loan
+      // display shows ONE row with the combined balance.
       var _ibcLoans = a.loans || [];
       var _ibcLoanBalance = a.loanBalance || 0;
       if(_ibcLoanBalance > 0 || _ibcLoans.length > 0){
         h += '<div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(234,179,8,.15)">';
-        h += '<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Active policy loans</div>';
-        if(_ibcLoans.length > 0){
-          _ibcLoans.forEach(function(loan, li){
-            var _lAmt = parseFloat(loan.amount) || 0;
-            var _lRate = ((loan.rate || 0.05) * 100).toFixed(1);
-            h += '<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 8px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:3px;margin-bottom:4px">';
-            h += '<div style="flex:1;min-width:0"><div style="font-size:13px;color:var(--wh);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(loan.purpose||'Loan')+'</div>';
-            h += '<div style="font-size:12px;color:var(--mu)">'+fmt(_lAmt)+' @ '+_lRate+'%</div></div>';
-            h += '</div>';
-          });
-        } else {
-          h += '<div style="font-size:13px;color:var(--mu);padding:4px 0">Total loan balance: <strong style="color:var(--wh);font-family:var(--fd,monospace)">'+fmt(_ibcLoanBalance)+'</strong></div>';
+        h += '<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Active policy loan</div>';
+        // Combined balance row. If a.loanBalance is set directly (the canonical
+        // total — populated by the IBC debt-strategy simulator OR by Add Expense
+        // policy-loan flow OR by annual review override) use it. Otherwise fall
+        // back to summing a.loans[]. Show count of source loans as informational
+        // detail when there are multiple individual entries.
+        var _combinedBalance = _ibcLoanBalance > 0
+          ? _ibcLoanBalance
+          : _ibcLoans.reduce(function(t, l){ return t + (parseFloat(l.amount) || 0); }, 0);
+        h += '<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 9px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:3px;margin-bottom:4px">';
+        h += '<div style="flex:1;min-width:0">';
+        h += '<div style="font-size:13px;color:var(--wh);font-weight:600">Total loan balance</div>';
+        if(_ibcLoans.length > 1){
+          // Multiple individual loans rolled in — note the count so users
+          // understand the combined balance includes everything. Specific per-
+          // loan history is preserved in a.loans[] and can be surfaced in the
+          // policy-detail screen if needed.
+          h += '<div style="font-size:11px;color:var(--mu)">'+_ibcLoans.length+' loans combined</div>';
+        } else if(_ibcLoans.length === 1 && _ibcLoans[0].purpose){
+          h += '<div style="font-size:11px;color:var(--mu)">'+esc(_ibcLoans[0].purpose)+'</div>';
         }
+        h += '</div>';
+        h += '<div style="font-family:var(--fd,monospace);font-size:14px;color:var(--wh);font-weight:700">'+fmt(_combinedBalance)+'</div>';
+        h += '</div>';
         // Repayment slider — sets a.monthlyLoanRepay directly. Slider cap is the
         // smaller of (current loan balance) and (current available surplus + already-allocated
         // amount on this card). Updates the "paid off in X mo" label live as user drags.
@@ -26764,118 +26945,6 @@ function _cpBuildTimeline(){
   // ═══════════════════════════════════════════════════════════════════════════
   var h='<div id="cpTimelineRoot" style="margin-bottom:16px">';
 
-  // ── Plan Milestones (per-phase tracks) ──
-  h+='<div style="padding:18px 22px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:12px">';
-  h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">';
-  h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">PLAN MILESTONES</div>';
-  h+='<div style="font-family:var(--fh);font-size:12px;color:var(--mu)">';
-  h+='You are here: <span style="color:#5B9BFF;font-weight:700">'+_tlFmt(monthsElapsed)+'</span> · '+monthsElapsed+' month'+(monthsElapsed===1?'':'s')+' in';
-  h+='</div></div>';
-  // Legend
-  h+='<div style="display:flex;gap:14px;margin-bottom:14px;font-size:12px;color:var(--mu);flex-wrap:wrap">';
-  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:#5B9BFF;border:2px solid var(--bg-card);box-shadow:0 0 0 1.5px #5B9BFF"></span>You are here</span>';
-  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(34,197,94,.7)"></span>Completed</span>';
-  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:rgba(91,155,255,.4);border:1px dashed rgba(91,155,255,.6)"></span>Future</span>';
-  h+='<span style="display:flex;align-items:center;gap:5px"><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#06B6D4"></span>Catch-up</span>';
-  h+='</div>';
-
-  if(!phases.length||phases.every(function(p){return!phaseMilestonesByPhase[p].length&&p!==1;})){
-    h+='<div style="text-align:center;padding:18px;color:var(--mu);font-size:13px">Add allocations to see your plan timeline.</div>';
-  } else {
-    phases.forEach(function(p){
-      var status=_phaseStatus(p);
-      var pStart=phaseStartByPhase[p]||0;
-      var pEnd=phaseEndByPhase[p]||horizon;
-      // Display window — pad ends slightly so milestones at boundaries don't get clipped
-      var visMin=Math.max(0,pStart-1);
-      var visMax=Math.max(visMin+12,pEnd+1);
-      var pColor=_phaseColor(p);
-      var phaseName=CPLAN['_phase'+p+'Name']||'Phase '+p;
-      // Phase header row
-      var statusBadge='';
-      if(status==='completed'){
-        statusBadge='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:#22C55E;background:rgba(34,197,94,.1);padding:3px 8px;border-radius:2px;letter-spacing:.08em">✓ COMPLETED</span>';
-      } else if(status==='current'){
-        statusBadge='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;background:rgba(91,155,255,.12);padding:3px 8px;border-radius:2px;letter-spacing:.08em">● ACTIVE</span>';
-      } else {
-        statusBadge='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--mu);background:rgba(100,116,139,.1);padding:3px 8px;border-radius:2px;letter-spacing:.08em">STARTS '+_relMonths(pStart).toUpperCase()+'</span>';
-      }
-      h+='<div style="margin-bottom:18px">';
-      h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
-      h+='<div style="display:flex;align-items:center;gap:8px"><div style="width:6px;height:14px;background:'+pColor+';border-radius:1px"></div><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+phaseName+'</span>'+statusBadge+'</div>';
-      h+='<div style="font-size:12px;color:var(--mu);font-family:var(--fh)">'+_tlFmt(visMin)+' → '+_tlFmt(visMax)+'</div>';
-      h+='</div>';
-      // Track wrapper — 2 label rows above the bar, 2 below
-      var milestones=phaseMilestonesByPhase[p]||[];
-      var placed=_placeLabels(milestones,3,97,visMin,visMax);
-      // Compute youAreHerePct on this phase's window — clamp into visible range
-      var yahPct=null;
-      if(monthsElapsed>=visMin&&monthsElapsed<=visMax){
-        yahPct=3+((monthsElapsed-visMin)/Math.max(1,visMax-visMin))*94;
-      }
-      // ── Top label row (above bar) — only row 0 ──
-      h+='<div style="position:relative;height:28px;margin:0 6px">';
-      placed.forEach(function(it){
-        if(it.row!==0)return;
-        h+='<div style="position:absolute;left:'+it.pct+'%;bottom:0;transform:translateX(-50%);text-align:center;max-width:140px">';
-        h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
-        h+='<div style="font-size:10px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
-        h+='</div>';
-      });
-      h+='</div>';
-      // ── The actual bar ──
-      // Phase status determines fill: completed = solid green, current = filled to YAH point
-      var barBgColor='rgba(91,155,255,.06)';
-      var barBdColor='rgba(91,155,255,.18)';
-      if(status==='completed'){barBgColor='rgba(34,197,94,.15)';barBdColor='rgba(34,197,94,.4)';}
-      else if(status==='current'){barBgColor='rgba(91,155,255,.08)';barBdColor='rgba(91,155,255,.25)';}
-      else {barBgColor='rgba(100,116,139,.05)';barBdColor='rgba(100,116,139,.18)';}
-      h+='<div style="position:relative;height:14px;margin:0 6px;background:'+barBgColor+';border:1px solid '+barBdColor+';border-radius:7px;'+(status==='future'?'border-style:dashed;':'')+'">';
-      // Filled portion (current or completed phases)
-      if(status==='completed'){
-        h+='<div style="position:absolute;inset:0;background:linear-gradient(90deg,rgba(34,197,94,.5),rgba(34,197,94,.3));border-radius:7px"></div>';
-      } else if(status==='current'&&yahPct!=null){
-        h+='<div style="position:absolute;left:0;top:0;bottom:0;width:'+yahPct+'%;background:linear-gradient(90deg,rgba(91,155,255,.4),rgba(91,155,255,.2));border-radius:7px 0 0 7px"></div>';
-      }
-      // Milestone dots on the bar
-      placed.forEach(function(it){
-        var isPast=it.month<=monthsElapsed;
-        h+='<div style="position:absolute;left:'+it.pct+'%;top:50%;transform:translate(-50%,-50%);width:10px;height:10px;border-radius:50%;background:'+it.color+';border:2px solid var(--bg-card);box-shadow:0 0 0 1.5px '+it.color+(isPast?'':';opacity:.7')+(it.catchUp?';animation:pulse 2s infinite':'')+';z-index:2"';
-        h+=' title="'+it.label+' — '+it.dateLabel+'"></div>';
-      });
-      // "You are here" diamond marker on this phase's bar (if it falls within window)
-      if(yahPct!=null){
-        h+='<div style="position:absolute;left:'+yahPct+'%;top:50%;transform:translate(-50%,-50%) rotate(45deg);width:14px;height:14px;background:#5B9BFF;border:2px solid var(--bg-card);box-shadow:0 0 0 2px #5B9BFF,0 0 12px rgba(91,155,255,.6);z-index:3"></div>';
-      }
-      h+='</div>';
-      // ── Bottom label rows (below bar) — rows 1 and 2 stacked ──
-      h+='<div style="position:relative;height:28px;margin:0 6px;margin-top:4px">';
-      placed.forEach(function(it){
-        if(it.row!==1)return;
-        h+='<div style="position:absolute;left:'+it.pct+'%;top:0;transform:translateX(-50%);text-align:center;max-width:140px">';
-        h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
-        h+='<div style="font-size:10px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
-        h+='</div>';
-      });
-      h+='</div>';
-      // Row 2: only render if any items live there (extra row of clearance)
-      var hasRow2=placed.some(function(it){return it.row===2;});
-      if(hasRow2){
-        h+='<div style="position:relative;height:28px;margin:0 6px;margin-top:2px">';
-        placed.forEach(function(it){
-          if(it.row!==2)return;
-          h+='<div style="position:absolute;left:'+it.pct+'%;top:0;transform:translateX(-50%);text-align:center;max-width:140px">';
-          h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
-          h+='<div style="font-size:10px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
-          h+='</div>';
-        });
-        h+='</div>';
-      }
-      h+='</div>';// phase block
-    });
-  }
-
-  h+='</div>';// Plan Milestones panel
 
   // ── Wealth Trajectory ──
   // Net-worth threshold markers at the year they're projected to be hit
@@ -27891,6 +27960,12 @@ function _cpAvailableBudget(excludeIdx){
   CPLAN.allocations.forEach(function(a,i){
     if(i===excludeIdx)return;
     deployed+=(parseFloat(a.amount)||0);
+    // Policy-loan repayment competes for the same pool as the regular sliders.
+    // Without this, dragging the IBC loan-repayment slider up doesn't shrink
+    // other sliders' available budget — pool double-spends. (The IBC slider's
+    // own cap subtracts only THIS allocation's existing repay via _availSurplus
+    // + _ibcRepay at line 25704, so the conflict only shows up across cards.)
+    if(a&&a.monthlyLoanRepay>0)deployed+=parseFloat(a.monthlyLoanRepay)||0;
     if(a&&a._completed&&a._staticPremium>0&&_premTypes[a.type]&&(a._staticFreq==null||a._staticFreq==='monthly')){
       staticPremiums+=parseFloat(a._staticPremium)||0;
     }
@@ -29289,11 +29364,18 @@ function _ibcProjectPolicy(policy, fromMonth, toMonth){
 
 // ═══════════════════════════════════════════════════════════════════════════
 
-function _cpCalcIBCDebt(debts,budget){
+function _cpCalcIBCDebt(debts,budget,userRepayOverride){
   if(!debts||!debts.length||budget<=0)return null;
   var surplus=CPLAN.surplus||0;
   if(surplus<200)return{eligible:false,reason:'Need at least $200/mo positive cash flow.'};
   if(CPLAN.totalDebt<=0)return{eligible:false,reason:'No active debts.'};
+  // RULE 8: when the user has adjusted the loan-repayment slider on the IBC
+  // continuation card, that amount overrides the simulator's auto-computed
+  // freed-minimums during the post-debt-free recovery phase. Without this,
+  // changing the slider has no effect on Phase 3's arrival time — the sim
+  // keeps using its own pool and the new phase's date doesn't shift. The
+  // override is non-null when set; null/undefined means use auto behavior.
+  var _userRepay=(typeof userRepayOverride==='number'&&userRepayOverride>=0)?userRepayOverride:null;
   // ── True IBC mechanics ──────────────────────────────────────────────────
   // 1. ALL of "budget" (the user's extra) flows to the policy each month.
   //    Debts get only their minimum payments during accumulation phase.
@@ -29365,7 +29447,17 @@ function _cpCalcIBCDebt(debts,budget){
       var loanInterest=totalLoanBalance*loanAnnRate/12;
       totalLoanInt+=loanInterest;
       totalLoanBalance+=loanInterest;
-      var loanPayment=Math.min(totalLoanFreedMins,totalLoanBalance);
+      // RULE 8 override: when the user has set a specific monthly repayment
+      // amount via the IBC repayment slider, that becomes the authoritative
+      // loan-payment value (clamped at the outstanding balance). The natural
+      // freed-minimums logic still drives the accumulation phase (each card
+      // clearing redirects its minimum), so this only takes effect once the
+      // sim is past origFreeMonth (all debts loan-paid-off). Before that, the
+      // mechanic IS the freed minimums redirecting and we let the sim run.
+      var _baseLoanPmt=totalLoanFreedMins;
+      var _allDebtsPaid=ds.every(function(d){return d.paid||d.bal<0.01;});
+      if(_userRepay!=null&&_allDebtsPaid)_baseLoanPmt=_userRepay;
+      var loanPayment=Math.min(_baseLoanPmt,totalLoanBalance);
       totalLoanBalance-=loanPayment;
       if(totalLoanBalance<0.01)totalLoanBalance=0;
     }
@@ -29507,6 +29599,15 @@ function _cpRenderDebtEngine(debtAlloc,idx){
       h+='<span style="font-size:14px">🏛️</span><div style="flex:1"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#A855F7">IBC (Whole Life): Accumulate & Loan</div>';
       h+='<div style="font-size:12px;color:var(--mu)">Build cash value, pay debts via policy loans → debts gone month '+ibc.months+', keep '+fmtK(ibc.vehicle)+' cash value</div></div>';
       h+='<button onclick="_cpSelectIBCStrategy()" style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;background:'+(CPLAN.debtStrategy==='ibc'?'rgba(168,85,247,.15)':'transparent')+';border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:2px;min-height:28px">Select</button></div>';
+      // Option A/B chooser — same chooser the DETAILED mode shows, surfaced
+      // here so guided-mode users (the majority) can pick what happens at
+      // CV=AV recovery. Without this, they're stuck on the 'continue' default
+      // because the chooser was only rendered inside the detailed branch
+      // below. Gated on IBC being the selected strategy so non-IBC users
+      // don't see the question.
+      if(CPLAN.debtStrategy==='ibc'){
+        h+=_cpRenderIBCEndChoice(ibc,debtAlloc,idx);
+      }
     } else if(ibc&&!ibc.eligible){
       h+='<div style="font-size:12px;color:var(--mu);padding:4px 0">🏛️ IBC: '+ibc.reason+'</div>';
     }
@@ -29577,43 +29678,57 @@ function _cpRenderDebtEngine(debtAlloc,idx){
         h+='<span style="font-family:var(--fh);font-weight:700;color:var(--gr)">Mo '+e.month+'</span>';
         h+='</div>';
       });
-      // ── Post-payoff choice — Option A (continue) vs Option B (cancel + tax) ──
-      // Once policy loans are fully repaid (CV=AV recovery month), the user faces a
-      // genuine choice: keep the policy and let it continue compounding (with the
-      // freed minimums redistributing to other growth), or surrender it to take the
-      // CV as a lump sum (with tax on the gain).
-      var _ibcChoiceCurrent=(debtAlloc._ibcEndChoice||'continue');
-      var _ibcCV=ibc.vehicle||0;
-      var _ibcPremiums=(ibc._totalPremiumsPaid||(ibc.budget*ibc.fullFreeMonth));
-      var _ibcGain=Math.max(0,_ibcCV-_ibcPremiums);
-      // Marginal-rate estimate: use the same household calc the tax tab uses, fallback 24%
-      var _ibcMarginal=(typeof CPLAN._marginalRate==='number'&&CPLAN._marginalRate>0)?(CPLAN._marginalRate/100):0.24;
-      var _ibcTaxHit=Math.round(_ibcGain*_ibcMarginal);
-      var _ibcAfterTax=_ibcCV-_ibcTaxHit;
-      h+='<div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(168,85,247,.15)">';
-      h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:6px">After CV=AV Recovery (Month '+ibc.fullFreeMonth+'): What\'s your plan?</div>';
-      h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
-      // Option A — continue
-      var _aSel=(_ibcChoiceCurrent==='continue');
-      h+='<div onclick="_cpSetIbcEndChoice('+idx+',\'continue\')" style="padding:10px;cursor:pointer;border-radius:2px;border:1px solid '+(_aSel?'rgba(168,85,247,.5)':'var(--bd)')+';background:'+(_aSel?'rgba(168,85,247,.1)':'transparent')+'">';
-      h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(_aSel?'#A855F7':'var(--wh)')+';margin-bottom:4px">'+(_aSel?'✓ ':'')+'Option A: Keep the policy</div>';
-      h+='<div style="font-size:12px;color:var(--mu);line-height:1.45">Freed minimums redistribute to growth via cascade. Extra ('+fmt(debtAlloc.amount)+'/mo) keeps funding the policy. CV available for future big purchases or retirement income.</div>';
-      h+='</div>';
-      // Option B — cancel
-      var _bSel=(_ibcChoiceCurrent==='cancel');
-      h+='<div onclick="_cpSetIbcEndChoice('+idx+',\'cancel\')" style="padding:10px;cursor:pointer;border-radius:2px;border:1px solid '+(_bSel?'rgba(239,68,68,.5)':'var(--bd)')+';background:'+(_bSel?'rgba(239,68,68,.08)':'transparent')+'">';
-      h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(_bSel?'var(--rd)':'var(--wh)')+';margin-bottom:4px">'+(_bSel?'✓ ':'')+'Option B: Cancel & take CV</div>';
-      h+='<div style="font-size:12px;color:var(--mu);line-height:1.45">Surrender lump sum '+fmtK(_ibcCV)+'. Est. tax on '+fmtK(_ibcGain)+' gain at '+Math.round(_ibcMarginal*100)+'%: <span style="color:var(--rd);font-weight:700">−'+fmtK(_ibcTaxHit)+'</span>. Net: <span style="color:var(--gr);font-weight:700">'+fmtK(_ibcAfterTax)+'</span>. Extra + minimums fully redistribute.</div>';
-      h+='</div>';
-      h+='</div>';
-      if(_bSel){
-        h+='<div style="margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.12);border-radius:2px;font-size:12px;color:var(--mu);line-height:1.5">⚠️ <strong style="color:var(--rd)">Heads up:</strong> Cancelling means you lose future compound growth on the CV (~4% on a WL base). Run this past a licensed agent before committing — the math can shift meaningfully depending on your age, the policy structure, and what you do with the proceeds.</div>';
-      }
-      h+='</div>';
+      // ── Post-payoff choice rendered via shared helper (works for both modes)
+      h+=_cpRenderIBCEndChoice(ibc,debtAlloc,idx);
       h+='<div style="font-size:12px;color:var(--mu);margin-top:6px;line-height:1.5"><strong style="color:var(--yl)">Conceptual illustration only.</strong> 5% vehicle growth and 5% loan interest are illustrative. A licensed professional must evaluate suitability.</div>';
       h+='<button onclick="document.getElementById(\'frTopic\').value=\'debt\';openFreeReviewRequest()" style="margin-top:6px;padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:2px;min-height:30px">Talk to a Professional About This Strategy</button>';
       h+='</div>';
     }
+  }
+  h+='</div>';
+  return h;
+}
+
+// ── _cpRenderIBCEndChoice ──────────────────────────────────────────────────
+// Shared helper that renders the Option A (keep policy) vs Option B (surrender
+// for lump sum) selector for an IBC debt strategy. Previously this UI lived
+// inline inside the DETAILED-mode branch of _cpRenderDebtEngine, which meant
+// guided-mode users (CPLAN.mode !== 'detailed') had no way to pick — they
+// were silently stuck on the default 'continue'. Now both modes call this
+// helper so the choice is always available when IBC is selected.
+//
+// Returns the HTML for the chooser block (no wrapping container — caller
+// adds margin/border as needed). Reads + writes debtAlloc._ibcEndChoice
+// via _cpSetIbcEndChoice.
+function _cpRenderIBCEndChoice(ibc,debtAlloc,idx){
+  if(!ibc||!ibc.eligible)return'';
+  if(!debtAlloc||debtAlloc.type!=='debt')return'';
+  var _ibcChoiceCurrent=(debtAlloc._ibcEndChoice||'continue');
+  var _ibcCV=ibc.vehicle||0;
+  var _ibcPremiums=(ibc._totalPremiumsPaid||(ibc.budget*ibc.fullFreeMonth));
+  var _ibcGain=Math.max(0,_ibcCV-_ibcPremiums);
+  // Marginal-rate estimate: use the same household calc the tax tab uses, fallback 24%
+  var _ibcMarginal=(typeof CPLAN._marginalRate==='number'&&CPLAN._marginalRate>0)?(CPLAN._marginalRate/100):0.24;
+  var _ibcTaxHit=Math.round(_ibcGain*_ibcMarginal);
+  var _ibcAfterTax=_ibcCV-_ibcTaxHit;
+  var h='<div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(168,85,247,.15)">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#A855F7;margin-bottom:6px">After CV=AV Recovery (Month '+ibc.fullFreeMonth+'): What\'s your plan?</div>';
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
+  // Option A — continue
+  var _aSel=(_ibcChoiceCurrent==='continue');
+  h+='<div onclick="_cpSetIbcEndChoice('+idx+',\'continue\')" style="padding:10px;cursor:pointer;border-radius:2px;border:1px solid '+(_aSel?'rgba(168,85,247,.5)':'var(--bd)')+';background:'+(_aSel?'rgba(168,85,247,.1)':'transparent')+'">';
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(_aSel?'#A855F7':'var(--wh)')+';margin-bottom:4px">'+(_aSel?'✓ ':'')+'Option A: Keep the policy</div>';
+  h+='<div style="font-size:12px;color:var(--mu);line-height:1.45">Freed minimums redistribute to growth via cascade. Extra ('+fmt(debtAlloc.amount)+'/mo) keeps funding the policy. CV available for future big purchases or retirement income.</div>';
+  h+='</div>';
+  // Option B — cancel
+  var _bSel=(_ibcChoiceCurrent==='cancel');
+  h+='<div onclick="_cpSetIbcEndChoice('+idx+',\'cancel\')" style="padding:10px;cursor:pointer;border-radius:2px;border:1px solid '+(_bSel?'rgba(239,68,68,.5)':'var(--bd)')+';background:'+(_bSel?'rgba(239,68,68,.08)':'transparent')+'">';
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+(_bSel?'var(--rd)':'var(--wh)')+';margin-bottom:4px">'+(_bSel?'✓ ':'')+'Option B: Cancel & take CV</div>';
+  h+='<div style="font-size:12px;color:var(--mu);line-height:1.45">Surrender lump sum '+fmtK(_ibcCV)+'. Est. tax on '+fmtK(_ibcGain)+' gain at '+Math.round(_ibcMarginal*100)+'%: <span style="color:var(--rd);font-weight:700">−'+fmtK(_ibcTaxHit)+'</span>. Net: <span style="color:var(--gr);font-weight:700">'+fmtK(_ibcAfterTax)+'</span>. Extra + minimums fully redistribute.</div>';
+  h+='</div>';
+  h+='</div>';
+  if(_bSel){
+    h+='<div style="margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.12);border-radius:2px;font-size:12px;color:var(--mu);line-height:1.5">⚠️ <strong style="color:var(--rd)">Heads up:</strong> Cancelling means you lose future compound growth on the CV (~4% on a WL base). Run this past a licensed agent before committing — the math can shift meaningfully depending on your age, the policy structure, and what you do with the proceeds.</div>';
   }
   h+='</div>';
   return h;
@@ -30124,6 +30239,11 @@ function _cpIBCRepayCommit(idx){
   if(!a)return;
   // Amount already persisted by the slide handler; just persist + recompute now.
   _cpMarkModified();
+  // Propagate to other sliders: the loan-repayment competes for the same pool
+  // as the main allocation sliders, so OTHER sliders' caps must shrink/grow to
+  // reflect the new available budget. Mirrors what _cpSlide does for the
+  // regular slider grid. refreshMax:true forces a recompute (not just the note).
+  if(typeof _cpUpdateSliderCaps==='function')_cpUpdateSliderCaps(idx,{refreshMax:true});
   try{if(typeof _cpRunSimulation === 'function')_cpRunSimulation();}catch(e){}
   _cpRender();
 }
@@ -31742,7 +31862,13 @@ function _cpRunSimulation(){
       // 100% of debtA.amount flows to the policy as premium. Debts get minimums only.
       // _cpCalcIBCDebt produces accurate timing for both debt-free and CV=AV recovery,
       // matching the visualization on the debt card.
-      var ibcSim=_cpCalcIBCDebt(hiRateDebts,debtA.amount);
+      // Pass debtA.monthlyLoanRepay as the user-repay override so when the user
+      // adjusts the loan-repayment slider on the IBC continuation card, the
+      // sim recomputes the loan-paydown trajectory accordingly. The override is
+      // ignored before all debts are loan-paid-off (the accumulation phase
+      // continues to use freed-minimums naturally).
+      var _userRepayInput=(typeof debtA.monthlyLoanRepay==='number'&&debtA.monthlyLoanRepay>0)?debtA.monthlyLoanRepay:null;
+      var ibcSim=_cpCalcIBCDebt(hiRateDebts,debtA.amount,_userRepayInput);
       if(ibcSim&&ibcSim.eligible){
         var ibcDebtFreeMonth=ibcSim.months;
         var ibcFullFreeMonth=ibcSim.fullFreeMonth;
@@ -31759,6 +31885,13 @@ function _cpRunSimulation(){
           debtOrder:ibcSim.payoffLog.map(function(p){return{name:p.name,month:p.month};}),
           _ibcContinues:debtA.amount,
           _ibcLoanRepayment:hiRateMin,
+          // Loan balance at debt-free month, read from the IBC sim series. The
+          // sim tracks per-month loanBal; at debt-free month the balance is what
+          // the policy owes itself after all debt-payoff loans were taken out.
+          // Consumer (_cpRunSimulation cascade engine) populates a.loanBalance
+          // from this value so the existing loan-repayment slider UI can display
+          // the correct outstanding balance and project the payoff timeline.
+          _ibcLoanBalance:(ibcSim.series&&ibcSim.series[ibcDebtFreeMonth-1]&&ibcSim.series[ibcDebtFreeMonth-1].loanBal)||0,
           allocIdx:CPLAN.allocations.indexOf(debtA)
         });
         // Event 2: at CV=AV recovery month — policy loans are paid off. Branch on user choice.
@@ -31877,22 +32010,47 @@ function _cpRunSimulation(){
       var dOwn=destOwner||'self';
       return dOwn===_srcOwner||dOwn==='joint';
     };
-    // IBC debt strategy: reclassify IBC premium as growth allocation when debt completes
+    // IBC debt strategy: at the debt-free milestone, the WL/IBC policy carries
+    // a loan balance to itself (= sum of debts paid off via policy loans, with
+    // accumulated simple interest). The continuation card transformation (in
+    // _cpRenderPlanV2's active-render block) flips the visual from "Debt" to
+    // "Whole Life Policy — Continuation". Critically: the premium ALLOCATION
+    // amount stays the same — no new dollar appears just because debts cleared.
+    // The freed debt minimums are NOT a cascade boost to the policy card; they
+    // are dollars the user is now committing to repaying the policy's loan to
+    // itself (separate from premium). They populate the standard a.loanBalance
+    // / a.monthlyLoanRepay fields so the EXISTING loan-repayment slider UI
+    // surfaces them with proper controls. When the user adjusts repayment up
+    // or down, _cpIBCRepayCommit re-runs this simulation and the next phase's
+    // arrival shifts to reflect the new payoff timeline.
     if(ev._ibcContinues&&ev._ibcContinues>0){
-      var ibcIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='ibc'&&ibcIdx<0)ibcIdx=i2;});
-      if(ibcIdx<0){
-        // No existing IBC allocation — find the debt allocation and note the continuation
-        var dIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='debt'&&dIdx<0)dIdx=i2;});
-        if(dIdx>=0){
-          allocFuture[dIdx].boosts.push({month:ev.month,amount:ev._ibcContinues,from:'IBC premium continues as growth vehicle'});
-          allocFuture[dIdx]._ibcContinuation=ev._ibcContinues;
+      // Find the debt allocation (it's about to become an IBC continuation card)
+      var dIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='debt'&&dIdx<0)dIdx=i2;});
+      if(dIdx>=0){
+        // Populate loan-repayment fields ONLY if not already set by user input or
+        // annual-review override. Preserves user adjustments across re-renders.
+        var _dA=CPLAN.allocations[dIdx];
+        // Loan balance at debt-free month = the simulator's tracked policy loan
+        // balance at that moment. ibcSim.series carries per-month loanBal but we
+        // don't have direct access here; ev.month is debt-free month and the IBC
+        // sim's totalLoanBalance at this point is what's owed. The sim function
+        // _cpCalcIBCDebt computes this; the cascade event ev._ibcLoanBalance
+        // carries it forward when set. Falls back to summing high-rate debt
+        // balances as a reasonable approximation when the field isn't populated.
+        var _loanBalAtDebtFree=ev._ibcLoanBalance||0;
+        if(_loanBalAtDebtFree<=0){
+          // Approximation: sum original high-rate debt balances (the loans were
+          // taken to pay off these debts, so this is the principal owed).
+          _loanBalAtDebtFree=(CPLAN.debts||[]).reduce(function(t,d){
+            return t+((parseFloat(d.rate)||0)>10?(parseFloat(d.balance)||0):0);
+          },0);
         }
-      } else {
-        // Add to existing IBC allocation
-        allocAmounts[ibcIdx]+=ev._ibcContinues;
-        allocFuture[ibcIdx].futureAmount=allocAmounts[ibcIdx];
-        allocFuture[ibcIdx].boosts.push({month:ev.month,amount:ev._ibcContinues,from:'IBC premium reclassified from debt payoff to pure growth'});
-        destinations.push({type:'ibc',name:'IBC (continued)',amount:ev._ibcContinues});
+        // Only populate if these fields are absent — respect prior user input
+        // and annual-review actuals which take precedence over simulator values.
+        if(!(_dA.loanBalance>0))_dA.loanBalance=Math.round(_loanBalAtDebtFree);
+        if(_dA.monthlyLoanRepay==null)_dA.monthlyLoanRepay=Math.round(ev._ibcLoanRepayment||0);
+        if(!_dA.loanRate)_dA.loanRate=0.05;// Standard IBC loan rate; can be overridden per-policy
+        allocFuture[dIdx]._ibcContinuation=ev._ibcContinues;
       }
     }
     // Specific cascade target — gate by owner match in hybrid
@@ -32447,10 +32605,10 @@ function _cpRenderChart(targetId){
   function yf(v){return padT+cH-(v-minV)/(maxV-minV)*cH;}
 
   var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;display:block;max-height:300px">';
-  for(var g=0;g<=4;g++){var gv=minV+(maxV-minV)*g/4;var gy=yf(gv);svg+='<line x1="'+padL+'" y1="'+gy+'" x2="'+(W-padR)+'" y2="'+gy+'" stroke="rgba(0,68,191,.06)" stroke-width="0.5"/>';svg+='<text x="'+(padL-4)+'" y="'+(gy+3)+'" fill="rgba(100,116,139,.5)" font-size="8" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(gv))+'</text>';}
+  for(var g=0;g<=4;g++){var gv=minV+(maxV-minV)*g/4;var gy=yf(gv);svg+='<line x1="'+padL+'" y1="'+gy+'" x2="'+(W-padR)+'" y2="'+gy+'" stroke="rgba(0,68,191,.06)" stroke-width="0.5"/>';svg+='<text x="'+(padL-4)+'" y="'+(gy+3)+'" fill="rgba(100,116,139,.5)" font-size="11" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(gv))+'</text>';}
   if(minV<0&&maxV>0)svg+='<line x1="'+padL+'" y1="'+yf(0)+'" x2="'+(W-padR)+'" y2="'+yf(0)+'" stroke="rgba(100,116,139,.2)" stroke-width="0.5" stroke-dasharray="3,3"/>';
   var _chartAge=CPLAN.age||35;
-  [0,5,10,15,20,25,30].forEach(function(yr5){svg+='<text x="'+x(yr5)+'" y="'+(H-padB+14)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="middle" font-family="var(--fh)">Age '+(_chartAge+yr5)+'</text>';});
+  [0,5,10,15,20,25,30].forEach(function(yr5){svg+='<text x="'+x(yr5)+'" y="'+(H-padB+14)+'" fill="rgba(100,116,139,.4)" font-size="11" text-anchor="middle" font-family="var(--fh)">Age '+(_chartAge+yr5)+'</text>';});
 
   // ── Displacement bands: proportioned between baseline and plan ──
   if(_cpTierHas('displacement_bands')){
@@ -32476,13 +32634,13 @@ function _cpRenderChart(targetId){
   // ── Baseline line (dashed) ──
   var basePts=baselineData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
   svg+='<polyline points="'+basePts+'" fill="none" stroke="rgba(100,116,139,.35)" stroke-width="1.5" stroke-dasharray="4,3" stroke-linejoin="round"/>';
-  svg+='<text x="'+(W-padR+4)+'" y="'+(yf(baselineData[years])+4)+'" fill="rgba(100,116,139,.6)" font-size="9" font-family="var(--fh)">'+fmtK(baselineData[years])+'</text>';
+  svg+='<text x="'+(W-padR+4)+'" y="'+(yf(baselineData[years])+4)+'" fill="rgba(100,116,139,.6)" font-size="12" font-family="var(--fh)">'+fmtK(baselineData[years])+'</text>';
 
   // ── Plan total line (solid blue) ──
   var totalPts=totalData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
   svg+='<polyline points="'+totalPts+'" fill="none" stroke="#5B9BFF" stroke-width="2.5" stroke-linejoin="round"/>';
   svg+='<circle cx="'+x(years)+'" cy="'+yf(totalData[years])+'" r="4" fill="#5B9BFF"/>';
-  svg+='<text x="'+(W-padR+4)+'" y="'+(yf(totalData[years])+4)+'" fill="#5B9BFF" font-size="10" font-family="var(--fh)" font-weight="700">'+fmtK(totalData[years])+'</text>';
+  svg+='<text x="'+(W-padR+4)+'" y="'+(yf(totalData[years])+4)+'" fill="#5B9BFF" font-size="12" font-family="var(--fh)" font-weight="700">'+fmtK(totalData[years])+'</text>';
 
   // ── Simulated scenario line (if life events active) ──
   if(simData&&simData.length>0){
@@ -32496,12 +32654,12 @@ function _cpRenderChart(targetId){
     var simPts=simData.map(function(v,i){return x(i)+','+yf(v);}).join(' ');
     svg+='<polyline points="'+simPts+'" fill="none" stroke="'+simCol+'" stroke-width="2" stroke-linejoin="round" stroke-dasharray="6,3"/>';
     svg+='<circle cx="'+x(years)+'" cy="'+yf(simData[years])+'" r="4" fill="'+simCol+'"/>';
-    svg+='<text x="'+(W-padR+4)+'" y="'+(yf(simData[years])+4)+'" fill="'+simCol+'" font-size="9" font-family="var(--fh)" font-weight="700">'+fmtK(simData[years])+'</text>';
+    svg+='<text x="'+(W-padR+4)+'" y="'+(yf(simData[years])+4)+'" fill="'+simCol+'" font-size="12" font-family="var(--fh)" font-weight="700">'+fmtK(simData[years])+'</text>';
     // Delta label between plan and simulated
     var simDelta=simData[years]-totalData[years];
     if(Math.abs(simDelta)>100){
       var simMidY=(yf(totalData[years])+yf(simData[years]))/2;
-      svg+='<text x="'+(W-padR-20)+'" y="'+simMidY+'" fill="'+simCol+'" font-size="8" font-family="var(--fh)" font-weight="700" text-anchor="end">'+(simDelta>0?'+':'')+fmtK(simDelta)+'</text>';
+      svg+='<text x="'+(W-padR-20)+'" y="'+simMidY+'" fill="'+simCol+'" font-size="11" font-family="var(--fh)" font-weight="700" text-anchor="end">'+(simDelta>0?'+':'')+fmtK(simDelta)+'</text>';
     }
   }
 
@@ -32509,23 +32667,23 @@ function _cpRenderChart(targetId){
   var planGain=totalData[years]-baselineData[years];
   if(Math.abs(planGain)>100){
     var midY2=(yf(totalData[years])+yf(baselineData[years]))/2;
-    svg+='<text x="'+(W-padR+4)+'" y="'+midY2+'" fill="'+(planGain>0?'rgba(34,197,94,.8)':'rgba(239,68,68,.8)')+'" font-size="8" font-family="var(--fh)" font-weight="700">'+(planGain>0?'+':'')+fmtK(planGain)+'</text>';
+    svg+='<text x="'+(W-padR+4)+'" y="'+midY2+'" fill="'+(planGain>0?'rgba(34,197,94,.8)':'rgba(239,68,68,.8)')+'" font-size="11" font-family="var(--fh)" font-weight="700">'+(planGain>0?'+':'')+fmtK(planGain)+'</text>';
   }
 
   // ── Milestones ──
   var efA=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
-  if(efA){var efYr=Math.ceil(Math.ceil((efA.target||CPLAN.efTarget)/efA.amount)/12);if(efYr>0&&efYr<years){svg+='<line x1="'+x(efYr)+'" y1="'+padT+'" x2="'+x(efYr)+'" y2="'+(H-padB)+'" stroke="rgba(34,197,94,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(efYr)+'" y="'+(padT-3)+'" fill="rgba(34,197,94,.6)" font-size="7" text-anchor="middle" font-family="var(--fh)">EF done</text>';}}
+  if(efA){var efYr=Math.ceil(Math.ceil((efA.target||CPLAN.efTarget)/efA.amount)/12);if(efYr>0&&efYr<years){svg+='<line x1="'+x(efYr)+'" y1="'+padT+'" x2="'+x(efYr)+'" y2="'+(H-padB)+'" stroke="rgba(34,197,94,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(efYr)+'" y="'+(padT-3)+'" fill="rgba(34,197,94,.6)" font-size="11" text-anchor="middle" font-family="var(--fh)">EF done</text>';}}
   var dA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
-  if(dA&&CPLAN.totalDebt>0){var dYr=Math.ceil(Math.ceil(CPLAN.totalDebt/(dA.amount+CPLAN.debtMin))/12);if(dYr>0&&dYr<years){svg+='<line x1="'+x(dYr)+'" y1="'+padT+'" x2="'+x(dYr)+'" y2="'+(H-padB)+'" stroke="rgba(249,115,22,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(dYr)+'" y="'+(padT-3)+'" fill="rgba(249,115,22,.6)" font-size="7" text-anchor="middle" font-family="var(--fh)">Debt free</text>';}}
+  if(dA&&CPLAN.totalDebt>0){var dYr=Math.ceil(Math.ceil(CPLAN.totalDebt/(dA.amount+CPLAN.debtMin))/12);if(dYr>0&&dYr<years){svg+='<line x1="'+x(dYr)+'" y1="'+padT+'" x2="'+x(dYr)+'" y2="'+(H-padB)+'" stroke="rgba(249,115,22,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(dYr)+'" y="'+(padT-3)+'" fill="rgba(249,115,22,.6)" font-size="11" text-anchor="middle" font-family="var(--fh)">Debt free</text>';}}
   if(_cpTierHas('milestones_extra')){
   // $100k and FI milestone labels live BELOW the Age labels (y = H-padB+22) so
   // they don't visually overlap with the Age tick row at y = H-padB+14.
   // Previous y-offset of +10 placed them inside the same band as Age 38 etc.,
   // making the labels look misaligned with the x-axis even though their
   // x-positions were correct.
-  for(var m100=1;m100<=years;m100++){if(totalData[m100]>=100000&&(m100===1||totalData[m100-1]<100000)){svg+='<line x1="'+x(m100)+'" y1="'+padT+'" x2="'+x(m100)+'" y2="'+(H-padB)+'" stroke="rgba(91,155,255,.2)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(m100)+'" y="'+(H-padB+22)+'" fill="rgba(91,155,255,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">$100k</text>';break;}}
+  for(var m100=1;m100<=years;m100++){if(totalData[m100]>=100000&&(m100===1||totalData[m100-1]<100000)){svg+='<line x1="'+x(m100)+'" y1="'+padT+'" x2="'+x(m100)+'" y2="'+(H-padB)+'" stroke="rgba(91,155,255,.2)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(m100)+'" y="'+(H-padB+22)+'" fill="rgba(91,155,255,.5)" font-size="11" text-anchor="middle" font-family="var(--fh)">$100k</text>';break;}}
   var fiTarget=CPLAN.expenses*12*25;
-  if(fiTarget>0){for(var mFI=1;mFI<=years;mFI++){if(totalData[mFI]>=fiTarget&&(mFI===1||totalData[mFI-1]<fiTarget)){svg+='<line x1="'+x(mFI)+'" y1="'+padT+'" x2="'+x(mFI)+'" y2="'+(H-padB)+'" stroke="rgba(168,85,247,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(mFI)+'" y="'+(H-padB+22)+'" fill="rgba(168,85,247,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">FI</text>';break;}}}
+  if(fiTarget>0){for(var mFI=1;mFI<=years;mFI++){if(totalData[mFI]>=fiTarget&&(mFI===1||totalData[mFI-1]<fiTarget)){svg+='<line x1="'+x(mFI)+'" y1="'+padT+'" x2="'+x(mFI)+'" y2="'+(H-padB)+'" stroke="rgba(168,85,247,.25)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(mFI)+'" y="'+(H-padB+22)+'" fill="rgba(168,85,247,.5)" font-size="11" text-anchor="middle" font-family="var(--fh)">FI</text>';break;}}}
   }
   svg+='</svg>';
   // Store chart data for hover interactivity
@@ -32549,6 +32707,18 @@ function _cpRenderChart(targetId){
       var px=(e2.touches?e2.touches[0].clientX:e2.clientX)-rect.left;
       var svgW=rect.width;var scaleX=600/svgW;// viewBox width
       var svgX=px*scaleX;
+      // Hide tooltip + vertical line when cursor is outside the plot area
+      // (padL to W-padR in viewBox space). Without this gate, mousemove events
+      // at the left margin clamp yr7 to 0 via Math.max — making the tooltip
+      // perpetually "stick" to Age <chartStartAge> with the data point at month 0
+      // even when the cursor is not over any data. Same applies past the right
+      // edge: yr7 would clamp to `years` and show the horizon value at all
+      // positions to the right of the chart's last data point.
+      if(svgX<padL-2||svgX>600-padR+2){
+        if(tip)tip.style.display='none';
+        if(vLine)vLine.style.display='none';
+        return;
+      }
       var yr7=Math.round((svgX-padL)/(600-padL-padR)*years);
       yr7=Math.max(0,Math.min(years,yr7));
       if(tip){
@@ -32732,6 +32902,23 @@ function _cpUpdateSliderCaps(skipIdx,opts){
     // Always refresh the cap note — it shows the live pool-aware available budget
     var noteEl=document.getElementById('cpCapNote'+i);
     if(noteEl)noteEl.innerHTML=_cpEffectiveCapNote(a.type,i);
+    // ── IBC repayment slider — same pool, parallel sync ──────────────────────
+    // The IBC repayment slider on an IBC card is in the same surplus-minus-
+    // breathing pool as the main contribution sliders. When OTHER sliders move,
+    // its cap should refresh just like the main sliders' caps refresh. The cap
+    // formula matches the render-time formula at line ~25704:
+    //   cap = min(loanBalance, availSurplus + currentRepay)
+    // The cap NOTE doesn't exist for the IBC repayment slider (no cpCapNote
+    // element), so we only update the max attribute when refreshMax is set.
+    if(_refreshMax&&(a.type==='ibc'||a.type==='wl'||a.type==='iul')&&a.loanBalance>0){
+      var _ibcSlEl=document.getElementById('ibcRepaySlider'+i);
+      if(_ibcSlEl){
+        var _curRepay=parseFloat(a.monthlyLoanRepay)||0;
+        var _avail=(typeof _cpAvailableBudget==='function')?_cpAvailableBudget(i):(CPLAN.surplus||0);
+        var _newRepayCap=Math.max(0,Math.min(parseFloat(a.loanBalance)||0,Math.round(_avail+_curRepay)));
+        _ibcSlEl.max=_newRepayCap;
+      }
+    }
   });
 }
 // ── OVER-BUDGET BANNER ── (permanently hidden)
@@ -32860,6 +33047,12 @@ function _cpSlideEnd(){
     if(typeof _cpRenderEFRunway==='function')_cpRenderEFRunway();
     if(typeof _cpRenderIncomeReplacement==='function')_cpRenderIncomeReplacement();
     if(CPLAN.mode==='detailed'&&typeof _cpRenderOutcomes==='function')_cpRenderOutcomes();
+    // Refresh IBC loan-repayment sliders' caps — they share the same pool as
+    // main allocation sliders, so any main-slider change shifts their available
+    // budget. _cpUpdateSliderCaps with refreshMax:true was extended to handle
+    // these too. Pass -1 as skipIdx so every slider (including the just-
+    // released main slider, which is fine because it stops moving on release).
+    if(typeof _cpUpdateSliderCaps==='function')_cpUpdateSliderCaps(-1,{refreshMax:true});
     // Refresh timeline if we have a container — targeted update only
     var tl=document.getElementById('cpTimelineRoot');
     if(tl&&typeof _cpBuildTimeline==='function')tl.outerHTML=_cpBuildTimeline();
@@ -33912,7 +34105,15 @@ function cplanSave(){
   // Wave 4: preserve state machine fields. Also fix latent Wave 1 bug —
   // _ibcUnderlyingType was missing from this map and was being lost on reload,
   // which made IUL allocations fall back to the WL 4% rate after any save/reload.
-  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true};});
+  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,
+  // Loan tracking fields — persisted so the IBC continuation card state
+  // survives logout/login. loanBalance is the canonical outstanding balance;
+  // monthlyLoanRepay is the user's repayment slider value; loans[] is the
+  // per-loan audit trail; loanRate is the simple-interest annual rate.
+  // _lastActualsDate + _actualsSource flag whether the balance came from an
+  // annual statement upload (Rule 5) vs a simulator projection — used to
+  // surface "from your Apr 2026 statement" indicators in the UI.
+  loanBalance:parseFloat(a.loanBalance)||0,monthlyLoanRepay:parseFloat(a.monthlyLoanRepay)||0,loans:Array.isArray(a.loans)?a.loans:[],loanRate:parseFloat(a.loanRate)||0,_lastActualsDate:a._lastActualsDate||null,_actualsSource:a._actualsSource||null};});
   var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,selectedApproach:CPLAN._selectedApproach||'',approaches:CPLAN._approaches||null,planSource:CPLAN.hasAdvisor?'advisor':'self',planMode:CPLAN.planMode||'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString(),phaseNames:{1:CPLAN._phase1Name||'',2:CPLAN._phase2Name||'',3:CPLAN._phase3Name||'',4:CPLAN._phase4Name||''},ai_generations:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.ai_generations)||[],checkIns:CPLAN._checkIns||{},
     // Phase A: persist time anchor + original-projection baseline. Both are immutable
     // after first save — they're only re-captured if missing (legacy plan migration).
