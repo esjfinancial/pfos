@@ -23375,7 +23375,18 @@ function _cpConvertAIRecs(aiData){
   // Bug fix: also cap traditional 401k at the employer match level (match capture is
   // valid even in tax-free; anything beyond match defeats the tax-free purpose).
   // Also filter trad_ira entirely (purely tax-deferred, not tax-free).
-  if(CPLAN._selectedApproach==='tax_free'||CPLAN._viewingApproach==='tax_free'){
+  // Scope-fix: read the approach being CONVERTED from aiData.approach (the edge
+  // function tags every response with `approach`), NOT from _selectedApproach/
+  // _viewingApproach. The latter reflects the user's current UI state, which is
+  // the wrong question when _cpProjectApproachWithSim is iterating all three
+  // approaches to build cached projections — a stale _viewingApproach='tax_free'
+  // from a prior preview would otherwise cause invest to be stripped from
+  // Traditional and Hybrid projections too, making their cached LTCG bucket
+  // empty even when the AI correctly recommended a taxable brokerage allocation.
+  // Falls back to global UI state only when aiData has no `approach` tag (rare —
+  // legacy plan replays, manual reconstructions).
+  var _convertingApproach=(aiData&&aiData.approach)||CPLAN._selectedApproach||CPLAN._viewingApproach;
+  if(_convertingApproach==='tax_free'){
     var _taxableRemoved=0;
     // Compute employer match dollar amount once — used to cap traditional 401k below.
     var _matchPctTF=0;
@@ -25014,11 +25025,20 @@ function _cpRenderPlanV2(){
           h+=_cpBuildCard(a,idx,false);
           h+='</div>';
         } else {
-          // Active growth items — render full card (with phase-appropriate amount)
+          // Active growth items — render full card with phase-cumulative
+          // amount (a.amount + all boosts that fired by this stage's
+          // trigger month). Always swap to phaseAmt when it differs from
+          // a.amount, even if no NEW boost happens in THIS phase. Example:
+          // Roth at IRS cap by Phase 2 has 0 new boost in Phase 3, but its
+          // Phase 3 amount is still $625 (from the Phase 2 cascade), not
+          // $583 (Phase 1 base). Without this, the slider in Phase 3 view
+          // would show the stale Phase 1 amount and the boost-indicator
+          // ("$X/mo now → $Y/mo after EF funded") would still claim a
+          // cascade that already fired.
           var origAmount=a.amount;
-          if(boost>0)a.amount=phaseAmt;// Temporarily show phase-specific amount
+          if(phaseAmt!==a.amount)a.amount=phaseAmt;
           h+=_cpBuildCard(a,idx,false);
-          if(boost>0)a.amount=origAmount;// Restore original
+          a.amount=origAmount;
         }
       });
     }
@@ -27634,6 +27654,21 @@ function _cpIRSMax(type,allocOrOwner){
       monthlyMax=0;
     }
   }
+  // EXTRAS-SEMANTICS HEADROOM: when called with an allocation, subtract the
+  // user's existing real-world contribution so the returned cap matches
+  // a.amount semantics ("EXTRA beyond what's already happening"). Without
+  // this, the cascade engine, PP9 enforcement, and effective-cap math would
+  // let EXTRA grow up to the full statutory limit, producing TOTAL
+  // contributions that exceed IRS (e.g. user already contributing $553/mo
+  // 401(k) gets a slider that allows $2,042/mo extra → $2,595/mo total >
+  // $24,500/yr 401(k) limit). Callers passing only `type` (display strings,
+  // auto-suggest defaults) get the statutory limit unchanged so the IRS-
+  // limit display text continues to read the literal IRS rule.
+  if(alloc && typeof _cpMatchExisting==='function'){
+    var _curMatch=_cpMatchExisting(alloc);
+    var _curContribIRS=(_curMatch&&_curMatch.currentContrib)||0;
+    if(_curContribIRS>0)monthlyMax=Math.max(0,monthlyMax-_curContribIRS);
+  }
   return monthlyMax;
 }
 // Phase D multi-partner: owner-aware retirement age lookup. Used everywhere a
@@ -27783,7 +27818,12 @@ function _cpIRSNote(type){
 
 // ── EFFECTIVE CAP NOTE — shows the live cap and what's governing it ──
 function _cpEffectiveCapNote(type,idx){
-  var irsMax=_cpIRSMax(type);
+  // Pass the allocation to _cpIRSMax so the returned cap reflects EXTRAS
+  // headroom (statutory − currentContrib), not the raw statutory limit.
+  // Without this, the displayed Cap line would govern the slider by an
+  // IRS limit value that ignores the user's existing contribution, letting
+  // (current + extra) exceed the legal maximum.
+  var irsMax=_cpIRSMax(type,CPLAN.allocations&&CPLAN.allocations[idx]);
   var available=_cpAvailableBudget(idx);
   var effective=Math.min(irsMax,available);
   var govBy,color;
