@@ -23207,7 +23207,7 @@ function _cpConvertAIRecs(aiData){
     // distinguish Policy #1 vs Policy #2 vs Policy #N within the same purpose lane.
     var _isInsurance=(map.type==='iul'||map.type==='wl'||map.type==='ibc'||(map.type==='edu'&&(r._eduVeh==='wl'||r._eduVeh==='iul')));
     var _policyId=_isInsurance?('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)):null;
-    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null});
+    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,_overflowAbsorber:r._overflowAbsorber===true});
     usedPool+=amt;
   });
 
@@ -24761,7 +24761,11 @@ function _cpRenderPlanV2(){
   // Only events that actually free money in the FUTURE count as cascade triggers — month=0
   // events represent already-completed states (e.g., "EF already funded" baseline) and
   // would otherwise spuriously create a Phase 2 tab with no real handoff timing.
-  var _sim=CPLAN._sim||{};var _simEvents=(_sim.events||[]).filter(function(e){return e.freed>0&&e.type!=='debt_milestone'&&(e.month||0)>0;});
+  // IBC continuation case: when debtStrategy='ibc', the debt-free milestone has freed:0
+  // (because the freed minimums redirect to policy-loan repayment, not growth) but
+  // _ibcContinues>0 marks it as a genuine phase boundary — the debt card transforms
+  // into the policy-continuation card at this month. Include it as a phase trigger.
+  var _sim=CPLAN._sim||{};var _simEvents=(_sim.events||[]).filter(function(e){return (e.freed>0||e._ibcContinues>0)&&e.type!=='debt_milestone'&&(e.month||0)>0;});
   var _allocPhases={};CPLAN.allocations.forEach(function(a){if(a.phase>0)_allocPhases[a.phase]=true;});
   // Check if phase has MEANINGFUL items (funded or genuinely new, not just $0 action items)
   function _phaseHasContent(pn){
@@ -24837,87 +24841,160 @@ function _cpRenderPlanV2(){
     h+='</div>';
   }
 
-  // ── Two-layer deployment bar (Phase 2+) ──
-  // E4: pre-compute future total for THIS active phase. If zero, hide the entire
-  // deployment bar (it would render an empty/misleading "0/mo" line).
-  var _e4FutureTotal=0;
-  if(_activeTab>1&&_sim.allocFuture){
-    _sim.allocFuture.forEach(function(af){
-      var a=CPLAN.allocations[af.idx];
-      if(!a)return;
-      if(a.type==='debt'||a.type==='ef')return;
-      if(a.type==='protection'&&a.amount===0)return;
-      var fa=af.futureAmount||af.currentAmount||0;
-      if(fa>0)_e4FutureTotal+=fa;
-    });
+  // ── Per-phase Deployment Comparison ────────────────────────────────────
+  // Phase 1 view: one bar (Phase 1 colored), shows the conventional Phase 1
+  // allocations including funded debt/EF/growth.
+  // Phase N>1 view: two bars stacked — phase N−1 grayed (reference) + phase N
+  // colored (current). Each bar uses PHASE-CUMULATIVE allocation amounts: the
+  // amount any given allocation receives in that specific stage after all
+  // cascade boosts that fired by that stage's trigger month have landed. This
+  // is the same math the per-card phase-amount swap uses at the active-render
+  // block (see _af.boosts filter by month < nextTriggerMonth). Without this,
+  // Phase 2 and Phase 3 would show the same bar because af.futureAmount
+  // collapses ALL future boosts into a single final-state amount.
+  //
+  // Helper — compute the per-allocation amount in a target phase:
+  function _cpPhaseAmtForAlloc(idx, targetPhase){
+    var a=CPLAN.allocations[idx];
+    if(!a)return 0;
+    var af=(_sim&&_sim.allocFuture)?_sim.allocFuture[idx]:null;
+    var amt=parseFloat(a.amount)||0;
+    if(!af||!af.boosts||!af.boosts.length)return amt;
+    var phaseTrig=_phaseTriggers[targetPhase];
+    var phaseTrigMo=phaseTrig?phaseTrig.month:0;
+    var nextTrig=_phaseTriggers[targetPhase+1];
+    var nextTrigMo=nextTrig?nextTrig.month:9999;
+    // Boosts with month < nextTrigMo have all fired by the END of this phase;
+    // those are cumulative-as-of-this-phase. Boosts with month >= nextTrigMo
+    // haven't fired yet and don't count in this phase's cumulative view.
+    af.boosts.forEach(function(b){if(b.month<nextTrigMo)amt+=b.amount;});
+    return amt;
   }
-  if(_activeTab>1&&_sim.allocFuture&&_e4FutureTotal>0){
-    h+='<div style="margin-bottom:14px">';
-    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">DEPLOYMENT COMPARISON</div>';
-    // Phase 1 layer (grayed)
-    h+='<div style="position:relative;height:10px;background:rgba(100,116,139,.06);border-radius:3px;margin-bottom:3px;overflow:hidden"><div style="display:flex;height:100%">';
-    CPLAN.allocations.forEach(function(a){if(a.amount>0&&CPLAN.surplus>0){var w=Math.max(1,Math.round(a.amount/CPLAN.surplus*100));h+='<div style="height:100%;width:'+w+'%;background:'+CP_COL[a.type]+';opacity:0.2"></div>';}});
-    h+='</div></div>';
-    // Phase 1 GROWTH total — apples-to-apples with Phase 2 (Phase 2 also excludes debt/ef/$0 protection).
-    // Without this filter, Phase 1 includes debt + EF totals which makes Phase 1 look
-    // larger than Phase 2 even though Phase 2 redistributes the same surplus into growth.
-    var _p1GrowthTotal=CPLAN.allocations.reduce(function(t,a){
-      if(a.type==='debt'||a.type==='ef')return t;
-      if(a.type==='protection'&&a.amount===0)return t;
-      return t+(parseFloat(a.amount)||0);
-    },0);
-    h+='<div style="font-size:10px;color:var(--mu);margin-bottom:4px">Phase 1: '+fmt(_p1GrowthTotal)+'/mo <span style="opacity:.7">growth deployment</span></div>';
-    // Phase 2 layer (colored — future amounts, excluding completed items)
-    var _futureTotal=0;
-    h+='<div style="position:relative;height:14px;background:rgba(100,116,139,.06);border-radius:3px;overflow:hidden"><div style="display:flex;height:100%">';
-    _sim.allocFuture.forEach(function(af){
-      var a=CPLAN.allocations[af.idx];
-      if(!a)return;// Defense: stale idx pointing to dropped allocation
-      if(a.type==='debt'||a.type==='ef')return;// Exclude completed items from Phase 2 bar
-      if(a.type==='protection'&&a.amount===0)return;// Exclude action-only items
-      var fa=af.futureAmount||af.currentAmount||0;
-      if(fa>0&&CPLAN.surplus>0){var w=Math.max(1,Math.round(fa/CPLAN.surplus*100));h+='<div style="height:100%;width:'+w+'%;background:'+(CP_COL[a.type]||'#94A3B8')+';opacity:0.7;transition:width .3s"></div>';_futureTotal+=fa;}
+  // Helper — does the allocation count as completed AT OR BEFORE this phase?
+  // Used to exclude already-finished items (debt/EF/etc.) from the colored bar
+  // of any phase that comes after their completion. _simEvents carries allocIdx
+  // for ef/debt/custom completion events; an event with month <= phaseTrigMo
+  // means the allocation finished by this phase's start.
+  function _cpAllocCompletedByPhase(idx, targetPhase){
+    if(targetPhase<=1)return false;// Phase 1 has no prior completions
+    var phaseTrig=_phaseTriggers[targetPhase];
+    var phaseTrigMo=phaseTrig?phaseTrig.month:0;
+    var ev=_simEvents.find(function(e){return e.allocIdx===idx;});
+    if(!ev)return false;
+    // The completion event for IBC debt strategy carries _ibcContinues — the
+    // debt isn't truly "completed and gone," it transforms into the policy
+    // continuation card. Treat it as NOT completed so the card still appears
+    // in the colored bar of phases past debt-free (rendered as IBC continuation).
+    if(ev._ibcContinues>0)return false;
+    return (ev.month||0)<=phaseTrigMo;
+  }
+  // Helper — render one bar (full deployment-comparison row) for a given phase
+  // at a given visual mode ('grayed' for reference rows, 'colored' for active).
+  // labelPrefix is the row label text. Returns the HTML fragment.
+  function _cpRenderPhaseBar(targetPhase, mode, labelPrefix){
+    var isGrayed=(mode==='grayed');
+    var opacity=isGrayed?0.2:0.7;
+    var height=isGrayed?'10px':'14px';
+    var rowMb=isGrayed?'3px':'0';
+    var labelColor=isGrayed?'var(--mu)':'var(--gr)';
+    var allocs=[];
+    var totalAmt=0;
+    CPLAN.allocations.forEach(function(a,idx){
+      // Exclude allocations that completed before this phase started — they're
+      // no longer contributing to current deployment in this phase.
+      if(_cpAllocCompletedByPhase(idx,targetPhase))return;
+      // Exclude action-only $0 items.
+      if(a.type==='protection'&&(parseFloat(a.amount)||0)===0)return;
+      // For Phase 1, debt and EF ARE active. For Phase N>1, they may be active
+      // OR they may be the IBC continuation (above). Use cumulative phase amount.
+      var fa=_cpPhaseAmtForAlloc(idx, targetPhase);
+      if(fa<=0)return;
+      allocs.push({a:a,idx:idx,fa:fa,colorType:a.type});
+      totalAmt+=fa;
     });
-    h+='</div></div>';
-    // Compute cumulative overflow up-front so we can include it in the Phase total
-    // (matches the "same surplus — redistributed" claim by accounting for every dollar)
-    var _phaseOverflow=0;
-    if(_sim.events&&_sim.events.length){
-      _sim.events.forEach(function(_evx){
-        if(_evx&&_evx._cascadeOverflow>0)_phaseOverflow+=_evx._cascadeOverflow;
+    // IBC continuation: if any debt allocation is in continuation mode at this
+    // phase, render it with the IBC purple color in the bar so it matches the
+    // transformed card render below. The underlying a.type stays 'debt' — we
+    // only override the colorType used for the visual fill.
+    if(CPLAN.debtStrategy==='ibc'&&targetPhase>1){
+      allocs.forEach(function(item){
+        if(item.a.type!=='debt')return;
+        var ev=_simEvents.find(function(e){return e.allocIdx===item.idx&&e._ibcContinues>0;});
+        var trigMo=_phaseTriggers[targetPhase]?_phaseTriggers[targetPhase].month:0;
+        if(ev&&(ev.month||0)<=trigMo)item.colorType='ibc';
       });
     }
-    var _phaseTotalWithOverflow=_futureTotal+Math.round(_phaseOverflow);
-    h+='<div style="font-size:10px;color:var(--gr);margin-top:2px">Phase '+_activeTab+': '+fmt(_phaseTotalWithOverflow)+'/mo (same surplus — redistributed)</div>';
-    // Phase 2+ deployment legend — show each allocation's future amount
-    h+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:4px;margin-bottom:4px">';
-    _sim.allocFuture.forEach(function(af){
-      var a=CPLAN.allocations[af.idx];
-      if(!a)return;// Defense: stale idx pointing to dropped allocation
-      if(a.type==='debt'||a.type==='ef')return;
-      if(a.type==='protection'&&a.amount===0)return;
-      var fa=af.futureAmount||af.currentAmount||0;
-      if(fa<=0)return;
-      var nm=a.customName||CP_NM[a.type]||a.type;
-      var boost=fa-(af.currentAmount||0);
-      h+='<div style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--mu)">';
-      h+='<div style="width:8px;height:8px;border-radius:2px;background:'+(CP_COL[a.type]||'#94A3B8')+';opacity:0.7;flex-shrink:0"></div>';
-      h+=nm+' <span style="color:'+(CP_COL[a.type]||'#94A3B8')+';font-weight:700">'+fmt(fa)+'</span>';
-      if(boost>0)h+=' <span style="color:var(--gr);font-size:10px">(+'+fmt(boost)+')</span>';
-      h+='</div>';
-    });
-    // Cascade overflow chip — surfaces any freed money that couldn't fit in
-    // tax-advantaged or insurance vehicles. Without this, the user sees Phase 2
-    // total < Phase 1 total with no explanation. Showing the overflow tells the
-    // user explicitly: "$X is sitting as cash savings — consider adding a
-    // taxable brokerage allocation to put it to work."
-    if(_phaseOverflow>0){
-      h+='<div title="Freed money that couldn\'t fit in any IRS-capped or fixed-premium vehicle. Add a taxable brokerage (Invest) allocation to put it to work." style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--yl);background:rgba(234,179,8,.06);padding:2px 6px;border-radius:2px">';
-      h+='<span style="font-size:11px">💰</span>';
-      h+='Cash savings <span style="color:var(--yl);font-weight:700">'+fmt(Math.round(_phaseOverflow))+'</span>';
-      h+='</div>';
+    // Per-phase overflow: events that fired by this phase's trigger month
+    // (cumulative through this stage). Same scoping as the bar above.
+    var phaseTrig=_phaseTriggers[targetPhase];
+    var phaseTrigMo=phaseTrig?phaseTrig.month:0;
+    // For Phase 1 the trigger month is 0; events at month 0 are pre-existing
+    // states ("EF already funded") that shouldn't surface a Phase 1 overflow.
+    // For Phase N>1, sum cascade overflow from events whose month <= phaseTrigMo.
+    var phaseOverflow=0;
+    if(targetPhase>1&&_sim.events&&_sim.events.length){
+      _sim.events.forEach(function(_evx){
+        if(_evx&&_evx._cascadeOverflow>0&&(_evx.month||0)<=phaseTrigMo)phaseOverflow+=_evx._cascadeOverflow;
+      });
     }
-    h+='</div>';
+    var totalWithOverflow=totalAmt+Math.round(phaseOverflow);
+    var s='';
+    s+='<div style="position:relative;height:'+height+';background:rgba(100,116,139,.06);border-radius:3px;margin-bottom:'+rowMb+';overflow:hidden"><div style="display:flex;height:100%">';
+    var denom=Math.max(CPLAN.surplus||totalWithOverflow,1);
+    allocs.forEach(function(item){
+      var w=Math.max(1,Math.round(item.fa/denom*100));
+      s+='<div style="height:100%;width:'+w+'%;background:'+(CP_COL[item.colorType]||CP_COL[item.a.type]||'#94A3B8')+';opacity:'+opacity+(isGrayed?'':';transition:width .3s')+'"></div>';
+    });
+    s+='</div></div>';
+    s+='<div style="font-size:10px;color:'+labelColor+';margin-bottom:'+(isGrayed?'4px':'2px')+'">'+labelPrefix+': '+fmt(totalWithOverflow)+'/mo'+(targetPhase===1?' <span style="opacity:.7">growth deployment</span>':' <span style="opacity:.85">(same surplus — redistributed)</span>')+'</div>';
+    // Legend only for the colored row (current phase).
+    if(!isGrayed){
+      s+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:4px;margin-bottom:4px">';
+      allocs.forEach(function(item){
+        // Display name: IBC continuation uses the transformed title so the
+        // legend matches the transformed card title in this phase.
+        var nm=item.colorType==='ibc'&&item.a.type==='debt'
+              ? 'Whole Life Policy — Continuation'
+              : (item.a.customName||CP_NM[item.a.type]||item.a.type);
+        var legendColor=CP_COL[item.colorType]||CP_COL[item.a.type]||'#94A3B8';
+        // Boost annotation: difference vs the SAME allocation's amount in the
+        // prior phase (or vs raw a.amount for Phase 1 → no boost).
+        var priorAmt=targetPhase>1?_cpPhaseAmtForAlloc(item.idx, targetPhase-1):0;
+        var boost=targetPhase>1?(item.fa-priorAmt):0;
+        s+='<div style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--mu)">';
+        s+='<div style="width:8px;height:8px;border-radius:2px;background:'+legendColor+';opacity:0.7;flex-shrink:0"></div>';
+        s+=nm+' <span style="color:'+legendColor+';font-weight:700">'+fmt(item.fa)+'</span>';
+        if(boost>0)s+=' <span style="color:var(--gr);font-size:10px">(+'+fmt(boost)+')</span>';
+        s+='</div>';
+      });
+      // Cascade overflow chip — only for current colored phase, scoped to this phase only.
+      if(phaseOverflow>0){
+        s+='<div title="Freed money that couldn\'t fit in any IRS-capped or fixed-premium vehicle by this phase. Consider opening a taxable brokerage (Traditional/Hybrid) or new permanent insurance (Tax-Free/Hybrid) to absorb." style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--yl);background:rgba(234,179,8,.06);padding:2px 6px;border-radius:2px">';
+        s+='<span style="font-size:11px">💰</span>';
+        s+='Cash savings <span style="color:var(--yl);font-weight:700">'+fmt(Math.round(phaseOverflow))+'</span>';
+        s+='</div>';
+      }
+      s+='</div>';
+    }
+    return s;
+  }
+  // Compute current-phase total — if zero, hide the whole block (prevents
+  // misleading $0/mo render).
+  var _curBarTotal=0;
+  CPLAN.allocations.forEach(function(a,idx){
+    if(_cpAllocCompletedByPhase(idx,_activeTab))return;
+    if(a.type==='protection'&&(parseFloat(a.amount)||0)===0)return;
+    var fa=_cpPhaseAmtForAlloc(idx,_activeTab);
+    if(fa>0)_curBarTotal+=fa;
+  });
+  if(_curBarTotal>0){
+    h+='<div style="margin-bottom:14px">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">DEPLOYMENT COMPARISON</div>';
+    if(_activeTab>1){
+      // Previous phase grayed reference + current phase colored.
+      h+=_cpRenderPhaseBar(_activeTab-1, 'grayed', 'Phase '+(_activeTab-1));
+    }
+    h+=_cpRenderPhaseBar(_activeTab, 'colored', 'Phase '+_activeTab);
     h+='</div>';
   }
 
@@ -25025,20 +25102,55 @@ function _cpRenderPlanV2(){
           h+=_cpBuildCard(a,idx,false);
           h+='</div>';
         } else {
-          // Active growth items — render full card with phase-cumulative
-          // amount (a.amount + all boosts that fired by this stage's
-          // trigger month). Always swap to phaseAmt when it differs from
-          // a.amount, even if no NEW boost happens in THIS phase. Example:
-          // Roth at IRS cap by Phase 2 has 0 new boost in Phase 3, but its
-          // Phase 3 amount is still $625 (from the Phase 2 cascade), not
-          // $583 (Phase 1 base). Without this, the slider in Phase 3 view
-          // would show the stale Phase 1 amount and the boost-indicator
-          // ("$X/mo now → $Y/mo after EF funded") would still claim a
-          // cascade that already fired.
-          var origAmount=a.amount;
-          if(phaseAmt!==a.amount)a.amount=phaseAmt;
+          // ── IBC continuation transformation ───────────────────────────
+          // When the plan uses IBC debt strategy (CPLAN.debtStrategy === 'ibc')
+          // and the active phase is past the debt-free month for THIS debt
+          // allocation, the card transforms from "Eliminate Debt" to a
+          // permanent-policy continuation card. The simulation engine already
+          // emits an event with _ibcContinues > 0 at the debt-free month; we
+          // detect that and override the card's display fields here.
+          //
+          // What stays the same: a.amount (same premium), idx, slider, big
+          // number — the user keeps paying the same monthly amount.
+          // What changes (display only, restored after render):
+          //   - a.type → 'ibc' (purple color, IBC name, hides debt strategy UI)
+          //   - a.customName → "Whole Life Policy — Continuation"
+          //   - a.reason → explanatory message about the loan-repayment phase
+          //
+          // The user is reminded they must also continue paying the freed debt
+          // minimums into the policy as loan repayment until the policy loans
+          // are repaid (ibc_recovery event). At that point, a new phase appears
+          // and the freed minimums redistribute to growth.
+          var _ibcContinuationActive=false;
+          var _ibcContEvent=null;
+          if(CPLAN.debtStrategy==='ibc'&&a.type==='debt'&&_activeTab>1){
+            _ibcContEvent=_simEvents.find(function(ev){return ev.allocIdx===idx&&ev._ibcContinues>0;});
+            if(_ibcContEvent&&(_ibcContEvent.month||0)<=_curTriggerMonth)_ibcContinuationActive=true;
+          }
+          var _origAmount=a.amount;
+          var _origType=a.type;
+          var _origCustomName=a.customName;
+          var _origReason=a.reason;
+          if(_ibcContinuationActive){
+            // Find the ibc_recovery event to surface the policy-loan-free month
+            var _recovEvent=_simEvents.find(function(ev){return ev.allocIdx===idx&&ev._ibcRecovery;});
+            var _recovMonth=_recovEvent?_recovEvent.month:null;
+            var _recovDate=_recovMonth?new Date(Date.now()+_recovMonth*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'}):'a future month';
+            var _loanRepayAmt=_ibcContEvent._ibcLoanRepayment||0;
+            a.type='ibc';
+            a.customName='Whole Life Policy — Continuation';
+            a.reason='Your high-rate debts are paid off via policy loans. You\'ll continue paying $'+fmt(_origAmount)+'/mo as policy premium AND $'+fmt(_loanRepayAmt)+'/mo (the freed debt minimums) toward policy loan repayment until '+_recovDate+'. A new phase will appear at that point when the policy loans are fully repaid (CV=AV) and that $'+fmt(_loanRepayAmt)+'/mo of freed minimums becomes available to redistribute to other growth allocations.';
+          }
+          // Phase-cumulative amount swap (existing behavior)
+          if(!_ibcContinuationActive && phaseAmt!==a.amount)a.amount=phaseAmt;
           h+=_cpBuildCard(a,idx,false);
-          a.amount=origAmount;
+          // Restore all overridden fields
+          a.amount=_origAmount;
+          if(_ibcContinuationActive){
+            a.type=_origType;
+            a.customName=_origCustomName;
+            a.reason=_origReason;
+          }
         }
       });
     }
@@ -25152,6 +25264,17 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _isActionOnlyForColor=(typeof _cpIsActionOnly==='function')?_cpIsActionOnly(a):(a.type==='protection'||(a.type==='custom'&&!a.target&&!a.amount));
   var color=_isActionOnlyForColor?'#94A3B8':(CP_COL[a.type]||'#94A3B8');
   var name=a.customName||CP_NM[a.type]||a.type;
+  // Match lookup is done here (not deferred until the slider block) so the
+  // big-number display below can show TOTAL (currentContrib + a.amount) instead
+  // of just EXTRA. This keeps the right-side big number consistent with what
+  // the slider's "Currently: $X + Extra: $Y = Total: $Z" line displays.
+  // For allocations with no real-world match (currentContrib = 0), Total === Extra
+  // and the displayed number is identical to before. Reset match claims so this
+  // call gets a clean ledger; the later slider block also calls _cpMatchExisting
+  // and the claim ledger handles repeat calls within the same render correctly.
+  var _matchBuildCard=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0,sourceLabel:''};
+  var _curContribCard=parseInt((_matchBuildCard&&_matchBuildCard.currentContrib)||0)||0;
+  var _displayTotal=_curContribCard+(parseFloat(a.amount)||0);
   var isD=CPLAN.mode==='detailed';
   // Completed items get a soft opacity so users can scan a phase and immediately see what's done.
   // Card is still interactive (Remove still works) but the wrapper communicates "this is checked off".
@@ -25166,7 +25289,12 @@ function _cpBuildCard(a,idx,isUnassigned){
   else {
     var _cardSlug=(typeof _cpLearnSlugFor==='function')?_cpLearnSlugFor(a.type,a.eduVehicle):'';
     var _cardInfo=(_cardSlug&&typeof _cpInfoBtn==='function')?_cpInfoBtn(_cardSlug,name):'';
-    h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);display:flex;align-items:center">'+name+_cardInfo+'</div>';
+    // NEW badge: when the AI emits an allocation tagged _overflowAbsorber: true,
+    // it was generated specifically to absorb projected cascade overflow. Surface
+    // that to the user with a small "NEW" badge next to the title so they
+    // understand the card was added beyond the conventional Phase 1 plan.
+    var _newBadge=a._overflowAbsorber===true?'<span style="margin-left:8px;padding:2px 6px;font-size:9px;font-weight:700;letter-spacing:.06em;color:var(--yl);background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);border-radius:2px;text-transform:uppercase">NEW</span>':'';
+    h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);display:flex;align-items:center">'+name+_cardInfo+_newBadge+'</div>';
   }
   // "Why this" in guided or AI reasoning. Interpolate {{AMOUNT}} placeholders
   // with the live a.amount so the prose always matches the slider — see
@@ -25191,7 +25319,11 @@ function _cpBuildCard(a,idx,isUnassigned){
     else if(a.type==='hsa'&&a._hdhpGated)_aoMsg='Action required — HSA contributions need HDHP enrollment. Confirm you\'re on a High Deductible Health Plan through your employer or marketplace, then return here to set a contribution amount up to the IRS limit ($367/mo self / $712/mo family).';
     h+='<div style="padding:10px 12px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.15);border-radius:4px;margin-top:8px;font-size:13px;color:var(--yl);line-height:1.5;display:flex;align-items:center;gap:8px"><span style="font-size:16px">📋</span><span>'+_aoMsg+'</span></div>';
   } else {
-    h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_cpHex2Rgba(color,0.08)+';border-radius:4px"><div id="cpAmt'+idx+'" style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(a.amount)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
+    // Big-number display = TOTAL (currentContrib + a.amount). a.amount stays as
+    // EXTRA in storage. Matches the slider's TOTAL display under extras semantics
+    // (see _cpSlide for the inverse — slider input value is treated as Total
+    // and Extra is derived as max(0, Total − currentContrib)).
+    h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_cpHex2Rgba(color,0.08)+';border-radius:4px"><div id="cpAmt'+idx+'" style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(_displayTotal)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
   }
   h+='</div>';
   // ── Cascade progression: show when unfunded items will start receiving money ──
@@ -26857,7 +26989,15 @@ function _cpSetBreathingRoom(v){
     var mi=document.getElementById('cpManual'+i);
     if(mi)mi.value=parseFloat(a.amount)||0;
     var amtEl=document.getElementById('cpAmt'+i);
-    if(amtEl)amtEl.textContent=fmt(parseFloat(a.amount)||0);
+    if(amtEl){
+      // Sync to TOTAL display (currentContrib + Extra) for consistency with the
+      // _cpBuildCard big-number render. Without the currentContrib lookup the
+      // breathing-room rebalance would show just Extra and the slider/breakdown
+      // would disagree.
+      var _matchRebal=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentContrib:0};
+      var _curContribRebal=parseInt((_matchRebal&&_matchRebal.currentContrib)||0)||0;
+      amtEl.textContent=fmt(_curContribRebal+(parseFloat(a.amount)||0));
+    }
   });
   // Refresh slider caps + cap notes — pass refreshMax:true since the budget itself changed
   if(typeof _cpUpdateSliderCaps==='function')_cpUpdateSliderCaps(-1,{refreshMax:true});
@@ -31651,7 +31791,8 @@ function _cpRunSimulation(){
               _ibcRecovery:true,
               _ibcChoice:'cancel',
               _ibcVehicleAtSurrender:ibcSim.vehicle,
-              _ibcOptBDestination:optBDest
+              _ibcOptBDestination:optBDest,
+              allocIdx:CPLAN.allocations.indexOf(debtA)
             });
           } else {
             events.push({
@@ -31661,7 +31802,8 @@ function _cpRunSimulation(){
               cascade:debtA.cascade,
               label:'IBC loans repaid (CV=AV) — freed minimums now redistributing',
               _ibcRecovery:true,
-              _ibcChoice:'continue'
+              _ibcChoice:'continue',
+              allocIdx:CPLAN.allocations.indexOf(debtA)
             });
           }
         } else {
@@ -32658,9 +32800,13 @@ function _cpSlide(i,v){
   _cpMarkModified();
   // TARGETED update — only touch the elements that changed, don't rebuild the DOM
   var a=CPLAN.allocations[i];
-  // 1. Update amount display
+  // 1. Update amount display = TOTAL (currentContrib + EXTRA), matching the
+  // big-number render in _cpBuildCard. Without this, dragging the slider would
+  // update the slider/numeric inputs but leave the big number stale.
+  var _matchAmt=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentContrib:0};
+  var _curContribAmt=parseInt((_matchAmt&&_matchAmt.currentContrib)||0)||0;
   var amtEl=document.getElementById('cpAmt'+i);
-  if(amtEl)amtEl.textContent=fmt(a.amount);
+  if(amtEl)amtEl.textContent=fmt(_curContribAmt+(parseFloat(a.amount)||0));
   // 1a. Update existing-account context line ("Currently $X + Extra $Y = $Z total")
   // when present. Slider drives the EXTRA value; total = currentContrib + extra.
   var extraEl=document.getElementById('cpExtra'+i);
@@ -33766,7 +33912,7 @@ function cplanSave(){
   // Wave 4: preserve state machine fields. Also fix latent Wave 1 bug —
   // _ibcUnderlyingType was missing from this map and was being lost on reload,
   // which made IUL allocations fall back to the WL 4% rate after any save/reload.
-  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false};});
+  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true};});
   var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,selectedApproach:CPLAN._selectedApproach||'',approaches:CPLAN._approaches||null,planSource:CPLAN.hasAdvisor?'advisor':'self',planMode:CPLAN.planMode||'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString(),phaseNames:{1:CPLAN._phase1Name||'',2:CPLAN._phase2Name||'',3:CPLAN._phase3Name||'',4:CPLAN._phase4Name||''},ai_generations:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.ai_generations)||[],checkIns:CPLAN._checkIns||{},
     // Phase A: persist time anchor + original-projection baseline. Both are immutable
     // after first save — they're only re-captured if missing (legacy plan migration).
