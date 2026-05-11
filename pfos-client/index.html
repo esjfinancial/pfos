@@ -20598,6 +20598,19 @@ function _cpEnsurePlanLoaded(){
   if(saved.approaches)CPLAN._approaches=saved.approaches;
   if(saved.selectedApproach)CPLAN._selectedApproach=saved.selectedApproach;
   var fd=APP._portalFd;if(fd&&fd.calcs){CPLAN.income=fd.calcs.inc||0;CPLAN.expenses=fd.calcs.baseExp||0;CPLAN.surplus=Math.max(0,(fd.calcs.netCF||0));CPLAN.totalDebt=fd.calcs.totalDebt||0;CPLAN.age=fd.age||parseInt((fd.S||{}).age)||35;CPLAN.debts=(fd.S||{}).debts||[];CPLAN.retirementAge=parseInt((fd.S&&fd.S.profile&&fd.S.profile.retAge))||CPLAN.retirementAge||65;CPLAN.retIncome=parseFloat((fd.S&&fd.S.profile&&fd.S.profile.retIncome))||0;CPLAN.spRetIncome=parseFloat((fd.S&&fd.S.profile&&fd.S.profile.spRetIncome))||0;}
+  // ── IBC-debt consolidation on load ──────────────────────────────────────
+  // Saved plans from before the S1 prompt fix (single-debt-card rule) may
+  // contain two debt allocations — one IBC-flavored, one avalanche-style.
+  // Run the consolidator here for the same reasons documented at the
+  // _cpConvertAIRecs post-processing site (search for "IBC-debt-strategy
+  // single-card consolidation"). Without this, a user with a legacy saved
+  // plan would see two debt cards even after deploying the fix, until they
+  // regenerate. The consolidator detects IBC intent via either the
+  // _ibcDebtStrategy flag or title/reason heuristics for plans that pre-date
+  // the flag being introduced.
+  if(typeof _cpConsolidateIBCDebtCardsOnLoad==='function'){
+    try{_cpConsolidateIBCDebtCardsOnLoad();}catch(_cErr){console.warn('IBC consolidator on load:',_cErr);}
+  }
   // Run simulation silently — initial pass without partner data (single-user view)
   if(typeof _cpRunSimulation==='function')try{_cpRunSimulation();}catch(e){}
   // Phase 4: eager partner load. If a couple link exists, fetch partner data in the
@@ -20882,6 +20895,58 @@ function _cpMigrateAllocationsToExtras(plan){
   });
   plan._extrasSemantics=true;// stamp so subsequent loads skip
   return plan;
+}
+
+// ── _cpConsolidateIBCDebtCardsOnLoad ────────────────────────────────────────
+// Same logic as the consolidation pass inside _cpConvertAIRecs (search for
+// "IBC-debt-strategy single-card consolidation"), but operates on the
+// already-loaded CPLAN.allocations rather than during the AI → CPLAN
+// conversion. Called from _cpEnsurePlanLoaded so saved plans from before the
+// S1 single-debt-card prompt fix get cleaned up at load time.
+//
+// Why two copies of this logic instead of factoring out a helper that both
+// callers use? The IIFE in _cpConvertAIRecs runs right after the conversion
+// loop and sees the just-pushed allocations — it has tight semantics about
+// when it can mutate (only during post-processing). Centralizing into a
+// shared helper would force the load path to import IIFE-internal context.
+// The duplication is ~40 lines and keeps the call sites self-explanatory.
+function _cpConsolidateIBCDebtCardsOnLoad(){
+  if(typeof CPLAN==='undefined'||!CPLAN.allocations)return;
+  var debtIdxs=[];
+  CPLAN.allocations.forEach(function(a,i){if(a.type==='debt'&&a.amount>0)debtIdxs.push(i);});
+  if(debtIdxs.length<2)return;
+  // First pass: prefer an explicitly flagged IBC card.
+  var ibcIdx=debtIdxs.find(function(i){return CPLAN.allocations[i]._ibcDebtStrategy===true;});
+  // Fallback: detect via title/reason heuristics for legacy plans.
+  if(ibcIdx==null){
+    ibcIdx=debtIdxs.find(function(i){
+      var a=CPLAN.allocations[i];
+      var t=((a.customName||'')+' '+(a.reason||'')).toLowerCase();
+      return t.indexOf('ibc')>=0||t.indexOf('infinite banking')>=0||(t.indexOf('whole life policy')>=0&&t.indexOf('debt')>=0);
+    });
+    if(ibcIdx!=null){
+      var aFix=CPLAN.allocations[ibcIdx];
+      aFix._ibcDebtStrategy=true;
+      var tFix=((aFix.customName||'')+' '+(aFix.reason||'')).toLowerCase();
+      if(!aFix._ibcUnderlyingType){
+        aFix._ibcUnderlyingType=(tFix.indexOf('indexed universal')>=0||tFix.indexOf('iul')>=0)?'iul':'wl';
+      }
+    }
+  }
+  if(ibcIdx==null)return;
+  var ibcA=CPLAN.allocations[ibcIdx];
+  var toRemove=[];
+  debtIdxs.forEach(function(i){
+    if(i===ibcIdx)return;
+    var other=CPLAN.allocations[i];
+    ibcA.amount=(parseFloat(ibcA.amount)||0)+(parseFloat(other.amount)||0);
+    toRemove.push(i);
+  });
+  toRemove.sort(function(a,b){return b-a;}).forEach(function(i){
+    CPLAN.allocations.splice(i,1);
+  });
+  CPLAN.debtStrategy='ibc';
+  console.log('[PFOS load] Consolidated '+toRemove.length+' duplicate debt cards from saved plan into IBC strategy ($'+ibcA.amount+'/mo)');
 }
 function _trackComplete(idx){
   var a=CPLAN.allocations[idx];if(!a)return;
@@ -23333,16 +23398,112 @@ function _cpConvertAIRecs(aiData){
     } else if(map.type==='wl'){
       _underlying='wl';
     }
+    // ── IBC-as-debt-strategy flag ─────────────────────────────────────────
+    // When the AI emits an allocation with section='debt' AND a strategy that
+    // resolves to type='ibc' (ibc_wl / ibc_iul / ibc), section-lock keeps the
+    // type as 'debt' (section_locked has debt:true at line ~23190). But the
+    // semantic intent is "this card represents the IBC debt strategy" — a
+    // dual-purpose allocation that funds a real WL/IUL policy AND eliminates
+    // debt via policy loans. We tag _ibcDebtStrategy:true so:
+    //   1. The retirement-projection chart (line ~32503 filter) can include
+    //      this debt-typed allocation in the legend and series, since the
+    //      IBC policy IS a retirement asset post-debt-free.
+    //   2. The C6 phase-3+ transformation can identify these for correct
+    //      "Whole Life Policy — Continuation" rendering.
+    //   3. cplanSave persists the flag so it survives reload.
+    var _isIBCDebtStrat=(r.section==='debt'&&map.type==='debt'&&_strat&&(_strat==='ibc_wl'||_strat==='ibc_iul'||_strat==='ibc'));
     // Wave 4 state machine: new allocations start in PROPOSED state. Insurance
     // products get a stable _policyId at creation so audits and snapshots can
     // distinguish Policy #1 vs Policy #2 vs Policy #N within the same purpose lane.
-    var _isInsurance=(map.type==='iul'||map.type==='wl'||map.type==='ibc'||(map.type==='edu'&&(r._eduVeh==='wl'||r._eduVeh==='iul')));
+    var _isInsurance=(map.type==='iul'||map.type==='wl'||map.type==='ibc'||(map.type==='edu'&&(r._eduVeh==='wl'||r._eduVeh==='iul'))||_isIBCDebtStrat);
     var _policyId=_isInsurance?('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)):null;
-    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,_overflowAbsorber:r._overflowAbsorber===true});
+    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying||(_isIBCDebtStrat&&_strat==='ibc_iul'?'iul':_isIBCDebtStrat?'wl':null),_ibcDebtStrategy:_isIBCDebtStrat,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,_overflowAbsorber:r._overflowAbsorber===true});
     usedPool+=amt;
   });
 
   // ── POST-PROCESSING ──
+
+  // ── IBC-debt-strategy single-card consolidation ──────────────────────────
+  // CRITICAL: Runs FIRST so all downstream post-processing (EF backstop, HSA
+  // gate, premium lock, etc.) sees the consolidated state. Without this, the
+  // simulator's `find(a.type==='debt')` could pick up a stale legacy avalanche
+  // card before the IBC card, suppressing the entire IBC continuation path.
+  //
+  // Background: pre-fix AI deployments sometimes emit BOTH an IBC-flavored debt
+  // allocation (strategy=ibc_wl/iul) AND a separate avalanche-style debt-
+  // acceleration allocation. The S1 prompt fix tells the AI to emit only one,
+  // but legacy AI outputs already in users' allocation_plan persist that pattern
+  // until next regeneration. Image 4 in our session showed exactly this:
+  //   "Open IBC Whole Life Policy for High-Interest Debt Elimination $400"
+  //   "High-Interest Debt Minimum Payments + Acceleration Support $800"
+  // Both with section='debt'. The AI's intent was clearly IBC, but the second
+  // card confused the simulator and the user.
+  //
+  // Strategy: when multiple type='debt' allocations exist AND at least one has
+  // _ibcDebtStrategy:true, consolidate down to ONE allocation:
+  //   - Keep the IBC-flagged allocation as the canonical one
+  //   - Merge all OTHER debt allocations' amounts into it (sum monthly_cost)
+  //   - Drop the duplicates
+  //   - Set CPLAN.debtStrategy='ibc' explicitly so the simulator knows
+  //
+  // Why merge amounts: the user's intent is "$X/mo to fight my high-rate debt."
+  // Whether the AI split that into ($400 IBC + $800 avalanche) or unified as
+  // ($1,200 IBC), the user's commitment is the same total. Merging preserves
+  // the deployment surface without losing budgeted dollars.
+  (function _consolidateIBCDebtCards(){
+    var debtIdxs=[];
+    CPLAN.allocations.forEach(function(a,i){if(a.type==='debt'&&a.amount>0)debtIdxs.push(i);});
+    if(debtIdxs.length<2)return;// nothing to consolidate
+    // First pass: prefer an explicitly flagged IBC card if any exists.
+    var ibcIdx=debtIdxs.find(function(i){return CPLAN.allocations[i]._ibcDebtStrategy===true;});
+    // Fallback: detect IBC intent from the title/reason of any debt card.
+    // The AI emits titles like "Open IBC Whole Life Policy for…" or "IBC
+    // Strategy for High-Rate Debt" which we can recognize even when the
+    // _ibcDebtStrategy flag wasn't set (legacy plans saved before the flag
+    // existed, OR AI outputs that didn't go through the new conversion path).
+    // Title matching is a string heuristic so we anchor on multiple distinct
+    // keywords ("ibc", "infinite banking", "whole life policy for") to keep
+    // false positives low.
+    if(ibcIdx==null){
+      ibcIdx=debtIdxs.find(function(i){
+        var a=CPLAN.allocations[i];
+        var t=((a.customName||'')+' '+(a.reason||'')).toLowerCase();
+        return t.indexOf('ibc')>=0||t.indexOf('infinite banking')>=0||(t.indexOf('whole life policy')>=0&&t.indexOf('debt')>=0);
+      });
+      // If detected via title, retroactively set the flag so downstream code
+      // (chart filter, retirement subtotal, persistence) recognizes this
+      // allocation as IBC-strategy.
+      if(ibcIdx!=null){
+        CPLAN.allocations[ibcIdx]._ibcDebtStrategy=true;
+        // Also infer underlying type for correct net-rate selection in
+        // _cpGetNetRate. Default to WL unless title clearly says IUL.
+        var aFix=CPLAN.allocations[ibcIdx];
+        var tFix=((aFix.customName||'')+' '+(aFix.reason||'')).toLowerCase();
+        if(!aFix._ibcUnderlyingType){
+          aFix._ibcUnderlyingType=(tFix.indexOf('indexed universal')>=0||tFix.indexOf('iul')>=0)?'iul':'wl';
+        }
+      }
+    }
+    if(ibcIdx==null)return;// no IBC-flagged debt card; leave others alone (different AI intent)
+    var ibcA=CPLAN.allocations[ibcIdx];
+    var toRemove=[];
+    debtIdxs.forEach(function(i){
+      if(i===ibcIdx)return;
+      var other=CPLAN.allocations[i];
+      // Sum the duplicate's amount into the IBC card's budget. Preserves the
+      // user's deployment commitment; the IBC simulator handles the math from
+      // there (premium drives policy, freed minimums repay loan).
+      ibcA.amount=(parseFloat(ibcA.amount)||0)+(parseFloat(other.amount)||0);
+      toRemove.push(i);
+    });
+    // Splice in reverse-index order so earlier indices stay valid as we delete.
+    toRemove.sort(function(a,b){return b-a;}).forEach(function(i){
+      CPLAN.allocations.splice(i,1);
+    });
+    // Anchor debt strategy so the simulator's IBC branch fires for this run.
+    CPLAN.debtStrategy='ibc';
+    console.log('[PFOS] Consolidated '+toRemove.length+' duplicate debt cards into IBC strategy allocation (now $'+ibcA.amount+'/mo)');
+  })();
 
   // P1 (Fix #1): Backstop — ensure every EF allocation has target populated.
   // The AI may omit target_amount on its EF recommendation; without target the
@@ -32317,7 +32478,12 @@ function _cpRunSimulation(){
     var balByIdx={};                       // running balance per alloc, persists across months within this year
     var unBalAccum=0;                      // running unallocated surplus (0% growth, just stacks)
     var growthIdxList=[];                  // alloc indices we walk per month (skip debt)
-    CPLAN.allocations.forEach(function(a,idx){if(a.type!=='debt'){growthIdxList.push(idx);balByIdx[idx]=_curBalanceByIdx[idx]||0;}});
+    // Include debt-typed allocations ONLY when they're IBC debt strategy:
+    // those represent a real permanent-insurance policy whose CV grows over
+    // time and contributes to retirement assets. Pure-debt allocations (avalanche/
+    // snowball card-acceleration) stay excluded since debt-elimination doesn't
+    // produce a growth balance to track.
+    CPLAN.allocations.forEach(function(a,idx){if(a.type!=='debt'||a._ibcDebtStrategy){growthIdxList.push(idx);balByIdx[idx]=_curBalanceByIdx[idx]||0;}});
     var monthlySurplus=CPLAN.surplus||0;
     // Phase D multi-partner: precompute per-allocation retirement-month and spousal IRA flags
     // so the inner monthly loop doesn't recompute these for every (yr, m, idx) triple.
@@ -32422,7 +32588,11 @@ function _cpRunSimulation(){
       // visibly disagree with the Net Worth view for plans that put $2-3M
       // into taxable brokerage by age 65. EF / 529 / vacation goals stay
       // excluded — those are specific-purpose buckets, not retirement income.
-      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'].indexOf(a.type)>=0){
+      // _ibcDebtStrategy: a debt-typed allocation that's actually an IBC
+      // policy funding source. Its accumulated balance (WL cash value) IS a
+      // retirement asset post-debt-free, so include it just like any 'ibc'
+      // allocation would be included.
+      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'].indexOf(a.type)>=0 || a._ibcDebtStrategy){
         if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
         _retOnlyByYear[yr]+=bal;
       }
@@ -32500,10 +32670,21 @@ function _cpRenderChart(targetId){
   var _retTypes=['roth','401k','roth401k','iul','wl','trad_ira','solo401k','sep_ira','hsa','ibc'];
   var _chartGrowthTypes=_isRetView?_retTypes:['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','ef','house','rental'];
   var active=CPLAN.allocations.filter(function(a){
-    if(a.type==='protection'||a.type==='debt')return false;
+    if(a.type==='protection')return false;
+    // type='debt' is normally excluded from the chart since debt isn't a
+    // growth asset. EXCEPTION: when _ibcDebtStrategy is set, the AI emitted
+    // this as section='debt' but with strategy=ibc_wl/iul — the allocation
+    // funds a real permanent insurance policy whose CV compounds tax-free
+    // post-debt-free month. Including it in the chart legend + series surfaces
+    // the IBC growth contribution in both the Retirement projection trajectory
+    // and the per-allocation breakdown tooltip. Without this exception, Tax-
+    // Free / Hybrid plans that use IBC for debt would silently undercount
+    // retirement assets by the full WL CV at horizon (~$108K+ on a 5-year
+    // policy, much more over 20-year horizons).
+    if(a.type==='debt'&&!a._ibcDebtStrategy)return false;
     if(a.type==='custom'&&a.amount===0)return false;
-    if(_isRetView&&_retTypes.indexOf(a.type)<0)return false;// Retirement view: only retirement vehicles
-    if(_chartGrowthTypes.indexOf(a.type)<0&&a.type!=='custom')return false;
+    if(_isRetView&&_retTypes.indexOf(a.type)<0&&!a._ibcDebtStrategy)return false;// Retirement view: only retirement vehicles
+    if(_chartGrowthTypes.indexOf(a.type)<0&&a.type!=='custom'&&!a._ibcDebtStrategy)return false;
     if(a.amount>0)return true;
     if(CPLAN._sim&&CPLAN._sim.allocFuture){var idx=CPLAN.allocations.indexOf(a);return CPLAN._sim.allocFuture[idx]&&CPLAN._sim.allocFuture[idx].futureAmount>0;}
     return false;
@@ -32734,7 +32915,18 @@ function _cpRenderChart(targetId){
         tipH+='<div style="color:var(--mu);font-size:11px">'+(_isRetView?'No new contributions':'Do nothing')+': '+fmtK(bv2)+'</div>';
         tipH+='<div style="color:'+(diff3>=0?'var(--gr)':'var(--rd)')+';font-size:12px;font-weight:700">'+(diff3>=0?'+':'')+fmtK(diff3)+'</div></div>';
         tip.innerHTML=tipH;
-        var tipX=Math.min(px,svgW-160);tip.style.left=tipX+'px';tip.style.top='4px';tip.style.display='block';
+        // Clamp tooltip position to stay within the plot area pixel bounds on
+        // both sides. svgW is rendered width; padL/padR are viewBox-units that
+        // we scale into pixel units via (svgW/600). Without left clamp, when
+        // cursor is at the left edge of the plot area (svgX === padL+ε), the
+        // tooltip's `left` was `px ≈ padL*(svgW/600)` — visually that's the
+        // leftmost edge of the plot. Without right clamp (existing min behavior
+        // already clamps right), tooltip would clip past the right axis.
+        var tipW=160;// approximate min-width per inline style above
+        var padLpx=padL*(svgW/600);
+        var padRpx=(600-padR)*(svgW/600);
+        var tipX=Math.max(padLpx,Math.min(px,padRpx-tipW));
+        tip.style.left=tipX+'px';tip.style.top='4px';tip.style.display='block';
       }
       if(vLine){vLine.style.left=px+'px';vLine.style.display='block';}
     }
@@ -34105,7 +34297,7 @@ function cplanSave(){
   // Wave 4: preserve state machine fields. Also fix latent Wave 1 bug —
   // _ibcUnderlyingType was missing from this map and was being lost on reload,
   // which made IUL allocations fall back to the WL 4% rate after any save/reload.
-  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,
+  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,
   // Loan tracking fields — persisted so the IBC continuation card state
   // survives logout/login. loanBalance is the canonical outstanding balance;
   // monthlyLoanRepay is the user's repayment slider value; loans[] is the
