@@ -23233,15 +23233,81 @@ function _cpConfirmedAIGen(){
   steps.forEach(function(s,i){h+='<div id="aiStep'+i+'" style="display:flex;align-items:center;gap:10px;padding:6px 0;opacity:0.2;transition:opacity .3s"><div style="width:20px;height:20px;border-radius:10px;background:rgba(168,85,247,.1);display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0" id="aiStepDot'+i+'">○</div><span style="font-size:13px;color:var(--mu)">'+s+'</span></div>';});
   h+='</div></div>';
   root3.innerHTML=h;
-  // Animate steps then generate
+  // ── PACED CHECKMARK ANIMATION + IMMEDIATE AI GENERATION ─────────────────
+  // Prior behavior: 6 checkmarks raced through in 2.4s, then _cpDoAIGenerate
+  // fired and the user waited ~85 more seconds staring at a loading dial.
+  // The checkmarks felt fake — they finished before any real work started.
+  //
+  // New behavior:
+  //   1. Fire _cpDoAIGenerate() IMMEDIATELY so the 3 parallel AI calls start
+  //      at second 0 instead of second 2.4.
+  //   2. Pace checkmarks at ~10s intervals so they animate ACROSS the actual
+  //      90-second generation window — each checkmark represents real elapsed
+  //      time, not synthetic motion.
+  //   3. _cpShowApproachFork() (called when the first approach resolves)
+  //      replaces the entire root3 innerHTML with the 3-card screen — at
+  //      that point the checkmark animation naturally stops because its
+  //      DOM elements are gone. No explicit cleanup needed; the interval
+  //      keeps firing but its getElementById lookups return null and the
+  //      conditional updates no-op safely. We still clearInterval when
+  //      the fork is rendered as a courtesy to avoid wasted ticks.
+  //   4. If all 3 approaches finish before the checkmarks complete (rare —
+  //      sub-60-second generation), _cpShowApproachFork triggered by the
+  //      .then() chain takes over and the user sees the cards immediately.
+  CPLAN._cpGenInProgress=true;
+  // Mark when generation started so the post-render checkmark loop can
+  // accelerate if generation took less than ~60s (no need to keep waiting
+  // when work is already done).
+  CPLAN._cpGenStartedAt=Date.now();
+  // Start the AI calls NOW.
+  _cpDoAIGenerate();
+  // Then pace the checkmarks. Total checkmark animation budget: ~60s (6 × 10s).
+  // Real AI generation is typically 60-90s, so checkmarks finish slightly
+  // before the dial-stage if cards take the full 90s, OR the cards arrive
+  // mid-checkmark and the fork-render replaces this UI entirely.
   var stepIdx=0;
+  var stepInterval=10000;// 10 seconds per step
   var stepTimer=setInterval(function(){
-    if(stepIdx>=steps.length){clearInterval(stepTimer);_cpDoAIGenerate();return;}
+    // If the fork screen has already taken over (first approach landed),
+    // stop animating — the checkmark DOM is gone.
+    if(!document.getElementById('aiStep0')){clearInterval(stepTimer);return;}
+    if(stepIdx>=steps.length){
+      clearInterval(stepTimer);
+      // All checkmarks complete but AI is still working. Switch the icon to
+      // a subtler "finalizing" animation so the user sees we're still on it
+      // (don't leave a static checkmark list with no apparent progress).
+      var iconEl=document.getElementById('aiLoadIcon');
+      if(iconEl){iconEl.textContent='⏳';iconEl.style.animation='spin 2s linear infinite';}
+      var titleEl=root3.querySelector('div[style*="font-weight:700"][style*="margin-bottom:20px"]');
+      // Add a footer note that AI is finalizing — fail gracefully if DOM
+      // structure has changed.
+      try{
+        var stepsCt=document.getElementById('aiLoadSteps');
+        if(stepsCt&&!document.getElementById('aiFinalizingNote')){
+          var noteEl=document.createElement('div');
+          noteEl.id='aiFinalizingNote';
+          noteEl.style.cssText='font-size:12px;color:var(--mu);text-align:center;margin-top:14px;font-style:italic';
+          noteEl.textContent='Finalizing — almost there...';
+          stepsCt.parentNode.appendChild(noteEl);
+        }
+      }catch(_e){}
+      return;
+    }
     var el=document.getElementById('aiStep'+stepIdx);
     var dot=document.getElementById('aiStepDot'+stepIdx);
-    if(el){el.style.opacity='1';}if(dot){dot.textContent='✓';dot.style.background='rgba(34,197,94,.15)';dot.style.color='var(--gr)';}
+    if(el){el.style.opacity='1';}
+    if(dot){dot.textContent='✓';dot.style.background='rgba(34,197,94,.15)';dot.style.color='var(--gr)';}
     stepIdx++;
-  },400);
+  },stepInterval);
+  // Light up the FIRST checkmark right away so the user sees motion
+  // immediately on click — without waiting 10s for the first tick.
+  setTimeout(function(){
+    var el0=document.getElementById('aiStep0');
+    var dot0=document.getElementById('aiStepDot0');
+    if(el0){el0.style.opacity='1';}
+    if(dot0){dot0.textContent='✓';dot0.style.background='rgba(34,197,94,.15)';dot0.style.color='var(--gr)';}
+    stepIdx=1;
+  },800);
 }
 
 // ── AI GENERATE (uses local logic for structure, can later add API for reasoning) ──
