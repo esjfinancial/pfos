@@ -28444,6 +28444,12 @@ function _cpAvailableBudget(excludeIdx){
   var _premTypes={protection:1,umbrella:1,estate:1,annuity_research:1,iul:1,wl:1,ibc:1};
   CPLAN.allocations.forEach(function(a,i){
     if(i===excludeIdx)return;
+    // Overflow-absorber allocations are virtual phase-2+ destinations for
+    // dollars cascaded out of Phase 1 (already counted via the original
+    // Phase 1 allocations that freed them). Counting them here would
+    // double-spend the pool — Phase 1's $X is freed, then re-spent as the
+    // absorber's $X, totaling $2X against the same surplus. Exclude.
+    if(a&&a._spawnedByOverflow===true)return;
     deployed+=(parseFloat(a.amount)||0);
     // Policy-loan repayment competes for the same pool as the regular sliders.
     // Without this, dragging the IBC loan-repayment slider up doesn't shrink
@@ -28493,6 +28499,11 @@ function _cpSliderMax(type,idx){
   if(CPLAN.allocations){
     CPLAN.allocations.forEach(function(a2,j){
       if(j===idx)return;
+      // Overflow-absorber allocations are virtual phase-2+ destinations for
+      // dollars cascaded out of Phase 1 (already counted via the original
+      // Phase 1 allocations that freed them). Counting them here would
+      // double-spend the pool — see _cpAvailableBudget for the same fix.
+      if(a2._spawnedByOverflow===true)return;
       _othersSum+=parseFloat(a2.amount)||0;
       // Static recurring premiums on completed insurance/action-only items
       // also occupy pool space — exclude them so the user can't double-spend.
@@ -32898,13 +32909,19 @@ function _cpRunSimulation(){
           });
           var _newPolicyType=_existingIBCUnderlying||(_planIsTaxFree?'wl':'iul');
           var _newPolicyName=(_newPolicyType==='iul'?'Indexed Universal Life Policy':'Whole Life Policy')+' — Overflow Absorber';
-          // Phase derivation: count how many cascade triggers occur at or
-          // before this event's month. The new policy belongs to (cascadeCount+1)
-          // since it's created BY this event firing.
-          var _phaseHint=1;
+          // Phase derivation: count strict-prior cascade triggers (events whose
+          // month is strictly before this event). The new policy is created BY
+          // this event firing AND lives in the phase AFTER this cascade — so:
+          //   phase = strict-prior count (cascades already settled)
+          //         + 1 (this event itself, which IS a cascade)
+          //         + 1 (the new phase that begins immediately after this cascade)
+          //       = _priorCount + 2
+          // Minimum is therefore phase 2 (first cascade fires → new policy in Phase 2),
+          // never phase 1. Phase 1 is the initial deployment, predating any cascade.
+          var _phaseHint=2;
           if(typeof events==='object'&&events&&events.length){
             var _priorCount=events.filter(function(e2){return (e2.month||0)<ev.month&&(e2.freed>0||e2._ibcContinues>0);}).length;
-            _phaseHint=Math.max(1,_priorCount+1);
+            _phaseHint=Math.max(2,_priorCount+2);
           }
           var _newAlloc={
             type:_newPolicyType,
@@ -33475,8 +33492,30 @@ function _cpRenderChart(targetId){
       } else {
         px=e2.clientX-rect.left;
       }
-      var svgW=rect.width;var scaleX=600/svgW;// viewBox width
-      var svgX=px*scaleX;
+      var svgW=rect.width;
+      // The SVG declaration uses width:100% + max-height:300px with default
+      // preserveAspectRatio="xMidYMid meet". When max-height activates (any
+      // container wider than ~692px at viewBox 600x260), the SVG ELEMENT keeps
+      // width:100% but the viewBox CONTENT renders narrower than the element
+      // and is centered horizontally. Without correcting for this, cursor→viewBox
+      // math uses the element width (too wide), and padLpx/padRpx (computed
+      // below from svgW) land at coordinates that fall in the empty centering-
+      // padding to the LEFT of the actual visible chart — so the tooltip clamp
+      // anchors outside the chart.
+      // Compute the rendered viewBox content's width and its horizontal offset
+      // within the SVG element. If element-aspect ≤ viewBox-aspect, content
+      // fills the width (no centering offset). If element-aspect > viewBox-aspect
+      // (the max-height-active case), content is full-height and centered
+      // horizontally with empty space on both sides.
+      var _elH=rect.height||1;
+      var _vbAspect=600/260;// matches SVG viewBox 0 0 600 260
+      var _renderedW=svgW,_contentOffsetX=0;
+      if(svgW/_elH>_vbAspect){
+        _renderedW=_elH*_vbAspect;
+        _contentOffsetX=(svgW-_renderedW)/2;
+      }
+      var scaleX=600/_renderedW;// viewBox→pixel scale (uses ACTUAL rendered width, not element width)
+      var svgX=(px-_contentOffsetX)*scaleX;
       // Hide tooltip + vertical line when cursor is outside the plot area
       // (padL to W-padR in viewBox space). Without this gate, mousemove events
       // at the left margin clamp yr7 to 0 via Math.max — making the tooltip
@@ -33532,21 +33571,28 @@ function _cpRenderChart(targetId){
         tip.style.display='block';
         var tipW=tip.offsetWidth||160;// fallback if measurement fails
         // CRITICAL: the SVG element may not start at the wrapper's left edge.
-        // When the SVG has max-height that's hit (constrained vertically), it
-        // shrinks proportionally to maintain aspect ratio, becoming narrower
-        // than the wrapper. The tip is positioned absolutely INSIDE the wrapper
-        // (position:relative parent), so tip.style.left is measured from
-        // wrapper-left — NOT from SVG-left. Without accounting for the SVG's
-        // offset within the wrapper, padLpx/padRpx (which are SVG-relative)
-        // get applied to wrapper-relative coordinates, placing the tooltip
-        // hundreds of pixels off from the visual plot area.
+        // When the SVG has max-height that's hit (constrained vertically), the
+        // SVG element keeps width:100% but its viewBox CONTENT is rendered
+        // narrower than the element and centered horizontally (default
+        // preserveAspectRatio="xMidYMid meet"). The tip is positioned absolutely
+        // INSIDE the wrapper (position:relative parent), so tip.style.left is
+        // measured from wrapper-left — NOT from SVG-left.
         //
-        // svgEl.offsetLeft gives the SVG's pixel offset from its positioned
-        // ancestor (the wrapper). Add it to padLpx/padRpx to convert from
-        // SVG-relative to wrapper-relative pixel coordinates.
+        // To get padLpx/padRpx at the ACTUAL visible chart edges (not the SVG
+        // element's edges, which include empty centering-padding when max-height
+        // is hit), we need three offsets stacked:
+        //   1. svgEl.offsetLeft — SVG element's position within the wrapper
+        //   2. _contentOffsetX  — viewBox content's centering offset within the
+        //                          SVG element (0 when max-height not active)
+        //   3. padL*(_renderedW/600) — viewBox padL scaled to rendered pixels
+        //      (uses _renderedW, NOT svgW — the prior svgW scaling was wrong
+        //      whenever max-height activated, which is most desktop viewports)
+        // Without all three, the tooltip clamp's "leftmost" anchor lands in the
+        // centering-padding to the LEFT of the visible chart, producing the
+        // "tooltip starts way outside the graph" symptom.
         var _svgOffsetX=svgEl.offsetLeft||0;
-        var padLpx=_svgOffsetX+padL*(svgW/600);
-        var padRpx=_svgOffsetX+(600-padR)*(svgW/600);
+        var padLpx=_svgOffsetX+_contentOffsetX+padL*(_renderedW/600);
+        var padRpx=_svgOffsetX+_contentOffsetX+(600-padR)*(_renderedW/600);
         // The cursor px is computed from rect.left (SVG-relative), but we
         // need it wrapper-relative for setting tip.style.left consistently
         // with padLpx/padRpx. Shift px by the SVG's wrapper-offset too.
