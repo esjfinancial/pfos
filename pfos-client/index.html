@@ -26105,7 +26105,35 @@ function _cpBuildCard(a,idx,isUnassigned){
       // display shows ONE row with the combined balance.
       var _ibcLoans = a.loans || [];
       var _ibcLoanBalance = a.loanBalance || 0;
-      if(_ibcLoanBalance > 0 || _ibcLoans.length > 0){
+      // PHASE-VIEW GATE: hide the loan UI when the user is viewing a phase
+      // past the IBC recovery month (CV=AV milestone). The simulator emits
+      // an ibc_recovery event at the loan-payoff month; if we're past that
+      // in the active phase view, the loans are conceptually paid off and
+      // the slider is irrelevant. Without this gate, Phase 3+ views would
+      // keep showing the loan slider with the same balance forever even
+      // though the cascade engine has redistributed those freed minimums
+      // to other growth allocations.
+      var _ibcLoanHiddenByPhase=false;
+      try{
+        if(CPLAN._sim&&CPLAN._sim.events&&typeof idx==='number'){
+          var _myRecov=CPLAN._sim.events.find(function(ev){return ev._ibcRecovery&&ev.allocIdx===idx;});
+          if(_myRecov&&typeof _cpPhaseTrigMonth==='function'){
+            var _curView=CPLAN._activePhaseTab||1;
+            var _curViewTrigMo=_cpPhaseTrigMonth(_curView);
+            if(_curViewTrigMo>=(_myRecov.month||0))_ibcLoanHiddenByPhase=true;
+          } else if(_myRecov){
+            // Fallback: derive trigger month from events directly when the
+            // helper isn't available.
+            var _curView2=CPLAN._activePhaseTab||1;
+            if(_curView2>1){
+              var _trigEvts=CPLAN._sim.events.filter(function(e){return (e.freed>0||e._ibcContinues>0||e._ibcRecovery)&&e.type!=='debt_milestone';});
+              var _trEv=_trigEvts[_curView2-2];
+              if(_trEv&&(_trEv.month||0)>=(_myRecov.month||0))_ibcLoanHiddenByPhase=true;
+            }
+          }
+        }
+      }catch(_eGate){}
+      if((_ibcLoanBalance > 0 || _ibcLoans.length > 0) && !_ibcLoanHiddenByPhase){
         h += '<div style="margin-top:10px;padding-top:10px;border-top:1px solid rgba(234,179,8,.15)">';
         h += '<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:rgba(226,232,240,.85);letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px">Active policy loan</div>';
         // Combined balance row. If a.loanBalance is set directly (the canonical
@@ -26302,7 +26330,15 @@ function _cpBuildCard(a,idx,isUnassigned){
           return;
         }
         var isSel=CPLAN.debtStrategy===s.key;var isBest=bestMo!=null&&s.mo===bestMo;
-        h+='<div onclick="CPLAN.debtStrategy=\''+s.key+'\';_cpRenderPlanV2()" style="cursor:pointer;text-align:center;padding:10px 6px;border-radius:4px;border:2px solid '+(isSel?bc2+',.5)':isBest?'rgba(34,197,94,.3)':'rgba(0,68,191,.1)')+';background:'+(isSel?bc2+',.15)':bc2+',.04)')+';transition:all .15s">';
+        // Route IBC clicks through _cpSelectIBCStrategy so the allocation
+        // gets tagged with _ibcDebtStrategy:true. All other strategies just
+        // set CPLAN.debtStrategy directly. Without this routing, the user
+        // can select IBC but downstream chart/projection filters won't see
+        // the IBC growth because the tag isn't set.
+        var _onclickAction=(s.key==='ibc')
+          ?"_cpSelectIBCStrategy()"
+          :"CPLAN.debtStrategy='"+s.key+"';_cpRenderPlanV2()";
+        h+='<div onclick="'+_onclickAction+'" style="cursor:pointer;text-align:center;padding:10px 6px;border-radius:4px;border:2px solid '+(isSel?bc2+',.5)':isBest?'rgba(34,197,94,.3)':'rgba(0,68,191,.1)')+';background:'+(isSel?bc2+',.15)':bc2+',.04)')+';transition:all .15s">';
         h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--mu);margin-bottom:4px;letter-spacing:.04em">'+s.lbl+'</div>';
         h+='<div style="font-family:var(--fd);font-size:20px;color:'+(isSel?bc2+',1)':'var(--wh)')+'">'+s.mo+'</div>';
         h+='<div style="font-size:11px;color:var(--mu)">months'+(s.key==='ibc'&&s.fullFree&&s.fullFree>s.mo?' (cards) · '+s.fullFree+' mo (incl. loan)':'')+'</div>';
@@ -26370,47 +26406,93 @@ function _cpBuildCard(a,idx,isUnassigned){
         var _ibcCV=ibcRes.vehicle||0;
         var _ibcInt=ibcRes.interest||0;
         var _ibcMo=ibcRes.fullFreeMonth||ibcRes.months||0;
+        var _ibcCardsMo=ibcRes.months||_ibcMo;// when cards specifically are paid off (may be < full timeline)
         var _aMo=avalRes.months||0;
         var _aInt=avalRes.interest||0;
-        // Avalanche end-position: debt eliminated (assumed) + $0 asset (avalanche
-        // doesn't build an asset). Net: -avalInterest paid.
-        // IBC end-position: debt eliminated (same outcome) + WL CV
-        // accumulated - policy-loan interest paid.
-        var _aNet=-_aInt;// $0 asset, debt gone, paid $aInt in interest along the way
-        var _ibcNet=_ibcCV-_ibcInt;// WL CV built, debt gone, paid $ibcInt to itself
+        // ── Opportunity cost: avalanche-then-invest scenario ────────────────
+        // Most honest apples-to-apples vs IBC over the same total period.
+        // Scenario: pay debts via avalanche (_aMo months), THEN redirect the
+        // freed monthly amount (premium + freed debt minimums) into a taxable
+        // brokerage for the remaining (_ibcMo - _aMo) months. Pre-tax growth
+        // at 6.5% (S&P long-term average net of expense ratios). Tax drag is
+        // long-term capital gains (15% federal — most common bracket; users
+        // in 0% bracket would see better numbers, 20% bracket worse) applied
+        // to the GAIN portion only (basis is the contributions made).
+        // 
+        // Why include this: pure avalanche-vs-IBC understates IBC's value by
+        // ignoring what avalanche's faster timeline frees up afterward. A
+        // user picking between strategies wants to know: "if I avalanche
+        // AND invest the post-debt-free freed amount, vs IBC, who's ahead
+        // at the same horizon?" Without this column, users can wrongly
+        // assume avalanche leaves them with $0 forever.
+        var _ltcg=0.15;// federal long-term capital gains; could later read from CPLAN._marginalRate context
+        var _taxableRate=0.065;// industry-typical net taxable brokerage growth
+        var _monthlyRate=Math.pow(1+_taxableRate,1/12)-1;
+        // Monthly contribution post-avalanche = premium ($a.amount) + freed debt minimums
+        var _postAvalMonthly=a.amount+(_totalMins||0);
+        var _investMonths=Math.max(0,_ibcMo-_aMo);
+        // Compound monthly contributions: FV = PMT * ((1+r)^n - 1) / r
+        var _taxableFV=0;
+        if(_monthlyRate>0&&_investMonths>0){
+          _taxableFV=_postAvalMonthly*((Math.pow(1+_monthlyRate,_investMonths)-1)/_monthlyRate);
+        } else if(_investMonths>0){
+          _taxableFV=_postAvalMonthly*_investMonths;
+        }
+        var _taxableBasis=_postAvalMonthly*_investMonths;
+        var _taxableGain=Math.max(0,_taxableFV-_taxableBasis);
+        var _taxableTax=Math.round(_taxableGain*_ltcg);
+        var _taxableAfterTax=Math.round(_taxableFV-_taxableTax);
+        // Avalanche column net: debts gone, $0 asset built during debt-pay phase,
+        // -aInt paid in interest. Plus taxable brokerage from post-avalanche
+        // investing for the matched IBC timeline.
+        var _aNet=_taxableAfterTax-_aInt;// includes opportunity-cost upside
+        // IBC end-position: debt eliminated + WL CV accumulated (tax-free,
+        // no LTCG drag) - policy-loan interest paid (to self, so really
+        // staying inside the policy — but for net-cash comparison we count
+        // it as an outflow since the user actually pays that amount over
+        // time even if it builds CV).
+        var _ibcNet=_ibcCV-_ibcInt;
         var _delta=_ibcNet-_aNet;
         var _deltaCol=_delta>0?'#22C55E':'#EF4444';
         var _moDiff=_ibcMo-_aMo;
         h+='<div style="margin-top:8px;padding:12px 14px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:4px">';
         h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="font-size:14px">📊</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:#A855F7">WHY IBC OVER AVALANCHE — NET FINANCIAL POSITION</span></div>';
-        h+='<div style="font-size:13px;line-height:1.55;color:rgba(226,232,240,.85)">';
-        h+='IBC takes <strong style="color:var(--or)">'+_moDiff+' more months</strong> to fully resolve ('+_ibcMo+' mo incl. policy-loan repayment vs avalanche\'s '+_aMo+' mo). The reason it can still be the better choice: <strong>net financial position</strong> at the end.';
-        h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">';
-        // Avalanche column
+        h+='<div style="font-size:13px;line-height:1.55;color:rgba(226,232,240,.85);margin-bottom:8px">Apples-to-apples over the same '+_ibcMo+'-month horizon: avalanche clears debts in '+_aMo+' mo and then invests the freed money in taxable brokerage; IBC clears debts in '+_ibcCardsMo+' mo with the policy carrying a loan for the rest of the timeline while CV compounds.</div>';
+        h+='<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px">';
+        // Column 1 — Avalanche (debt-only, no investing)
         h+='<div style="padding:8px 10px;background:rgba(249,115,22,.04);border:1px solid rgba(249,115,22,.15);border-radius:3px">';
-        h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#F97316;letter-spacing:.06em;margin-bottom:4px">AVALANCHE</div>';
-        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Debt eliminated: <span style="color:var(--gr)">✓</span></div>';
+        h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#F97316;letter-spacing:.06em;margin-bottom:4px">AVALANCHE ONLY</div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Debts gone at: <span style="color:var(--gr)">mo '+_aMo+'</span></div>';
         h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Asset built: <span style="color:var(--mu)">$0</span></div>';
         h+='<div style="font-size:11px;color:var(--mu)">Interest paid: <span style="color:var(--or)">-'+fmtK(_aInt)+'</span></div>';
-        h+='<div style="border-top:1px solid rgba(249,115,22,.15);margin-top:4px;padding-top:4px;font-size:12px;font-weight:700;color:var(--wh)">Net: <span style="color:#EF4444">'+fmtK(_aNet)+'</span></div>';
+        h+='<div style="border-top:1px solid rgba(249,115,22,.15);margin-top:4px;padding-top:4px;font-size:12px;font-weight:700;color:var(--wh)">Net: <span style="color:#EF4444">-'+fmtK(_aInt)+'</span></div>';
         h+='</div>';
-        // IBC column
+        // Column 2 — Avalanche + Taxable Brokerage (opportunity cost framing)
+        h+='<div style="padding:8px 10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:3px">';
+        h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#5B9BFF;letter-spacing:.06em;margin-bottom:4px">AVALANCHE + TAXABLE</div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Debts gone at: <span style="color:var(--gr)">mo '+_aMo+'</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Brokerage FV: <span style="color:#22C55E">+'+fmtK(_taxableFV)+'</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">LTCG tax (15%): <span style="color:var(--or)">-'+fmtK(_taxableTax)+'</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu)">Interest paid: <span style="color:var(--or)">-'+fmtK(_aInt)+'</span></div>';
+        h+='<div style="border-top:1px solid rgba(91,155,255,.15);margin-top:4px;padding-top:4px;font-size:12px;font-weight:700;color:var(--wh)">Net (after-tax): <span style="color:'+(_aNet>0?'#22C55E':'#EF4444')+'">'+fmtK(_aNet)+'</span></div>';
+        h+='</div>';
+        // Column 3 — IBC
         h+='<div style="padding:8px 10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:3px">';
         h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#A855F7;letter-spacing:.06em;margin-bottom:4px">IBC</div>';
-        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Debt eliminated: <span style="color:var(--gr)">✓</span></div>';
-        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Asset built: <span style="color:#22C55E">+'+fmtK(_ibcCV)+'</span></div>';
-        h+='<div style="font-size:11px;color:var(--mu)">Loan interest paid (to self): <span style="color:var(--or)">-'+fmtK(_ibcInt)+'</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Debts gone at: <span style="color:var(--gr)">mo '+_ibcCardsMo+'</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">CV built (tax-free): <span style="color:#22C55E">+'+fmtK(_ibcCV)+'</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu)">Loan int (to self): <span style="color:var(--or)">-'+fmtK(_ibcInt)+'</span></div>';
         h+='<div style="border-top:1px solid rgba(168,85,247,.15);margin-top:4px;padding-top:4px;font-size:12px;font-weight:700;color:var(--wh)">Net: <span style="color:'+_deltaCol+'">'+fmtK(_ibcNet)+'</span></div>';
         h+='</div>';
         h+='</div>';
         h+='<div style="margin-top:8px;font-size:12px;color:'+_deltaCol+';font-weight:600">';
         if(_delta>0){
-          h+='IBC end-position is <strong>'+fmtK(_delta)+' better</strong> than avalanche even though it took '+_moDiff+' more months. The WL cash value continues compounding tax-free after debt-free, which avalanche\'s end state ($0 asset) doesn\'t do.';
+          h+='IBC end-position is <strong>'+fmtK(_delta)+' better</strong> than avalanche-then-invest over the same '+_ibcMo+' months, after accounting for 15% LTCG drag on the taxable brokerage gains. WL cash value compounds tax-free (no LTCG ever if accessed via policy loans) while taxable brokerage gives up '+fmtK(_taxableTax)+' to capital gains tax on '+fmtK(_taxableGain)+' of growth.';
         } else {
-          h+='IBC end-position is <strong>'+fmtK(Math.abs(_delta))+' worse</strong> than avalanche in this specific scenario. If you choose IBC, the trade-off is liquidity flexibility + the policy\'s long-term tax-free growth vs strictly faster debt resolution.';
+          h+='Avalanche + taxable brokerage is <strong>'+fmtK(Math.abs(_delta))+' better</strong> than IBC over this '+_ibcMo+'-month horizon, even after LTCG tax. The strict-debt-payoff route wins here. If you choose IBC, the trade-off is: WL is tax-free for life (taxable brokerage owes LTCG on every withdrawal); long-term horizons past this timeline could favor IBC since compounding continues tax-free while taxable keeps paying LTCG.';
         }
         h+='</div>';
-        h+='<div style="margin-top:6px;font-size:11px;color:var(--mu);line-height:1.5">Note: IBC assumes policy stays in force long-term. Surrendering Year 1-5 typically loses value due to front-loaded acquisition costs. Run carrier-specific illustration before committing.</div>';
+        h+='<div style="margin-top:6px;font-size:11px;color:var(--mu);line-height:1.5">Note: Taxable brokerage assumes 6.5% net annual growth (S&P long-term avg) and 15% LTCG on final gain. Excludes dividend tax during accumulation (~0.4% drag for low-cost index funds — would slightly favor IBC). IBC assumes policy stays in force long-term; surrendering Year 1-5 loses value due to front-loaded costs. Run carrier-specific illustration before committing.</div>';
         h+='</div>';
       }
       // Consolidation loan terms input — shown when consolidation is selected
@@ -30350,11 +30432,36 @@ function _cpIBCYearlyReviewSave(idx){
 // can show the policy's CV growth alongside the debt elimination.
 function _cpSelectIBCStrategy(){
   CPLAN.debtStrategy = 'ibc';
+  // Tag the allocation that represents the IBC debt strategy with
+  // _ibcDebtStrategy:true so downstream filters (chart legend, retirement
+  // subtotal, strategy summary cards, projection growth-walk) include the
+  // policy's CV growth in retirement projections. Without this tag, the
+  // user clicks "IBC" in the strategy comparison panel, CPLAN.debtStrategy
+  // gets set to 'ibc', but no allocation is marked as the IBC carrier —
+  // every retirement-projection consumer keeps excluding the IBC growth
+  // because they gate on _ibcDebtStrategy.
+  //
+  // Priority for tagging: type='debt' allocation first (this is the debt-
+  // acceleration card the user is converting to IBC strategy). Falls back
+  // to existing iul/wl/ibc allocation (the IBC carrier policy itself, if
+  // one exists separately from the debt card).
+  var _debtAlloc=(CPLAN.allocations||[]).find(function(a){return a.type==='debt'&&a.amount>0;});
+  if(_debtAlloc){
+    _debtAlloc._ibcDebtStrategy=true;
+    if(!_debtAlloc._ibcUnderlyingType)_debtAlloc._ibcUnderlyingType='wl';
+  } else {
+    var _insAlloc=(CPLAN.allocations||[]).find(function(a){return (a.type==='iul'||a.type==='wl'||a.type==='ibc')&&a.amount>0;});
+    if(_insAlloc){
+      _insAlloc._ibcDebtStrategy=true;
+      if(!_insAlloc._ibcUnderlyingType)_insAlloc._ibcUnderlyingType=(_insAlloc.type==='iul'?'iul':'wl');
+    }
+  }
   // Check if user has any IBC/WL/IUL growth allocation already.
   var hasIBC = (CPLAN.allocations || []).some(function(a){
     return a.type === 'ibc' || a.type === 'wl' || a.type === 'iul';
   });
   if(hasIBC){
+    if(typeof cplanSave==='function')try{cplanSave();}catch(_e){}
     _cpRender();
     return;
   }
@@ -32144,6 +32251,19 @@ function _cpRunSimulation(){
     if(!a)return false;
     if(typeof _cpActionOnlyTypes!=='undefined'&&_cpActionOnlyTypes[a.type])return true;
     if(!_gateActive)return true; // trajectory mode — count all planned contributions
+    // IBC-debt-strategy allocations stay trackable regardless of _completed
+    // state. The IBC card represents an opened policy that's actively funding
+    // debt-elimination loans — its mechanics (loan-take, freed-min repayment,
+    // CV=AV recovery) drive cascade events that the rest of the projection
+    // depends on. Without this exception, if the user has marked ANY OTHER
+    // card Done (which engages _gateActive), the unmarked IBC card fails
+    // _cpIsTrackable, the simulator's `debtA = find(...&&_cpIsTrackable(a))`
+    // returns undefined, the IBC branch never runs, no _ibcContinues event
+    // ever emits, and the Phase 3+ "WL Continuation" card never appears —
+    // even though IBC is the selected strategy. The IBC card is conceptually
+    // a long-term commitment the user opens once and runs for years; the
+    // "Done" click semantics don't fit it well.
+    if(a._ibcDebtStrategy)return true;
     return !!a._completed;
   }
   // Expose for downstream consumers (chart annotations, score tooltips, etc.)
@@ -32371,22 +32491,14 @@ function _cpRunSimulation(){
         allocFuture[dIdx]._ibcContinuation=ev._ibcContinues;
       }
     }
-    // ibc_recovery event = policy loans fully repaid (CV=AV). At this point the
-    // continuation card's loan-repayment slider should disappear (no balance to
-    // repay) and the user's monthlyLoanRepay budget should redistribute to
-    // other growth allocations via the cascade engine below. Zero the loan
-    // tracking fields here so the UI stops showing the slider in Phase N+2.
-    // Without this, the slider keeps showing the OLD loan balance even after
-    // recovery month, which reads as "money still tied up in loan repayment
-    // even though loans are paid off" — exactly the user's complaint.
-    if(ev._ibcRecovery&&ev.allocIdx!=null){
-      var _recovA=CPLAN.allocations[ev.allocIdx];
-      if(_recovA){
-        _recovA.loanBalance=0;
-        _recovA.monthlyLoanRepay=0;
-        _recovA.loans=[];// audit trail of paid-off loans persisted in plan history; clearing here
-      }
-    }
+    // ibc_recovery event = policy loans fully repaid (CV=AV). At this point
+    // the user's monthlyLoanRepay budget redistributes to other growth
+    // allocations via the cascade engine below. Render-side handles hiding
+    // the loan UI when the active phase is past the recovery month — we do
+    // NOT zero a.loanBalance / a.monthlyLoanRepay here, because the cascade
+    // engine runs at every _cpRunSimulation call (not time-walking), and
+    // zeroing unconditionally would erase the user's pre-recovery loan info
+    // in every simulation pass, breaking the Phase 2 loan UI entirely.
     // Specific cascade target — gate by owner match in hybrid
     if(ev.cascade){
       var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0&&_cascadeOwnerOK(a2.owner))tIdx=i2;});
@@ -32604,20 +32716,45 @@ function _cpRunSimulation(){
         // about ("takes the remainder as cash savings instead of using it
         // for more growth"). Tax-Free's whitelist precludes invest/taxable,
         // so PUA-via-existing-policy is the only viable growth outlet.
+        // Approach detection: Tax-Free uses PUA-only since no taxable
+        // brokerage allocation exists; Hybrid uses PUA when no high-headroom
+        // taxable invest allocation is available (whitelist allows both).
+        // CPLAN._selectedApproach is the user's chosen approach key, set when
+        // they pick from the 3 strategy summary cards.
+        var _approach=CPLAN._selectedApproach||'';
         var _hasInvest=CPLAN.allocations.some(function(a){return a.type==='invest';});
-        var _planIsTaxFree=!_hasInvest;// proxy: Tax-Free is the only approach that excludes invest
-        if(_planIsTaxFree){
+        var _planIsTaxFreeLike=(_approach==='tax_free')||(_approach==='hybrid'&&!_hasInvest);
+        // Fallback proxy when _selectedApproach isn't set (legacy plans saved
+        // before the field existed): no invest allocation = treat as Tax-Free.
+        if(!_approach)_planIsTaxFreeLike=!_hasInvest;
+        if(_planIsTaxFreeLike){
+          // Prefer a dedicated IBC/IUL/WL allocation. If none exists (Tax-Free
+          // plans that route IBC entirely through the _ibcDebtStrategy-flagged
+          // debt allocation), use that — it IS a permanent insurance policy
+          // funded at a.amount premium, just typed 'debt' because the AI
+          // emitted it under section='debt'. Without this fallback, Tax-Free
+          // plans that use IBC for debt strategy and have no separate WL
+          // allocation skip the PUA path entirely and dump the post-recovery
+          // freed amount into cash savings.
           var _permInsIdx=CPLAN.allocations.findIndex(function(a,i){
             return (a.type==='iul'||a.type==='wl'||a.type==='ibc')&&allocAmounts[i]>0&&_cascadeOwnerOK(a.owner);
           });
+          if(_permInsIdx<0){
+            _permInsIdx=CPLAN.allocations.findIndex(function(a,i){
+              return a._ibcDebtStrategy&&allocAmounts[i]>0&&_cascadeOwnerOK(a.owner);
+            });
+          }
           if(_permInsIdx>=0){
             var _permA=CPLAN.allocations[_permInsIdx];
             allocAmounts[_permInsIdx]+=freed;
             allocFuture[_permInsIdx].futureAmount=allocAmounts[_permInsIdx];
             allocFuture[_permInsIdx].boosts.push({month:ev.month,amount:freed,from:ev.label+' (PUA overflow)'});
-            var _existPI=destinations.find(function(d){return d.type===_permA.type;});
+            // Use 'ibc' as display type when _ibcDebtStrategy (otherwise it would
+            // show as 'debt' in the destinations list, which is confusing).
+            var _displayType=(_permA._ibcDebtStrategy&&_permA.type==='debt')?'ibc':_permA.type;
+            var _existPI=destinations.find(function(d){return d.type===_displayType;});
             if(_existPI)_existPI.amount+=freed;
-            else destinations.push({type:_permA.type,name:(_permA.customName||CP_NM[_permA.type]||_permA.type)+' (PUA rider)',amount:freed});
+            else destinations.push({type:_displayType,name:(_permA.customName||CP_NM[_displayType]||_displayType)+' (PUA rider)',amount:freed});
             freed=0;
           }
         }
@@ -33095,7 +33232,7 @@ function _cpRenderChart(targetId){
   // Store chart data for hover interactivity
   var chartId='cpChart_'+Date.now();
   svg='<div id="'+chartId+'" style="position:relative;cursor:crosshair" data-years="'+years+'" data-padl="'+padL+'" data-padr="'+padR+'">'+svg;
-  svg+='<div id="'+chartId+'_tip" style="display:none;position:absolute;pointer-events:none;background:rgba(12,12,52,.95);border:1px solid rgba(91,155,255,.3);border-radius:4px;padding:8px 12px;font-size:12px;min-width:120px;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>';
+  svg+='<div id="'+chartId+'_tip" style="display:none;position:absolute;pointer-events:none;background:rgba(12,12,52,.95);border:1px solid rgba(91,155,255,.3);border-radius:4px;padding:8px 12px;font-size:12px;min-width:120px;max-width:280px;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3)"></div>';
   svg+='<div id="'+chartId+'_line" style="display:none;position:absolute;top:'+padT+'px;width:1px;height:'+(H-padT-padB)+'px;background:rgba(91,155,255,.4);pointer-events:none;z-index:5"></div>';
   svg+='</div>';
   // Hover handler — attached after innerHTML
@@ -33141,10 +33278,19 @@ function _cpRenderChart(targetId){
       if(tip){
         var bv2=_chartBase[yr7]||0;var pv2=_chartPlan[yr7]||0;var diff3=pv2-bv2;
         var tipH='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:6px">Age '+(_chartUserAge+yr7)+'</div>';
-        // Per-allocation breakdown
+        // Per-allocation breakdown. Allocation names are truncated to keep
+        // the tooltip narrow enough that it always fits inside the chart's
+        // plot area (max-width:280px on the tip container). Without this,
+        // full AI-generated titles like "401(k) — Capture Full Match Plus
+        // Traditional Bracket Arbitrage" push the tip wider than the plot
+        // area can hold, forcing the position-clamp to lock the tip at the
+        // left edge regardless of cursor position. We use white-space:nowrap
+        // + overflow:hidden + text-overflow:ellipsis on the name span so
+        // long names truncate to "401(k) — Capture Full Match Plu..." with
+        // visual ellipsis, while the dollar value column stays fully visible.
         _chartActive.forEach(function(ca){
           var sv=(_chartSeries[ca.type]&&_chartSeries[ca.type][yr7])||0;
-          if(sv>0)tipH+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px"><span style="width:8px;height:8px;border-radius:2px;background:'+ca.color+';flex-shrink:0"></span><span style="color:var(--mu);font-size:11px;flex:1">'+ca.name+'</span><span style="color:'+ca.color+';font-weight:700;font-size:12px">'+fmtK(sv)+'</span></div>';
+          if(sv>0)tipH+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:2px;max-width:100%"><span style="width:8px;height:8px;border-radius:2px;background:'+ca.color+';flex-shrink:0"></span><span style="color:var(--mu);font-size:11px;flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="'+ca.name.replace(/"/g,'&quot;')+'">'+ca.name+'</span><span style="color:'+ca.color+';font-weight:700;font-size:12px;flex-shrink:0">'+fmtK(sv)+'</span></div>';
         });
         tipH+='<div style="border-top:1px solid rgba(100,116,139,.15);margin-top:4px;padding-top:4px">';
         tipH+='<div style="color:var(--gr);font-size:12px">Plan: <strong>'+fmtK(pv2)+'</strong></div>';
