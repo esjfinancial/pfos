@@ -25031,32 +25031,18 @@ function _cpRenderPlanV2(){
   // Plan Health Score (top position)
   h+='<div id="cplanHealthScore" style="margin-bottom:14px"></div>';
 
-  // Red-flag panel — sits between instructions/status above and the deployment bar / phase
+  // Red-flag panel — sits between instructions/status above and the phase
   // tabs below, so the reading order is: instructions → status → recommendations → allocate.
   // Populated by _cpRenderRedFlags() in the post-render setTimeout below.
   h+='<div id="cplanRedFlags" style="margin-bottom:14px"></div>';
 
-  // Deployment bar
-  h+='<div id="cpDeployBar" style="height:10px;display:flex;border-radius:5px;overflow:hidden;background:rgba(0,68,191,.05);margin-bottom:6px">';
-  CPLAN.allocations.forEach(function(a){if(a.amount>0){var w2=CPLAN.surplus>0?Math.max(1,Math.round(a.amount/CPLAN.surplus*100)):0;h+='<div style="height:100%;width:'+w2+'%;background:'+CP_COL[a.type]+';opacity:0.7;transition:width .3s"></div>';}});
-  // Static protection premiums (completed items with real premiums) — protection (life/disability)
-  // and the new action-only types from step 4 (umbrella, estate, annuity_research) all use the
-  // same overlay treatment when completed with a recurring premium.
-  var _premTypes={protection:1,umbrella:1,estate:1,annuity_research:1};
-  CPLAN.allocations.forEach(function(a){if(a._staticPremium>0&&a._completed&&_premTypes[a.type]){var w3=CPLAN.surplus>0?Math.max(1,Math.round(a._staticPremium/CPLAN.surplus*100)):0;h+='<div style="height:100%;width:'+w3+'%;background:#E879F9;opacity:0.6;transition:width .3s" title="'+(a._carrier||a.customName||CP_NM[a.type]||'Policy')+' premium"></div>';}});
-  if(unalloc>0)h+='<div style="height:100%;width:'+Math.round(unalloc/Math.max(CPLAN.surplus,1)*100)+'%;background:rgba(100,116,139,.1)"></div>';
-  h+='</div>';
-  // Deployment bar legend
-  h+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-bottom:16px">';
-  CPLAN.allocations.forEach(function(a){if(a.amount>0){var nm=a.customName||CP_NM[a.type]||a.type;h+='<div style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:'+CP_COL[a.type]+';opacity:0.7;flex-shrink:0"></div>'+nm+' <span style="color:'+CP_COL[a.type]+';font-weight:700">'+fmt(a.amount)+'</span></div>';}});
-  // Static premium legend entries — same _premTypes set as the bar above
-  CPLAN.allocations.forEach(function(a){if(a._staticPremium>0&&a._completed&&_premTypes[a.type]){var pNm=(a._carrier||a.customName||CP_NM[a.type]||'Policy')+' premium';h+='<div style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:#E879F9;opacity:0.6;flex-shrink:0"></div>'+pNm+' <span style="color:#E879F9;font-weight:700">'+fmt(a._staticPremium)+'</span>'+(a._termEndYear?' <span style="font-size:10px;color:var(--mu)">(ends '+a._termEndYear+')</span>':'')+'</div>';}});
-  // Split unallocated remainder into reserved breathing room + available-to-allocate
-  var _brReserveLeg=Math.round((CPLAN.surplus||0)*(brPct/100));
-  var _availLeg=Math.max(0,unalloc-_brReserveLeg);
-  if(_brReserveLeg>0)h+='<div style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:rgba(34,197,94,.5);flex-shrink:0"></div>Breathing room <span style="color:var(--gr);font-weight:700">'+fmt(_brReserveLeg)+'</span></div>';
-  if(_availLeg>0)h+='<div style="display:flex;align-items:center;gap:5px;font-size:13px;color:var(--mu)"><div style="width:10px;height:10px;border-radius:2px;background:rgba(100,116,139,.3);flex-shrink:0"></div>Available to allocate <span style="color:#5B9BFF;font-weight:700">'+fmt(_availLeg)+'</span></div>';
-  h+='</div>';
+  // (The top-level deployment bar that used to live here has been removed —
+  // it duplicated the per-phase deployment comparison bars rendered inside
+  // each phase tab below. Showing the same allocation breakdown twice
+  // (once at the top, once per phase) created visual redundancy and forced
+  // the user to scan two parallel views of the same data. The breathing-room
+  // widget below still shows total reserved cash; per-phase bars cover the
+  // allocation split.)
 
   // Breathing room control
   // The big number on this widget is the BREATHING ROOM RESERVE (surplus * brPct/100),
@@ -28375,35 +28361,64 @@ function _cpAvailableBudget(excludeIdx){
 }
 function _cpSliderMax(type,idx){
   var irsMax=_cpIRSMax(type);
-  // STATIC cap: min(IRS limit, surplus − breathing). Deliberately independent of
-  // other allocations' current amounts. The dynamic constraint (sum across all
-  // allocations ≤ budget) is enforced at slide time via snap-back in _cpSlide,
-  // not by mutating each slider's `max` attribute. Mutating max attributes during
-  // an active drag was causing every other slider's thumb to visually shift
-  // because the browser re-positions the thumb relative to its track when max
-  // changes — making sliders appear "linked" even though their `value` was unchanged.
-  // The cap NOTE (_cpEffectiveCapNote) still shows the live pool-aware available so
-  // the user knows how much room remains.
+  // DYNAMIC cap per user requirement:
+  //   slider_i.max = min(IRS_limit_for(type_i), surplus − breathing − sum(other_sliders))
   //
-  // EXTRAS SEMANTICS: a.amount is the EXTRA contribution beyond what the user is
-  // already doing. The IRS limit applies to TOTAL contribution (current + extra),
-  // so the EXTRA can only go up to (IRS_max − currentContrib). Subtracting the
-  // user's existing contribution here keeps the slider from letting them push
-  // total contribution past the legal limit.
+  // This is the strict invariant: the SUM of every slider's value across all
+  // allocations can never exceed (surplus − breathing room). Individual
+  // sliders are further capped by their IRS limit where applicable. When the
+  // user lowers slider X by $Y, every other slider's max GROWS by $Y because
+  // the (surplus−breathing−sum_others) term increases. No auto-bumping; the
+  // user can then raise other sliders up to their new max if they choose.
+  //
+  // CRITICAL: max updates fire on drag-END (_cpSlideEnd / _cpUpdateSliderCaps
+  // with refreshMax:true), NOT on every drag tick. Mid-drag updates caused
+  // visual thumb-jumping on other sliders because changing a range input's
+  // max attribute reflows the thumb position. The user sees stable thumbs
+  // during drag; on release, all sliders refresh to reflect new ceilings.
+  //
+  // EXTRAS SEMANTICS: a.amount is the EXTRA contribution beyond what the
+  // user is already doing in their real accounts. The IRS limit applies to
+  // the TOTAL (current + extra), so the extras-headroom = IRS − currentContrib.
+  // Pool-headroom = surplus − breathing − sum of OTHER allocations' a.amount.
+  // Final max = min(extras-headroom, pool-headroom).
   var surplus=CPLAN.surplus||0;
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
-  var budgetCap=Math.round(surplus*(1-brPct));
-  // Floor of $100 so sliders are always usable even on very small surpluses
-  if(budgetCap<100)budgetCap=Math.max(100,Math.min(surplus||100,15000));
-  // Subtract current contribution if there's an existing matching account.
-  // Guarded against undefined idx and missing helper for early-init contexts.
+  var poolCeiling=Math.round(surplus*(1-brPct));
+  // Sum of every OTHER allocation's a.amount (excludes this slider's own value
+  // so the slider's max is "what could this slider go to, given the others
+  // stay put"). Active-render only — completed action-only items don't have
+  // sliders but their _staticPremium does eat into the pool, so include those.
+  var _othersSum=0;
+  var _premStaticTypes={protection:1,umbrella:1,estate:1,annuity_research:1,iul:1,wl:1,ibc:1};
+  if(CPLAN.allocations){
+    CPLAN.allocations.forEach(function(a2,j){
+      if(j===idx)return;
+      _othersSum+=parseFloat(a2.amount)||0;
+      // Static recurring premiums on completed insurance/action-only items
+      // also occupy pool space — exclude them so the user can't double-spend.
+      if(a2._completed&&a2._staticPremium>0&&_premStaticTypes[a2.type]&&(a2._staticFreq==null||a2._staticFreq==='monthly')){
+        _othersSum+=parseFloat(a2._staticPremium)||0;
+      }
+      // Policy-loan repayment from other allocations also competes for the
+      // same pool — see _cpAvailableBudget for the same logic.
+      if(a2.monthlyLoanRepay>0)_othersSum+=parseFloat(a2.monthlyLoanRepay)||0;
+    });
+  }
+  var poolHeadroom=Math.max(0,poolCeiling-_othersSum);
+  // Floor handling: if pool came out at 0 (surplus too tight), allow a tiny
+  // positive max so the slider DOM still has a valid range. Snap-back in
+  // _cpSlide handles the actual enforcement.
+  if(poolHeadroom<1)poolHeadroom=1;
+  // Subtract current contribution if there's an existing matching account
+  // (extras semantics — the IRS cap applies to TOTAL, slider operates on EXTRA).
   var _curContrib=0;
   if(typeof idx==='number'&&CPLAN.allocations&&CPLAN.allocations[idx]&&typeof _cpMatchExisting==='function'){
     var _m=_cpMatchExisting(CPLAN.allocations[idx]);
     _curContrib=parseFloat(_m&&_m.currentContrib)||0;
   }
   var _irsExtra=Math.max(0,irsMax-_curContrib);
-  return Math.max(0,Math.round(Math.min(_irsExtra,budgetCap)));
+  return Math.max(0,Math.round(Math.min(_irsExtra,poolHeadroom)));
 }
 function _cpIRSNote(type){
   var age=CPLAN.age||30;var is50=age>=50;var is55=age>=55;var is60_63=age>=60&&age<=63;
@@ -30445,15 +30460,24 @@ function _cpSelectIBCStrategy(){
   // acceleration card the user is converting to IBC strategy). Falls back
   // to existing iul/wl/ibc allocation (the IBC carrier policy itself, if
   // one exists separately from the debt card).
+  console.log('[IBC-DEBUG] _cpSelectIBCStrategy called. CPLAN.allocations:',
+    (CPLAN.allocations||[]).map(function(a,i){
+      return {idx:i,type:a.type,amount:a.amount,customName:a.customName,_ibcDebtStrategy:!!a._ibcDebtStrategy,_ibcUnderlyingType:a._ibcUnderlyingType};
+    })
+  );
   var _debtAlloc=(CPLAN.allocations||[]).find(function(a){return a.type==='debt'&&a.amount>0;});
   if(_debtAlloc){
     _debtAlloc._ibcDebtStrategy=true;
     if(!_debtAlloc._ibcUnderlyingType)_debtAlloc._ibcUnderlyingType='wl';
+    console.log('[IBC-DEBUG] Tagged DEBT allocation with _ibcDebtStrategy:true',{customName:_debtAlloc.customName,amount:_debtAlloc.amount,_ibcUnderlyingType:_debtAlloc._ibcUnderlyingType});
   } else {
     var _insAlloc=(CPLAN.allocations||[]).find(function(a){return (a.type==='iul'||a.type==='wl'||a.type==='ibc')&&a.amount>0;});
     if(_insAlloc){
       _insAlloc._ibcDebtStrategy=true;
       if(!_insAlloc._ibcUnderlyingType)_insAlloc._ibcUnderlyingType=(_insAlloc.type==='iul'?'iul':'wl');
+      console.log('[IBC-DEBUG] Tagged INSURANCE allocation with _ibcDebtStrategy:true',{type:_insAlloc.type,customName:_insAlloc.customName,amount:_insAlloc.amount,_ibcUnderlyingType:_insAlloc._ibcUnderlyingType});
+    } else {
+      console.warn('[IBC-DEBUG] No debt/insurance allocation found to tag — IBC strategy set but no carrier');
     }
   }
   // Check if user has any IBC/WL/IUL growth allocation already.
@@ -30461,10 +30485,12 @@ function _cpSelectIBCStrategy(){
     return a.type === 'ibc' || a.type === 'wl' || a.type === 'iul';
   });
   if(hasIBC){
+    console.log('[IBC-DEBUG] hasIBC=true, calling cplanSave + _cpRender. CPLAN.debtStrategy now:',CPLAN.debtStrategy);
     if(typeof cplanSave==='function')try{cplanSave();}catch(_e){}
     _cpRender();
     return;
   }
+  console.log('[IBC-DEBUG] hasIBC=false, showing AddIBCAllocPrompt');
   // No insurance-based growth allocation yet — prompt them.
   _cpShowAddIBCAllocPrompt();
 }
@@ -32716,45 +32742,98 @@ function _cpRunSimulation(){
         // about ("takes the remainder as cash savings instead of using it
         // for more growth"). Tax-Free's whitelist precludes invest/taxable,
         // so PUA-via-existing-policy is the only viable growth outlet.
-        // Approach detection: Tax-Free uses PUA-only since no taxable
-        // brokerage allocation exists; Hybrid uses PUA when no high-headroom
-        // taxable invest allocation is available (whitelist allows both).
+        // Approach detection: Tax-Free uses new-policy creation (no taxable
+        // brokerage allocation exists); Hybrid uses new-policy creation only
+        // when the user's risk class is conservative or moderate, and for
+        // moderate only when their existing risky-investment allocations are
+        // large enough to need protection (>40% of pool deployment).
         // CPLAN._selectedApproach is the user's chosen approach key, set when
         // they pick from the 3 strategy summary cards.
         var _approach=CPLAN._selectedApproach||'';
         var _hasInvest=CPLAN.allocations.some(function(a){return a.type==='invest';});
-        var _planIsTaxFreeLike=(_approach==='tax_free')||(_approach==='hybrid'&&!_hasInvest);
-        // Fallback proxy when _selectedApproach isn't set (legacy plans saved
-        // before the field existed): no invest allocation = treat as Tax-Free.
-        if(!_approach)_planIsTaxFreeLike=!_hasInvest;
-        if(_planIsTaxFreeLike){
-          // Prefer a dedicated IBC/IUL/WL allocation. If none exists (Tax-Free
-          // plans that route IBC entirely through the _ibcDebtStrategy-flagged
-          // debt allocation), use that — it IS a permanent insurance policy
-          // funded at a.amount premium, just typed 'debt' because the AI
-          // emitted it under section='debt'. Without this fallback, Tax-Free
-          // plans that use IBC for debt strategy and have no separate WL
-          // allocation skip the PUA path entirely and dump the post-recovery
-          // freed amount into cash savings.
-          var _permInsIdx=CPLAN.allocations.findIndex(function(a,i){
-            return (a.type==='iul'||a.type==='wl'||a.type==='ibc')&&allocAmounts[i]>0&&_cascadeOwnerOK(a.owner);
-          });
-          if(_permInsIdx<0){
-            _permInsIdx=CPLAN.allocations.findIndex(function(a,i){
-              return a._ibcDebtStrategy&&allocAmounts[i]>0&&_cascadeOwnerOK(a.owner);
+        // Risk class from main app state. Labels are 'Conservative'/'Moderate'/'Aggressive'.
+        var _riskLbl=((window.S&&window.S.riskProfile&&window.S.riskProfile.label)||'').toLowerCase();
+        var _planIsTaxFree=(_approach==='tax_free')||(!_approach&&!_hasInvest);
+        var _planIsHybridEligible=false;
+        if(_approach==='hybrid'){
+          if(_riskLbl==='conservative')_planIsHybridEligible=true;
+          else if(_riskLbl==='moderate'){
+            // Only emit new policy if existing risky allocations (invest/taxable)
+            // are >40% of deployed pool — at that point the user has growth-side
+            // exposure that benefits from a permanent tax-free counterweight.
+            var _totalDeployed=0,_riskyDeployed=0;
+            CPLAN.allocations.forEach(function(a,i){
+              var _amt=allocAmounts[i]||0;
+              if(_amt<=0)return;
+              _totalDeployed+=_amt;
+              if(a.type==='invest')_riskyDeployed+=_amt;
             });
+            if(_totalDeployed>0&&(_riskyDeployed/_totalDeployed)>0.4)_planIsHybridEligible=true;
           }
-          if(_permInsIdx>=0){
-            var _permA=CPLAN.allocations[_permInsIdx];
-            allocAmounts[_permInsIdx]+=freed;
-            allocFuture[_permInsIdx].futureAmount=allocAmounts[_permInsIdx];
-            allocFuture[_permInsIdx].boosts.push({month:ev.month,amount:freed,from:ev.label+' (PUA overflow)'});
-            // Use 'ibc' as display type when _ibcDebtStrategy (otherwise it would
-            // show as 'debt' in the destinations list, which is confusing).
-            var _displayType=(_permA._ibcDebtStrategy&&_permA.type==='debt')?'ibc':_permA.type;
-            var _existPI=destinations.find(function(d){return d.type===_displayType;});
-            if(_existPI)_existPI.amount+=freed;
-            else destinations.push({type:_displayType,name:(_permA.customName||CP_NM[_displayType]||_displayType)+' (PUA rider)',amount:freed});
+          // Aggressive: skip — user's growth thesis is taxable-brokerage-driven;
+          // a new permanent policy doesn't match their stated risk preference.
+        }
+        // Viability threshold: a brand-new permanent insurance policy needs at
+        // least ~$200/mo premium to be worth opening (smaller premiums get eaten
+        // by carrier minimums and policy fees). If freed is below this, skip
+        // new-policy creation and let it fall through to cash savings.
+        var _minViablePremium=200;
+        var _shouldCreateNewPolicy=(_planIsTaxFree||_planIsHybridEligible)&&freed>=_minViablePremium;
+        if(_shouldCreateNewPolicy){
+          // Create a NEW permanent insurance policy as the destination for this
+          // freed amount. Critical: do NOT add to an existing IUL/WL/IBC — that
+          // would violate MEC (Modified Endowment Contract) limits since
+          // permanent insurance policies are funded at design-time and adding
+          // premium post-issue typically pushes the policy past the 7-pay
+          // corridor. The MEC-safe approach is opening a NEW policy designed
+          // around the freed-cash-flow amount.
+          //
+          // Vehicle choice: match the existing IBC underlying type if any
+          // (consistency — if user is comfortable with WL, the new policy is
+          // also WL; same for IUL). Default WL for Tax-Free, IUL for Hybrid
+          // (Hybrid users typically tolerate market-linked accumulation).
+          var _existingIBCUnderlying=null;
+          CPLAN.allocations.forEach(function(a){
+            if(a._ibcUnderlyingType&&!_existingIBCUnderlying)_existingIBCUnderlying=a._ibcUnderlyingType;
+            else if((a.type==='wl'||a.type==='iul')&&!_existingIBCUnderlying)_existingIBCUnderlying=a.type;
+          });
+          var _newPolicyType=_existingIBCUnderlying||(_planIsTaxFree?'wl':'iul');
+          var _newPolicyName=(_newPolicyType==='iul'?'Indexed Universal Life Policy':'Whole Life Policy')+' — Overflow Absorber';
+          // Phase derivation: count how many cascade triggers occur at or
+          // before this event's month. The new policy belongs to (cascadeCount+1)
+          // since it's created BY this event firing.
+          var _phaseHint=1;
+          if(typeof events==='object'&&events&&events.length){
+            var _priorCount=events.filter(function(e2){return (e2.month||0)<ev.month&&(e2.freed>0||e2._ibcContinues>0);}).length;
+            _phaseHint=Math.max(1,_priorCount+1);
+          }
+          var _newAlloc={
+            type:_newPolicyType,
+            amount:freed,
+            target:0,
+            phase:_phaseHint,
+            cascade:'',
+            customName:_newPolicyName,
+            reason:'A new permanent insurance policy designed around the cash freed when prior commitments completed. Funded at '+fmt(freed)+'/mo as overflow absorber. MEC-safe (designed at this premium level from inception, not added to an existing policy). Tax-free cash value accumulation; loan provisions match the existing IBC strategy if any.',
+            flagTitle:'',flagType:'opp',flagIcon:'',eduVehicle:'',owner:'self',
+            _ibcUnderlyingType:_newPolicyType,
+            _ibcDebtStrategy:false,
+            _overflowAbsorber:true,// flag so it shows differently in UI + skips IRS-cap math
+            _state:'proposed',
+            _policyId:'pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8),
+            _policyNumber:null,_lockedPremium:null,_openedDate:null,
+            _spawnedByOverflow:true,// flag for de-duplication on subsequent sim passes
+            _spawnEventLabel:ev.label
+          };
+          // De-dup: don't spawn the same policy twice if cascade engine re-runs.
+          var _alreadySpawned=CPLAN.allocations.some(function(a){
+            return a._spawnedByOverflow&&a._spawnEventLabel===ev.label;
+          });
+          if(!_alreadySpawned){
+            CPLAN.allocations.push(_newAlloc);
+            allocAmounts.push(freed);
+            allocFuture.push({futureAmount:freed,startsMonth:ev.month,boosts:[{month:ev.month,amount:freed,from:ev.label+' (new policy)'}]});
+            destinations.push({type:_newPolicyType,name:_newPolicyName,amount:freed});
             freed=0;
           }
         }
@@ -32846,6 +32925,27 @@ function _cpRunSimulation(){
     // snowball card-acceleration) stay excluded since debt-elimination doesn't
     // produce a growth balance to track.
     CPLAN.allocations.forEach(function(a,idx){if(a.type!=='debt'||a._ibcDebtStrategy){growthIdxList.push(idx);balByIdx[idx]=_curBalanceByIdx[idx]||0;}});
+    // ── IBC-DEBUG: dump simulator growthIdxList so we can verify IBC allocations
+    // are being walked in the per-month projection loop. Only logs once per
+    // sim pass (not per year) to avoid spamming console.
+    if(!CPLAN._ibcDebugLogged){
+      try{
+        console.log('[IBC-DEBUG] _cpRunSimulation growthIdxList:',
+          growthIdxList.map(function(idx){
+            var a=CPLAN.allocations[idx];
+            return {idx:idx,type:a.type,name:a.customName,amount:a.amount,_ibcDebtStrategy:!!a._ibcDebtStrategy};
+          })
+        );
+        var _excluded=CPLAN.allocations.map(function(a,i){return{a:a,i:i};}).filter(function(x){return growthIdxList.indexOf(x.i)<0;});
+        if(_excluded.length){
+          console.log('[IBC-DEBUG] Excluded from growthIdxList:',
+            _excluded.map(function(x){return {idx:x.i,type:x.a.type,name:x.a.customName,_ibcDebtStrategy:!!x.a._ibcDebtStrategy};})
+          );
+        }
+        CPLAN._ibcDebugLogged=true;
+        setTimeout(function(){CPLAN._ibcDebugLogged=false;},2000);// reset so next sim pass logs again
+      }catch(_dErr2){}
+    }
     var monthlySurplus=CPLAN.surplus||0;
     // Phase D multi-partner: precompute per-allocation retirement-month and spousal IRA flags
     // so the inner monthly loop doesn't recompute these for every (yr, m, idx) triple.
@@ -33051,6 +33151,26 @@ function _cpRenderChart(targetId){
     if(CPLAN._sim&&CPLAN._sim.allocFuture){var idx=CPLAN.allocations.indexOf(a);return CPLAN._sim.allocFuture[idx]&&CPLAN._sim.allocFuture[idx].futureAmount>0;}
     return false;
   });
+  // ── IBC-DEBUG: dump chart state so we can diagnose missing-IBC-in-projection ──
+  // Logs every allocation with its critical flags + the filter decision so we
+  // can tell whether IBC is missing because (a) no IBC allocation exists,
+  // (b) _ibcDebtStrategy flag never got set, or (c) some other filter excluded
+  // it despite the flag being set. Remove via grep '[IBC-DEBUG]' once verified.
+  try{
+    console.log('[IBC-DEBUG] _cpRenderChart view='+(_isRetView?'retirement':'networth')+' debtStrategy='+CPLAN.debtStrategy+' selectedApproach='+CPLAN._selectedApproach);
+    console.log('[IBC-DEBUG] All CPLAN.allocations:',
+      CPLAN.allocations.map(function(a,i){
+        var inActive=active.indexOf(a)>=0;
+        return {idx:i,type:a.type,amount:a.amount,customName:a.customName,
+          _ibcDebtStrategy:!!a._ibcDebtStrategy,_ibcUnderlyingType:a._ibcUnderlyingType,
+          _overflowAbsorber:!!a._overflowAbsorber,_completed:!!a._completed,
+          phase:a.phase,inChartActive:inActive};
+      })
+    );
+    console.log('[IBC-DEBUG] active count='+active.length+', _retTypes='+JSON.stringify(_retTypes));
+    var _ibcInActive=active.filter(function(a){return a._ibcDebtStrategy||a.type==='ibc'||a.type==='wl'||a.type==='iul';});
+    console.log('[IBC-DEBUG] IBC-eligible allocations in active set:',_ibcInActive.length,_ibcInActive.map(function(a){return {type:a.type,name:a.customName,amount:a.amount,_ibcDebtStrategy:!!a._ibcDebtStrategy};}));
+  }catch(_dErr){console.warn('[IBC-DEBUG] logging error:',_dErr);}
   if(!active.length&&!CPLAN._sim){el.innerHTML='';return;}
   // ── Chart toggle: Net Worth vs Retirement ──
   var _toggleH='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
@@ -33312,25 +33432,44 @@ function _cpRenderChart(targetId){
         tip.style.visibility='hidden';
         tip.style.display='block';
         var tipW=tip.offsetWidth||160;// fallback if measurement fails
-        var padLpx=padL*(svgW/600);
-        var padRpx=(600-padR)*(svgW/600);
+        // CRITICAL: the SVG element may not start at the wrapper's left edge.
+        // When the SVG has max-height that's hit (constrained vertically), it
+        // shrinks proportionally to maintain aspect ratio, becoming narrower
+        // than the wrapper. The tip is positioned absolutely INSIDE the wrapper
+        // (position:relative parent), so tip.style.left is measured from
+        // wrapper-left — NOT from SVG-left. Without accounting for the SVG's
+        // offset within the wrapper, padLpx/padRpx (which are SVG-relative)
+        // get applied to wrapper-relative coordinates, placing the tooltip
+        // hundreds of pixels off from the visual plot area.
+        //
+        // svgEl.offsetLeft gives the SVG's pixel offset from its positioned
+        // ancestor (the wrapper). Add it to padLpx/padRpx to convert from
+        // SVG-relative to wrapper-relative pixel coordinates.
+        var _svgOffsetX=svgEl.offsetLeft||0;
+        var padLpx=_svgOffsetX+padL*(svgW/600);
+        var padRpx=_svgOffsetX+(600-padR)*(svgW/600);
+        // The cursor px is computed from rect.left (SVG-relative), but we
+        // need it wrapper-relative for setting tip.style.left consistently
+        // with padLpx/padRpx. Shift px by the SVG's wrapper-offset too.
+        var _pxWrapper=px+_svgOffsetX;
         // Default: card just to the right of the cursor. If that would
         // overflow the right edge of the plot area, flip to the left side
         // of the cursor. Final clamp: card must stay fully within the plot
         // area between padLpx and padRpx — never overflowing the chart's
         // visible width on either side.
-        var tipX=px+12;
-        if(tipX+tipW>padRpx)tipX=px-tipW-12;
+        var tipX=_pxWrapper+12;
+        if(tipX+tipW>padRpx)tipX=_pxWrapper-tipW-12;
         tipX=Math.max(padLpx,Math.min(tipX,padRpx-tipW));
         tip.style.left=tipX+'px';tip.style.top='4px';
         tip.style.visibility='visible';
         // Vertical line at cursor px — visually shows which x-position is
-        // being read. Since yr7 is a round() of the cursor's continuous
-        // position, the line at cursor px is at most 0.5 years off from
-        // the data point being displayed; visually indistinguishable.
-        if(vLine){vLine.style.left=px+'px';vLine.style.display='block';}
+        // being read. Position it wrapper-relative too so it aligns with
+        // the cursor (which is over the SVG, which is offset within wrapper).
+        if(vLine){vLine.style.left=_pxWrapper+'px';vLine.style.display='block';}
       } else if(vLine){
-        vLine.style.left=px+'px';vLine.style.display='block';
+        // Fallback if tip element missing — still position vLine wrapper-relative.
+        var _svgOff2=svgEl.offsetLeft||0;
+        vLine.style.left=(px+_svgOff2)+'px';vLine.style.display='block';
       }
     }
     svgEl.addEventListener('mousemove',showTip);
