@@ -20914,26 +20914,36 @@ function _cpConsolidateIBCDebtCardsOnLoad(){
   if(typeof CPLAN==='undefined'||!CPLAN.allocations)return;
   var debtIdxs=[];
   CPLAN.allocations.forEach(function(a,i){if(a.type==='debt'&&a.amount>0)debtIdxs.push(i);});
-  if(debtIdxs.length<2)return;
+  if(debtIdxs.length===0)return;// no debt cards to process
+  // ── Title/reason-based IBC detection for ANY debt card ───────────────────
+  // Even when there's only one debt card (no duplicates to consolidate), we
+  // still need to detect whether it's the IBC strategy and tag it. Legacy
+  // plans saved before the _ibcDebtStrategy flag existed have IBC-titled
+  // debt cards that the downstream chart/projection filters won't recognize
+  // without the flag. Without this pass, those plans show the IBC card in
+  // the debt UI but its growth never flows into the retirement projection,
+  // strategy summary cards, or chart legend — exactly the user's complaint.
+  debtIdxs.forEach(function(i){
+    var a=CPLAN.allocations[i];
+    if(a._ibcDebtStrategy)return;// already flagged
+    var t=((a.customName||'')+' '+(a.reason||'')).toLowerCase();
+    var _looksIBC=t.indexOf('ibc')>=0
+                ||t.indexOf('infinite banking')>=0
+                ||(t.indexOf('whole life')>=0&&(t.indexOf('debt')>=0||t.indexOf('elimination')>=0))
+                ||(t.indexOf('money multiplier')>=0)
+                ||(CPLAN.debtStrategy==='ibc'&&t.indexOf('policy')>=0);// CPLAN.debtStrategy was loaded earlier
+    if(_looksIBC){
+      a._ibcDebtStrategy=true;
+      if(!a._ibcUnderlyingType){
+        a._ibcUnderlyingType=(t.indexOf('indexed universal')>=0||t.indexOf('iul')>=0)?'iul':'wl';
+      }
+      console.log('[PFOS load] Tagged debt card #'+i+' as IBC strategy from title/reason: "'+(a.customName||'').slice(0,60)+'"');
+    }
+  });
+  if(debtIdxs.length<2)return;// detection done; no consolidation needed
   // First pass: prefer an explicitly flagged IBC card.
   var ibcIdx=debtIdxs.find(function(i){return CPLAN.allocations[i]._ibcDebtStrategy===true;});
-  // Fallback: detect via title/reason heuristics for legacy plans.
-  if(ibcIdx==null){
-    ibcIdx=debtIdxs.find(function(i){
-      var a=CPLAN.allocations[i];
-      var t=((a.customName||'')+' '+(a.reason||'')).toLowerCase();
-      return t.indexOf('ibc')>=0||t.indexOf('infinite banking')>=0||(t.indexOf('whole life policy')>=0&&t.indexOf('debt')>=0);
-    });
-    if(ibcIdx!=null){
-      var aFix=CPLAN.allocations[ibcIdx];
-      aFix._ibcDebtStrategy=true;
-      var tFix=((aFix.customName||'')+' '+(aFix.reason||'')).toLowerCase();
-      if(!aFix._ibcUnderlyingType){
-        aFix._ibcUnderlyingType=(tFix.indexOf('indexed universal')>=0||tFix.indexOf('iul')>=0)?'iul':'wl';
-      }
-    }
-  }
-  if(ibcIdx==null)return;
+  if(ibcIdx==null)return;// no IBC card detected; leave duplicates alone (different AI intent)
   var ibcA=CPLAN.allocations[ibcIdx];
   var toRemove=[];
   debtIdxs.forEach(function(i){
@@ -25460,7 +25470,13 @@ function _cpRenderPlanV2(){
           var _origReason2=a.reason;
           var _origAmount2=a.amount;
           a.type='ibc';
-          a.customName='Whole Life Policy — Continuation';
+          // Title reflects the IBC underlying vehicle so the user can see at
+          // a glance whether their continuation policy is WL- or IUL-based.
+          // _ibcUnderlyingType is set at conversion time (line ~23420) based on
+          // strategy: 'ibc_wl' → 'wl', 'ibc_iul' → 'iul'. Default to WL when
+          // missing (most common IBC structure uses dividend-paying WL).
+          var _underlyingLabel=(a._ibcUnderlyingType==='iul')?'IUL':'WL';
+          a.customName='IBC '+_underlyingLabel+' Continuation';
           a.reason='Your high-rate debts are paid off via policy loans. Premium continues at the same amount as before. The freed debt minimums now flow toward repaying the policy loan — see the loan-repayment slider below to adjust how much per month, and the "paid off in ~X months" estimate. A new phase will appear around '+_recovDate2+' when the policy loans are fully repaid (CV=AV) and that money becomes available to redistribute to other growth allocations.';
           // Phase-cumulative amount swap (same logic as the active-render branch)
           if(phaseAmt!==a.amount)a.amount=phaseAmt;
@@ -26337,6 +26353,64 @@ function _cpBuildCard(a,idx,isUnassigned){
         h+='<div style="margin-top:10px;padding:12px 14px;background:'+_cpHex2Rgba(_iCol,0.05)+';border:1px solid '+_cpHex2Rgba(_iCol,0.2)+';border-radius:4px;border-left:3px solid '+_iCol+'">';
         h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:6px"><span style="font-size:14px">'+_iIcon+'</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:'+_iCol+'">'+_iLabel+'</span></div>';
         h+='<div style="font-size:13px;line-height:1.5;color:rgba(226,232,240,.85)">'+_instr+'</div>';
+        h+='</div>';
+      }
+      // ── Why IBC? Net-financial-position reasoning ───────────────────────
+      // When IBC is the selected strategy, surface the math comparing IBC to
+      // avalanche on the dimension that actually matters: net financial
+      // position at debt-free, not raw months-to-clear. Avalanche typically
+      // wins on raw timeline (16mo vs IBC's 22mo cards / 68mo incl. loan),
+      // but IBC produces a funded WL policy with cash value at the end. The
+      // honest comparison: (debt eliminated) + (asset built) — across both
+      // strategies. Without this reasoning surfaced inline, users see IBC
+      // takes ~3-4x as long on the comparison cards and reasonably ask
+      // "why would I pick this?" — the answer requires the asset side of
+      // the ledger which the per-card comparison doesn't show.
+      if(_stratKey==='ibc'&&ibcRes&&ibcRes.eligible&&avalRes){
+        var _ibcCV=ibcRes.vehicle||0;
+        var _ibcInt=ibcRes.interest||0;
+        var _ibcMo=ibcRes.fullFreeMonth||ibcRes.months||0;
+        var _aMo=avalRes.months||0;
+        var _aInt=avalRes.interest||0;
+        // Avalanche end-position: debt eliminated (assumed) + $0 asset (avalanche
+        // doesn't build an asset). Net: -avalInterest paid.
+        // IBC end-position: debt eliminated (same outcome) + WL CV
+        // accumulated - policy-loan interest paid.
+        var _aNet=-_aInt;// $0 asset, debt gone, paid $aInt in interest along the way
+        var _ibcNet=_ibcCV-_ibcInt;// WL CV built, debt gone, paid $ibcInt to itself
+        var _delta=_ibcNet-_aNet;
+        var _deltaCol=_delta>0?'#22C55E':'#EF4444';
+        var _moDiff=_ibcMo-_aMo;
+        h+='<div style="margin-top:8px;padding:12px 14px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:4px">';
+        h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px"><span style="font-size:14px">📊</span><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:#A855F7">WHY IBC OVER AVALANCHE — NET FINANCIAL POSITION</span></div>';
+        h+='<div style="font-size:13px;line-height:1.55;color:rgba(226,232,240,.85)">';
+        h+='IBC takes <strong style="color:var(--or)">'+_moDiff+' more months</strong> to fully resolve ('+_ibcMo+' mo incl. policy-loan repayment vs avalanche\'s '+_aMo+' mo). The reason it can still be the better choice: <strong>net financial position</strong> at the end.';
+        h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">';
+        // Avalanche column
+        h+='<div style="padding:8px 10px;background:rgba(249,115,22,.04);border:1px solid rgba(249,115,22,.15);border-radius:3px">';
+        h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#F97316;letter-spacing:.06em;margin-bottom:4px">AVALANCHE</div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Debt eliminated: <span style="color:var(--gr)">✓</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Asset built: <span style="color:var(--mu)">$0</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu)">Interest paid: <span style="color:var(--or)">-'+fmtK(_aInt)+'</span></div>';
+        h+='<div style="border-top:1px solid rgba(249,115,22,.15);margin-top:4px;padding-top:4px;font-size:12px;font-weight:700;color:var(--wh)">Net: <span style="color:#EF4444">'+fmtK(_aNet)+'</span></div>';
+        h+='</div>';
+        // IBC column
+        h+='<div style="padding:8px 10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:3px">';
+        h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;color:#A855F7;letter-spacing:.06em;margin-bottom:4px">IBC</div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Debt eliminated: <span style="color:var(--gr)">✓</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Asset built: <span style="color:#22C55E">+'+fmtK(_ibcCV)+'</span></div>';
+        h+='<div style="font-size:11px;color:var(--mu)">Loan interest paid (to self): <span style="color:var(--or)">-'+fmtK(_ibcInt)+'</span></div>';
+        h+='<div style="border-top:1px solid rgba(168,85,247,.15);margin-top:4px;padding-top:4px;font-size:12px;font-weight:700;color:var(--wh)">Net: <span style="color:'+_deltaCol+'">'+fmtK(_ibcNet)+'</span></div>';
+        h+='</div>';
+        h+='</div>';
+        h+='<div style="margin-top:8px;font-size:12px;color:'+_deltaCol+';font-weight:600">';
+        if(_delta>0){
+          h+='IBC end-position is <strong>'+fmtK(_delta)+' better</strong> than avalanche even though it took '+_moDiff+' more months. The WL cash value continues compounding tax-free after debt-free, which avalanche\'s end state ($0 asset) doesn\'t do.';
+        } else {
+          h+='IBC end-position is <strong>'+fmtK(Math.abs(_delta))+' worse</strong> than avalanche in this specific scenario. If you choose IBC, the trade-off is liquidity flexibility + the policy\'s long-term tax-free growth vs strictly faster debt resolution.';
+        }
+        h+='</div>';
+        h+='<div style="margin-top:6px;font-size:11px;color:var(--mu);line-height:1.5">Note: IBC assumes policy stays in force long-term. Surrendering Year 1-5 typically loses value due to front-loaded acquisition costs. Run carrier-specific illustration before committing.</div>';
         h+='</div>';
       }
       // Consolidation loan terms input — shown when consolidation is selected
@@ -29133,7 +29207,7 @@ function _cpRenderStressTests(){
         if((a.type==='ef'||a.type==='house')&&a.target>0&&bal>=a.target)contrib=0;
         bal=(bal+contrib)*(1+rate);
       }
-      if(a.type!=='debt')total+=bal;
+      if(a.type!=='debt'||a._ibcDebtStrategy)total+=bal;
     });
     total-=CPLAN.totalDebt;total-=efShock;
     return Math.round(total);
@@ -32297,6 +32371,22 @@ function _cpRunSimulation(){
         allocFuture[dIdx]._ibcContinuation=ev._ibcContinues;
       }
     }
+    // ibc_recovery event = policy loans fully repaid (CV=AV). At this point the
+    // continuation card's loan-repayment slider should disappear (no balance to
+    // repay) and the user's monthlyLoanRepay budget should redistribute to
+    // other growth allocations via the cascade engine below. Zero the loan
+    // tracking fields here so the UI stops showing the slider in Phase N+2.
+    // Without this, the slider keeps showing the OLD loan balance even after
+    // recovery month, which reads as "money still tied up in loan repayment
+    // even though loans are paid off" — exactly the user's complaint.
+    if(ev._ibcRecovery&&ev.allocIdx!=null){
+      var _recovA=CPLAN.allocations[ev.allocIdx];
+      if(_recovA){
+        _recovA.loanBalance=0;
+        _recovA.monthlyLoanRepay=0;
+        _recovA.loans=[];// audit trail of paid-off loans persisted in plan history; clearing here
+      }
+    }
     // Specific cascade target — gate by owner match in hybrid
     if(ev.cascade){
       var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0&&_cascadeOwnerOK(a2.owner))tIdx=i2;});
@@ -32448,7 +32538,16 @@ function _cpRunSimulation(){
         var _allGrowth=CPLAN.allocations.map(function(a,i){return{a:a,i:i};})
           .filter(function(x){
             if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection')return false;
-            if(x.a.type==='iul'||x.a.type==='wl'||x.a.type==='ibc')return false; // fixed premium
+            // Insurance premiums (iul/wl/ibc) are normally FIXED at policy
+            // inception. EXCEPTION: allocations explicitly tagged with
+            // _overflowAbsorber:true are designed to accept additional
+            // contributions — the AI emits these (per S2 prompt block) as
+            // the destination for cascade overflow in Tax-Free / Hybrid plans
+            // that would otherwise drop money into "cash savings." Without
+            // this exception, the entire purpose of _overflowAbsorber is
+            // defeated since the filter blocks the receiving allocation.
+            var _isFixedPremiumIns=(x.a.type==='iul'||x.a.type==='wl'||x.a.type==='ibc');
+            if(_isFixedPremiumIns&&!x.a._overflowAbsorber)return false;
             // Action-only items must not absorb cascade overflow. The AI's
             // PHASE STRUCTURE rule (edge fn line 698) says "Do NOT cascade to
             // action-only items (protection, estate, tax review)". The
@@ -32464,6 +32563,12 @@ function _cpRunSimulation(){
             return (irsMax-allocAmounts[x.i])>0;
           })
           .sort(function(a,b){
+            // Prioritize _overflowAbsorber-tagged allocations first — these
+            // exist specifically to absorb overflow, so they should receive
+            // before any other headroom-having growth vehicle.
+            var aAbs=(a.a._overflowAbsorber)?1:0;
+            var bAbs=(b.a._overflowAbsorber)?1:0;
+            if(aAbs!==bAbs)return bAbs-aAbs;
             var aHr=_cpIRSMax(a.a.type,a.a)-allocAmounts[a.i];
             var bHr=_cpIRSMax(b.a.type,b.a)-allocAmounts[b.i];
             return bHr-aHr;// largest headroom first
@@ -32487,6 +32592,37 @@ function _cpRunSimulation(){
       // (3) Any leftover at this point is true overflow — stash on the event so
       // downstream UI (deployment legend) can surface it as "+ cash savings".
       if(freed>0){
+        // Tax-Free fallback: if we're in a Tax-Free plan AND there's an
+        // existing IBC/WL/IUL allocation (likely the policy that's already
+        // active and just had its loan repaid), allow the overflow to flow
+        // there as a paid-up additions rider — economically equivalent to
+        // the _overflowAbsorber pattern when the AI didn't explicitly tag
+        // one. Without this fallback, Tax-Free plans without invest
+        // allocations and without an _overflowAbsorber tagged allocation
+        // would drop the entire post-loan-recovery freed amount into
+        // "cash savings" — which is literally what the user is complaining
+        // about ("takes the remainder as cash savings instead of using it
+        // for more growth"). Tax-Free's whitelist precludes invest/taxable,
+        // so PUA-via-existing-policy is the only viable growth outlet.
+        var _hasInvest=CPLAN.allocations.some(function(a){return a.type==='invest';});
+        var _planIsTaxFree=!_hasInvest;// proxy: Tax-Free is the only approach that excludes invest
+        if(_planIsTaxFree){
+          var _permInsIdx=CPLAN.allocations.findIndex(function(a,i){
+            return (a.type==='iul'||a.type==='wl'||a.type==='ibc')&&allocAmounts[i]>0&&_cascadeOwnerOK(a.owner);
+          });
+          if(_permInsIdx>=0){
+            var _permA=CPLAN.allocations[_permInsIdx];
+            allocAmounts[_permInsIdx]+=freed;
+            allocFuture[_permInsIdx].futureAmount=allocAmounts[_permInsIdx];
+            allocFuture[_permInsIdx].boosts.push({month:ev.month,amount:freed,from:ev.label+' (PUA overflow)'});
+            var _existPI=destinations.find(function(d){return d.type===_permA.type;});
+            if(_existPI)_existPI.amount+=freed;
+            else destinations.push({type:_permA.type,name:(_permA.customName||CP_NM[_permA.type]||_permA.type)+' (PUA rider)',amount:freed});
+            freed=0;
+          }
+        }
+      }
+      if(freed>0){
         ev._cascadeOverflow=(ev._cascadeOverflow||0)+freed;
         freed=0;
       }
@@ -32507,7 +32643,13 @@ function _cpRunSimulation(){
   var avgAllRate=CPLAN.totalDebt>0?allDebts.reduce(function(t,d){return t+((parseFloat(d.rate)||0)/100/12)*(parseFloat(d.balance)||0);},0)/CPLAN.totalDebt:0;
   var hiRatePmt=debtA?(debtA.amount+hiRateMin):hiRateMin;// Extra + high-rate minimums
   // Per-allocation balance tracking for chart bands
-  var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt')allocSeries[a.type+'_'+i]=[];});
+  // Per-allocation balance tracking for chart bands. Include _ibcDebtStrategy
+  // debt allocations (real WL/IUL policies whose CV grows over time and IS a
+  // retirement asset). Without this initialization the allocSeries[key] is
+  // undefined, the per-month push at line ~32790 fails silently, and the
+  // chart tooltip shows the policy contribution missing from per-allocation
+  // breakdown even though its growth is correctly included in totalData.
+  var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt'||a._ibcDebtStrategy)allocSeries[a.type+'_'+i]=[];});
   var _retOnlyByYear={};
   var retirementData=[];
   // Home equity tracking — get home value from profile if homeowner
@@ -32993,16 +33135,9 @@ function _cpRenderChart(targetId){
       }
       var yr7=Math.round((svgX-padL)/(600-padL-padR)*years);
       yr7=Math.max(0,Math.min(years,yr7));
-      // Snap to the same 5-year tick spacing the X-axis uses (line ~32792
-      // emits labels at [0,5,10,15,20,25,30]). Without snapping, cursor at an
-      // unlabeled year (e.g. yr=2 = Age 40 between the visible Age 38 and
-      // Age 43 ticks) shows tooltip "Age 40" — which the user reads as wrong
-      // because no "Age 40" label appears on the chart and they're hovering
-      // over the area immediately right of "Age 38". Snapping aligns tooltip
-      // data with the nearest visible tick so cursor near Age 38 → "Age 38",
-      // cursor halfway between → "Age 43" (the next visible tick), etc.
-      yr7=Math.round(yr7/5)*5;
-      yr7=Math.max(0,Math.min(years,yr7));
+      // No snapping — show every age. The user explicitly wants the tooltip
+      // to follow the cursor smoothly across the full chart width, rendering
+      // whichever age is closest to cursor's actual X position.
       if(tip){
         var bv2=_chartBase[yr7]||0;var pv2=_chartPlan[yr7]||0;var diff3=pv2-bv2;
         var tipH='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:6px">Age '+(_chartUserAge+yr7)+'</div>';
@@ -33016,33 +33151,40 @@ function _cpRenderChart(targetId){
         tipH+='<div style="color:var(--mu);font-size:11px">'+(_isRetView?'No new contributions':'Do nothing')+': '+fmtK(bv2)+'</div>';
         tipH+='<div style="color:'+(diff3>=0?'var(--gr)':'var(--rd)')+';font-size:12px;font-weight:700">'+(diff3>=0?'+':'')+fmtK(diff3)+'</div></div>';
         tip.innerHTML=tipH;
-        // CRITICAL: Position the tooltip card at the DATA POINT'S exact pixel X,
-        // not at the cursor's px. This way the tooltip card visually aligns with
-        // the age-axis tick whose data is being displayed inside the card. Maps
-        // viewBox x of the data point (x(yr7) = padL + yr7/years*cW in viewBox
-        // units) to pixel space via (svgW/600).
-        var _dataPointPxX=(padL+(yr7/years)*(600-padL-padR))*(svgW/600);
-        var tipW=160;// approximate min-width per inline style above
+        // Position card at the CURSOR's pixel X (not snapped to data point)
+        // so the tip moves smoothly with the cursor. Vertical hover line
+        // anchors to the cursor as well — they move together.
+        // CRITICAL: tipW is the ACTUAL rendered width — not the min-width style
+        // attribute. The previous implementation hardcoded tipW=160 but the
+        // tooltip content (per-allocation breakdown + summary) renders much
+        // wider in practice (~400-520px). That made the right-edge clamp
+        // useless: the card consistently overflowed the chart's right padding,
+        // sometimes extending past the rightmost age tick. Reading offsetWidth
+        // after innerHTML gives the actual rendered width. We need this AFTER
+        // setting innerHTML and BEFORE setting style.left, so the measurement
+        // reflects the real card geometry.
+        tip.style.visibility='hidden';
+        tip.style.display='block';
+        var tipW=tip.offsetWidth||160;// fallback if measurement fails
         var padLpx=padL*(svgW/600);
         var padRpx=(600-padR)*(svgW/600);
-        // Anchor card just to the right of the data point (12px offset so the
-        // card doesn't sit ON the vertical line). If that would overflow the
-        // right edge, flip to the left side of the data point.
-        var tipX=_dataPointPxX+12;
-        if(tipX+tipW>padRpx)tipX=_dataPointPxX-tipW-12;
-        // Final clamp to plot area bounds
+        // Default: card just to the right of the cursor. If that would
+        // overflow the right edge of the plot area, flip to the left side
+        // of the cursor. Final clamp: card must stay fully within the plot
+        // area between padLpx and padRpx — never overflowing the chart's
+        // visible width on either side.
+        var tipX=px+12;
+        if(tipX+tipW>padRpx)tipX=px-tipW-12;
         tipX=Math.max(padLpx,Math.min(tipX,padRpx-tipW));
-        tip.style.left=tipX+'px';tip.style.top='4px';tip.style.display='block';
-        // Also position the vertical line at the data point's exact pixel X
-        // (NOT the cursor's px) so the line snaps to the actual data column.
-        // Without this, the cursor would point at one age but the displayed
-        // data and line would be at the nearest year boundary, creating visual
-        // misalignment that read as "tooltip data doesn't match cursor."
-        if(vLine){vLine.style.left=_dataPointPxX+'px';vLine.style.display='block';}
+        tip.style.left=tipX+'px';tip.style.top='4px';
+        tip.style.visibility='visible';
+        // Vertical line at cursor px — visually shows which x-position is
+        // being read. Since yr7 is a round() of the cursor's continuous
+        // position, the line at cursor px is at most 0.5 years off from
+        // the data point being displayed; visually indistinguishable.
+        if(vLine){vLine.style.left=px+'px';vLine.style.display='block';}
       } else if(vLine){
-        // Fallback if tip element missing (shouldn't happen)
-        var _dpFB=(padL+(yr7/years)*(600-padL-padR))*(svgW/600);
-        vLine.style.left=_dpFB+'px';vLine.style.display='block';
+        vLine.style.left=px+'px';vLine.style.display='block';
       }
     }
     svgEl.addEventListener('mousemove',showTip);
