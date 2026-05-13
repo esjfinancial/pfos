@@ -28450,25 +28450,32 @@ function _cpAvailableBudget(excludeIdx){
   var _premTypes={protection:1,umbrella:1,estate:1,annuity_research:1,iul:1,wl:1,ibc:1};
   CPLAN.allocations.forEach(function(a,i){
     if(i===excludeIdx)return;
-    // Overflow-absorber allocations are virtual phase-2+ destinations for
-    // dollars cascaded out of Phase 1 (already counted via the original
-    // Phase 1 allocations that freed them). Counting them here would
-    // double-spend the pool — Phase 1's $X is freed, then re-spent as the
-    // absorber's $X, totaling $2X against the same surplus. Exclude.
-    // FIELD-NAME NOTE: must use _overflowAbsorber (not _spawnedByOverflow)
-    // because the save shape at ~35001 only persists _overflowAbsorber. The
-    // cascade engine sets BOTH flags when spawning, but _spawnedByOverflow is
-    // dropped on first save — so a stale filter on _spawnedByOverflow misses
-    // every post-save absorber. _overflowAbsorber is also set by AI-emitted
-    // absorbers (line ~23523), making it the canonical durable identifier.
-    if(a&&a._overflowAbsorber===true)return;
+    // Cascade-engine-spawned absorber allocations are virtual destinations
+    // for freed cascade cash whose amount IS the freed money (already counted
+    // upstream via the source allocation that freed it). Counting again here
+    // double-spends the freed cash against the pool. Distinguished from AI-
+    // emitted absorbers (which set only _overflowAbsorber:true) by the
+    // _cascadeSpawned:true flag set at the spawn site (~line 33054).
+    // AI-emitted absorbers are NOT filtered out — their amount is a legitimate
+    // pool draw the AI chose as the destination for freed minimums.
+    if(a&&a._cascadeSpawned===true)return;
     deployed+=(parseFloat(a.amount)||0);
     // Policy-loan repayment competes for the same pool as the regular sliders.
     // Without this, dragging the IBC loan-repayment slider up doesn't shrink
     // other sliders' available budget — pool double-spends. (The IBC slider's
     // own cap subtracts only THIS allocation's existing repay via _availSurplus
     // + _ibcRepay at line 25704, so the conflict only shows up across cards.)
-    if(a&&a.monthlyLoanRepay>0)deployed+=parseFloat(a.monthlyLoanRepay)||0;
+    //
+    // EXCEPTION (Fix K): IBC-debt-strategy allocations have monthlyLoanRepay
+    // auto-set by the cascade engine (~line 32710) when an _ibcContinues event
+    // fires. That repayment is funded by freed debt MINIMUMS, which are not
+    // part of CPLAN.surplus (surplus is calcs.netCF, already net of debt
+    // minimums). Counting it here double-spends those minimums against the
+    // pool, producing Roth/401k slider caps of $0 even though the AI emitted
+    // legitimate positive amounts. User-initiated policy loans (set manually
+    // via loan modal at line 30868) on non-IBC-debt allocations DO come from
+    // pool dollars and are still counted.
+    if(a&&a.monthlyLoanRepay>0&&!a._ibcDebtStrategy)deployed+=parseFloat(a.monthlyLoanRepay)||0;
     if(a&&a._completed&&a._staticPremium>0&&_premTypes[a.type]&&(a._staticFreq==null||a._staticFreq==='monthly')){
       staticPremiums+=parseFloat(a._staticPremium)||0;
     }
@@ -28511,13 +28518,10 @@ function _cpSliderMax(type,idx){
   if(CPLAN.allocations){
     CPLAN.allocations.forEach(function(a2,j){
       if(j===idx)return;
-      // Overflow-absorber allocations are virtual phase-2+ destinations for
-      // dollars cascaded out of Phase 1 (already counted via the original
-      // Phase 1 allocations that freed them). Counting them here would
-      // double-spend the pool — see _cpAvailableBudget for the same fix
-      // and for the FIELD-NAME NOTE on why _overflowAbsorber (not
-      // _spawnedByOverflow) is the correct flag to filter on.
-      if(a2._overflowAbsorber===true)return;
+      // Cascade-engine-spawned absorbers are excluded — see _cpAvailableBudget
+      // for full rationale. AI-emitted absorbers (only _overflowAbsorber:true,
+      // not _cascadeSpawned) ARE counted as legitimate pool draws.
+      if(a2._cascadeSpawned===true)return;
       _othersSum+=parseFloat(a2.amount)||0;
       // Static recurring premiums on completed insurance/action-only items
       // also occupy pool space — exclude them so the user can't double-spend.
@@ -28526,7 +28530,9 @@ function _cpSliderMax(type,idx){
       }
       // Policy-loan repayment from other allocations also competes for the
       // same pool — see _cpAvailableBudget for the same logic.
-      if(a2.monthlyLoanRepay>0)_othersSum+=parseFloat(a2.monthlyLoanRepay)||0;
+      // EXCEPTION (Fix K): IBC-debt-strategy repayment is funded by freed
+      // minimums (not pool draws). See _cpAvailableBudget for full rationale.
+      if(a2.monthlyLoanRepay>0&&!a2._ibcDebtStrategy)_othersSum+=parseFloat(a2.monthlyLoanRepay)||0;
     });
   }
   var poolHeadroom=Math.max(0,poolCeiling-_othersSum);
@@ -30610,11 +30616,6 @@ function _cpSelectNonIBCStrategy(newStrategy){
 // can show the policy's CV growth alongside the debt elimination.
 function _cpSelectIBCStrategy(){
   CPLAN.debtStrategy = 'ibc';
-  console.log('[IBC-DEBUG] _cpSelectIBCStrategy called. CPLAN.allocations:',
-    (CPLAN.allocations||[]).map(function(a,i){
-      return {idx:i,type:a.type,amount:a.amount,customName:a.customName,_ibcDebtStrategy:!!a._ibcDebtStrategy,_ibcUnderlyingType:a._ibcUnderlyingType};
-    })
-  );
   // Check if the user already has an EXPLICITLY DESIGNATED IBC carrier.
   // A retirement-supplement IUL/WL (e.g., a max-funded IUL designed for tax-
   // free supplemental income) is structurally different from an IBC carrier
@@ -30634,7 +30635,6 @@ function _cpSelectIBCStrategy(){
         || a._isIBCVehicle === true;
   });
   if(!hasIBC){
-    console.log('[IBC-DEBUG] hasIBC=false, showing AddIBCAllocPrompt');
     // No designated IBC policy yet — prompt the user to designate one.
     // The popup's choice handlers (_cpAddIBCAllocLink with 'create',
     // 'existing', or 'skip') handle policy creation/designation AND the
@@ -30658,18 +30658,13 @@ function _cpSelectIBCStrategy(){
   if(_debtAlloc){
     _debtAlloc._ibcDebtStrategy=true;
     if(!_debtAlloc._ibcUnderlyingType)_debtAlloc._ibcUnderlyingType='wl';
-    console.log('[IBC-DEBUG] Tagged DEBT allocation with _ibcDebtStrategy:true',{customName:_debtAlloc.customName,amount:_debtAlloc.amount,_ibcUnderlyingType:_debtAlloc._ibcUnderlyingType});
   } else {
     var _insAlloc=(CPLAN.allocations||[]).find(function(a){return (a.type==='ibc'||(a._isIBCVehicle===true&&(a.type==='iul'||a.type==='wl')))&&a.amount>0;});
     if(_insAlloc){
       _insAlloc._ibcDebtStrategy=true;
       if(!_insAlloc._ibcUnderlyingType)_insAlloc._ibcUnderlyingType=(_insAlloc.type==='iul'?'iul':'wl');
-      console.log('[IBC-DEBUG] Tagged INSURANCE allocation with _ibcDebtStrategy:true',{type:_insAlloc.type,customName:_insAlloc.customName,amount:_insAlloc.amount,_ibcUnderlyingType:_insAlloc._ibcUnderlyingType});
-    } else {
-      console.warn('[IBC-DEBUG] No debt/insurance allocation found to tag — IBC strategy set but no carrier');
     }
   }
-  console.log('[IBC-DEBUG] hasIBC=true, calling cplanSave + _cpRender. CPLAN.debtStrategy now:',CPLAN.debtStrategy);
   if(typeof cplanSave==='function')try{cplanSave();}catch(_e){}
   _cpRender();
 }
@@ -33050,6 +33045,7 @@ function _cpRunSimulation(){
             _ibcUnderlyingType:_newPolicyType,
             _ibcDebtStrategy:false,
             _overflowAbsorber:true,// flag so it shows differently in UI + skips IRS-cap math
+            _cascadeSpawned:true,// distinguishes cascade-engine-spawned absorbers from AI-emitted ones; pool/slider math excludes only these (their amount IS the freed cash, already counted via the source allocation)
             _state:'proposed',
             _policyId:'pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8),
             _policyNumber:null,_lockedPremium:null,_openedDate:null,
@@ -33207,27 +33203,6 @@ function _cpRunSimulation(){
     // snowball card-acceleration) stay excluded since debt-elimination doesn't
     // produce a growth balance to track.
     CPLAN.allocations.forEach(function(a,idx){if(a.type!=='debt'||a._ibcDebtStrategy){growthIdxList.push(idx);balByIdx[idx]=_curBalanceByIdx[idx]||0;}});
-    // ── IBC-DEBUG: dump simulator growthIdxList so we can verify IBC allocations
-    // are being walked in the per-month projection loop. Only logs once per
-    // sim pass (not per year) to avoid spamming console.
-    if(!CPLAN._ibcDebugLogged){
-      try{
-        console.log('[IBC-DEBUG] _cpRunSimulation growthIdxList:',
-          growthIdxList.map(function(idx){
-            var a=CPLAN.allocations[idx];
-            return {idx:idx,type:a.type,name:a.customName,amount:a.amount,_ibcDebtStrategy:!!a._ibcDebtStrategy};
-          })
-        );
-        var _excluded=CPLAN.allocations.map(function(a,i){return{a:a,i:i};}).filter(function(x){return growthIdxList.indexOf(x.i)<0;});
-        if(_excluded.length){
-          console.log('[IBC-DEBUG] Excluded from growthIdxList:',
-            _excluded.map(function(x){return {idx:x.i,type:x.a.type,name:x.a.customName,_ibcDebtStrategy:!!x.a._ibcDebtStrategy};})
-          );
-        }
-        CPLAN._ibcDebugLogged=true;
-        setTimeout(function(){CPLAN._ibcDebugLogged=false;},2000);// reset so next sim pass logs again
-      }catch(_dErr2){}
-    }
     var monthlySurplus=CPLAN.surplus||0;
     // Phase D multi-partner: precompute per-allocation retirement-month and spousal IRA flags
     // so the inner monthly loop doesn't recompute these for every (yr, m, idx) triple.
@@ -33471,26 +33446,6 @@ function _cpRenderChart(targetId){
     if(CPLAN._sim&&CPLAN._sim.allocFuture){var idx=CPLAN.allocations.indexOf(a);return CPLAN._sim.allocFuture[idx]&&CPLAN._sim.allocFuture[idx].futureAmount>0;}
     return false;
   });
-  // ── IBC-DEBUG: dump chart state so we can diagnose missing-IBC-in-projection ──
-  // Logs every allocation with its critical flags + the filter decision so we
-  // can tell whether IBC is missing because (a) no IBC allocation exists,
-  // (b) _ibcDebtStrategy flag never got set, or (c) some other filter excluded
-  // it despite the flag being set. Remove via grep '[IBC-DEBUG]' once verified.
-  try{
-    console.log('[IBC-DEBUG] _cpRenderChart view='+(_isRetView?'retirement':'networth')+' debtStrategy='+CPLAN.debtStrategy+' selectedApproach='+CPLAN._selectedApproach);
-    console.log('[IBC-DEBUG] All CPLAN.allocations:',
-      CPLAN.allocations.map(function(a,i){
-        var inActive=active.indexOf(a)>=0;
-        return {idx:i,type:a.type,amount:a.amount,customName:a.customName,
-          _ibcDebtStrategy:!!a._ibcDebtStrategy,_ibcUnderlyingType:a._ibcUnderlyingType,
-          _overflowAbsorber:!!a._overflowAbsorber,_completed:!!a._completed,
-          phase:a.phase,inChartActive:inActive};
-      })
-    );
-    console.log('[IBC-DEBUG] active count='+active.length+', _retTypes='+JSON.stringify(_retTypes));
-    var _ibcInActive=active.filter(function(a){return a._ibcDebtStrategy||a.type==='ibc'||a.type==='wl'||a.type==='iul';});
-    console.log('[IBC-DEBUG] IBC-eligible allocations in active set:',_ibcInActive.length,_ibcInActive.map(function(a){return {type:a.type,name:a.customName,amount:a.amount,_ibcDebtStrategy:!!a._ibcDebtStrategy};}));
-  }catch(_dErr){console.warn('[IBC-DEBUG] logging error:',_dErr);}
   if(!active.length&&!CPLAN._sim){el.innerHTML='';return;}
   // ── Chart toggle: Net Worth vs Retirement ──
   var _toggleH='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
@@ -35197,7 +35152,7 @@ function cplanSave(){
   // Wave 4: preserve state machine fields. Also fix latent Wave 1 bug —
   // _ibcUnderlyingType was missing from this map and was being lost on reload,
   // which made IUL allocations fall back to the WL 4% rate after any save/reload.
-  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,
+  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,
   // Loan tracking fields — persisted so the IBC continuation card state
   // survives logout/login. loanBalance is the canonical outstanding balance;
   // monthlyLoanRepay is the user's repayment slider value; loans[] is the
