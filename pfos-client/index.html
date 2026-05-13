@@ -26421,13 +26421,14 @@ function _cpBuildCard(a,idx,isUnassigned){
         }
         var isSel=CPLAN.debtStrategy===s.key;var isBest=bestMo!=null&&s.mo===bestMo;
         // Route IBC clicks through _cpSelectIBCStrategy so the allocation
-        // gets tagged with _ibcDebtStrategy:true. All other strategies just
-        // set CPLAN.debtStrategy directly. Without this routing, the user
-        // can select IBC but downstream chart/projection filters won't see
-        // the IBC growth because the tag isn't set.
+        // gets tagged with _ibcDebtStrategy:true, and non-IBC clicks through
+        // _cpSelectNonIBCStrategy so any prior IBC tags get CLEARED. Without
+        // the clearing path, switching IBC→avalanche leaves _ibcDebtStrategy
+        // set on the debt allocation, and downstream chart/projection filters
+        // continue to render IBC growth as if the strategy were still IBC.
         var _onclickAction=(s.key==='ibc')
           ?"_cpSelectIBCStrategy()"
-          :"CPLAN.debtStrategy='"+s.key+"';_cpRenderPlanV2()";
+          :"_cpSelectNonIBCStrategy('"+s.key+"')";
         h+='<div onclick="'+_onclickAction+'" style="cursor:pointer;text-align:center;padding:10px 6px;border-radius:4px;border:2px solid '+(isSel?bc2+',.5)':isBest?'rgba(34,197,94,.3)':'rgba(0,68,191,.1)')+';background:'+(isSel?bc2+',.15)':bc2+',.04)')+';transition:all .15s">';
         h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--mu);margin-bottom:4px;letter-spacing:.04em">'+s.lbl+'</div>';
         h+='<div style="font-family:var(--fd);font-size:20px;color:'+(isSel?bc2+',1)':'var(--wh)')+'">'+s.mo+'</div>';
@@ -28454,7 +28455,13 @@ function _cpAvailableBudget(excludeIdx){
     // Phase 1 allocations that freed them). Counting them here would
     // double-spend the pool — Phase 1's $X is freed, then re-spent as the
     // absorber's $X, totaling $2X against the same surplus. Exclude.
-    if(a&&a._spawnedByOverflow===true)return;
+    // FIELD-NAME NOTE: must use _overflowAbsorber (not _spawnedByOverflow)
+    // because the save shape at ~35001 only persists _overflowAbsorber. The
+    // cascade engine sets BOTH flags when spawning, but _spawnedByOverflow is
+    // dropped on first save — so a stale filter on _spawnedByOverflow misses
+    // every post-save absorber. _overflowAbsorber is also set by AI-emitted
+    // absorbers (line ~23523), making it the canonical durable identifier.
+    if(a&&a._overflowAbsorber===true)return;
     deployed+=(parseFloat(a.amount)||0);
     // Policy-loan repayment competes for the same pool as the regular sliders.
     // Without this, dragging the IBC loan-repayment slider up doesn't shrink
@@ -28507,8 +28514,10 @@ function _cpSliderMax(type,idx){
       // Overflow-absorber allocations are virtual phase-2+ destinations for
       // dollars cascaded out of Phase 1 (already counted via the original
       // Phase 1 allocations that freed them). Counting them here would
-      // double-spend the pool — see _cpAvailableBudget for the same fix.
-      if(a2._spawnedByOverflow===true)return;
+      // double-spend the pool — see _cpAvailableBudget for the same fix
+      // and for the FIELD-NAME NOTE on why _overflowAbsorber (not
+      // _spawnedByOverflow) is the correct flag to filter on.
+      if(a2._overflowAbsorber===true)return;
       _othersSum+=parseFloat(a2.amount)||0;
       // Static recurring premiums on completed insurance/action-only items
       // also occupy pool space — exclude them so the user can't double-spend.
@@ -30555,6 +30564,31 @@ function _cpIBCYearlyReviewSave(idx){
 }
 
 
+// ── _cpSelectNonIBCStrategy ─────────────────────────────────────────────────
+// Switches debtStrategy to any non-IBC value (avalanche, snowball, hybrid,
+// consolidation) and clears IBC-strategy tags previously set by
+// _cpSelectIBCStrategy. Without this clearing step, the retirement projection
+// chart and other consumers (lines 33286, 33293) that gate on
+// _ibcDebtStrategy keep treating the allocation as IBC-active even though
+// debtStrategy has been switched away — producing the stale "IBC-like growth
+// on avalanche" symptom on the projection chart after IBC→avalanche toggle.
+function _cpSelectNonIBCStrategy(newStrategy){
+  CPLAN.debtStrategy = newStrategy;
+  (CPLAN.allocations||[]).forEach(function(a){
+    if(a&&a._ibcDebtStrategy===true){
+      a._ibcDebtStrategy=false;
+      // Only clear _ibcUnderlyingType on type='debt' allocations — these
+      // had the underlying type auto-assigned at line ~30586/30592 when IBC
+      // was selected. Don't touch standalone iul/wl/ibc allocations'
+      // _ibcUnderlyingType, which carries semantic meaning for the policy
+      // itself (e.g., IUL vs WL crediting rates at lines 31049/31061).
+      if(a.type==='debt')a._ibcUnderlyingType=null;
+    }
+  });
+  _cpRenderPlanV2();
+}
+
+
 // ── _cpSelectIBCStrategy ────────────────────────────────────────────────────
 // Wraps the simple "set IBC strategy" with awareness: if user has no IBC growth
 // allocation yet, prompts them to either auto-create one or use an existing
@@ -30562,31 +30596,57 @@ function _cpIBCYearlyReviewSave(idx){
 // can show the policy's CV growth alongside the debt elimination.
 function _cpSelectIBCStrategy(){
   CPLAN.debtStrategy = 'ibc';
-  // Tag the allocation that represents the IBC debt strategy with
-  // _ibcDebtStrategy:true so downstream filters (chart legend, retirement
-  // subtotal, strategy summary cards, projection growth-walk) include the
-  // policy's CV growth in retirement projections. Without this tag, the
-  // user clicks "IBC" in the strategy comparison panel, CPLAN.debtStrategy
-  // gets set to 'ibc', but no allocation is marked as the IBC carrier —
-  // every retirement-projection consumer keeps excluding the IBC growth
-  // because they gate on _ibcDebtStrategy.
-  //
-  // Priority for tagging: type='debt' allocation first (this is the debt-
-  // acceleration card the user is converting to IBC strategy). Falls back
-  // to existing iul/wl/ibc allocation (the IBC carrier policy itself, if
-  // one exists separately from the debt card).
   console.log('[IBC-DEBUG] _cpSelectIBCStrategy called. CPLAN.allocations:',
     (CPLAN.allocations||[]).map(function(a,i){
       return {idx:i,type:a.type,amount:a.amount,customName:a.customName,_ibcDebtStrategy:!!a._ibcDebtStrategy,_ibcUnderlyingType:a._ibcUnderlyingType};
     })
   );
+  // Check if the user already has an EXPLICITLY DESIGNATED IBC carrier.
+  // A retirement-supplement IUL/WL (e.g., a max-funded IUL designed for tax-
+  // free supplemental income) is structurally different from an IBC carrier
+  // (max-funded WL with PUA loading, minimum death benefit, designed to be
+  // loaned against). Matching on type alone here false-positives the
+  // retirement-supplement case and silently uses an unfit policy as the IBC
+  // vehicle. Narrow check to two explicit IBC-designation signals:
+  //   (1) type==='ibc' — allocation explicitly created as IBC
+  //   (2) _isIBCVehicle — user previously picked "existing" in this popup
+  // NOTE: _ibcDebtStrategy is NOT checked here because the auto-tagging block
+  // below would set it on the debt allocation moments before this check,
+  // making the check trivially true and suppressing the popup forever. The
+  // popup is responsible for deciding what becomes the IBC carrier; the
+  // auto-tagging path is for the post-popup-resolved case only.
+  var hasIBC = (CPLAN.allocations || []).some(function(a){
+    return a.type === 'ibc'
+        || a._isIBCVehicle === true;
+  });
+  if(!hasIBC){
+    console.log('[IBC-DEBUG] hasIBC=false, showing AddIBCAllocPrompt');
+    // No designated IBC policy yet — prompt the user to designate one.
+    // The popup's choice handlers (_cpAddIBCAllocLink with 'create',
+    // 'existing', or 'skip') handle policy creation/designation AND the
+    // subsequent re-render. We do NOT auto-tag the debt allocation here
+    // because tagging would commit to using whichever happens to be the
+    // first eligible allocation, bypassing the user's choice.
+    _cpShowAddIBCAllocPrompt();
+    return;
+  }
+  // hasIBC is true — a designated IBC policy already exists. Tag the debt
+  // allocation (or fall back to the designated insurance allocation) with
+  // _ibcDebtStrategy:true so downstream filters (chart legend, retirement
+  // subtotal, strategy summary cards, projection growth-walk) include the
+  // policy's CV growth in retirement projections.
+  //
+  // Priority for tagging: type='debt' allocation first (this is the debt-
+  // acceleration card the user is converting to IBC strategy). Falls back
+  // to existing iul/wl/ibc allocation (the IBC carrier policy itself, if
+  // one exists separately from the debt card).
   var _debtAlloc=(CPLAN.allocations||[]).find(function(a){return a.type==='debt'&&a.amount>0;});
   if(_debtAlloc){
     _debtAlloc._ibcDebtStrategy=true;
     if(!_debtAlloc._ibcUnderlyingType)_debtAlloc._ibcUnderlyingType='wl';
     console.log('[IBC-DEBUG] Tagged DEBT allocation with _ibcDebtStrategy:true',{customName:_debtAlloc.customName,amount:_debtAlloc.amount,_ibcUnderlyingType:_debtAlloc._ibcUnderlyingType});
   } else {
-    var _insAlloc=(CPLAN.allocations||[]).find(function(a){return (a.type==='iul'||a.type==='wl'||a.type==='ibc')&&a.amount>0;});
+    var _insAlloc=(CPLAN.allocations||[]).find(function(a){return (a.type==='ibc'||(a._isIBCVehicle===true&&(a.type==='iul'||a.type==='wl')))&&a.amount>0;});
     if(_insAlloc){
       _insAlloc._ibcDebtStrategy=true;
       if(!_insAlloc._ibcUnderlyingType)_insAlloc._ibcUnderlyingType=(_insAlloc.type==='iul'?'iul':'wl');
@@ -30595,19 +30655,9 @@ function _cpSelectIBCStrategy(){
       console.warn('[IBC-DEBUG] No debt/insurance allocation found to tag — IBC strategy set but no carrier');
     }
   }
-  // Check if user has any IBC/WL/IUL growth allocation already.
-  var hasIBC = (CPLAN.allocations || []).some(function(a){
-    return a.type === 'ibc' || a.type === 'wl' || a.type === 'iul';
-  });
-  if(hasIBC){
-    console.log('[IBC-DEBUG] hasIBC=true, calling cplanSave + _cpRender. CPLAN.debtStrategy now:',CPLAN.debtStrategy);
-    if(typeof cplanSave==='function')try{cplanSave();}catch(_e){}
-    _cpRender();
-    return;
-  }
-  console.log('[IBC-DEBUG] hasIBC=false, showing AddIBCAllocPrompt');
-  // No insurance-based growth allocation yet — prompt them.
-  _cpShowAddIBCAllocPrompt();
+  console.log('[IBC-DEBUG] hasIBC=true, calling cplanSave + _cpRender. CPLAN.debtStrategy now:',CPLAN.debtStrategy);
+  if(typeof cplanSave==='function')try{cplanSave();}catch(_e){}
+  _cpRender();
 }
 
 function _cpShowAddIBCAllocPrompt(){
@@ -30691,6 +30741,21 @@ function _cpAddIBCAllocLink(choice){
     });
     if(existing){
       existing._isIBCVehicle = true;
+    }
+  }
+  // For create/existing: tag the debt allocation with _ibcDebtStrategy:true
+  // so downstream filters (chart legend, retirement subtotal, strategy summary
+  // cards, projection growth-walk) include the IBC policy's CV growth. Prior
+  // to Fix D (narrowed hasIBC check), _cpSelectIBCStrategy did this tagging
+  // up-front before showing the popup. The narrowed gate moved tagging behind
+  // hasIBC=true, so the popup-resolved path needs to do its own tagging.
+  // 'skip' intentionally does NOT tag — the user opted out of designating a
+  // carrier, so downstream filters correctly continue to exclude IBC growth.
+  if(choice === 'create' || choice === 'existing'){
+    var _debtAlloc=(CPLAN.allocations||[]).find(function(a){return a.type==='debt'&&a.amount>0;});
+    if(_debtAlloc){
+      _debtAlloc._ibcDebtStrategy=true;
+      if(!_debtAlloc._ibcUnderlyingType)_debtAlloc._ibcUnderlyingType='wl';
     }
   }
   // 'skip' → just leave debtStrategy='ibc' set, no card change
