@@ -30585,6 +30585,20 @@ function _cpSelectNonIBCStrategy(newStrategy){
       if(a.type==='debt')a._ibcUnderlyingType=null;
     }
   });
+  // Regenerate the cached simulation BEFORE rendering. _cpRenderPlanV2 reads
+  // CPLAN._sim.events directly to build phase header labels (line ~25198)
+  // and the per-allocation transformation gates at lines 25508/25574. The
+  // event labels are produced inside the simulator's IBC branch at line
+  // ~32528 ('High-rate debt free — freed minimums repaying IBC policy
+  // loans'), gated on CPLAN.debtStrategy==='ibc' at line ~32504. After
+  // switching to a non-IBC strategy here, the gate flips correctly — but
+  // CPLAN._sim still holds the events generated under the previous IBC
+  // run. Without regenerating, the Phase 3 header reads the stale IBC
+  // label even though the strategy has changed and the transformation
+  // gates correctly suppress IBC-specific card renders. Matches the
+  // popup-resolve path at ~30766 which calls _cpRunSimulation() for the
+  // same reason.
+  if(typeof _cpRunSimulation==='function')try{_cpRunSimulation();}catch(_e){}
   _cpRenderPlanV2();
 }
 
@@ -32958,7 +32972,26 @@ function _cpRunSimulation(){
         // by carrier minimums and policy fees). If freed is below this, skip
         // new-policy creation and let it fall through to cash savings.
         var _minViablePremium=200;
-        var _shouldCreateNewPolicy=(_planIsTaxFree||_planIsHybridEligible)&&freed>=_minViablePremium;
+        // Fix E: Overflow Absorber is an IBC-specific mechanism. Its design
+        // intent is to absorb the minimums freed when IBC policy loans are
+        // fully repaid (CV=AV recovery) into a new policy. On non-IBC plans
+        // (avalanche/snowball/hybrid/consolidation), freed cash from generic
+        // debt-completion or EF-completion events should NOT spawn a new
+        // permanent insurance policy — there's no policy-loan-repayment
+        // mechanic that legitimately produces the "freed minimums redirected
+        // to a new policy" pattern. Without this gate the engine fires the
+        // absorber on any cascade event with leftover freed cash, pulling
+        // money into a policy the user never asked for.
+        //
+        // _ibcRecovery and _ibcContinues are only set inside the IBC branch of
+        // the event generator (line ~32504, debtStrategy==='ibc'). Together
+        // they cover both legitimate IBC paths:
+        //   _ibcRecovery=true   → standard CV=AV recovery (Option A continue
+        //                          OR Option B surrender)
+        //   _ibcContinues>0    → instant-CV=AV edge case (loans repaid in
+        //                          same month as last debt cleared)
+        var _isIbcCascadeEvent=(ev._ibcRecovery===true)||((ev._ibcContinues||0)>0);
+        var _shouldCreateNewPolicy=_isIbcCascadeEvent&&(_planIsTaxFree||_planIsHybridEligible)&&freed>=_minViablePremium;
         if(_shouldCreateNewPolicy){
           // Create a NEW permanent insurance policy as the destination for this
           // freed amount. Critical: do NOT add to an existing IUL/WL/IBC — that
