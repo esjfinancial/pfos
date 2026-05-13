@@ -31126,6 +31126,13 @@ function _cpGetGrossRate(a){
   // completion time; for plan-time projections before completion we fall back to WL,
   // which is the more conservative assumption for unknown IBC structures.
   if(a.type==='ibc')return a._ibcUnderlyingType==='iul'?0.055:0.04;
+  // type='debt' allocations with _ibcDebtStrategy:true are NOT real debt — they
+  // represent the IBC policy itself, funding debt-elimination via policy loans
+  // while premium continues compounding the policy's CV tax-free. Without this
+  // case, the chart's growth-walk gets rate=0 from the fallthrough below, and
+  // the IBC line tracks only the sum of premiums paid with no growth. Mirror
+  // the type==='ibc' treatment above: WL underlying = 4%, IUL = 5.5%.
+  if(a.type==='debt'&&a._ibcDebtStrategy)return a._ibcUnderlyingType==='iul'?0.055:0.04;
   return 0;
 }
 function _cpGetFeeRate(a){if(a._feeRate!=null&&a._feeRate>0)return a._feeRate/100;if(a.type==='invest')return 0.01;if(a.type==='401k'||a.type==='roth401k')return 0.01;if(a.type==='roth'||a.type==='trad_ira'||a.type==='solo401k'||a.type==='sep_ira')return 0.005;if(a.type==='hsa')return 0.005;if(a.type==='edu'){var ev=a.eduVehicle||'529';return(ev==='wl'||ev==='iul')?0:0.005;}return 0;}
@@ -31138,6 +31145,11 @@ function _cpGetCF(a){
   // of how AG 49-A illustrations and indexed crediting are structured. Falls back to
   // WL pre-completion (more conservative).
   if(a.type==='ibc')return a._ibcUnderlyingType==='iul'?0.82:0.75;
+  // type='debt' allocations with _ibcDebtStrategy:true represent the IBC policy
+  // itself (see _cpGetGrossRate for full rationale). Mirror the type==='ibc'
+  // CF treatment so the chart's growth-walk applies the same premium-to-CV
+  // efficiency factor.
+  if(a.type==='debt'&&a._ibcDebtStrategy)return a._ibcUnderlyingType==='iul'?0.82:0.75;
   return 1;
 }
 function _cpSetGrossReturn(i,v){CPLAN.allocations[i]._grossReturn=parseFloat(v)||0;clearTimeout(CPLAN._retFeeTimer);CPLAN._retFeeTimer=setTimeout(_cpRender,300);}
@@ -33118,6 +33130,57 @@ function _cpRunSimulation(){
     _curContribByIdx[idx]=parseFloat(_m&&_m.currentContrib)||0;
   });
 
+  // ── Precompute insurance CV trajectories ────────────────────────────────
+  // For WL/IUL/IBC allocations (including type='debt' with _ibcDebtStrategy:
+  // true, which IS the IBC policy itself), use _ibcProjectPolicy — the same
+  // engine the per-allocation cards and CV charts use — to compute a CV-by-
+  // month trajectory. This guarantees the retirement projection chart's
+  // values match the card's projection numbers (e.g., the IBC card showed
+  // $1.3M at age 65 while the chart showed $583K — model mismatch).
+  // _ibcProjectPolicy models year-1-vs-later premium-to-CV efficiency, PUA
+  // dividend reinvestment, and anniversary-anchored crediting, which a flat
+  // CF × annual rate cannot reproduce.
+  //
+  // Allocations WITH cascade boosts (af.boosts.length > 0) are NOT pre-
+  // computed: _ibcProjectPolicy doesn't accept mid-call premium changes.
+  // Those fall through to the inline annual formula. For typical IBC plans
+  // the IBC allocation has no boosts (freed minimums redistribute to OTHER
+  // allocations, not the policy itself), so precomputation applies.
+  //
+  // _curBalanceByIdx is honored as startingCV — preserves existing real-world
+  // CV when matched via _cpMatchExisting (audit-anchored cases).
+  var _ibcCVByMonth={};
+  var _ibcAllocFallback={};
+  CPLAN.allocations.forEach(function(a,idx){
+    var _isInsuranceAlloc=(a.type==='wl'||a.type==='iul'||a.type==='ibc'||(a.type==='debt'&&a._ibcDebtStrategy));
+    if(!_isInsuranceAlloc)return;
+    if(typeof _ibcProjectPolicy!=='function')return;
+    var _af=(allocFuture&&allocFuture[idx])||null;
+    var _hasBoosts=_af&&_af.boosts&&_af.boosts.length>0;
+    if(_hasBoosts){_ibcAllocFallback[idx]=true;return;}
+    // Resolve underlying policy type. type='ibc' uses _ibcUnderlyingType (WL
+    // fallback); type='debt' with _ibcDebtStrategy uses _ibcUnderlyingType
+    // (WL fallback); plain wl/iul use their type directly.
+    var _polType;
+    if(a.type==='iul')_polType='iul';
+    else if(a.type==='wl')_polType='wl';
+    else _polType=a._ibcUnderlyingType||'wl';
+    var _polParams=Object.assign({},_ibcPolicyDefaults(_polType),{
+      monthlyPremium:parseFloat(a.amount)||0,
+      startingCV:_curBalanceByIdx[idx]||0
+    });
+    try{
+      var _proj=_ibcProjectPolicy(_polParams,0,years*12);
+      if(_proj&&_proj.data&&_proj.data.length){
+        var _byMonth={};
+        _proj.data.forEach(function(d){_byMonth[d.month]=d.cv;});
+        _ibcCVByMonth[idx]=_byMonth;
+      } else {
+        _ibcAllocFallback[idx]=true;
+      }
+    } catch(_pErr){_ibcAllocFallback[idx]=true;}
+  });
+
   for(var yr=0;yr<=years;yr++){
     // Baseline: idle cash at 0%, ALL debt with min payments only
     var baseCash=CPLAN.surplus*12*yr;
@@ -33247,7 +33310,45 @@ function _cpRunSimulation(){
         }
         effectiveAmt+=_curC;
         var contrib=effectiveAmt*cf;
-        balByIdx[idx]=(balByIdx[idx]+contrib)*(1+(rate/12));
+        // Project the running balance forward. Three branches:
+        //
+        // 1. INSURANCE WITH PRECOMPUTED TRAJECTORY (_ibcCVByMonth[idx] exists):
+        //    Look up CV at month m from _ibcProjectPolicy's output. This
+        //    matches the per-allocation card's projection numbers exactly —
+        //    same engine, same parameters. The card's $1.3M and chart's IBC
+        //    line now agree at every year.
+        //
+        // 2. INSURANCE FALLBACK (allocation has boosts, or projection failed):
+        //    Use annual flat-CF compounding (Fix H math). Accumulates premium
+        //    monthly without growth between anniversaries, applies the full
+        //    annual rate when m%12===0.
+        //
+        // 3. NON-INSURANCE (401k, Roth, invest, HSA, EF, custom, etc.):
+        //    Annual compounding to match the card tile formula at line ~25992:
+        //    `(_yr20+_c)*(1+_mr)` where _c is the annual contribution and _mr
+        //    is the annual rate. Switched from monthly (rate/12) compounding
+        //    so card tiles and chart series agree for every vehicle.
+        //    Accumulates contributions monthly during the year, applies the
+        //    full annual rate to the year-end balance on m%12===0.
+        var _isInsuranceVehicle=(a.type==='wl'||a.type==='iul'||a.type==='ibc'||(a.type==='debt'&&a._ibcDebtStrategy));
+        if(_isInsuranceVehicle&&_ibcCVByMonth[idx]&&!_ibcAllocFallback[idx]){
+          // Precomputed CV trajectory — set balance directly from _ibcProjectPolicy.
+          // _ibcProjectPolicy already factors premium contributions internally
+          // via the cvEfficiencyYr curve + guaranteed/dividend mechanics, so
+          // we do NOT add `contrib` separately here (would double-count).
+          var _cvAtM=_ibcCVByMonth[idx][m];
+          if(_cvAtM!=null)balByIdx[idx]=_cvAtM;
+          // monthDeployed still tracks the cash flow leaving the user's pocket
+          // for budget reconciliation (regardless of where it lands in CV).
+        } else if(_isInsuranceVehicle){
+          // Fallback for boosted insurance allocations or projection failure.
+          balByIdx[idx]=balByIdx[idx]+contrib;
+          if(m%12===0)balByIdx[idx]=balByIdx[idx]*(1+rate);
+        } else {
+          // Non-insurance — annual compounding (matches card tile formula).
+          balByIdx[idx]=balByIdx[idx]+contrib;
+          if(m%12===0)balByIdx[idx]=balByIdx[idx]*(1+rate);
+        }
         monthDeployed+=effectiveAmt;
       });
       // Anything not deployed this month sits in unallocated cash at 0%
