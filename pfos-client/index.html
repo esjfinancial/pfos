@@ -24633,6 +24633,66 @@ function _cpViewApproach(key){
   // allocations array. Without this, insurance uniqueness drops or other PP
   // post-processors create stale idx → undefined references in the render path.
   if(typeof _cpRunSimulation==='function')try{_cpRunSimulation();}catch(e){console.warn('Sim rebuild failed:',e);}
+  // POST-CONVERSION DEPLOYMENT BACKSTOP: the existing _redeployPostGate IIFE
+  // inside _cpConvertAIRecs is supposed to catch under-deployment after all
+  // frontend gates fire, but multiple plan-view screenshots showed Phase 1
+  // bars rendering below pool (Traditional $4,998, Tax-Free $4,550, Hybrid
+  // $5,021 — all under $5,514). Rather than chase which conversion gate is
+  // dropping dollars, use the AI's actual emitted sum as the target. Any
+  // deployment shortfall vs AI intent gets routed to the largest non-action
+  // allocation using the same ladder as the server-side correction.
+  try{
+    var _aiSum=(aiData.recommendations||[]).reduce(function(t,r){return t+(Number(r.monthly_cost)||0);},0);
+    var _frontSum=(CPLAN.allocations||[]).reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+    var _gap=Math.round(_aiSum-_frontSum);
+    if(_gap>50){
+      // Ladder mirrors server FIX 3 + the existing _redeployPostGate:
+      //   T1: existing insurance (iul/wl/ibc) — no IRS cap
+      //   T2: existing taxable brokerage (invest) — no IRS cap
+      //   T3: any non-action growth allocation with IRS headroom, largest first
+      var _insTypes=['iul','wl','ibc'];
+      var _ins=(CPLAN.allocations||[])
+        .map(function(a,i){return{a:a,i:i};})
+        .filter(function(x){return _insTypes.indexOf(x.a.type)>=0&&(parseFloat(x.a.amount)||0)>0&&!x.a._completed;})
+        .sort(function(a,b){return(parseFloat(b.a.amount)||0)-(parseFloat(a.a.amount)||0);});
+      if(_ins.length>0){
+        _ins[0].a.amount=Math.round((parseFloat(_ins[0].a.amount)||0)+_gap);
+      } else {
+        var _inv=(CPLAN.allocations||[]).find(function(a){return a.type==='invest'&&!a._completed;});
+        if(_inv){
+          _inv.amount=Math.round((parseFloat(_inv.amount)||0)+_gap);
+        } else {
+          // T3: walk non-action allocations by IRS headroom
+          var _growth=(CPLAN.allocations||[]).map(function(a,i){return{a:a,i:i};})
+            .filter(function(x){
+              if(_insTypes.indexOf(x.a.type)>=0)return false;
+              if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection'||x.a.type==='custom')return false;
+              if(x.a._completed||x.a._hdhpGated)return false;
+              var irsMax=typeof _cpIRSMax==='function'?_cpIRSMax(x.a.type,x.a):Infinity;
+              return (irsMax-(parseFloat(x.a.amount)||0))>0;
+            })
+            .sort(function(a,b){
+              var aHr=(typeof _cpIRSMax==='function'?_cpIRSMax(a.a.type,a.a):Infinity)-(parseFloat(a.a.amount)||0);
+              var bHr=(typeof _cpIRSMax==='function'?_cpIRSMax(b.a.type,b.a):Infinity)-(parseFloat(b.a.amount)||0);
+              return bHr-aHr;
+            });
+          var _remaining=_gap;
+          _growth.forEach(function(g){
+            if(_remaining<=0)return;
+            var irsMaxG=typeof _cpIRSMax==='function'?_cpIRSMax(g.a.type,g.a):Infinity;
+            var headroom=Math.max(0,irsMaxG-(parseFloat(g.a.amount)||0));
+            var addG=Math.min(_remaining,headroom);
+            if(addG>0){
+              g.a.amount=Math.round((parseFloat(g.a.amount)||0)+addG);
+              _remaining-=addG;
+            }
+          });
+        }
+      }
+      // Refresh simulation so the bar reflects the new amounts immediately
+      if(typeof _cpRunSimulation==='function')try{_cpRunSimulation();}catch(e2){console.warn('Sim rebuild after gap-fill failed:',e2);}
+    }
+  }catch(_e){console.warn('Post-view deployment backstop failed:',_e);}
   _cpRenderPlanV2();
 }
 // ── Retry a single failed approach ──
