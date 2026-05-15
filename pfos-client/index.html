@@ -20621,6 +20621,27 @@ function _cpEnsurePlanLoaded(){
   if(typeof _cpConsolidateIBCDebtCardsOnLoad==='function'){
     try{_cpConsolidateIBCDebtCardsOnLoad();}catch(_cErr){console.warn('IBC consolidator on load:',_cErr);}
   }
+  // Stale monthlyLoanRepay cleanup. The field is legitimate only on:
+  //   • Insurance allocations (iul/wl/ibc) with an active user-initiated policy
+  //     loan (set via the loan modal at line ~30868).
+  //   • IBC-debt-strategy allocations where the cascade engine auto-sets it
+  //     post-debt-payoff (Fix K; see ~line 32964).
+  // On any other allocation type (regular debt, ef, retirement vehicles, etc.),
+  // a non-zero monthlyLoanRepay is stale data left over from prior plan states
+  // (e.g., the user tried IBC, switched away, but the field persisted on the
+  // debt card). It then leaks into OTHER cards' available-budget calc via
+  // _cpAvailableBudget — producing asymmetric slider caps where the EF card's
+  // cap is smaller than the debt card's by the leaked amount. Clear it.
+  try{
+    var _legitLoanRepayTypes={iul:1,wl:1,ibc:1};
+    (CPLAN.allocations||[]).forEach(function(a){
+      if(!a||!(parseFloat(a.monthlyLoanRepay)>0))return;
+      var keep=false;
+      if(_legitLoanRepayTypes[a.type])keep=true;
+      if(a.type==='debt'&&a._ibcDebtStrategy===true)keep=true;
+      if(!keep)a.monthlyLoanRepay=0;
+    });
+  }catch(_lr){console.warn('monthlyLoanRepay cleanup:',_lr);}
   // Run simulation silently — initial pass without partner data (single-user view)
   if(typeof _cpRunSimulation==='function')try{_cpRunSimulation();}catch(e){}
   // Phase 4: eager partner load. If a couple link exists, fetch partner data in the
@@ -25499,6 +25520,18 @@ function _cpRenderPlanV2(){
     if(typeof _cpUnassignedHelpHtml==='function')h+=_cpUnassignedHelpHtml();
     h+='<div style="margin-bottom:16px;padding:16px;border:1px dashed rgba(234,179,8,.3);border-radius:4px;background:rgba(234,179,8,.03)">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--yl);margin-bottom:10px">'+unassigned.length+' unassigned item'+(unassigned.length>1?'s':'')+'</div>';
+    // If any debt allocation is present in the unassigned column, render the
+    // debt-strategy picker (avalanche/snowball/hybrid/consolidation/IBC) once
+    // at the top of the column so users see strategy options BEFORE configuring
+    // the debt amount. _cpRenderDebtEngine renders an empty string if there
+    // are no high-rate debts to apply a strategy to, so the guard is implicit.
+    var _firstDebtAlloc=unassigned.find(function(a){return a.type==='debt';});
+    if(_firstDebtAlloc&&typeof _cpRenderDebtEngine==='function'){
+      try{
+        var _debtIdx=CPLAN.allocations.indexOf(_firstDebtAlloc);
+        h+=_cpRenderDebtEngine(_firstDebtAlloc,_debtIdx);
+      }catch(_e){}
+    }
     unassigned.forEach(function(a,i){
       var idx=CPLAN.allocations.indexOf(a);
       h+=_cpBuildCard(a,idx,true);
@@ -29296,6 +29329,39 @@ function _cpExtractRedFlags(){
     if(liquidRatio<0.15&&liquidAssets<d.expenses*6){
       flags.push({type:'opp',icon:'🔒',title:'Most savings locked until retirement',desc:fmtK(totalRetBal)+' in retirement accounts vs '+fmtK(liquidAssets)+' liquid. Pre-59½ withdrawals trigger a 10% penalty plus tax. A taxable brokerage or HYSA buffer gives you flexibility for goals before retirement.',action:'savings'});
     }
+  }
+
+  // ── No taxable brokerage (wealth-building opportunity) ──
+  // Surfaces a "consider a taxable brokerage" card when client has healthy
+  // surplus, is age 25+, but has NO existing taxable brokerage — either in
+  // their current investments OR in the active plan. Most clients with
+  // healthy cash flow never saw any prompt to consider one because the
+  // existing flags only fired on distress conditions (sub-5% savings rate,
+  // retirement-vs-liquid imbalance). Taxable brokerage is wealth-building
+  // basics: liquid pre-retirement access, LTCG treatment, no contribution
+  // cap. Worth surfacing actively.
+  var _hasInvestAlloc=CPLAN.allocations.some(function(a){return a.type==='invest'&&a.amount>0;});
+  var _hasBrokerageAcct=((rawS2.investments)||[]).some(function(iv){
+    if(!iv)return false;
+    var t=(iv.type||'').toLowerCase();
+    // Treat brokerage + mutual_fund + robo_advisor as "taxable investing"
+    // (consistent with INV_TYPES catalog in pfos-main). Exclude crypto
+    // (not equity), HSA (retirement-purpose), and "other" (ambiguous).
+    return t==='brokerage'||t==='mutual_fund'||t==='robo_advisor';
+  });
+  // Also check legacy S.assets.invest field — older clients may have
+  // entered a brokerage balance at the asset level before per-account tracking.
+  var _legacyInvestBal=parseFloat((rawS2.assets&&rawS2.assets.invest)||0);
+  var _hasAnyTaxableInvest=_hasInvestAlloc||_hasBrokerageAcct||_legacyInvestBal>1000;
+  var _surplusRatio=d.income>0?(d.income-d.expenses)/d.income:0;
+  if(!_hasAnyTaxableInvest&&d.age>=25&&_surplusRatio>=0.10&&d.income>0){
+    flags.push({
+      type:'opp',
+      icon:'📈',
+      title:'No taxable brokerage in your plan',
+      desc:'A taxable brokerage account is the flexible wealth-building layer beyond retirement accounts — no contribution caps, accessible before 59½ without penalty, long-term capital gains taxed at preferential rates. Especially useful for pre-retirement goals (house, sabbatical, early retirement bridge).',
+      action:'savings'
+    });
   }
 
   // ── Mortgage in retirement (debt with payoff date past retirement age) ──
