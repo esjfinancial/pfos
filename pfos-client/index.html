@@ -26800,7 +26800,7 @@ function _cpBuildCard(a,idx,isUnassigned){
       ];
       // bestMo: minimum among numeric (non-N/A) months; falls through to undefined if all N/A
       var bestMo=strats.filter(function(s){return!s.na&&s.mo>0;}).reduce(function(m,s){return m===null||s.mo<m?s.mo:m;},null);
-      h+='<div style="margin:10px 0;padding:12px;background:rgba(0,68,191,.04);border:1px solid rgba(0,68,191,.1);border-radius:6px">';
+      h+='<div data-cpdebtidx="'+idx+'" style="margin:10px 0;padding:12px;background:rgba(0,68,191,.04);border:1px solid rgba(0,68,191,.1);border-radius:6px">';
       h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">STRATEGY COMPARISON · High-rate min-only: '+_minOnlyLabel+'</div>';
       h+='<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:6px">';
       strats.forEach(function(s){
@@ -26824,14 +26824,14 @@ function _cpBuildCard(a,idx,isUnassigned){
         var _onclickAction=(s.key==='ibc')
           ?"_cpSelectIBCStrategy()"
           :"_cpSelectNonIBCStrategy('"+s.key+"')";
-        h+='<div onclick="'+_onclickAction+'" style="cursor:pointer;text-align:center;padding:10px 6px;border-radius:4px;border:2px solid '+(isSel?bc2+',.5)':isBest?'rgba(34,197,94,.3)':'rgba(0,68,191,.1)')+';background:'+(isSel?bc2+',.15)':bc2+',.04)')+';transition:all .15s">';
+        h+='<div id="cpStrat_'+idx+'_'+s.key+'" onclick="'+_onclickAction+'" style="cursor:pointer;text-align:center;padding:10px 6px;border-radius:4px;border:2px solid '+(isSel?bc2+',.5)':isBest?'rgba(34,197,94,.3)':'rgba(0,68,191,.1)')+';background:'+(isSel?bc2+',.15)':bc2+',.04)')+';transition:all .15s">';
         h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--mu);margin-bottom:4px;letter-spacing:.04em">'+s.lbl+'</div>';
-        h+='<div style="font-family:var(--fd);font-size:20px;color:'+(isSel?bc2+',1)':'var(--wh)')+'">'+s.mo+'</div>';
-        h+='<div style="font-size:11px;color:var(--mu)">months'+(s.key==='ibc'&&s.fullFree&&s.fullFree>s.mo?' (cards) · '+s.fullFree+' mo (incl. loan)':'')+'</div>';
-        h+='<div style="font-size:12px;color:var(--or);margin-top:4px;font-weight:600">'+fmtK(s.int)+'</div>';
+        h+='<div id="cpStratMo_'+idx+'_'+s.key+'" style="font-family:var(--fd);font-size:20px;color:'+(isSel?bc2+',1)':'var(--wh)')+'">'+s.mo+'</div>';
+        h+='<div id="cpStratMoLbl_'+idx+'_'+s.key+'" style="font-size:11px;color:var(--mu)">months'+(s.key==='ibc'&&s.fullFree&&s.fullFree>s.mo?' (cards) · '+s.fullFree+' mo (incl. loan)':'')+'</div>';
+        h+='<div id="cpStratInt_'+idx+'_'+s.key+'" style="font-size:12px;color:var(--or);margin-top:4px;font-weight:600">'+fmtK(s.int)+'</div>';
         h+='<div style="font-size:10px;color:var(--mu)">interest</div>';
-        if(s.cv)h+='<div style="font-size:12px;color:var(--pu);margin-top:4px;font-weight:600">+'+fmtK(s.cv)+'</div><div style="font-size:10px;color:var(--pu)">cash value</div>';
-        if(s.key==='consolidation')h+='<div style="font-size:11px;color:rgba(91,155,255,.8);margin-top:2px">'+fmt(_consolPmt)+'/mo</div>';
+        if(s.cv)h+='<div id="cpStratCV_'+idx+'_'+s.key+'" style="font-size:12px;color:var(--pu);margin-top:4px;font-weight:600">+'+fmtK(s.cv)+'</div><div style="font-size:10px;color:var(--pu)">cash value</div>';
+        if(s.key==='consolidation')h+='<div id="cpStratPmt_'+idx+'_'+s.key+'" style="font-size:11px;color:rgba(91,155,255,.8);margin-top:2px">'+fmt(_consolPmt)+'/mo</div>';
         if(isBest)h+='<div style="color:var(--gr);font-size:10px;font-weight:700;margin-top:4px;padding:2px 6px;background:rgba(34,197,94,.1);border-radius:2px;display:inline-block">FASTEST</div>';
         if(isSel)h+='<div style="color:'+bc2+',1);font-size:10px;font-weight:700;margin-top:2px">✓ SELECTED</div>';
         h+='</div>';
@@ -34412,6 +34412,66 @@ function _cpUpdateOverBudgetBanner(){
   var propBtn=document.querySelector('[onclick="cplanProposeChanges()"]');
   if(propBtn){propBtn.disabled=false;propBtn.style.opacity='';propBtn.style.cursor='';}
 }
+// Targeted live-update for the in-card debt strategy comparison grid during
+// slider drag. Re-runs simulators with current allocation amount and rewrites
+// the existing DOM elements (months/interest/CV/payment) via textContent — no
+// re-render, no drag focus loss. Only the 5-card grid updates; the heavier
+// net-position breakdown and per-strategy instructions stay static during drag
+// and refresh on _cpSlideEnd.
+function _cpUpdateDebtStrategyNumbers(idx){
+  var a=CPLAN.allocations[idx];
+  if(!a||a.type!=='debt'||(parseFloat(a.amount)||0)<=0)return;
+  if(typeof _cpDebtSimulate!=='function'||typeof _cpDebtSort!=='function')return;
+  if(!CPLAN.debts||!CPLAN.debts.length)return;
+  // Mirror _cpBuildCard's filter: high-rate first, fallback to all positive
+  var _activeDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0&&(parseFloat(d.rate)||0)>10;});
+  if(!_activeDebts.length)_activeDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0;});
+  if(!_activeDebts.length)return;
+  // Re-run all five simulators with the new amount. These are cheap enough
+  // for live drag updates — sub-millisecond each in practice for typical
+  // 3-5 debt portfolios.
+  var avalRes,snowRes,hybRes,ibcRes;
+  try{
+    avalRes=_cpDebtSimulate(_cpDebtSort(_activeDebts,'avalanche'),a.amount);
+    snowRes=_cpDebtSimulate(_cpDebtSort(_activeDebts,'snowball'),a.amount);
+    hybRes=(typeof _cpCalcDebtPlan==='function')?_cpCalcDebtPlan(_activeDebts,a.amount,'hybrid'):null;
+    ibcRes=(typeof _cpCalcIBCDebt==='function')?_cpCalcIBCDebt(_activeDebts,a.amount):null;
+  }catch(_sErr){return;}
+  // Consolidation (math identical to _cpBuildCard)
+  var _consolRate=(CPLAN._consolRate||8)/100/12;
+  var _consolTerm=CPLAN._consolTerm||60;
+  var _consolBal=_activeDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+  var _consolPmt=_consolRate>0?Math.round(_consolBal*_consolRate/(1-Math.pow(1+_consolRate,-_consolTerm))):Math.round(_consolBal/_consolTerm);
+  var _consolInt=Math.round(Math.max(0,_consolPmt*_consolTerm-_consolBal));
+  // Apply to DOM — guard each element since the card may be off-screen or stale
+  function _setText(id,txt){var el=document.getElementById(id);if(el)el.textContent=txt;}
+  _setText('cpStratMo_'+idx+'_avalanche',avalRes.months);
+  _setText('cpStratInt_'+idx+'_avalanche',fmtK(avalRes.interest));
+  _setText('cpStratMo_'+idx+'_snowball',snowRes.months);
+  _setText('cpStratInt_'+idx+'_snowball',fmtK(snowRes.interest));
+  // Hybrid: if it returns N/A this drag, the existing N/A card stays N/A (no
+  // numeric elements to update); if it returns numbers this drag, update them
+  if(hybRes&&!hybRes._naReason&&hybRes.months){
+    _setText('cpStratMo_'+idx+'_hybrid',hybRes.months);
+    _setText('cpStratInt_'+idx+'_hybrid',fmtK(hybRes.interest));
+  }
+  _setText('cpStratMo_'+idx+'_consolidation',_consolTerm);
+  _setText('cpStratInt_'+idx+'_consolidation',fmtK(_consolInt));
+  _setText('cpStratPmt_'+idx+'_consolidation',fmt(_consolPmt)+'/mo');
+  if(ibcRes&&ibcRes.eligible!==false&&ibcRes.months){
+    _setText('cpStratMo_'+idx+'_ibc',ibcRes.months);
+    _setText('cpStratInt_'+idx+'_ibc',fmtK(ibcRes.interest));
+    if(ibcRes.vehicle)_setText('cpStratCV_'+idx+'_ibc','+'+fmtK(ibcRes.vehicle));
+    // Update the months label if fullFree differs from months (loan trail)
+    var moLblEl=document.getElementById('cpStratMoLbl_'+idx+'_ibc');
+    if(moLblEl){
+      moLblEl.textContent=(ibcRes.fullFreeMonth&&ibcRes.fullFreeMonth>ibcRes.months)
+        ?'months (cards) · '+ibcRes.fullFreeMonth+' mo (incl. loan)'
+        :'months';
+    }
+  }
+}
+
 function _cpSlide(i,v){
   // Snapshot debt amounts BEFORE this slide so _cpSlideEnd can detect a
   // zero-crossing on any debt allocation (positive → 0 OR 0 → positive).
@@ -34515,7 +34575,11 @@ function _cpSlide(i,v){
       sl.innerHTML='Deploying <strong style="color:var(--gr)">'+fmt(allocated2)+'</strong>/mo ('+pct+'% of surplus)'+(_brResSlide>0?' · <span style="color:var(--gr)">'+fmt(_brResSlide)+' breathing room</span>':'')+(_availSlide>0?' · <span style="color:#5B9BFF">'+fmt(_availSlide)+' available to allocate</span>':'');
     }
   }
-  // 4. Debounce heavy renders (chart, timeline, completion estimates)
+  // 4. Live-update debt strategy comparison numbers (no re-render, no drag
+  //    focus loss). Cheap enough to run every tick. Only fires for debt
+  //    allocations with amount > 0.
+  if(a&&a.type==='debt')_cpUpdateDebtStrategyNumbers(i);
+  // 5. Debounce heavy renders (chart, timeline, completion estimates)
   clearTimeout(CPLAN._slideTimer);CPLAN._slideTimer=setTimeout(function(){
     try{_cpRunSimulation();_cpRenderChart();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();}catch(e){}
     if(CPLAN.mode==='detailed'){try{_cpRenderOutcomes();}catch(e2){}}
