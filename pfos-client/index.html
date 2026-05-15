@@ -26343,7 +26343,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _sliderTotalMin=_curContribSlide;// can't slide below the user's current real-world contribution
   h+='<div style="display:flex;align-items:center;gap:8px;margin:4px 0">';
   h+='<input type="range" data-cpidx="'+idx+'" data-cpcurrent="'+_curContribSlide+'" min="'+_sliderTotalMin+'" max="'+_sliderTotalMax+'" step="5" value="'+Math.min(_sliderTotal,_sliderTotalMax)+'" oninput="_cpSlide('+idx+',this.value);var _mi=document.getElementById(\'cpManual'+idx+'\');if(_mi){var _rv=String(this.value).replace(/\\B(?=(\\d{3})+(?!\\d))/g,\',\');_mi.value=_rv}" onchange="_cpSlideEnd()" style="flex:1;accent-color:'+color+';height:6px"'+(_premiumLocked?' title="Premium locked at $'+a.amount+'/mo — see lock icon"':'')+'>';
-  h+='<div class="inp-prefix" style="width:100px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" data-cpidx="'+idx+'" data-cpcurrent="'+_curContribSlide+'" id="cpManual'+idx+'" value="'+_sliderTotal+'" min="'+_sliderTotalMin+'" max="'+_sliderTotalMax+'" step="5" oninput="var _raw=this.value.replace(/[^0-9]/g,\'\');_cpSlide('+idx+',_raw);var _sl=this.parentElement.previousElementSibling;if(_sl)_sl.value=_raw" style="padding-left:22px;min-height:32px;font-size:13px;width:100%"></div>';
+  h+='<div class="inp-prefix" style="width:100px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" data-cpidx="'+idx+'" data-cpcurrent="'+_curContribSlide+'" id="cpManual'+idx+'" value="'+_sliderTotal+'" min="'+_sliderTotalMin+'" max="'+_sliderTotalMax+'" step="5" oninput="var _raw=this.value.replace(/[^0-9]/g,\'\');_cpSlide('+idx+',_raw);var _sl=this.parentElement.previousElementSibling;if(_sl)_sl.value=_raw" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:32px;font-size:13px;width:100%"></div>';
   h+='</div>';
   if(_premiumLocked){
     h+='<div style="display:flex;align-items:center;gap:6px;margin-top:2px;padding:6px 8px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.18);border-radius:3px">';
@@ -34413,6 +34413,18 @@ function _cpUpdateOverBudgetBanner(){
   if(propBtn){propBtn.disabled=false;propBtn.style.opacity='';propBtn.style.cursor='';}
 }
 function _cpSlide(i,v){
+  // Snapshot debt amounts BEFORE this slide so _cpSlideEnd can detect a
+  // zero-crossing on any debt allocation (positive → 0 OR 0 → positive).
+  // The in-card debt strategy grid is gated on amount>0; if it just appeared
+  // or disappeared, the card needs a structural rebuild that targeted-update
+  // doesn't do. Stored on first drag tick only — subsequent ticks of the
+  // same drag would clobber the pre-drag value.
+  if(!CPLAN._preSlideDebtAmts){
+    CPLAN._preSlideDebtAmts={};
+    (CPLAN.allocations||[]).forEach(function(a,idx){
+      if(a&&a.type==='debt')CPLAN._preSlideDebtAmts[idx]=parseFloat(a.amount)||0;
+    });
+  }
   // Reset the match-claim ledger so this single-card update gets fresh
   // non-zero matcher data without inheriting claims from a prior render. The
   // single-card matcher calls below need their own clean cycle.
@@ -34515,6 +34527,25 @@ function _cpSlideEnd(){
   // every slider in the DOM, which loses the user's drag focus and (on touch devices)
   // can cause the next touch to land on a completely different slider.
   clearTimeout(CPLAN._slideTimer);
+  // Detect debt zero-crossing: did any debt allocation cross between 0 and >0
+  // during this drag? If so, the in-card strategy grid (avalanche/snowball/
+  // hybrid/IBC) needs to be added or removed, which requires a full structural
+  // re-render. Drag focus is no longer relevant here since the user already
+  // released the slider. Compare current amount to the snapshot stored at the
+  // first _cpSlide tick (see _cpSlide head). Clear the snapshot after using it.
+  var _debtZeroCross=false;
+  if(CPLAN._preSlideDebtAmts){
+    (CPLAN.allocations||[]).forEach(function(a,idx){
+      if(!a||a.type!=='debt')return;
+      var pre=CPLAN._preSlideDebtAmts[idx]||0;
+      var post=parseFloat(a.amount)||0;
+      if((pre===0&&post>0)||(pre>0&&post===0))_debtZeroCross=true;
+    });
+    CPLAN._preSlideDebtAmts=null;
+  }
+  if(_debtZeroCross&&typeof _cpRenderPlanV2==='function'){
+    try{_cpRenderPlanV2();return;}catch(_rE){console.warn('Debt-card re-render:',_rE);}
+  }
   try{
     if(typeof _cpRunSimulation==='function')_cpRunSimulation();
     if(typeof _cpRenderChart==='function')_cpRenderChart();
