@@ -22925,10 +22925,14 @@ function _cpSyncFlagsToUnassigned(){
     diversify:'diversify',
     expenses:null // no allocation type; surface as a "review expenses" placeholder via diversify-style action
   };
-  var chooserActions={retirement:1, edu:1, rollover:1};
+  var chooserActions={retirement:1, edu:1, rollover:1, growth:1};
   // Retirement flag is "addressed" by any retirement vehicle in the plan; same idea for edu/rollover.
   var retTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
   var rolloverDestTypes=['rollover','roth','roth401k','iul','wl','401k','trad_ira','solo401k','sep_ira','hsa','ibc','fixed_annuity','fia','variable_annuity','spia'];
+  // Growth chooser is "addressed" by any growth-bearing vehicle. Same set the
+  // chooser menu offers (invest + permanent insurance + annuities). Important:
+  // keep this aligned with the menu shown in _cpShowFlagMenu's 'growth' config.
+  var growthDestTypes=['invest','iul','wl','fixed_annuity','fia','variable_annuity','spia'];
   var flags=_cpExtractRedFlags()||[];
   flags.forEach(function(f){
     var act=f.action;
@@ -22940,6 +22944,7 @@ function _cpSyncFlagsToUnassigned(){
       if(act==='retirement') alreadyIn=CPLAN.allocations.some(function(a){return retTypes.indexOf(a.type)>=0&&a.amount>0;});
       else if(act==='edu') alreadyIn=CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;});
       else if(act==='rollover') alreadyIn=CPLAN.allocations.some(function(a){return rolloverDestTypes.indexOf(a.type)>=0;});
+      else if(act==='growth') alreadyIn=CPLAN.allocations.some(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
       // Also count an existing placeholder for this same chooser action as "represented"
       // so the placeholder doesn't multiply on re-renders.
       if(!alreadyIn) alreadyIn=CPLAN.allocations.some(function(a){return a._chooserAction===act;});
@@ -22958,7 +22963,7 @@ function _cpSyncFlagsToUnassigned(){
     if(chooserActions[act]){
       // Placeholder card. Type is irrelevant for the placeholder render path; we use
       // 'custom' so type-aware code paths gracefully ignore it (no IRS limits, no slider).
-      var titleByAct={retirement:'Choose a retirement vehicle',edu:'Choose an education vehicle',rollover:'Choose a rollover destination'};
+      var titleByAct={retirement:'Choose a retirement vehicle',edu:'Choose an education vehicle',rollover:'Choose a rollover destination',growth:'Choose a growth vehicle'};
       CPLAN.allocations.push(_extend(nowFlag,{type:'custom',amount:0,target:0,phase:0,cascade:'',customName:titleByAct[act]||'Choose a vehicle',_chooserAction:act,_isPlaceholder:true}));
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t2=actionOnlyMap[act]; if(t2==null)return;
@@ -26067,9 +26072,9 @@ function _cpBuildCard(a,idx,isUnassigned){
   // vehicles drop into unassigned as real cards.
   if(a&&a._chooserAction){
     var _chAct=a._chooserAction;
-    var _chTitle=a.customName||(_chAct==='retirement'?'Choose a retirement vehicle':_chAct==='edu'?'Choose an education vehicle':'Choose a rollover destination');
-    var _chColor=_chAct==='retirement'?'#22C55E':_chAct==='edu'?'#06B6D4':'#A855F7';
-    var _chIcon=_chAct==='retirement'?'🎯':_chAct==='edu'?'🎓':'🔄';
+    var _chTitle=a.customName||(_chAct==='retirement'?'Choose a retirement vehicle':_chAct==='edu'?'Choose an education vehicle':_chAct==='growth'?'Choose a growth vehicle':'Choose a rollover destination');
+    var _chColor=_chAct==='retirement'?'#22C55E':_chAct==='edu'?'#06B6D4':_chAct==='growth'?'#EC4899':'#A855F7';
+    var _chIcon=_chAct==='retirement'?'🎯':_chAct==='edu'?'🎓':_chAct==='growth'?'📈':'🔄';
     var _chRgba=_cpHex2Rgba(_chColor,0.10);
     var _chBdr=_cpHex2Rgba(_chColor,0.18);
     var ph='<div style="margin-bottom:10px;border-left:4px solid '+_chColor+';background:'+_chRgba+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_chBdr+';border-right:1px solid '+_chBdr+';border-bottom:1px solid '+_chBdr+';position:relative">';
@@ -28320,6 +28325,15 @@ function _cpShowFlagMenu(flagAction,phase){
       title:'Where would you like to roll it?',
       subtitle:'Old 401(k) destinations — check one or more, then Add Selected to Plan. The AI recommendation displays alongside the flag; the choice is yours.',
       categoryKeys:['Retirement — Tax-Free','Retirement — Tax-Deferred','Annuities & Guaranteed Income','Specialized']
+    },
+    growth:{
+      title:'Choose a growth vehicle',
+      subtitle:'Build wealth beyond retirement caps — taxable brokerage for flexibility, permanent insurance for tax-deferred CV growth, annuities for guaranteed minimums. Pick one or more, then Add Selected to Plan.',
+      // Specific item whitelist rather than full category filter, because the
+      // user explicitly asked NOT to include Roth (separate retirement card),
+      // custom goals (already extracted elsewhere), or rental (too complex
+      // to surface as a casual chooser). Only the 6 accumulation vehicles.
+      itemWhitelist:['invest','iul','wl','fixed_annuity','fia','variable_annuity']
     }
   };
   var cfg=flagConfig[flagAction];
@@ -28377,8 +28391,20 @@ function _cpShowFlagMenu(flagAction,phase){
       {type:'rollover',desc:'Roll over old retirement accounts'}
     ]}
   ];
-  // Keep only the categories this flag cares about
-  categories=categories.filter(function(cat){return cfg.categoryKeys.indexOf(cat.name)>=0;});
+  // Keep only the categories this flag cares about. Two modes:
+  //   • categoryKeys: keep every item in those categories
+  //   • itemWhitelist: keep only the listed types across any category
+  // Whitelist mode preserves category headers (visual grouping in the modal)
+  // while restricting selectable items to the exact set the flag wants.
+  if(cfg.itemWhitelist){
+    var _wl=cfg.itemWhitelist;
+    categories.forEach(function(cat){
+      cat.items=cat.items.filter(function(it){return _wl.indexOf(it.type)>=0;});
+    });
+    categories=categories.filter(function(cat){return cat.items.length>0;});
+  } else {
+    categories=categories.filter(function(cat){return cfg.categoryKeys.indexOf(cat.name)>=0;});
+  }
   // Apply the same filters as _cpShowAddMenu: drop employer-only types if no employer
   if(!CPLAN.employer){categories.forEach(function(cat){cat.items=cat.items.filter(function(it){return it.type!=='401k'&&it.type!=='roth401k';});});}
   // Dedup: drop items that already exist in the plan. For edu sub-types, dedup on the
@@ -28596,6 +28622,7 @@ function _cpFlagLearnSlug(action){
     estate:'will',
     annuity_research:'fixed-indexed-annuity',
     diversify:'diversification',
+    growth:'diversification',
     expenses:'breathing-room',
     '401k':'401'
   };
@@ -29231,36 +29258,41 @@ function _cpExtractRedFlags(){
     }
   }
 
-  // ── No taxable brokerage (wealth-building opportunity) ──
-  // Surfaces a "consider a taxable brokerage" card when client has healthy
-  // surplus, is age 25+, but has NO existing taxable brokerage — either in
-  // their current investments OR in the active plan. Most clients with
-  // healthy cash flow never saw any prompt to consider one because the
-  // existing flags only fired on distress conditions (sub-5% savings rate,
-  // retirement-vs-liquid imbalance). Taxable brokerage is wealth-building
-  // basics: liquid pre-retirement access, LTCG treatment, no contribution
-  // cap. Worth surfacing actively.
-  var _hasInvestAlloc=CPLAN.allocations.some(function(a){return a.type==='invest'&&a.amount>0;});
-  var _hasBrokerageAcct=((rawS2.investments)||[]).some(function(iv){
+  // ── Growth diversification chooser ──
+  // Surfaces a chooser card when client has healthy surplus but NO growth-bearing
+  // vehicle in their plan or current investments. Growth vehicles include
+  // taxable brokerage, WL, IUL, FIA, annuities — anything that builds wealth
+  // beyond retirement-bucket caps. Uses the same chooser pattern as the
+  // retirement flag (placeholder card + Choose… button + multi-select menu).
+  // Sync layer (_cpSyncFlagsToUnassigned) treats 'growth' as a chooserAction
+  // and emits a placeholder; _cpShowFlagMenu shows the filtered menu.
+  var _growthTypes=['invest','iul','wl','fixed_annuity','fia','variable_annuity','spia'];
+  var _hasGrowthAlloc=CPLAN.allocations.some(function(a){
+    return _growthTypes.indexOf(a.type)>=0&&(parseFloat(a.amount)||0)>0;
+  });
+  var _hasGrowthAcct=((rawS2.investments)||[]).some(function(iv){
     if(!iv)return false;
     var t=(iv.type||'').toLowerCase();
-    // Treat brokerage + mutual_fund + robo_advisor as "taxable investing"
-    // (consistent with INV_TYPES catalog in pfos-main). Exclude crypto
-    // (not equity), HSA (retirement-purpose), and "other" (ambiguous).
+    // Brokerage/mutual fund/robo = taxable equity exposure
     return t==='brokerage'||t==='mutual_fund'||t==='robo_advisor';
   });
-  // Also check legacy S.assets.invest field — older clients may have
-  // entered a brokerage balance at the asset level before per-account tracking.
+  // Legacy S.assets.invest also counts as existing growth exposure
   var _legacyInvestBal=parseFloat((rawS2.assets&&rawS2.assets.invest)||0);
-  var _hasAnyTaxableInvest=_hasInvestAlloc||_hasBrokerageAcct||_legacyInvestBal>1000;
+  // Existing permanent insurance policies marked as retirement-focused (not IBC)
+  var _hasPermInsurance=(rawS2.policies||[]).some(function(p){
+    if(!p)return false;
+    var t=(p.type||'').toLowerCase();
+    return (t.indexOf('whole')>=0||t.indexOf('iul')>=0)&&(parseFloat(p.cv)||0)>0;
+  });
+  var _hasAnyGrowth=_hasGrowthAlloc||_hasGrowthAcct||_legacyInvestBal>1000||_hasPermInsurance;
   var _surplusRatio=d.income>0?(d.income-d.expenses)/d.income:0;
-  if(!_hasAnyTaxableInvest&&d.age>=25&&_surplusRatio>=0.10&&d.income>0){
+  if(!_hasAnyGrowth&&d.age>=25&&_surplusRatio>=0.10&&d.income>0){
     flags.push({
       type:'opp',
       icon:'📈',
-      title:'No taxable brokerage in your plan',
-      desc:'A taxable brokerage account is the flexible wealth-building layer beyond retirement accounts — no contribution caps, accessible before 59½ without penalty, long-term capital gains taxed at preferential rates. Especially useful for pre-retirement goals (house, sabbatical, early retirement bridge).',
-      action:'savings'
+      title:'No growth diversification in your plan',
+      desc:'You have healthy surplus but no growth-bearing vehicle beyond retirement accounts. Growth options include taxable brokerage (flexible pre-retirement access, LTCG treatment), permanent insurance with cash value (WL/IUL — tax-deferred growth, tax-free access via loans), and annuities (FIA/MYGA — guaranteed minimums). Pick what fits your timeline and risk tolerance.',
+      action:'growth'
     });
   }
 
