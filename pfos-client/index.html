@@ -8,7 +8,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="description" content="Architected Systems Client Portal — view your financial plan, goals, and advisor recommendations.">
-  <link rel="manifest" href="data:application/manifest+json,%7B%22name%22%3A%22PFOS%20Financial%20Portal%22%2C%22short_name%22%3A%22PFOS%22%2C%22start_url%22%3A%22%2Fpfos-client%22%2C%22display%22%3A%22standalone%22%2C%22background_color%22%3A%22%2309092E%22%2C%22theme_color%22%3A%22%2309092E%22%2C%22icons%22%3A%5B%7B%22src%22%3A%22https%3A%2F%2Fesjfinancial.com%2Fpfos-icon-192.png%22%2C%22sizes%22%3A%22192x192%22%2C%22type%22%3A%22image%2Fpng%22%7D%2C%7B%22src%22%3A%22https%3A%2F%2Fesjfinancial.com%2Fpfos-icon-512.png%22%2C%22sizes%22%3A%22512x512%22%2C%22type%22%3A%22image%2Fpng%22%7D%5D%7D">
+  <link rel="manifest" href="/manifest.json">
   <meta name="theme-color" content="#09092E">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -23,6 +23,45 @@
 <meta name="theme-color" content="#09092E">
 </head>
 <body>
+<script>
+// ── Service Worker registration ──
+// Registers /sw.js on window load. Required for:
+//   - Chrome desktop's address-bar install icon
+//   - Offline cached pages
+//   - Faster repeat-visit loads (cached static assets)
+// Falls back gracefully if registration fails — the app works fine without
+// the SW, just without offline support and without the install-icon promotion.
+// Only registers in production (skip during local dev to avoid stale cache
+// issues during active development).
+if ('serviceWorker' in navigator && location.protocol === 'https:') {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('/sw.js', { scope: '/' })
+      .then(function(reg) {
+        // Listen for an updated SW becoming available. We don't force-reload —
+        // the new version takes over on next navigation. Forcing reload mid-
+        // session could lose unsaved form input or interrupt a plan generation.
+        reg.addEventListener('updatefound', function() {
+          var newWorker = reg.installing;
+          if (!newWorker) return;
+          newWorker.addEventListener('statechange', function() {
+            if (newWorker.state === 'installed' && navigator.serviceWorker.controller) {
+              // New version waiting. Could surface a "Refresh to update" banner
+              // here if desired. For now silent — user gets new version on next
+              // navigation or tab restart.
+              console.log('[PFOS] New version available — will activate on next navigation');
+            }
+          });
+        });
+      })
+      .catch(function(err) {
+        // SW registration failure isn't fatal — the app works without it.
+        // Common causes: served over http (only https supports SW), sw.js
+        // not deployed yet, MIME type wrong on the response.
+        console.warn('[PFOS] Service worker registration failed:', err);
+      });
+  });
+}
+</script>
 <script>
 (function(){
   var d = document.documentElement;
@@ -6285,6 +6324,14 @@ function _portalDeleteEntry(entryId){
 // All data is read from the portal's mirrored S — same source pfos-main reads from
 // for its home page, so the two views stay in sync.
 function _portalRenderSpendDashboard(){
+  // Ensure CPLAN is hydrated before reading allocations for the Plan Deployment
+  // block and combined "Where Every Dollar Goes" donut. The spending page can
+  // be opened before the plan page (no order guarantee), and without this hook
+  // CPLAN.allocations is empty even when APP._portalFd.allocation_plan has the
+  // saved data. _cpEnsurePlanLoaded is idempotent — returns early if already
+  // hydrated. Without this, users with a saved plan saw "No plan allocations
+  // yet" on the spending page until they manually visited My Plan first.
+  if(typeof _cpEnsurePlanLoaded==='function'){try{_cpEnsurePlanLoaded();}catch(_eP){console.warn('CPLAN hydrate on spending page:',_eP);}}
   var fd=APP._portalFd||{};
   var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
   var calcs=APP._portalCalcs||fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
@@ -22914,16 +22961,16 @@ async function _cpSendPlanInquiry(){
 // ── SELF-BUILD: Show unassigned flags + empty phases ──
 function _cpStartSelfBuild(){
   CPLAN.planMode='self';CPLAN.allocations=[];
-  // Clear lingering AI artifacts. The user is explicitly choosing self-build
-  // over AI, so any prior AI summary / approach-fork data should be reset.
-  // Without this, _aiSummary persists and confuses downstream gates that use
-  // it as an "is AI user" signal (e.g., the _cpSyncFlagsToUnassigned trigger
-  // in _cpRenderPlanV2). Result before fix: sync skipped on self-build users
-  // who had previously tried AI, leaving the unassigned column with only the
-  // initial 4-flag seed instead of the full ~9 flags _cpExtractRedFlags
-  // produces on every render.
-  CPLAN._aiSummary='';
-  CPLAN._approaches=null;
+  // Clear AI "active selection" state when entering DIY — the user is building
+  // their own plan, so no AI approach is the active plan anymore. BUT we
+  // preserve _approaches (the AI's three generated proposals) and _aiSummary
+  // because the Switch button should let users return to those proposals if
+  // they change their mind. Without preserving _approaches, Switch on a
+  // DIY-after-AI plan would dead-end at the first-time fork screen with no
+  // way back to the saved AI options.
+  // The earlier _aiSummary-flag-sync conflict was fixed by trusting
+  // planMode==='self' as the authoritative sync gate (see _cpRenderPlanV2
+  // line ~25697), so we no longer need to wipe _aiSummary here.
   CPLAN._selectedApproach=null;
   CPLAN._viewingApproach=null;
   // Create allocations from red flags, all unassigned (phase 0 = unassigned).
