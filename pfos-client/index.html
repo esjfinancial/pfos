@@ -22900,6 +22900,18 @@ async function _cpSendPlanInquiry(){
 // ── SELF-BUILD: Show unassigned flags + empty phases ──
 function _cpStartSelfBuild(){
   CPLAN.planMode='self';CPLAN.allocations=[];
+  // Clear lingering AI artifacts. The user is explicitly choosing self-build
+  // over AI, so any prior AI summary / approach-fork data should be reset.
+  // Without this, _aiSummary persists and confuses downstream gates that use
+  // it as an "is AI user" signal (e.g., the _cpSyncFlagsToUnassigned trigger
+  // in _cpRenderPlanV2). Result before fix: sync skipped on self-build users
+  // who had previously tried AI, leaving the unassigned column with only the
+  // initial 4-flag seed instead of the full ~9 flags _cpExtractRedFlags
+  // produces on every render.
+  CPLAN._aiSummary='';
+  CPLAN._approaches=null;
+  CPLAN._selectedApproach=null;
+  CPLAN._viewingApproach=null;
   // Create allocations from red flags, all unassigned (phase 0 = unassigned).
   // Multi-option categories (retirement, education) are intentionally OMITTED here —
   // those flags appear in the red-flag panel with a "Choose…" button so the user can
@@ -25478,17 +25490,16 @@ function _cpRenderPlanV2(){
   if(_curAp)h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+(CPLAN._selectedApproach?'var(--mu)':'var(--yl)')+';letter-spacing:.06em">'+(_apLabels[_curAp])+(CPLAN._viewingApproach&&!CPLAN._selectedApproach?' (preview)':'')+'</span>';
   h+='<button onclick="'+(CPLAN._approaches?'_cpShowApproachFork()':'CPLAN.allocations=[];_cpStartAIRec()')+'" style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:26px">'+(CPLAN._approaches?'Switch':'Compare Approaches')+'</button>';
   h+='</div>';
-  h+='<button onclick="CPLAN.allocations=[];_cpStartAIRec()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);color:var(--pu);cursor:pointer;border-radius:2px;min-height:32px">⚡ Regenerate</button>';
-  // Wave 4: Plan Audit button. Pro+ tier (and Comp), with 90-day (Pro+) /
-  // 180-day (Pro) cooldown. Disabled state surfaces the reason inline.
+  // Plan Audit button — replaces the prior Regenerate button as the canonical
+  // plan-modification path now that the AI is producing reliable plans. Only
+  // renders when the user is eligible (Pro/Pro+/Comp tier AND past cooldown).
+  // For ineligible users, no button shows — they continue using their current
+  // plan or wait for cooldown. _cpAuditAvailability handles tier and cooldown
+  // logic; we just gate on ok:true.
   if(CPLAN._selectedApproach){
-    var _auditAvail=(typeof _cpAuditAvailability==='function')?_cpAuditAvailability():{ok:false,reason:'tier'};
+    var _auditAvail=(typeof _cpAuditAvailability==='function')?_cpAuditAvailability():{ok:false};
     if(_auditAvail.ok){
-      h+='<button onclick="_cpRunPlanAudit().then(function(r){if(r)_cpRenderPlanV2();})" title="Review your existing plan and surface non-destructive suggestions. Cooldown applies." style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">📋 Plan Audit</button>';
-    } else if(_auditAvail.reason==='cooldown'){
-      h+='<button disabled title="'+(_auditAvail.message||'')+'" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(100,116,139,.05);border:1px solid rgba(100,116,139,.15);color:var(--mu);cursor:not-allowed;border-radius:2px;min-height:32px;opacity:0.6">📋 Audit (in '+_auditAvail.daysRemaining+'d)</button>';
-    } else if(_auditAvail.reason==='tier'){
-      h+='<button disabled title="Plan Audit is available on Pro and above" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(100,116,139,.05);border:1px solid rgba(100,116,139,.15);color:var(--mu);cursor:not-allowed;border-radius:2px;min-height:32px;opacity:0.6">📋 Audit 🔒</button>';
+      h+='<button onclick="_cpRunPlanAudit().then(function(r){if(r)_cpRenderPlanV2();})" title="Review your existing plan and surface non-destructive suggestions. Cooldown applies after use." style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">📋 Plan Audit</button>';
     }
   }
   h+='<button onclick="cplanSave()" id="cplanSaveBtn" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:32px">💾 Save</button>';
@@ -25616,9 +25627,14 @@ function _cpRenderPlanV2(){
   // Unassigned items (self-build only, phase 0)
   // In DIY mode, sync detected red flags into unassigned cards before rendering.
   // This replaces the old standalone "Issues & Recommended Actions" panel — the flags
-  // now ARE the unassigned cards. Skipped in AI/advisory because their plans address
-  // the same issues directly.
-  if(!CPLAN.hasAdvisor && !CPLAN._aiSummary && CPLAN.planMode!=='ai'){
+  // now ARE the unassigned cards. Gate: trust planMode as authoritative. Previously
+  // the gate also bailed when CPLAN._aiSummary was truthy, but that field can linger
+  // on the plan after the user switches from an AI attempt to self-build, leaving
+  // them in a state where planMode='self' but _aiSummary still set — sync would be
+  // skipped and the unassigned column would only contain the initial 4-flag seed
+  // from _cpStartSelfBuild. By trusting planMode, the sync runs whenever the user
+  // is actually building their own plan, regardless of historical AI artifacts.
+  if(!CPLAN.hasAdvisor && CPLAN.planMode==='self'){
     if(typeof _cpSyncFlagsToUnassigned==='function')_cpSyncFlagsToUnassigned();
   }
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0;});
