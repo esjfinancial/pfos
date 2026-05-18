@@ -22933,9 +22933,39 @@ function _cpStartSelfBuild(){
   };
   flags.forEach(function(f){
     var sol=solMap[f.action];
-    if(sol&&!CPLAN.allocations.some(function(a){return a.type===sol.type;})){
-      CPLAN.allocations.push({type:sol.type,amount:0,target:sol.type==='ef'?Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal)):0,phase:0,cascade:'',flagTitle:f.title,flagType:f.type,flagIcon:f.icon,reason:f.desc||''});
+    if(!sol)return;
+    // For protection, allow multiple cards (life + disability + LTC + etc) by
+    // deduping on flagTitle. Other types stay type-level dedup since they only
+    // have a single flavor.
+    var dup;
+    if(sol.type==='protection'){
+      dup=CPLAN.allocations.some(function(a){return a.type==='protection'&&a.flagTitle===f.title;});
+    } else {
+      dup=CPLAN.allocations.some(function(a){return a.type===sol.type;});
     }
+    if(dup)return;
+    // Map protection sub-flag to a distinct card header so users see
+    // "Term Life Insurance Review" / "Disability Insurance Review" / etc.
+    // instead of a single generic "Protection Review" that conflates them.
+    // Mirrors the AI plan's separate cards.
+    var _customNm='';
+    if(sol.type==='protection'){
+      var _ptMap={
+        'No life insurance detected':'Term Life Insurance Review',
+        'Life coverage may be too low':'Life Coverage Review',
+        'No disability coverage detected':'Disability Insurance Review',
+        'No long-term care planning':'Long-Term Care Review'
+      };
+      _customNm=_ptMap[f.title]||'';
+      // Handle dynamic-title variant (e.g. 'Disability coverage gap: $250/mo')
+      if(!_customNm){
+        for(var _k in _ptMap){if(f.title.indexOf(_k)===0){_customNm=_ptMap[_k];break;}}
+      }
+      if(!_customNm&&f.title.indexOf('Disability coverage gap')===0)_customNm='Disability Coverage Gap Review';
+    }
+    var pushObj={type:sol.type,amount:0,target:sol.type==='ef'?Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal)):0,phase:0,cascade:'',flagTitle:f.title,flagType:f.type,flagIcon:f.icon,reason:f.desc||''};
+    if(_customNm)pushObj.customName=_customNm;
+    CPLAN.allocations.push(pushObj);
   });
   // Add goals from PFOS main. Skip recurring goals (e.g., annual vacation fund,
   // quarterly insurance premium reserves) — those never "complete" in the cascade
@@ -23017,15 +23047,45 @@ function _cpSyncFlagsToUnassigned(){
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t=actionOnlyMap[act];
       if(t==null) return; // 'expenses' has no allocation type — handled separately if we add a card later
-      alreadyIn=CPLAN.allocations.some(function(a){return a.type===t;});
+      // For 'protection' specifically, multiple flags can fire (life + disability +
+      // LTC + underinsured-life + disability-gap) and each deserves its own card —
+      // the AI version of the plan emits separate "Term Life Insurance Review" and
+      // "Disability Insurance Review" cards, and the DIY mode should match. Dedup
+      // on flagTitle so different protection flags don't collapse into one card.
+      // Other action-only types (umbrella, estate, diversify) keep the type-level
+      // dedup since they don't have multiple sub-flavors.
+      if(act==='protection'){
+        alreadyIn=CPLAN.allocations.some(function(a){return a.type===t&&a.flagTitle===f.title;});
+      } else {
+        alreadyIn=CPLAN.allocations.some(function(a){return a.type===t;});
+      }
     } else if(directMap[act]){
       alreadyIn=CPLAN.allocations.some(function(a){return a.type===directMap[act];});
     } else if(act==='401k'){
       alreadyIn=CPLAN.allocations.some(function(a){return a.type==='401k';});
     }
     if(alreadyIn)return;
+    // Map flag title to a meaningful card header for protection sub-types.
+    // Generic "Protection Review" was misleading since multiple distinct
+    // gaps can land here. Specific names mirror the AI version.
+    var _protectionTitleMap={
+      'No life insurance detected':'Term Life Insurance Review',
+      'Life coverage may be too low':'Life Coverage Review',
+      'No disability coverage detected':'Disability Insurance Review',
+      'Disability coverage gap':'Disability Coverage Gap Review',
+      'No long-term care planning':'Long-Term Care Review'
+    };
     // Stage a new card with flag context + appropriate type/markers
     var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,reason:f.desc||''};
+    // Allow disability-gap title which is dynamic ('Disability coverage gap: $X/mo')
+    if(act==='protection'){
+      var _customNm=_protectionTitleMap[f.title];
+      if(!_customNm){
+        // Loose match for dynamic titles (e.g., 'Disability coverage gap: $250/mo')
+        for(var _k in _protectionTitleMap){if(f.title.indexOf(_k)===0){_customNm=_protectionTitleMap[_k];break;}}
+      }
+      if(_customNm)nowFlag.customName=_customNm;
+    }
     if(chooserActions[act]){
       // Placeholder card. Type is irrelevant for the placeholder render path; we use
       // 'custom' so type-aware code paths gracefully ignore it (no IRS limits, no slider).
@@ -25488,7 +25548,7 @@ function _cpRenderPlanV2(){
   var _curAp=CPLAN._selectedApproach||CPLAN._viewingApproach||'';
   h+='<div style="display:flex;align-items:center;gap:6px">';
   if(_curAp)h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+(CPLAN._selectedApproach?'var(--mu)':'var(--yl)')+';letter-spacing:.06em">'+(_apLabels[_curAp])+(CPLAN._viewingApproach&&!CPLAN._selectedApproach?' (preview)':'')+'</span>';
-  h+='<button onclick="'+(CPLAN._approaches?'_cpShowApproachFork()':'CPLAN.allocations=[];_cpStartAIRec()')+'" style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:26px">'+(CPLAN._approaches?'Switch':'Compare Approaches')+'</button>';
+  h+='<button onclick="'+(CPLAN._approaches?'_cpShowApproachFork()':'_cpRenderFork()')+'" title="'+(CPLAN._approaches?'Switch between your generated approaches':'Go back to the plan-building options')+'" style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:26px">Switch</button>';
   h+='</div>';
   // Plan Audit button — replaces the prior Regenerate button as the canonical
   // plan-modification path now that the AI is producing reliable plans. Only
@@ -28223,10 +28283,26 @@ function _cpShowAddMenu(phase){
   categories.forEach(function(cat){
     menu+='<div style="margin-bottom:12px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+cat.color+';margin-bottom:6px;padding-left:4px">'+cat.name+'</div>';
     cat.items.forEach(function(it){
-      menu+='<div onclick="document.getElementById(\'addMenuOverlay\').remove();_cpAddToPhase(\''+it.type+'\','+phase+')" style="display:flex;align-items:center;gap:10px;padding:10px 8px;cursor:pointer;border-radius:4px;transition:all .15s;min-height:44px;margin-bottom:2px" onmouseover="this.style.background=\''+cat.color+'12\';this.style.transform=\'translateX(4px)\'" onmouseout="this.style.background=\'transparent\';this.style.transform=\'none\'">';
+      var _addNm=CP_NM[it.type]||it.type;
+      // ⓘ info button using the shared Learn-tab slug map. Same pattern as the
+      // chooser-flag menus (retirement/edu/rollover/growth). Clicking opens
+      // a popover with the Learn-tab entry for that vehicle so users have
+      // in-context education without leaving the add flow.
+      var _addInfoBtn=(typeof _cpInfoBtn==='function'&&typeof _cpLearnSlugFor==='function')
+        ?_cpInfoBtn(_cpLearnSlugFor(it.type,it.eduVehicle),_addNm)
+        :'';
+      menu+='<div style="display:flex;align-items:center;gap:10px;padding:10px 8px;border-radius:4px;transition:all .15s;min-height:44px;margin-bottom:2px" onmouseover="this.style.background=\''+cat.color+'12\';this.style.transform=\'translateX(4px)\'" onmouseout="this.style.background=\'transparent\';this.style.transform=\'none\'">';
+      // The icon + name + desc cluster is the clickable add affordance. The
+      // ⓘ button sits OUTSIDE this clickable area so clicking the info icon
+      // doesn't accidentally add the item to the phase. Click handler on the
+      // inner cluster, not the outer row.
+      menu+='<div onclick="document.getElementById(\'addMenuOverlay\').remove();_cpAddToPhase(\''+it.type+'\','+phase+')" style="display:flex;align-items:center;gap:10px;flex:1;cursor:pointer;min-width:0">';
       menu+='<div style="width:32px;height:32px;border-radius:8px;background:'+cat.color+'12;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">'+(CP_IC[it.type]||'⭐')+'</div>';
-      menu+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+(CP_NM[it.type]||it.type)+'</div>';
+      menu+='<div style="min-width:0;flex:1"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);display:flex;align-items:center;gap:6px">'+_addNm+'</div>';
       menu+='<div style="font-size:12px;color:var(--mu);line-height:1.4">'+it.desc+'</div></div></div>';
+      // Info button — separate flex child, doesn't trigger the add
+      if(_addInfoBtn)menu+='<div style="flex-shrink:0">'+_addInfoBtn+'</div>';
+      menu+='</div>';
     });
     menu+='</div>';
   });
