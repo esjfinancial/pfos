@@ -10346,12 +10346,12 @@ function _svgDonut(data,size,label){
   if(!data||!data.length) return '';
   var total=data.reduce(function(s,d){return s+d.v;},0)||1;
   var cx=size/2;var cy=size/2;var r=size/2-20;var r2=r*0.6;
-  // Each slice gets a unique class for the hover effect (CSS injected once per
-  // donut instance) and an SVG <title> child element for the native browser
-  // tooltip showing "<label>: $<amount>/mo (<pct>%)" on hover. Cursor changes
-  // to pointer; brightness lifts slightly on hover for visible affordance.
+  // Each donut instance gets a unique ID so its custom tooltip element doesn't
+  // collide with other donuts on the same page. The hover style (brightness +
+  // opacity) is injected once per instance via a scoped <style> block.
   var _donutId='donut_'+Math.random().toString(36).slice(2,9);
   var svg='<style>.'+_donutId+' path{cursor:pointer;transition:opacity 0.15s, filter 0.15s}.'+_donutId+' path:hover{opacity:0.85;filter:brightness(1.15)}</style>';
+  svg+='<div style="position:relative;display:inline-block;max-width:'+size+'px">';
   svg+='<svg class="'+_donutId+'" viewBox="0 0 '+size+' '+size+'" style="width:100%;height:auto;max-width:'+size+'px">';
   var angle=0;
   data.forEach(function(d){
@@ -10362,22 +10362,71 @@ function _svgDonut(data,size,label){
     var ix1=cx+r2*Math.cos((angle-90)*Math.PI/180);var iy1=cy+r2*Math.sin((angle-90)*Math.PI/180);
     var ix2=cx+r2*Math.cos((angle+slice-90)*Math.PI/180);var iy2=cy+r2*Math.sin((angle+slice-90)*Math.PI/180);
     var _pct=Math.round(d.v/total*100);
-    var _tipText=(d.l||'Unlabeled')+': $'+fmt(Math.round(d.v))+'/mo ('+_pct+'%)';
-    svg+='<path d="M'+ix1+' '+iy1+' L'+x1+' '+y1+' A'+r+' '+r+' 0 '+large+' 1 '+x2+' '+y2+' L'+ix2+' '+iy2+' A'+r2+' '+r2+' 0 '+large+' 0 '+ix1+' '+iy1+'" fill="'+d.c+'" stroke="var(--bg)" stroke-width="1"><title>'+_tipText.replace(/"/g,'&quot;').replace(/</g,'&lt;')+'</title></path>';
+    // Fancy tooltip HTML — same visual style as pfos-client's projection chart
+    // tooltip. Stored in data-tip so the shared _donutTip helper can render it
+    // at the cursor. Replaces the prior native <title> popup which was slow
+    // (~400ms browser delay) and styled inconsistently across OSes.
+    var _label=(d.l||'Unlabeled');
+    var _tipHtml='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:4px">'+_label.replace(/</g,'&lt;').replace(/"/g,'&quot;')+'</div>'
+      +'<div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">$'+fmt(Math.round(d.v))+'/mo</div>'
+      +'<div style="font-size:11px;color:var(--mu)">'+_pct+'% of total</div>';
+    svg+='<path d="M'+ix1+' '+iy1+' L'+x1+' '+y1+' A'+r+' '+r+' 0 '+large+' 1 '+x2+' '+y2+' L'+ix2+' '+iy2+' A'+r2+' '+r2+' 0 '+large+' 0 '+ix1+' '+iy1+'" fill="'+d.c+'" stroke="var(--bg)" stroke-width="1" data-tip="'+_tipHtml.replace(/"/g,'&quot;')+'" onmouseenter="_donutTip(\''+_donutId+'\',event,this)" onmousemove="_donutTip(\''+_donutId+'\',event,this)" onmouseleave="_donutTipHide(\''+_donutId+'\')"></path>';
     angle+=slice;
   });
   svg+='<text x="'+cx+'" y="'+(cy-4)+'" fill="var(--wh)" font-size="11" font-weight="700" text-anchor="middle" font-family="var(--fh)" pointer-events="none">'+fmtK(total)+'</text>';
   svg+='<text x="'+cx+'" y="'+(cy+8)+'" fill="var(--mu)" font-size="7" text-anchor="middle" pointer-events="none">/month</text>';
   svg+='</svg>';
+  // Absolute-positioned tooltip element — managed by _donutTip / _donutTipHide.
+  // Sits inside the position:relative wrapper so cursor offsets work cleanly.
+  svg+='<div id="'+_donutId+'_tip" style="display:none;position:absolute;pointer-events:none;background:rgba(12,12,52,.95);border:1px solid rgba(91,155,255,.3);border-radius:4px;padding:8px 12px;font-size:12px;min-width:120px;max-width:220px;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3);top:0;left:0"></div>';
+  svg+='</div>';
   // Legend
   var leg='<div style="display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:4px">';
   data.forEach(function(d){
     if(d.v<=0)return;
     var _legPct=Math.round(d.v/total*100);
-    leg+='<div style="font-size:8px;color:var(--mu);display:flex;align-items:center;gap:3px" title="'+(d.l||'').replace(/"/g,'&quot;')+': '+fmt(Math.round(d.v))+'/mo ('+_legPct+'%)"><span style="width:6px;height:6px;border-radius:1px;background:'+d.c+'"></span>'+d.l+' '+fmt(d.v)+' <span style="opacity:.6">('+_legPct+'%)</span></div>';
+    leg+='<div style="font-size:8px;color:var(--mu);display:flex;align-items:center;gap:3px"><span style="width:6px;height:6px;border-radius:1px;background:'+d.c+'"></span>'+d.l+' '+fmt(d.v)+' <span style="opacity:.6">('+_legPct+'%)</span></div>';
   });
   leg+='</div>';
   return '<div style="text-align:center">'+svg+leg+'</div>';
+}
+
+// Shared donut hover tooltip — used by every _svgDonut instance on pfos-main.
+// Mirrors the projection chart tooltip pattern from pfos-client. Each donut
+// has a unique ID; the path slices carry data-tip="<html>" with the tooltip
+// body. Cursor position is computed relative to the position:relative wrapper
+// so the tip stays anchored. Idempotent — repeated mouseenter/mousemove just
+// update content + position; tip element is reused per-donut.
+function _donutTip(donutId,e,pathEl){
+  var tip=document.getElementById(donutId+'_tip');
+  if(!tip||!pathEl)return;
+  var html=pathEl.getAttribute('data-tip');
+  if(!html)return;
+  var wrap=tip.offsetParent||tip.parentNode;
+  if(!wrap)return;
+  var wRect=wrap.getBoundingClientRect();
+  var cx=e.clientX-wRect.left;
+  var cy=e.clientY-wRect.top;
+  tip.innerHTML=html;
+  tip.style.visibility='hidden';
+  tip.style.display='block';
+  var tw=tip.offsetWidth||140;
+  var th=tip.offsetHeight||40;
+  // Cursor + 12px offset, then clamp to wrapper bounds. Flip sides when the
+  // tip would overflow the wrapper edge.
+  var left=cx+12;
+  var top=cy+12;
+  if(left+tw>wRect.width-4)left=cx-tw-12;
+  if(left<4)left=4;
+  if(top+th>wRect.height-4)top=cy-th-12;
+  if(top<4)top=4;
+  tip.style.left=left+'px';
+  tip.style.top=top+'px';
+  tip.style.visibility='visible';
+}
+function _donutTipHide(donutId){
+  var tip=document.getElementById(donutId+'_tip');
+  if(tip)tip.style.display='none';
 }
 
 // ── MAIN TRACKING DASHBOARD ──
