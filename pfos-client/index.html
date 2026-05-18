@@ -23000,6 +23000,82 @@ function _cpStartSelfBuild(){
   }
   // No existing DIY work — seed fresh placeholders from red flags.
   CPLAN.allocations=[];
+  // ── PRE-SEED: existing retirement accounts as funded cards ──
+  // Per spec: "the user's current accounts should show up as a card already
+  // in the phases since they already have them open. Choose should only be
+  // for additional accounts." Before processing red flags (which produce
+  // EMPTY chooser placeholders for retirement), scan the user's actual
+  // retirement accounts and create funded cards for each. The retirement
+  // red flag's chooser will then suggest ADDITIONAL accounts, not duplicate
+  // the existing ones.
+  var rawS_seed=(APP._portalFd&&APP._portalFd.S)||{};
+  var existingRet=rawS_seed.retAccounts||[];
+  var _retTypeMap={
+    'roth_ira':'roth',
+    '401k_current':'401k','403b_current':'401k','tsp_current':'401k',
+    'roth401k_current':'roth401k',
+    'trad_ira':'trad_ira',
+    'solo_401k':'solo401k','roth_solo_401k':'solo401k',
+    'sep_ira':'sep_ira'
+  };
+  var _retPhaseMap={
+    'roth':2,'401k':2,'roth401k':2,'trad_ira':2,'solo401k':2,'sep_ira':2
+  };
+  existingRet.forEach(function(r){
+    var allocType=_retTypeMap[r.type];
+    if(!allocType)return;
+    var contrib=parseFloat(r.contrib)||0;
+    if(contrib<=0)return;// Don't seed accounts the user isn't actively funding
+    var owner=r.owner||'personal';
+    // Both personal AND spouse retirement accounts get seeded. Per spec
+    // (from clarification): "spouse accounts seeded too for joint households."
+    // owner is preserved on the allocation so the simulation correctly routes
+    // contribution math through the spouse's data source via _cpMatchExisting.
+    // Dedup: same type+owner combo shouldn't double-seed if the user already
+    // has an account for this combination (defensive — allocations[] is empty
+    // here but multiple accounts of the same type are possible).
+    if(CPLAN.allocations.some(function(a){return a.type===allocType && (a.owner||'personal')===owner;}))return;
+    var ownerLabel=(owner==='spouse')?' [spouse]':'';
+    var displayName=(r.provider||r.label||'')?
+      ((r.provider||r.label)+' ('+(CP_NM[allocType]||allocType)+')'+ownerLabel):
+      ((CP_NM[allocType]||allocType)+ownerLabel);
+    CPLAN.allocations.push({
+      type:allocType,
+      amount:Math.round(contrib),
+      target:0,
+      phase:_retPhaseMap[allocType]||2,
+      cascade:'',
+      customName:displayName,
+      owner:owner,
+      reason:'Existing account detected from your financial data. Current contribution preset; adjust as needed.'
+    });
+  });
+  // Similarly seed existing IUL/WL/IBC policies as funded cards. The protection
+  // flag system already handles "no life detected" / "no disability" but
+  // doesn't surface EXISTING policies as live cards in the plan.
+  var existingPolicies=rawS_seed.policies||rawS_seed.insurancePolicies||[];
+  existingPolicies.forEach(function(p){
+    var pType=(p.type||'').toLowerCase();
+    var pIbc=p.ibcFlag==='yes';
+    var allocType=null;
+    if(pType.indexOf('iul')>=0||pType.indexOf('indexed universal')>=0){allocType=pIbc?'ibc':'iul';}
+    else if(pType==='whole life'){allocType=pIbc?'ibc':'wl';}
+    if(!allocType)return;
+    var premium=parseFloat(p.premium)||0;
+    if(premium<=0)return;
+    // Dedup
+    if(CPLAN.allocations.some(function(a){return a.type===allocType;}))return;
+    var displayName=p.company?(p.company+' ('+(CP_NM[allocType]||allocType)+')'):(CP_NM[allocType]||allocType);
+    CPLAN.allocations.push({
+      type:allocType,
+      amount:Math.round(premium),
+      target:0,
+      phase:3,
+      cascade:'',
+      customName:displayName,
+      reason:'Existing policy detected from your financial data. Current premium preset; adjust as needed.'
+    });
+  });
   // Create allocations from red flags, all unassigned (phase 0 = unassigned).
   // Multi-option categories (retirement, education) are intentionally OMITTED here —
   // those flags appear in the red-flag panel with a "Choose…" button so the user can
@@ -24741,7 +24817,15 @@ function _cpShowApproachFork(){
       +'<button onclick="_cpConfirmedAIGen()" style="padding:9px 18px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.08em;background:rgba(234,179,8,.15);border:1px solid rgba(234,179,8,.45);color:var(--yl);border-radius:4px;cursor:pointer;white-space:nowrap;min-height:36px">🔄 Regenerate All</button>'
     +'</div>';
   }
-  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:20px">';
+  // Detect DIY existence early so the AI grid can be sized to accommodate it.
+  // When DIY work exists, use 4 columns (Traditional / Tax-Free / Hybrid / DIY)
+  // so all cards sit on one row with consistent visual treatment. Without this
+  // detection, the DIY card landed on its own row below the 3 AI cards with
+  // empty space next to it — awkward layout.
+  var _earlyDiy=CPLAN._diyPlan;
+  var _earlyDiyHasWork=_earlyDiy && _earlyDiy.allocations && _earlyDiy.allocations.some(function(a){return(parseFloat(a.amount)||0)>0;});
+  var _forkColCount=_earlyDiyHasWork?4:3;
+  h+='<div style="display:grid;grid-template-columns:repeat('+_forkColCount+',1fr);gap:14px;margin-bottom:20px">';
   cards.forEach(function(cd){
     var data=ap[cd.key];
     var isLoading=!ap.hasOwnProperty(cd.key);
@@ -24975,33 +25059,158 @@ function _cpShowApproachFork(){
     }
     h+='</div>';
   });
-  h+='</div>';
   // ── DIY CARD: render only when the user has saved DIY work ──
   // Per spec: DIY appears as a 4th card on the fork once the user has built
   // anything (any allocation amount > 0). Empty placeholder DIY does NOT show
   // here — that's the "if user never allocated anything to DIY, nothing saves"
-  // rule from your spec.
+  // rule from your spec. Layout/styling MATCHES the AI cards above for visual
+  // uniformity — same projected retirement value, retirement income breakdown,
+  // tax bucket breakdown, total deployed, and button stack.
   var _diy=CPLAN._diyPlan;
   var _diyHasWork=_diy && _diy.allocations && _diy.allocations.some(function(a){return(parseFloat(a.amount)||0)>0;});
   if(_diyHasWork){
-    var _diyMonthly=_diy.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
-    var _diyCount=_diy.allocations.filter(function(a){return(parseFloat(a.amount)||0)>0;}).length;
-    h+='<div style="display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:20px">';
-    h+='<div style="background:rgba(91,155,255,.04);border:2px solid rgba(91,155,255,.2);border-radius:8px;padding:24px 20px;text-align:center;position:relative;transition:border-color .2s" onmouseover="this.style.borderColor=\'#5B9BFF\'" onmouseout="this.style.borderColor=\'rgba(91,155,255,.2)\'">';
+    // Build the DIY card using the same projection math as the AI cards.
+    // Strategy: temporarily swap CPLAN.allocations to the DIY allocations, run
+    // _cpRunSimulation (the same cascade-aware sim the AI cards use), capture
+    // the resulting end-state balances, then restore CPLAN.allocations. If the
+    // sim fails for any reason, fall back to the straight-line compounding
+    // (the AI cards' own fallback path) so the card still renders.
+    var _diyRecs=_diy.allocations.filter(function(a){return(parseFloat(a.amount)||0)>0;});
+    var _diyMonthly=_diyRecs.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+    var _diyCount=_diyRecs.length;
+    var _diyRetVehicles=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest','edu','ef','custom','rollover','protection'];
+    var _diyTaxBucket={
+      '401k':'ord','trad_ira':'ord','solo401k':'ord','sep_ira':'ord','rollover':'ord',
+      'roth':'free','roth401k':'free','hsa':'free','iul':'free','wl':'free','ibc':'free',
+      'edu':'free','ef':'free','custom':'free',
+      'invest':'ltcg'
+    };
+    var _diyYrs=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
+    var _diyRetVal=0;
+    var _diyBuckets={ord:0,ltcg:0,free:0};
+    // Run the cascade-aware sim against DIY allocations
+    var _diySimUsed=false;
+    try{
+      var _savedAllocs=CPLAN.allocations;
+      var _savedSim=CPLAN._sim;
+      CPLAN.allocations=JSON.parse(JSON.stringify(_diyRecs));
+      if(typeof _cpRunSimulation==='function'){
+        _cpRunSimulation();
+        var _diySim=CPLAN._sim;
+        if(_diySim && _diySim.projRetValue>0){
+          _diyRetVal=_diySim.projRetValue;
+          (_diySim.allocEndBalances||[]).forEach(function(ab){
+            var aType=ab.type;
+            if(_diyRetVehicles.indexOf(aType)<0)return;
+            var _bk=_diyTaxBucket[aType]||'ord';
+            _diyBuckets[_bk]+=(ab.endBal||0);
+          });
+          _diySimUsed=true;
+        }
+      }
+      // Restore the previous CPLAN state — important so subsequent renders
+      // (the actual plan view if user clicks View) start from clean state.
+      CPLAN.allocations=_savedAllocs;
+      CPLAN._sim=_savedSim;
+    }catch(_eDS){
+      console.warn('DIY sim failed; falling back to straight-line:',_eDS);
+      // Ensure restore happened
+      try{
+        if(typeof _savedAllocs!=='undefined')CPLAN.allocations=_savedAllocs;
+        if(typeof _savedSim!=='undefined')CPLAN._sim=_savedSim;
+      }catch(_eR){}
+    }
+    // Fallback: straight-line compounding if the sim path didn't yield a value
+    if(!_diySimUsed){
+      _diyRecs.forEach(function(al){
+        var amt=parseFloat(al.amount)||0;if(amt<=0)return;
+        var aType=al.type;
+        if(_diyRetVehicles.indexOf(aType)<0)return;
+        var rate=0.065;
+        if(aType==='wl')rate=0.04;
+        else if(aType==='iul')rate=0.055;
+        else if(aType==='ibc')rate=(al._ibcUnderlyingType==='iul')?0.055:0.04;
+        else if(aType==='hsa')rate=0.055;
+        else if(aType==='invest')rate=0.065;
+        else if(aType==='401k'||aType==='roth401k')rate=0.06;
+        var bal=0;for(var _dy=1;_dy<=_diyYrs;_dy++){bal=(bal+amt*12)*(1+rate);}
+        _diyRetVal+=bal;
+        var _bk=_diyTaxBucket[aType]||'ord';
+        _diyBuckets[_bk]+=bal;
+      });
+    }
+    var _diyYrsInRet=(typeof _cpYearsInRetirement==='function')?_cpYearsInRetirement():25;
+    var _diyR=0.01/12,_diyN=_diyYrsInRet*12;
+    var _diyPMTfactor=_diyR/(1-Math.pow(1+_diyR,-_diyN));
+    var _diyRetInc=_diyRetVal>0?Math.round(_diyRetVal*_diyPMTfactor):0;
+    // Compute retirement-bracket tax (same as AI cards). Use 2026 brackets.
+    var _diyMfj=CPLAN.marital==='Married'||CPLAN.marital==='Domestic Partnership';
+    var _diyRetAnnInc=_diyRetInc*12;
+    var _diyRetTaxPct=10;
+    if(_diyMfj){if(_diyRetAnnInc>768700)_diyRetTaxPct=37;else if(_diyRetAnnInc>512450)_diyRetTaxPct=35;else if(_diyRetAnnInc>403550)_diyRetTaxPct=32;else if(_diyRetAnnInc>211400)_diyRetTaxPct=24;else if(_diyRetAnnInc>100800)_diyRetTaxPct=22;else if(_diyRetAnnInc>24800)_diyRetTaxPct=12;}
+    else{if(_diyRetAnnInc>640600)_diyRetTaxPct=37;else if(_diyRetAnnInc>256225)_diyRetTaxPct=35;else if(_diyRetAnnInc>201775)_diyRetTaxPct=32;else if(_diyRetAnnInc>105700)_diyRetTaxPct=24;else if(_diyRetAnnInc>50400)_diyRetTaxPct=22;else if(_diyRetAnnInc>12400)_diyRetTaxPct=12;}
+    var _diyBkInc={
+      ord: _diyRetVal>0?Math.round(_diyBuckets.ord*_diyPMTfactor):0,
+      ltcg:_diyRetVal>0?Math.round(_diyBuckets.ltcg*_diyPMTfactor):0,
+      free:_diyRetVal>0?Math.round(_diyBuckets.free*_diyPMTfactor):0
+    };
+    var _diyBkTax={
+      ord: Math.round(_diyBkInc.ord*_diyRetTaxPct/100),
+      ltcg:Math.round(_diyBkInc.ltcg*15/100),
+      free:0
+    };
+    var _diyTotalTax=_diyBkTax.ord+_diyBkTax.ltcg+_diyBkTax.free;
+    var _diyNetInc=_diyRetInc-_diyTotalTax;
+    var _diyBlendedPct=_diyRetInc>0?Math.round(_diyTotalTax*100/_diyRetInc):0;
+    // DIY-specific styling: matches blue Build-my-own theme to differentiate from AI
+    var _diyColor='#5B9BFF';
+    // DIY card is rendered as the 4th cell inside the existing AI grid.
+    // No separate grid wrapper here — the AI grid was sized to repeat(4,1fr)
+    // when _earlyDiyHasWork is true (see the grid opener earlier).
+    h+='<div style="background:rgba(91,155,255,.04);border:2px solid rgba(91,155,255,.2);border-radius:8px;padding:24px 20px;text-align:center;position:relative;transition:border-color .2s" onmouseover="this.style.borderColor=\''+_diyColor+'\'" onmouseout="this.style.borderColor=\'rgba(91,155,255,.2)\'">';
     h+='<div style="font-size:32px;margin-bottom:8px">🔧</div>';
     h+='<div style="font-family:var(--fh);font-size:16px;font-weight:800;color:var(--wh);margin-bottom:4px">My DIY Plan</div>';
-    h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-bottom:16px;min-height:36px">'+_diyCount+' funded allocation'+(_diyCount!==1?'s':'')+' totaling '+fmt(Math.round(_diyMonthly))+'/mo. Click View to continue editing or Use This Plan to commit.</div>';
-    // View button — loads DIY into the editor. _cpStartSelfBuild detects the
-    // saved DIY and restores it instead of re-seeding from red flags.
+    h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-bottom:16px;min-height:36px">'+_diyCount+' funded allocation'+(_diyCount!==1?'s':'')+' built by you. Click View to continue editing or Use This Plan to commit.</div>';
+    // Projected retirement value — same format as AI cards (color + "M" suffix when >= 1M)
+    var _diyRetMillions=_diyRetVal/1000000;
+    var _diyRetDisplay=_diyRetMillions>=1?'$'+_diyRetMillions.toFixed(1)+'M':fmt(Math.round(_diyRetVal));
+    h+='<div style="font-family:var(--fd);font-size:42px;font-weight:300;color:'+_diyColor+';margin-bottom:2px;line-height:1.1">'+_diyRetDisplay+'</div>';
+    h+='<div style="font-size:12px;color:var(--mu);margin-bottom:6px">projected at retirement</div>';
+    h+='<div style="font-size:10px;color:var(--mu);font-style:italic;margin-bottom:12px">Estimated end-state — see plan view for the full year-by-year trajectory</div>';
+    // Retirement income breakdown (mirrors AI card structure)
+    if(_diyRetInc>0){
+      h+='<div style="background:rgba(91,155,255,.04);border-radius:4px;padding:10px 12px;margin-bottom:12px;text-align:left;font-size:11px;color:var(--mu);line-height:1.6">';
+      h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--wh);text-align:center;margin-bottom:6px">RETIREMENT INCOME</div>';
+      h+='<div style="text-align:center;margin-bottom:6px"><span style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(_diyRetInc)+'/mo</span> <span style="font-size:11px;color:var(--mu)">gross</span></div>';
+      if(_diyTotalTax>0){
+        h+='<div style="text-align:center;color:var(--rd);font-size:11px;margin-bottom:4px">− '+fmt(_diyTotalTax)+' tax ('+_diyBlendedPct+'% blended)</div>';
+        h+='<div style="text-align:center"><span style="font-family:var(--fd);font-size:13px;color:var(--wh);font-weight:700">'+fmt(_diyNetInc)+'/mo</span> <span style="font-size:11px;color:var(--mu)">net after tax</span></div>';
+      } else {
+        h+='<div style="text-align:center"><span style="font-family:var(--fd);font-size:13px;color:var(--gr);font-weight:700">'+fmt(_diyRetInc)+'/mo</span> <span style="font-size:11px;color:var(--mu)">tax-free</span></div>';
+      }
+      // Bucket breakdown
+      if(_diyBkInc.ord>0 || _diyBkInc.ltcg>0 || _diyBkInc.free>0){
+        h+='<div style="border-top:1px solid rgba(91,155,255,.1);margin-top:8px;padding-top:6px;font-size:11px;color:var(--mu);line-height:1.7">';
+        if(_diyBkInc.ord>0)h+='<div style="display:flex;justify-content:space-between"><span>Ordinary income (Trad 401k/IRA)</span><span style="color:var(--wh)">'+fmt(_diyBkInc.ord)+'/mo</span> <span style="color:var(--rd);margin-left:6px">-'+fmt(_diyBkTax.ord)+'</span></div>';
+        if(_diyBkInc.ltcg>0)h+='<div style="display:flex;justify-content:space-between"><span>LTCG (taxable brokerage)</span><span style="color:var(--wh)">'+fmt(_diyBkInc.ltcg)+'/mo</span> <span style="color:var(--rd);margin-left:6px">-'+fmt(_diyBkTax.ltcg)+'</span></div>';
+        if(_diyBkInc.free>0)h+='<div style="display:flex;justify-content:space-between"><span>Tax-free (Roth, HSA, ins. loans)</span><span style="color:var(--wh)">'+fmt(_diyBkInc.free)+'/mo</span> <span style="color:var(--gr);margin-left:6px">$0</span></div>';
+        h+='</div>';
+      }
+      h+='</div>';
+    }
+    // Monthly deployed
+    h+='<div style="font-size:13px;color:var(--mu);margin-bottom:14px"><span style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(Math.round(_diyMonthly))+'</span>/mo deployed</div>';
+    // Button stack — matches AI cards
     h+='<div style="display:flex;flex-direction:column;gap:6px">';
-    h+='<button onclick="_cpStartSelfBuild()" title="Load your DIY plan to continue editing. Switch returns here." style="width:100%;padding:8px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px;border:1px solid rgba(91,155,255,.2);background:transparent;color:#5B9BFF">👁 View This Plan</button>';
-    // Use This Plan on DIY: load + commit. Same flow as AI cards but loading
-    // path is _cpStartSelfBuild (which restores saved DIY).
-    h+='<button onclick="_cpStartSelfBuild();_cpCommitPlan();" title="Permanently lock in your DIY plan. AI plans will be deleted." style="width:100%;padding:10px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px;border:1px solid rgba(91,155,255,.25);background:rgba(91,155,255,.08);color:#5B9BFF">✓ Use This Plan</button>';
-    h+='</div>';
+    h+='<button onclick="_cpStartSelfBuild()" title="Load your DIY plan to continue editing. Switch returns here." style="width:100%;padding:8px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px;border:1px solid rgba(91,155,255,.2);background:transparent;color:'+_diyColor+'">👁 View This Plan</button>';
+    h+='<button onclick="_cpStartSelfBuild();_cpCommitPlan();" title="Permanently lock in your DIY plan. AI plans will be deleted." style="width:100%;padding:10px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px;border:1px solid rgba(91,155,255,.25);background:rgba(91,155,255,.08);color:'+_diyColor+'">✓ Use This Plan</button>';
     h+='</div>';
     h+='</div>';
   }
+  // Close the AI cards grid (which may have included DIY as a 4th cell).
+  // This close fires whether or not DIY was rendered — the grid is always opened
+  // before the cards loop and must always be closed before the bottom-row buttons.
+  h+='</div>';
   // ── BOTTOM ROW: "create what's missing" buttons ──
   // Show only the buttons for plans that don't exist yet. Per spec:
   // - AI exists, DIY doesn't → show "Build my own" + Free consultation
@@ -26534,7 +26743,14 @@ function _cpBuildCard(a,idx,isUnassigned){
     if(a.reason)ph+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+a.reason+'</div>';
     ph+='</div></div>';
     ph+='<div style="display:flex;gap:6px;align-items:center">';
-    ph+='<button onclick="CPLAN._cpChooserSourceIdx='+idx+';_cpShowFlagMenu(\''+_chAct+'\',0)" style="padding:9px 18px;font-family:var(--fh);font-size:13px;font-weight:700;background:'+_cpHex2Rgba(_chColor,0.18)+';border:1px solid '+_cpHex2Rgba(_chColor,0.4)+';color:'+_chColor+';cursor:pointer;border-radius:4px;min-height:36px">Choose…</button>';
+    // Default phase by chooser action — retirement/growth go to phase 2,
+    // education/rollover go to phase 3. Previously this passed 0 which forced
+    // every chooser pick into Unassigned even though the user explicitly
+    // picked a retirement/education vehicle from a flag prompt. Sensible
+    // defaults make the cards land in a real phase the user can immediately
+    // see funded; they can still drag to a different phase if needed.
+    var _defaultPhase=_chAct==='retirement'?2:_chAct==='growth'?3:_chAct==='edu'?3:_chAct==='rollover'?2:2;
+    ph+='<button onclick="CPLAN._cpChooserSourceIdx='+idx+';_cpShowFlagMenu(\''+_chAct+'\','+_defaultPhase+')" style="padding:9px 18px;font-family:var(--fh);font-size:13px;font-weight:700;background:'+_cpHex2Rgba(_chColor,0.18)+';border:1px solid '+_cpHex2Rgba(_chColor,0.4)+';color:'+_chColor+';cursor:pointer;border-radius:4px;min-height:36px">Choose…</button>';
     ph+='<button onclick="_cpRemove('+idx+')" title="Dismiss" style="padding:6px 10px;font-family:var(--fh);font-size:13px;font-weight:700;background:transparent;border:1px solid rgba(239,68,68,.25);color:var(--rd);cursor:pointer;border-radius:4px;min-height:36px">×</button>';
     ph+='</div></div></div>';
     return ph;
@@ -28773,7 +28989,23 @@ function _cpToast(msg,ms){
 
 function _cpAddToPhase(type,phase){
   var t=0;if(type==='ef')t=Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal));
-  CPLAN.allocations.push({type:type,amount:0,target:t,phase:phase,cascade:'',customName:type==='custom'?'My goal':''});
+  // Pre-fill amount for retirement types based on the user's existing
+  // contribution detected from their financial data. Without this, picking
+  // 401k from a chooser added a $0 card even when the user already
+  // contributes — they'd have to know their own current contribution and
+  // manually set the slider. _cpMatchExisting reads retAccts and returns the
+  // matched contribution if any.
+  var startAmount=0;
+  var _retTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira'];
+  if(_retTypes.indexOf(type)>=0 && typeof _cpMatchExisting==='function'){
+    try{
+      var _match=_cpMatchExisting({type:type});
+      if(_match && _match.currentContrib > 0){
+        startAmount=Math.round(_match.currentContrib);
+      }
+    }catch(_eM){console.warn('Existing contrib detect:',_eM);}
+  }
+  CPLAN.allocations.push({type:type,amount:startAmount,target:t,phase:phase,cascade:'',customName:type==='custom'?'My goal':''});
   var newIdx=CPLAN.allocations.length-1;
   // ── Cascade prompt resolution path ──
   // If the user just picked "Add a new allocation" in the cascade prompt, the original
@@ -29016,15 +29248,18 @@ function _cpFlagMenuSubmit(){
   var list=document.getElementById('cpFlagMenuList');
   if(!list)return;
   // The placeholder mechanism stashes the source card index on CPLAN before opening
-  // the chooser. If present, the picked vehicles drop into UNASSIGNED (phase=0) so
-  // the user can adjust the slider and assign each card to a phase from there. We
-  // also remove the placeholder card after the new ones are added.
+  // the chooser. The placeholder gets removed after the new cards are added.
+  // Previously this also forced the picked vehicles into UNASSIGNED (phase=0)
+  // on the theory that the user would then assign them to phases manually.
+  // That's an extra step — the user picked retirement, they want it in a
+  // retirement phase. Now the picks land in the phase the flag originally
+  // suggested (which the chooser receives via data-phase).
   var sourceIdx=(typeof CPLAN._cpChooserSourceIdx==='number')?CPLAN._cpChooserSourceIdx:-1;
   CPLAN._cpChooserSourceIdx=null;
   var phase=parseInt(list.getAttribute('data-phase'));
   if(isNaN(phase))phase=1;
-  // If we opened from a placeholder, override phase to 0 (unassigned) per the agreed flow
-  if(sourceIdx>=0)phase=0;
+  // NOTE: the prior "if(sourceIdx>=0)phase=0" override was REMOVED. Picks now
+  // honor the originally-passed phase. The placeholder card is still removed.
   var checked=Array.prototype.slice.call(list.querySelectorAll('input[type="checkbox"]:checked'));
   if(!checked.length)return;
   // Suppress per-add cascade prompts inside the loop — we'll show one at the end if any
