@@ -4460,9 +4460,22 @@ function _cpInfoPopover(anchorEl, slug){
   document.body.appendChild(pop);
 }
 function _syncPlanToMain(){
-  if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length)return;
+  if(typeof CPLAN==='undefined')return;
+  // Prefer in-memory CPLAN (most current) but fall back to the persisted
+  // allocation_plan if CPLAN is empty. Without this fallback, any transient
+  // CPLAN.allocations=[] (e.g., during _cpStartSelfBuild) would cause the
+  // sync to bail, leaving pfos-main with potentially stale or missing plan
+  // data depending on when this function got called.
+  var _liveAllocs=(CPLAN.allocations&&CPLAN.allocations.length)?CPLAN.allocations:null;
+  var _savedAllocs=null;
+  if(!_liveAllocs){
+    var _sp=APP&&APP._portalFd&&APP._portalFd.allocation_plan;
+    if(_sp&&_sp.allocations&&_sp.allocations.length)_savedAllocs=_sp.allocations;
+  }
+  var _allocsSource=_liveAllocs||_savedAllocs;
+  if(!_allocsSource||!_allocsSource.length)return;// nothing to sync from either source
   var plan={
-    allocations:CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target};}),
+    allocations:_allocsSource.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target};}),
     sim:CPLAN._sim?{netWorth:CPLAN._sim.netWorth,baseline:CPLAN._sim.baseline,retirement:CPLAN._sim.retirement}:null,
     tracking:_cpTracking,
     calendar:_cpPlanCalendar,
@@ -5926,7 +5939,7 @@ function _portalSvgDonut(data,size,label){
     // in white, percentage in muted small text.
     var _label=(d.l||'Unlabeled');
     var _tipHtml='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:4px">'+_label.replace(/</g,'&lt;').replace(/"/g,'&quot;')+'</div>'
-      +'<div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">$'+fmt(Math.round(d.v))+'/mo</div>'
+      +'<div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">'+fmt(Math.round(d.v))+'/mo</div>'
       +'<div style="font-size:11px;color:var(--mu)">'+_pct+'% of total</div>';
     svg+='<path d="M'+ix1+' '+iy1+' L'+x1+' '+y1+' A'+r+' '+r+' 0 '+large+' 1 '+x2+' '+y2+' L'+ix2+' '+iy2+' A'+r2+' '+r2+' 0 '+large+' 0 '+ix1+' '+iy1+'" fill="'+d.c+'" stroke="var(--bg)" stroke-width="1" data-tip="'+_tipHtml.replace(/"/g,'&quot;')+'" onmouseenter="_donutTip(\''+_donutId+'\',event,this)" onmousemove="_donutTip(\''+_donutId+'\',event,this)" onmouseleave="_donutTipHide(\''+_donutId+'\')"></path>';
     angle+=slice;
@@ -6331,7 +6344,17 @@ function _portalRenderSpendDashboard(){
   // saved data. _cpEnsurePlanLoaded is idempotent — returns early if already
   // hydrated. Without this, users with a saved plan saw "No plan allocations
   // yet" on the spending page until they manually visited My Plan first.
-  if(typeof _cpEnsurePlanLoaded==='function'){try{_cpEnsurePlanLoaded();}catch(_eP){console.warn('CPLAN hydrate on spending page:',_eP);}}
+  if(typeof _cpEnsurePlanLoaded==='function'){
+    try{
+      _cpEnsurePlanLoaded();
+      // Also propagate the freshly-hydrated plan to pfos-main, so its Home
+      // donut and Plan section see the data when the user landed on spending
+      // first (before visiting My Plan). Without this, pfos-main's
+      // _planAllocations stays empty until the user actually opens My Plan.
+      // Both stores end up populated regardless of navigation order.
+      if(typeof _syncPlanToMain==='function')_syncPlanToMain();
+    }catch(_eP){console.warn('CPLAN hydrate on spending page:',_eP);}
+  }
   var fd=APP._portalFd||{};
   var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
   var calcs=APP._portalCalcs||fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
@@ -22960,19 +22983,23 @@ async function _cpSendPlanInquiry(){
 
 // ── SELF-BUILD: Show unassigned flags + empty phases ──
 function _cpStartSelfBuild(){
-  CPLAN.planMode='self';CPLAN.allocations=[];
-  // Clear AI "active selection" state when entering DIY — the user is building
-  // their own plan, so no AI approach is the active plan anymore. BUT we
-  // preserve _approaches (the AI's three generated proposals) and _aiSummary
-  // because the Switch button should let users return to those proposals if
-  // they change their mind. Without preserving _approaches, Switch on a
-  // DIY-after-AI plan would dead-end at the first-time fork screen with no
-  // way back to the saved AI options.
-  // The earlier _aiSummary-flag-sync conflict was fixed by trusting
-  // planMode==='self' as the authoritative sync gate (see _cpRenderPlanV2
-  // line ~25697), so we no longer need to wipe _aiSummary here.
+  CPLAN.planMode='self';
   CPLAN._selectedApproach=null;
   CPLAN._viewingApproach=null;
+  // PRESERVE EXISTING DIY: if the user already has DIY work saved (any
+  // allocation with amount > 0 was made previously), restore it instead of
+  // wiping and re-seeding from red flags. Per spec: "if they only selected
+  // DIY and started making edits, when they go back into plan, it will show
+  // that same DIY plan card and clicking View continues editing." Without
+  // this restore, every entry to DIY mode would reset the user's work.
+  var savedDiy=CPLAN._diyPlan;
+  if(savedDiy && savedDiy.allocations && savedDiy.allocations.length){
+    CPLAN.allocations=JSON.parse(JSON.stringify(savedDiy.allocations));
+    _cpRenderPlanV2();
+    return;
+  }
+  // No existing DIY work — seed fresh placeholders from red flags.
+  CPLAN.allocations=[];
   // Create allocations from red flags, all unassigned (phase 0 = unassigned).
   // Multi-option categories (retirement, education) are intentionally OMITTED here —
   // those flags appear in the red-flag panel with a "Choose…" button so the user can
@@ -24558,27 +24585,105 @@ function _cpConvertAIRecs(aiData){
 // ── Select an approach from the 3 generated options ──
 function _cpSelectApproach(key){
   if(!CPLAN._approaches||!CPLAN._approaches[key])return;
+  // Load logic: prefer the user's edited version if it exists, otherwise load
+  // the AI original. Without this preference, clicking a card with prior edits
+  // would silently revert those edits — defeating the per-card auto-save.
+  var edited=(CPLAN._editedApproaches||{})[key];
   var aiData=CPLAN._approaches[key];
   CPLAN._selectedApproach=key;
   CPLAN._viewingApproach=null;
-  _cpConvertAIRecs(aiData);
+  if(edited && edited.allocations && edited.allocations.length){
+    // Restore the user's edited copy — sliders return to their last positions
+    CPLAN.allocations=JSON.parse(JSON.stringify(edited.allocations));
+  } else {
+    // First-time load — convert AI recommendations into allocations
+    _cpConvertAIRecs(aiData);
+  }
   // Wave 4 state transition: PROPOSED → SELECTED for all allocations.
-  // The user has committed to this approach; allocations are now editable but
-  // tracked as a chosen plan rather than a preview. Insurance products won't
-  // lock until Done is clicked individually.
+  // The user has loaded this approach for editing; allocations are now editable.
+  // Insurance products won't lock until Done is clicked individually.
   CPLAN.allocations.forEach(function(a){if(a._state==='proposed')a._state='selected';});
-  // Record generation
-  var plan=APP._portalFd&&APP._portalFd.allocation_plan;
-  if(!plan)plan={};if(!plan.ai_generations)plan.ai_generations=[];
-  plan.ai_generations.push({date:new Date().toISOString(),tier:CPLAN.tier});
-  if(APP._portalFd)APP._portalFd.allocation_plan=plan;
-  var tier2=CPLAN.tier||'core';var maxG=tier2==='pro_plus'||tier2==='comp'?9999:tier2==='pro'?2:1;
-  var used=plan.ai_generations.length;var remain=Math.max(0,maxG-used);
-  var tierNames={core:'Core',pro:'Pro',pro_plus:'Pro+',comp:'Comp',trial:'Trial'};
-  CPLAN._aiTierMsg=(tierNames[tier2]||'Core')+' tier: '+remain+' AI generation'+(remain!==1?'s':'')+' remaining';
-  CPLAN._originalAIPlan=JSON.parse(JSON.stringify(CPLAN.allocations));
+  // NOTE: ai_generations counter is NO LONGER bumped here. It now bumps at
+  // generation time (in _cpDoAIGenerate when all 3 approaches successfully
+  // land). Picking an approach is a free navigation action; only the AI call
+  // costs a generation. See _cpDoAIGenerate around line ~25140 for the bump.
+  CPLAN._originalAIPlan=JSON.parse(JSON.stringify(CPLAN._approaches[key].recommendations||CPLAN._approaches[key].allocations||[]));
   // Wave 4 snapshot: capture initial plan state for history/audit context.
-  if(typeof _cpCaptureSnapshot==='function')_cpCaptureSnapshot('approach_selected','user','Initial plan: '+key+' approach selected');
+  if(typeof _cpCaptureSnapshot==='function')_cpCaptureSnapshot('approach_selected','user','Loaded plan: '+key+' approach');
+  _cpRenderPlanV2();
+  cplanSave();
+}
+
+// ── REVERT: discard edits to the currently-loaded approach ──
+// Restores the AI's original recommendations over the user's edited copy.
+// Destructive — confirmation required. Only available for AI approaches
+// (DIY has no "original" to revert to; user would Start Over instead).
+function _cpRevertApproach(){
+  var key=CPLAN._selectedApproach;
+  if(!key||!CPLAN._approaches||!CPLAN._approaches[key]){
+    try{alert('No approach loaded to revert.');}catch(e){}
+    return;
+  }
+  var hasEdits=(CPLAN._editedApproaches||{})[key];
+  if(!hasEdits){
+    try{alert('No edits to revert — this approach is already at its AI original.');}catch(e){}
+    return;
+  }
+  var msg='This will discard all your edits to this approach and restore the AI\'s original recommendations. Continue?';
+  if(!confirm(msg))return;
+  // Wipe the edited copy and reload from AI original
+  if(CPLAN._editedApproaches)delete CPLAN._editedApproaches[key];
+  _cpConvertAIRecs(CPLAN._approaches[key]);
+  CPLAN.allocations.forEach(function(a){if(a._state==='proposed')a._state='selected';});
+  CPLAN._originalAIPlan=JSON.parse(JSON.stringify(CPLAN._approaches[key].recommendations||CPLAN._approaches[key].allocations||[]));
+  _cpRenderPlanV2();
+  cplanSave();
+}
+
+// ── COMMIT: permanently lock in the currently-loaded plan ──
+// Confirmation modal warns user that other plans (other AI approaches, DIY) will
+// be permanently deleted. On confirm: deletes everything else from storage, sets
+// _planCommitted flag which hides Switch/Compare/Revert UI from the plan page.
+// After commit, Audit is the only modification path forward.
+function _cpCommitPlan(){
+  var msg='⚠️ PERMANENT ACTION\n\n'
+    +'This will:\n'
+    +'• Lock in this plan as your one financial plan\n'
+    +'• Permanently delete your other AI plan options and any DIY work\n'
+    +'• Remove the Switch and Compare buttons\n\n'
+    +'After this, the only way to modify your plan is the Plan Audit feature '
+    +'(available based on your tier and timing).\n\n'
+    +'Continue?';
+  if(!confirm(msg))return;
+  // Wipe everything that's not the active plan. The user picked. Everything
+  // else goes — both AI originals and edited copies for OTHER approaches,
+  // and the standalone DIY plan if it exists.
+  var keepKey=CPLAN._selectedApproach||'';
+  if(keepKey && CPLAN._approaches){
+    // Keep only the chosen approach's AI original (for historical reference);
+    // discard the others
+    var keepData=CPLAN._approaches[keepKey];
+    CPLAN._approaches={};
+    CPLAN._approaches[keepKey]=keepData;
+    // Discard all edited versions except the chosen one
+    if(CPLAN._editedApproaches){
+      var keepEdited=CPLAN._editedApproaches[keepKey];
+      CPLAN._editedApproaches={};
+      if(keepEdited)CPLAN._editedApproaches[keepKey]=keepEdited;
+    }
+  } else {
+    // No approach selected — must be DIY commit. Clear approaches entirely
+    // and keep the diyPlan as the committed plan.
+    CPLAN._approaches=null;
+    CPLAN._editedApproaches={};
+  }
+  // For DIY commit, the diyPlan slot is no longer needed — the active
+  // allocations ARE the committed plan now
+  if(!keepKey)CPLAN._diyPlan=null;
+  // The committed flag is what hides Switch/Compare/Revert in the UI.
+  // Cannot be unset by the user — once committed, this is permanent.
+  CPLAN._planCommitted=true;
+  CPLAN._planCommittedAt=new Date().toISOString();
   _cpRenderPlanV2();
   cplanSave();
 }
@@ -24857,19 +24962,62 @@ function _cpShowApproachFork(){
       h+='<div style="margin-bottom:14px"><div style="font-family:var(--fd);font-size:16px;color:var(--wh)">'+fmt(monthlyCost)+'<span style="font-size:12px;color:var(--mu)">/mo deployed</span></div>';
       if(monthlyCost!==_pool)h+='<div style="font-size:11px;color:var(--yl)">target: '+fmt(_pool)+'/mo</div>';
       h+='</div>';
-      // Buttons — View and Use
+      // Buttons — View loads for editing, Use This Plan loads + commits permanently
       h+='<div style="display:flex;flex-direction:column;gap:6px">';
-      h+='<button onclick="_cpViewApproach(\''+cd.key+'\')" style="width:100%;padding:8px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px;border:1px solid '+(isHybrid?'rgba(168,85,247,.3)':'rgba(91,155,255,.2)')+';background:transparent;color:'+(isHybrid?'#A855F7':'#5B9BFF')+'">👁 View This Plan</button>';
-      h+='<button onclick="_cpSelectApproach(\''+cd.key+'\')" style="width:100%;padding:10px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px;border:1px solid '+(isHybrid?'rgba(168,85,247,.4)':'rgba(91,155,255,.25)')+';background:'+(isHybrid?'rgba(168,85,247,.12)':'rgba(91,155,255,.08)')+';color:'+(isHybrid?'var(--pu)':'#5B9BFF')+'">✓ Use This Plan</button>';
+      h+='<button onclick="_cpViewApproach(\''+cd.key+'\')" title="Load this plan to view details and edit sliders. Switch returns here. Nothing is committed until you click Use This Plan." style="width:100%;padding:8px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px;border:1px solid '+(isHybrid?'rgba(168,85,247,.3)':'rgba(91,155,255,.2)')+';background:transparent;color:'+(isHybrid?'#A855F7':'#5B9BFF')+'">👁 View This Plan</button>';
+      // Use This Plan: load + commit in one click. Loads the approach into
+      // the active editor and immediately fires the commit confirmation modal.
+      // On confirm: other plans deleted, switch/compare/revert UI removed
+      // forever. _cpSelectApproach loads; _cpCommitPlan asks for confirmation
+      // and finalizes.
+      h+='<button onclick="_cpSelectApproach(\''+cd.key+'\');_cpCommitPlan();" title="Permanently lock in this plan. Other plans will be deleted." style="width:100%;padding:10px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px;border:1px solid '+(isHybrid?'rgba(168,85,247,.4)':'rgba(91,155,255,.25)')+';background:'+(isHybrid?'rgba(168,85,247,.12)':'rgba(91,155,255,.08)')+';color:'+(isHybrid?'var(--pu)':'#5B9BFF')+'">✓ Use This Plan</button>';
       h+='</div>';
     }
     h+='</div>';
   });
   h+='</div>';
-  // Build own + Agent buttons
-  h+='<div style="display:flex;gap:10px;justify-content:center">';
-  h+='<button onclick="_cpStartSelfBuild()" style="padding:10px 24px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:40px">Build My Own Plan</button>';
-  if(!CPLAN.hasAdvisor)h+='<button onclick="_cpRequestAgent()" style="padding:10px 24px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.15);color:var(--gr);cursor:pointer;border-radius:4px;min-height:40px">Connect With an Agent</button>';
+  // ── DIY CARD: render only when the user has saved DIY work ──
+  // Per spec: DIY appears as a 4th card on the fork once the user has built
+  // anything (any allocation amount > 0). Empty placeholder DIY does NOT show
+  // here — that's the "if user never allocated anything to DIY, nothing saves"
+  // rule from your spec.
+  var _diy=CPLAN._diyPlan;
+  var _diyHasWork=_diy && _diy.allocations && _diy.allocations.some(function(a){return(parseFloat(a.amount)||0)>0;});
+  if(_diyHasWork){
+    var _diyMonthly=_diy.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+    var _diyCount=_diy.allocations.filter(function(a){return(parseFloat(a.amount)||0)>0;}).length;
+    h+='<div style="display:grid;grid-template-columns:1fr;gap:14px;margin-bottom:20px">';
+    h+='<div style="background:rgba(91,155,255,.04);border:2px solid rgba(91,155,255,.2);border-radius:8px;padding:24px 20px;text-align:center;position:relative;transition:border-color .2s" onmouseover="this.style.borderColor=\'#5B9BFF\'" onmouseout="this.style.borderColor=\'rgba(91,155,255,.2)\'">';
+    h+='<div style="font-size:32px;margin-bottom:8px">🔧</div>';
+    h+='<div style="font-family:var(--fh);font-size:16px;font-weight:800;color:var(--wh);margin-bottom:4px">My DIY Plan</div>';
+    h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-bottom:16px;min-height:36px">'+_diyCount+' funded allocation'+(_diyCount!==1?'s':'')+' totaling '+fmt(Math.round(_diyMonthly))+'/mo. Click View to continue editing or Use This Plan to commit.</div>';
+    // View button — loads DIY into the editor. _cpStartSelfBuild detects the
+    // saved DIY and restores it instead of re-seeding from red flags.
+    h+='<div style="display:flex;flex-direction:column;gap:6px">';
+    h+='<button onclick="_cpStartSelfBuild()" title="Load your DIY plan to continue editing. Switch returns here." style="width:100%;padding:8px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px;border:1px solid rgba(91,155,255,.2);background:transparent;color:#5B9BFF">👁 View This Plan</button>';
+    // Use This Plan on DIY: load + commit. Same flow as AI cards but loading
+    // path is _cpStartSelfBuild (which restores saved DIY).
+    h+='<button onclick="_cpStartSelfBuild();_cpCommitPlan();" title="Permanently lock in your DIY plan. AI plans will be deleted." style="width:100%;padding:10px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px;border:1px solid rgba(91,155,255,.25);background:rgba(91,155,255,.08);color:#5B9BFF">✓ Use This Plan</button>';
+    h+='</div>';
+    h+='</div>';
+    h+='</div>';
+  }
+  // ── BOTTOM ROW: "create what's missing" buttons ──
+  // Show only the buttons for plans that don't exist yet. Per spec:
+  // - AI exists, DIY doesn't → show "Build my own" + Free consultation
+  // - DIY exists, AI doesn't → show "Generate AI plan" + Free consultation
+  // - Both exist → show only Free consultation
+  // - Neither (shouldn't happen here since this view is only reached with
+  //   at least one) → original fork is shown elsewhere
+  var _aiExists=CPLAN._approaches && (CPLAN._approaches.traditional || CPLAN._approaches.tax_free || CPLAN._approaches.hybrid);
+  h+='<div style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">';
+  if(!_diyHasWork){
+    h+='<button onclick="_cpStartSelfBuild()" style="padding:10px 24px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:40px">🔧 Build My Own Plan</button>';
+  }
+  if(!_aiExists){
+    h+='<button onclick="_cpStartAIRec()" style="padding:10px 24px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.15);color:#A855F7;cursor:pointer;border-radius:4px;min-height:40px">⚡ Generate AI Plan</button>';
+  }
+  if(!CPLAN.hasAdvisor)h+='<button onclick="_cpRequestAgent()" style="padding:10px 24px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.15);color:var(--gr);cursor:pointer;border-radius:4px;min-height:40px">👤 Connect With an Agent</button>';
   h+='</div></div>';
   root.innerHTML=h;
 }
@@ -25113,6 +25261,33 @@ function _cpDoAIGenerate(){
             // All 3 failed — fall through to DIY autosuggest instead of an empty fork
             _cpAutoSuggestV2();_cpRenderPlanV2();cplanSave();
           } else {
+            // GENERATION COUNTER: bump ai_generations HERE (at successful
+            // generation) rather than in _cpSelectApproach (at pick time).
+            // Per spec: "every user gets 1 generation, picking doesn't burn one."
+            // The bump must fire on the action that costs real money (the AI
+            // call), not on the user navigating the result. This closes the
+            // previous loop where a user could regenerate infinitely by not
+            // picking. After this fix, _cpSelectApproach no longer bumps.
+            var _plan=APP._portalFd&&APP._portalFd.allocation_plan;
+            if(!_plan)_plan={};
+            if(!_plan.ai_generations)_plan.ai_generations=[];
+            _plan.ai_generations.push({date:new Date().toISOString(),tier:CPLAN.tier});
+            if(APP._portalFd)APP._portalFd.allocation_plan=_plan;
+            var _tier=CPLAN.tier||'core';
+            var _maxG=_tier==='pro_plus'||_tier==='comp'?9999:_tier==='pro'?2:1;
+            var _remain=Math.max(0,_maxG-_plan.ai_generations.length);
+            var _tierNames={core:'Core',pro:'Pro',pro_plus:'Pro+',comp:'Comp',trial:'Trial'};
+            CPLAN._aiTierMsg=(_tierNames[_tier]||'Core')+' tier: '+_remain+' AI generation'+(_remain!==1?'s':'')+' remaining';
+            // Persist approaches to Supabase IMMEDIATELY on landing — before the
+            // user picks one. Previously the approaches lived only in memory
+            // (CPLAN._approaches) until _cpSelectApproach fired cplanSave().
+            // Result: a user who saw the 3 cards but didn't pick one would lose
+            // them on tab close, and re-clicking AI next session would burn a
+            // fresh 90-second generation. Now the approaches persist as soon as
+            // they're available and next session can re-render the same cards
+            // without re-generating. cplanSave reads CPLAN._approaches and
+            // writes it to allocation_plan.approaches.
+            if(typeof cplanSave==='function')cplanSave();
             _cpShowApproachFork();
           }
         }
@@ -25609,7 +25784,16 @@ function _cpRenderPlanV2(){
   var _curAp=CPLAN._selectedApproach||CPLAN._viewingApproach||'';
   h+='<div style="display:flex;align-items:center;gap:6px">';
   if(_curAp)h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+(CPLAN._selectedApproach?'var(--mu)':'var(--yl)')+';letter-spacing:.06em">'+(_apLabels[_curAp])+(CPLAN._viewingApproach&&!CPLAN._selectedApproach?' (preview)':'')+'</span>';
-  h+='<button onclick="'+(CPLAN._approaches?'_cpShowApproachFork()':'_cpRenderFork()')+'" title="'+(CPLAN._approaches?'Switch between your generated approaches':'Go back to the plan-building options')+'" style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:26px">Switch</button>';
+  // Switch button — always routes to the universal fork (home base) so user
+  // can pick a different plan. Hidden after permanent commit since there's
+  // nothing else to switch to.
+  if(!CPLAN._planCommitted){
+    h+='<button onclick="_cpShowApproachFork()" title="Go back to your plan options. Auto-saved edits are preserved." style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:26px">← Switch</button>';
+    // Revert button — only shown when user has edits to an AI approach
+    if(_curAp && CPLAN._editedApproaches && CPLAN._editedApproaches[_curAp]){
+      h+='<button onclick="_cpRevertApproach()" title="Restore the AI\'s original recommendations for this approach. Your edits will be discarded." style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.2);color:var(--yl);cursor:pointer;border-radius:2px;min-height:26px">↺ Revert</button>';
+    }
+  }
   h+='</div>';
   // Plan Audit button — replaces the prior Regenerate button as the canonical
   // plan-modification path now that the AI is producing reliable plans. Only
@@ -25617,10 +25801,14 @@ function _cpRenderPlanV2(){
   // For ineligible users, no button shows — they continue using their current
   // plan or wait for cooldown. _cpAuditAvailability handles tier and cooldown
   // logic; we just gate on ok:true.
-  if(CPLAN._selectedApproach){
+  // Plan Audit button — only available AFTER permanent commit and only when
+  // eligible (tier + cooldown). Per spec: audit is the post-commit path for
+  // adjusting a permanent plan. Before commit, users should be exploring the
+  // fork and editing freely, not auditing.
+  if(CPLAN._planCommitted && CPLAN._selectedApproach){
     var _auditAvail=(typeof _cpAuditAvailability==='function')?_cpAuditAvailability():{ok:false};
     if(_auditAvail.ok){
-      h+='<button onclick="_cpRunPlanAudit().then(function(r){if(r)_cpRenderPlanV2();})" title="Review your existing plan and surface non-destructive suggestions. Cooldown applies after use." style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">📋 Plan Audit</button>';
+      h+='<button onclick="_cpRunPlanAudit().then(function(r){if(r)_cpRenderPlanV2();})" title="Review your committed plan and surface non-destructive suggestions. Cooldown applies after use." style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:32px">📋 Plan Audit</button>';
     }
   }
   h+='<button onclick="cplanSave()" id="cplanSaveBtn" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);color:var(--gr);cursor:pointer;border-radius:2px;min-height:32px">💾 Save</button>';
@@ -26276,11 +26464,25 @@ function _cpRenderPlanV2(){
   if(CPLAN._complianceNote){
     h+='<div style="margin-top:14px;padding:10px 14px;border:1px solid rgba(100,116,139,.1);border-radius:2px;background:rgba(100,116,139,.03)"><div style="font-size:11px;color:rgba(100,116,139,.6);line-height:1.5">'+CPLAN._complianceNote+'</div></div>';
   }
-  // Actions
+  // Actions row — pruned post-commit so user sees only path-forward actions.
+  // - Start Over: only available in DIY mode (no committed AI plan). For AI
+  //   users, the Revert button (in the header) is the equivalent action.
+  // - Compare to AI Original: only available when user has edits to an AI
+  //   approach (something to compare against). Hidden after commit.
+  // - Do Nothing vs This Plan: REMOVED per spec — the projection chart below
+  //   already shows the same "what if you stop saving" comparison.
+  // - Propose to Advisor: advisor flow, unchanged.
+  // - Plan Audit: (added separately above) — only shows when eligible (tier
+  //   + cooldown). After commit, this is the user's one modification path.
   h+='<div style="display:flex;gap:8px;margin-top:14px;flex-wrap:wrap">';
-  h+='<button onclick="CPLAN.allocations=[];CPLAN.planMode=null;_cpRenderFork()" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(100,116,139,.06);border:1px solid rgba(100,116,139,.15);color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px">Start Over</button>';
-  if(CPLAN._originalAIPlan)h+='<button onclick="_cpShowPlanComparison()" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.15);color:#A855F7;cursor:pointer;border-radius:2px;min-height:36px">Compare to AI Original</button>';
-  h+='<button onclick="_cpShowDoNothing()" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:36px">Do Nothing vs This Plan</button>';
+  if(!CPLAN._planCommitted && CPLAN.planMode==='self'){
+    // Start Over wipes current DIY work and returns to original fork.
+    // Confirmation prompt since it's destructive.
+    h+='<button onclick="if(confirm(\'Discard your DIY plan and start over?\')){CPLAN.allocations=[];CPLAN._diyPlan=null;CPLAN.planMode=null;cplanSave();_cpRenderFork();}" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(100,116,139,.06);border:1px solid rgba(100,116,139,.15);color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px">Start Over</button>';
+  }
+  if(!CPLAN._planCommitted && CPLAN._originalAIPlan && CPLAN._selectedApproach && CPLAN._editedApproaches && CPLAN._editedApproaches[CPLAN._selectedApproach]){
+    h+='<button onclick="_cpShowPlanComparison()" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.15);color:#A855F7;cursor:pointer;border-radius:2px;min-height:36px">Compare to AI Original</button>';
+  }
   if(CPLAN.hasAdvisor)h+='<button onclick="cplanProposeChanges()" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yl);cursor:pointer;border-radius:2px;min-height:36px">Propose to Advisor</button>';
   h+='</div>';
   root.innerHTML=h;
@@ -29394,12 +29596,28 @@ function _cpExtractRedFlags(){
   // No employer match capture
   if(d.employer&&!CPLAN.allocations.some(function(a){return a.type==='401k'&&a.amount>0;}))
     flags.push({type:'warn',icon:'💼',title:'Employer match not captured',desc:'Your employer'+(d.employer?' ('+d.employer+')':'')+' may offer free matching contributions — this is the highest guaranteed return available.',action:'401k'});
-  // No life insurance
+  // No life insurance — fires for any adult with income. Framing differs by
+  // life stage: breadwinners with dependents have an active income-replacement
+  // gap; single filers with no dependents have an insurability + final-expense
+  // + future-dependents opportunity (still worth evaluating while young/healthy
+  // since rates lock in at current health classification for the term).
   var hasLife=(d.policies||[]).some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('life')>=0||t.indexOf('term')>=0;});
-  if(!hasLife&&(d.marital==='Married'||d.children.length>0)){
+  if(!hasLife&&d.income>0){
     var _annIncLife=(d.income||0)*12;
-    var _lifeMin=Math.round(_annIncLife*8);var _lifeMax=Math.round(_annIncLife*12);
-    flags.push({type:'warn',icon:'🛡️',title:'No life insurance detected',desc:'With dependents, a coverage gap puts your family at financial risk if something happens to you. Industry-standard guidance is 8-12x annual income for breadwinners with dependents'+(d.income?' — about '+fmtK(_lifeMin)+'-'+fmtK(_lifeMax)+' of death benefit on your '+fmtK(_annIncLife)+'/yr income':'')+'. A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.',action:'protection'});
+    var _hasDeps=(d.marital==='Married'||d.children.length>0);
+    var _lifeMin,_lifeMax,_lifeDesc,_lifeSev;
+    if(_hasDeps){
+      // Breadwinner with dependents — standard 8-12x income replacement guidance
+      _lifeMin=Math.round(_annIncLife*8);_lifeMax=Math.round(_annIncLife*12);
+      _lifeSev='warn';
+      _lifeDesc='With dependents, a coverage gap puts your family at financial risk if something happens to you. Industry-standard guidance is 8-12x annual income for breadwinners with dependents'+(d.income?' — about '+fmtK(_lifeMin)+'-'+fmtK(_lifeMax)+' of death benefit on your '+fmtK(_annIncLife)+'/yr income':'')+'. A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.';
+    } else {
+      // Single, no dependents — insurability lock-in + final expenses + future-deps prep
+      _lifeMin=Math.round(_annIncLife*5);_lifeMax=Math.round(_annIncLife*10);
+      _lifeSev='opp';
+      _lifeDesc='Even without current dependents, term life is worth evaluating now. Three reasons: (1) <strong style="color:var(--wh)">insurability lock-in</strong> — premiums are set at your current age and health classification, so getting coverage while young and healthy locks in low rates for 20-30 years before any future health changes raise your cost or make you uninsurable; (2) <strong style="color:var(--wh)">final expenses + non-dischargeable debts</strong> — funeral costs, private student loans (some don\'t die with you), co-signed debts, and business debts that pass to your estate; (3) <strong style="color:var(--wh)">future dependents</strong> — getting term before marriage or children is dramatically cheaper than getting it after. Industry guidance for single filers is 5-10x annual income'+(d.income?' (about '+fmtK(_lifeMin)+'-'+fmtK(_lifeMax)+' on your '+fmtK(_annIncLife)+'/yr income)':'')+'. A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.';
+    }
+    flags.push({type:_lifeSev,icon:'🛡️',title:'No life insurance detected',desc:_lifeDesc,action:'protection'});
   }
   // No disability insurance
   var hasDisab=(d.policies||[]).some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('disab')>=0;});
@@ -31737,6 +31955,16 @@ function initClientPlan(){
     if(loadedPlan.checkIns)CPLAN._checkIns=loadedPlan.checkIns;
     if(loadedPlan.approaches)CPLAN._approaches=loadedPlan.approaches;
     if(loadedPlan.selectedApproach)CPLAN._selectedApproach=loadedPlan.selectedApproach;
+    // Load edited copies of approaches and the standalone DIY plan. These are
+    // separate from approaches (which holds AI originals) and from allocations
+    // (which is the currently-loaded plan). Auto-save writes here on every
+    // slider release. Revert reads from approaches to restore originals.
+    if(loadedPlan.editedApproaches)CPLAN._editedApproaches=loadedPlan.editedApproaches;
+    if(loadedPlan.diyPlan)CPLAN._diyPlan=loadedPlan.diyPlan;
+    // _planCommitted: once true, the user has permanently chosen this plan.
+    // The fork, switch, compare, and revert UI all stay hidden afterward.
+    if(loadedPlan.planCommitted)CPLAN._planCommitted=loadedPlan.planCommitted;
+    if(loadedPlan.planCommittedAt)CPLAN._planCommittedAt=loadedPlan.planCommittedAt;
     if(loadedPlan.phaseNames){for(var pni=1;pni<=4;pni++){if(loadedPlan.phaseNames[pni])CPLAN['_phase'+pni+'Name']=loadedPlan.phaseNames[pni];}}
     // Phase A: time anchor + original-projection baseline (for "you are here" + accountability)
     if(loadedPlan.planStartDate)CPLAN._planStartDate=loadedPlan.planStartDate;
@@ -31763,8 +31991,9 @@ function initClientPlan(){
       CPLAN.allocations.forEach(function(a){if(a.phase===undefined)a.phase=1;});
       _cpRenderPlanV2();
     }
-  } else if(CPLAN.allocations.length){
-    // No advisor, has plan — render normally
+  } else if(CPLAN._planCommitted && CPLAN.allocations.length){
+    // User has committed to a plan permanently — go directly to plan view.
+    // No fork, no switch back to comparisons.
     CPLAN.allocations.forEach(function(a){if(a.phase===undefined)a.phase=1;});
     _cpRenderPlanV2();
   } else if(CPLAN.advisorPlan){
@@ -31772,8 +32001,14 @@ function initClientPlan(){
     CPLAN.allocations=JSON.parse(JSON.stringify(CPLAN.advisorPlan));
     CPLAN.allocations.forEach(function(a){if(a.phase===undefined)a.phase=1;});
     _cpRenderPlanV2();
+  } else if((CPLAN._approaches && (CPLAN._approaches.traditional || CPLAN._approaches.tax_free || CPLAN._approaches.hybrid))
+            || (CPLAN._diyPlan && CPLAN._diyPlan.allocations && CPLAN._diyPlan.allocations.some(function(a){return(parseFloat(a.amount)||0)>0;}))){
+    // User has saved AI approaches or saved DIY work but never committed.
+    // Land on the universal fork showing whatever exists. Per spec: this is
+    // the home base — Switch from any plan view returns here.
+    _cpShowApproachFork();
   } else {
-    // No advisor, no plan — existing 3-option fork
+    // No advisor, no plan, no saved approaches, no DIY — original 3-option fork
     _cpRenderFork();
   }
   // Annual refresh check
@@ -35055,6 +35290,38 @@ function _cpSlideEnd(){
     // Refresh timeline if we have a container — targeted update only
     var tl=document.getElementById('cpTimelineRoot');
     if(tl&&typeof _cpBuildTimeline==='function')tl.outerHTML=_cpBuildTimeline();
+    // Propagate slider change to pfos-main and persist to saved plan. Without
+    // these, pfos-main's Home donut would show pre-drag amounts until the user
+    // navigates away and back to the plan page (which fires DEPLOY on render).
+    // cplanSave keeps APP._portalFd.allocation_plan in sync so the spending
+    // page's _cpEnsurePlanLoaded fallback reads current data.
+    if(typeof _syncPlanToMain==='function')_syncPlanToMain();
+    // PER-CARD AUTO-SAVE: copy the current edits to the right storage slot
+    // before cplanSave runs. This is what keeps multiple plans alive at once.
+    //   - If user is loaded into an AI approach (selectedApproach set), edits
+    //     go to _editedApproaches[key]. The AI original at _approaches[key]
+    //     stays untouched for Revert.
+    //   - If user is in DIY mode AND has at least one allocation with amount > 0,
+    //     edits go to _diyPlan. Below-threshold DIY (all amounts $0) does NOT
+    //     save — per spec, empty placeholder DIY shouldn't appear as a card.
+    try{
+      if(CPLAN._selectedApproach && CPLAN._approaches && CPLAN._approaches[CPLAN._selectedApproach]){
+        if(!CPLAN._editedApproaches)CPLAN._editedApproaches={};
+        CPLAN._editedApproaches[CPLAN._selectedApproach]={
+          allocations:JSON.parse(JSON.stringify(CPLAN.allocations)),
+          updatedAt:new Date().toISOString()
+        };
+      } else if(CPLAN.planMode==='self'){
+        var hasFundedDIY=(CPLAN.allocations||[]).some(function(a){return(parseFloat(a.amount)||0)>0;});
+        if(hasFundedDIY){
+          CPLAN._diyPlan={
+            allocations:JSON.parse(JSON.stringify(CPLAN.allocations)),
+            updatedAt:new Date().toISOString()
+          };
+        }
+      }
+    }catch(_sE){console.warn('Per-card auto-save:',_sE);}
+    if(typeof cplanSave==='function')cplanSave();
   }catch(e){console.warn('SlideEnd update:',e);}
 }
 function _cpSetAmt(i,v){CPLAN.allocations[i].amount=parseInt((v+'').replace(/[^0-9]/g,''))||0;_cpEnforce();_cpMarkModified();_cpRender();}
@@ -36135,7 +36402,24 @@ function cplanSave(){
   // annual statement upload (Rule 5) vs a simulator projection — used to
   // surface "from your Apr 2026 statement" indicators in the UI.
   loanBalance:parseFloat(a.loanBalance)||0,monthlyLoanRepay:parseFloat(a.monthlyLoanRepay)||0,loans:Array.isArray(a.loans)?a.loans:[],loanRate:parseFloat(a.loanRate)||0,_lastActualsDate:a._lastActualsDate||null,_actualsSource:a._actualsSource||null};});
-  var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,selectedApproach:CPLAN._selectedApproach||'',approaches:CPLAN._approaches||null,planSource:CPLAN.hasAdvisor?'advisor':'self',planMode:CPLAN.planMode||'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString(),phaseNames:{1:CPLAN._phase1Name||'',2:CPLAN._phase2Name||'',3:CPLAN._phase3Name||'',4:CPLAN._phase4Name||''},ai_generations:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.ai_generations)||[],checkIns:CPLAN._checkIns||{},
+  var plan={allocations:cleanAllocs,surplus:CPLAN.surplus,debtStrategy:CPLAN.debtStrategy,selectedApproach:CPLAN._selectedApproach||'',approaches:CPLAN._approaches||null,
+    // editedApproaches: per-approach storage of user edits. Separate from
+    // 'approaches' (which holds the AI's untouched originals). Updated by
+    // _cpSlideEnd on every slider release whenever the user is loaded into
+    // an AI approach. Lets Revert restore the original by reading approaches[key]
+    // and Compare diff the two. Null per-key means no edits yet for that approach.
+    editedApproaches:CPLAN._editedApproaches||{},
+    // diyPlan: the user's DIY-mode allocations stored independently of the AI
+    // approaches. Only populated once user has at least one allocation with
+    // amount > 0 in DIY mode. Lets the user switch to AI and back without
+    // losing DIY work.
+    diyPlan:CPLAN._diyPlan||null,
+    // planCommitted: once true, the user has permanently chosen this plan via
+    // _cpCommitPlan. Hides switch/compare/revert UI from the plan page forever.
+    // Cannot be unset — committing is a one-way action by design.
+    planCommitted:CPLAN._planCommitted===true,
+    planCommittedAt:CPLAN._planCommittedAt||null,
+    planSource:CPLAN.hasAdvisor?'advisor':'self',planMode:CPLAN.planMode||'self',riskProfile:CPLAN.riskProfile||'moderate',healthScore:_cpCalcHealthScore(),created:new Date().toISOString(),phaseNames:{1:CPLAN._phase1Name||'',2:CPLAN._phase2Name||'',3:CPLAN._phase3Name||'',4:CPLAN._phase4Name||''},ai_generations:(APP._portalFd&&APP._portalFd.allocation_plan&&APP._portalFd.allocation_plan.ai_generations)||[],checkIns:CPLAN._checkIns||{},
     // Phase A: persist time anchor + original-projection baseline. Both are immutable
     // after first save — they're only re-captured if missing (legacy plan migration).
     planStartDate:CPLAN._planStartDate||null,
