@@ -5719,6 +5719,9 @@ function _spendingDonutSVG(slices,totalSpent,totalIn){
   var R=95,r=60,cx=110,cy=110;
   var startA=-90;
   var paths='';
+  // Unique ID per donut instance so multiple donuts on the same page don't
+  // share a tooltip element.
+  var _id='sd_'+Math.random().toString(36).slice(2,9);
   if(slices.length===1){
     paths+='<circle cx="'+cx+'" cy="'+cy+'" r="'+R+'" fill="'+slices[0].color+'" />';
     paths+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="var(--bg)" />';
@@ -5733,18 +5736,69 @@ function _spendingDonutSVG(slices,totalSpent,totalIn){
       var x4=cx+r*Math.cos(sa),y4=cy+r*Math.sin(sa);
       var lg=pct>0.5?1:0;
       var d='M '+x1+' '+y1+' A '+R+' '+R+' 0 '+lg+' 1 '+x2+' '+y2+' L '+x3+' '+y3+' A '+r+' '+r+' 0 '+lg+' 0 '+x4+' '+y4+' Z';
-      paths+='<path d="'+d+'" fill="'+s.color+'" stroke="var(--bg)" stroke-width="2" style="transition:opacity .15s" onmouseover="this.style.opacity=.82" onmouseout="this.style.opacity=1"><title>'+s.label+': $'+Math.round(s.amount).toLocaleString()+' ('+Math.round(pct*100)+'%)</title></path>';
+      // Fancy tooltip: store tooltip HTML in data-tip, handle hover via the
+      // shared _donutTip() helper which manages a single positioned div tip
+      // inside the wrapper. No <title> = no native-browser delay/styling.
+      var _tipHtml='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:4px">'+s.label.replace(/"/g,'&quot;')+'</div>'
+        +'<div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">$'+Math.round(s.amount).toLocaleString()+'</div>'
+        +'<div style="font-size:11px;color:var(--mu)">'+Math.round(pct*100)+'% of spending</div>';
+      paths+='<path d="'+d+'" fill="'+s.color+'" stroke="var(--bg)" stroke-width="2" data-tip="'+_tipHtml.replace(/"/g,'&quot;')+'" style="cursor:pointer;transition:opacity .15s,filter .15s" onmouseenter="_donutTip(\''+_id+'\',event,this)" onmousemove="_donutTip(\''+_id+'\',event,this)" onmouseleave="_donutTipHide(\''+_id+'\')" onmouseover="this.style.opacity=.82;this.style.filter=\'brightness(1.1)\'" onmouseout="this.style.opacity=1;this.style.filter=\'none\'"></path>';
       startA=endA;
     });
   }
   var pctIn=totalIn>0?Math.round(totalSpent/totalIn*100):0;
-  var svg='<svg viewBox="0 0 220 220" style="width:100%;max-width:240px;height:auto;display:block;margin:0 auto" aria-label="Spending breakdown">';
+  var svg='<div style="position:relative">';
+  svg+='<svg viewBox="0 0 220 220" style="width:100%;max-width:240px;height:auto;display:block;margin:0 auto" aria-label="Spending breakdown">';
   svg+=paths;
-  svg+='<text x="'+cx+'" y="'+(cy-12)+'" text-anchor="middle" font-size="9" fill="var(--mu)" font-family="var(--fh)" letter-spacing="1.5" style="font-weight:700">SPENT</text>';
-  svg+='<text x="'+cx+'" y="'+(cy+14)+'" text-anchor="middle" font-size="26" fill="var(--wh)" font-family="var(--fd)">$'+Math.round(totalSpent).toLocaleString()+'</text>';
-  svg+='<text x="'+cx+'" y="'+(cy+30)+'" text-anchor="middle" font-size="9" fill="var(--mu)" font-family="var(--fh)" font-weight="600">'+pctIn+'% of income</text>';
+  svg+='<text x="'+cx+'" y="'+(cy-12)+'" text-anchor="middle" font-size="9" fill="var(--mu)" font-family="var(--fh)" letter-spacing="1.5" style="font-weight:700" pointer-events="none">SPENT</text>';
+  svg+='<text x="'+cx+'" y="'+(cy+14)+'" text-anchor="middle" font-size="26" fill="var(--wh)" font-family="var(--fd)" pointer-events="none">$'+Math.round(totalSpent).toLocaleString()+'</text>';
+  svg+='<text x="'+cx+'" y="'+(cy+30)+'" text-anchor="middle" font-size="9" fill="var(--mu)" font-family="var(--fh)" font-weight="600" pointer-events="none">'+pctIn+'% of income</text>';
   svg+='</svg>';
+  // Absolute-positioned tooltip element — managed by _donutTip / _donutTipHide
+  svg+='<div id="'+_id+'_tip" style="display:none;position:absolute;pointer-events:none;background:rgba(12,12,52,.95);border:1px solid rgba(91,155,255,.3);border-radius:4px;padding:8px 12px;font-size:12px;min-width:120px;max-width:220px;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3);top:0;left:0"></div>';
+  svg+='</div>';
   return svg;
+}
+
+// Shared donut hover tooltip — used by spending donut + any other donut/pie
+// that wants the fancy positioned tooltip instead of the slow native browser
+// <title> popup. The element with id "<donutId>_tip" must exist inside the
+// donut's position:relative wrapper. Each path slice has data-tip="<html>"
+// carrying the tooltip body. Positioning: cursor + small offset, with clamp
+// to keep the tip inside the wrapper bounds. Idempotent — repeated mouseenter
+// or mousemove just update content + position.
+function _donutTip(donutId,e,pathEl){
+  var tip=document.getElementById(donutId+'_tip');
+  if(!tip||!pathEl)return;
+  var html=pathEl.getAttribute('data-tip');
+  if(!html)return;
+  // Wrapper is the tip's offsetParent (position:relative div around the SVG).
+  var wrap=tip.offsetParent||tip.parentNode;
+  if(!wrap)return;
+  var wRect=wrap.getBoundingClientRect();
+  // Cursor position relative to the wrapper
+  var cx=e.clientX-wRect.left;
+  var cy=e.clientY-wRect.top;
+  tip.innerHTML=html;
+  tip.style.visibility='hidden';
+  tip.style.display='block';
+  var tw=tip.offsetWidth||140;
+  var th=tip.offsetHeight||40;
+  // Offset 12px to the right and below the cursor, then clamp to the
+  // wrapper's bounds so the tip never spills out.
+  var left=cx+12;
+  var top=cy+12;
+  if(left+tw>wRect.width-4)left=cx-tw-12;// Flip to left side
+  if(left<4)left=4;
+  if(top+th>wRect.height-4)top=cy-th-12;// Flip above cursor
+  if(top<4)top=4;
+  tip.style.left=left+'px';
+  tip.style.top=top+'px';
+  tip.style.visibility='visible';
+}
+function _donutTipHide(donutId){
+  var tip=document.getElementById(donutId+'_tip');
+  if(tip)tip.style.display='none';
 }
 function _spendingDonutBlock(monthEntries,totalSpent,totalIn){
   if(!monthEntries||!monthEntries.length||totalSpent<=0) return '';
@@ -23427,7 +23481,13 @@ function _cpConfirmedAIGen(){
   h+='<div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:20px">Building your personalized plan</div>';
   h+='<div id="aiLoadSteps" style="max-width:320px;margin:0 auto;text-align:left">';
   steps.forEach(function(s,i){h+='<div id="aiStep'+i+'" style="display:flex;align-items:center;gap:10px;padding:6px 0;opacity:0.2;transition:opacity .3s"><div style="width:20px;height:20px;border-radius:10px;background:rgba(168,85,247,.1);display:flex;align-items:center;justify-content:center;font-size:12px;flex-shrink:0" id="aiStepDot'+i+'">○</div><span style="font-size:13px;color:var(--mu)">'+s+'</span></div>';});
-  h+='</div></div>';
+  h+='</div>';
+  // Sub-status line — populated by the 4-second rotator inside _cpConfirmedAIGen.
+  // Sits below the 6 main checkmarks and shows the micro-action currently in
+  // flight (e.g., "Running avalanche simulation"). Stays empty during the 0.8s
+  // pre-first-checkmark window so the user doesn't see an orphaned status with
+  // no checkmark progress yet.
+  h+='<div id="aiSubStatus" style="margin-top:14px;text-align:center;font-size:12px;color:var(--mu);font-style:italic;min-height:18px;letter-spacing:.02em"></div></div>';
   root3.innerHTML=h;
   // ── PACED CHECKMARK ANIMATION + IMMEDIATE AI GENERATION ─────────────────
   // Prior behavior: 6 checkmarks raced through in 2.4s, then _cpDoAIGenerate
@@ -23462,13 +23522,41 @@ function _cpConfirmedAIGen(){
   // before the dial-stage if cards take the full 90s, OR the cards arrive
   // mid-checkmark and the fork-render replaces this UI entirely.
   var stepIdx=0;
-  var stepInterval=10000;// 10 seconds per step
+  // 20s per main step × 6 steps = 120s total, matching observed AI generation
+  // time (~2 minutes). Previously 10s/step finished all checks at 60s, leaving
+  // 60s of nothing visible. Now checks naturally pace across the full window.
+  var stepInterval=20000;
+  // Sub-status messages — rotate within each step every ~4s so the user sees
+  // motion continuously even when the main checkmark hasn't advanced yet.
+  // Five sub-messages per step (one shown for ~4s each across 20s) gives a
+  // believable "AI is working" feel without resorting to fake percentages.
+  var subStatuses=[
+    ['Reading income sources','Categorizing expenses','Computing surplus','Identifying breathing room','Confirming cash flow stability'],
+    ['Listing debts by rate','Running avalanche simulation','Running snowball simulation','Checking IBC eligibility','Comparing strategies by net position'],
+    ['Reviewing life insurance','Checking disability coverage','Evaluating umbrella exposure','Assessing health insurance','Computing protection gap'],
+    ['Mapping current retirement accounts','Computing employer match capture','Checking Roth eligibility','Modeling growth horizons','Sequencing tax-advantaged buckets'],
+    ['Computing marginal tax bracket','Evaluating Roth conversion windows','Checking HSA triple-tax advantage','Modeling tax drag','Optimizing bucket order'],
+    ['Ordering phases by impact','Setting cascade triggers','Modeling redistribution flow','Computing phase deployment','Finalizing roadmap']
+  ];
+  // Active sub-status rotator — fires inside each step's 20s window
+  var subIdx=0;
+  var subTimer=setInterval(function(){
+    if(!document.getElementById('aiStep0')){clearInterval(subTimer);return;}
+    if(stepIdx>=steps.length){clearInterval(subTimer);return;}
+    var subEl=document.getElementById('aiSubStatus');
+    if(subEl&&subStatuses[stepIdx]){
+      var msgs=subStatuses[stepIdx];
+      subEl.textContent='· '+msgs[subIdx%msgs.length];
+      subIdx++;
+    }
+  },4000);
   var stepTimer=setInterval(function(){
-    // If the fork screen has already taken over (first approach landed),
-    // stop animating — the checkmark DOM is gone.
-    if(!document.getElementById('aiStep0')){clearInterval(stepTimer);return;}
+    // If the fork screen has already taken over (all 3 approaches landed
+    // before our 120s budget), stop animating — the checkmark DOM is gone.
+    if(!document.getElementById('aiStep0')){clearInterval(stepTimer);clearInterval(subTimer);return;}
     if(stepIdx>=steps.length){
       clearInterval(stepTimer);
+      clearInterval(subTimer);
       // All checkmarks complete but AI is still working. Switch the icon to
       // a subtler "finalizing" animation so the user sees we're still on it
       // (don't leave a static checkmark list with no apparent progress).
@@ -23486,6 +23574,9 @@ function _cpConfirmedAIGen(){
           noteEl.textContent='Finalizing — almost there...';
           stepsCt.parentNode.appendChild(noteEl);
         }
+        // Clear the sub-status — finalizing message takes over
+        var subEl=document.getElementById('aiSubStatus');
+        if(subEl)subEl.textContent='';
       }catch(_e){}
       return;
     }
@@ -23494,6 +23585,7 @@ function _cpConfirmedAIGen(){
     if(el){el.style.opacity='1';}
     if(dot){dot.textContent='✓';dot.style.background='rgba(34,197,94,.15)';dot.style.color='var(--gr)';}
     stepIdx++;
+    subIdx=0;// Reset rotation for the new step's sub-statuses
   },stepInterval);
   // Light up the FIRST checkmark right away so the user sees motion
   // immediately on click — without waiting 10s for the first tick.
@@ -24839,10 +24931,13 @@ function _cpDoAIGenerate(){
   // Phase D: forward partner data so AI can produce owner-tagged recs
   _cpLoadPartnerForAI().then(function(partnerInfo){
     if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
-    // Initialize approaches as undefined (=loading), show fork with loading states
+    // Initialize approaches as undefined (=loading). Do NOT call
+    // _cpShowApproachFork() yet — that would overwrite the checkmark
+    // progress page (rendered by _cpConfirmedAIGen) with loading-state
+    // cards. Keep the user on the checkmark page until ALL 3 approaches
+    // have resolved (success or error). Only then transition to the fork.
     CPLAN._approaches={};
-    _cpShowApproachFork();
-    // Fire 3 independent calls — each updates UI as it completes
+    // Fire 3 independent calls — track completion to know when to switch screens
     // Snapshot the financial inputs at generation time so the UI can flag
     // staleness later if the user changes their numbers without regenerating.
     var _genSurplus=CPLAN.surplus||0;
@@ -24874,9 +24969,19 @@ function _cpDoAIGenerate(){
         CPLAN._approaches[ap]=null;
       }).then(function(){
         _apDone++;
-        _cpShowApproachFork();
-        if(_apDone===3&&!CPLAN._approaches.traditional&&!CPLAN._approaches.tax_free&&!CPLAN._approaches.hybrid){
-          _cpAutoSuggestV2();_cpRenderPlanV2();cplanSave();
+        // Wait for ALL 3 to resolve before swapping the checkmark page out
+        // for the fork screen. Previously this fired on each completion,
+        // which killed the checkmark animation mid-way (the first approach
+        // typically resolves ~30s into a 90s generation window). Now the
+        // user stays on checkmarks the whole time, and the fork appears
+        // with all 3 cards already populated.
+        if(_apDone===3){
+          if(!CPLAN._approaches.traditional&&!CPLAN._approaches.tax_free&&!CPLAN._approaches.hybrid){
+            // All 3 failed — fall through to DIY autosuggest instead of an empty fork
+            _cpAutoSuggestV2();_cpRenderPlanV2();cplanSave();
+          } else {
+            _cpShowApproachFork();
+          }
         }
       });
     });
