@@ -21185,7 +21185,7 @@ function _trackFindAccount(a){
 var _cpMatchClaims = {};
 function _cpResetMatchClaims(){ _cpMatchClaims = {}; }
 
-function _cpMatchExisting(a){
+function _cpMatchExisting(a, opts){
   if(!a)return{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
   // Early-return for types with no matchable real-world source:
   //   debt        — handled by debt simulator, not balance-projection
@@ -21195,6 +21195,13 @@ function _cpMatchExisting(a){
   if(a.type==='debt'||a.type==='protection'||a.type==='rollover'){
     return{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
   }
+  // Inspection-only mode: callers that just want to read current real-world
+  // state without claiming the bucket (red-flag computation, summary panels,
+  // diagnostic tooling) pass {inspect:true}. The claim ledger is designed to
+  // prevent same-cycle DOUBLE-COUNTING when multiple allocations of the same
+  // (owner, type) compete for the underlying data; an inspection caller
+  // doesn't compete — it just needs to read the truth.
+  var _inspect=opts&&opts.inspect===true;
   var owner=a.owner||'self';
   // Identify this allocation by its array index. If the allocation isn't in
   // CPLAN.allocations (rare — some test paths construct ad-hoc allocations),
@@ -21205,9 +21212,9 @@ function _cpMatchExisting(a){
   // by a DIFFERENT allocation in the current cycle, return zeros. The first
   // allocation to claim it gets the full balance/contribution; same-allocation
   // repeat calls within the cycle return the cached value (handled implicitly
-  // because the same _aId still owns the claim).
+  // because the same _aId still owns the claim). Skipped in inspect mode.
   var _claimKey=owner+':'+a.type;
-  if(_cpMatchClaims[_claimKey]&&_cpMatchClaims[_claimKey]!==_aId){
+  if(!_inspect && _cpMatchClaims[_claimKey]&&_cpMatchClaims[_claimKey]!==_aId){
     return{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
   }
   var rawS=(APP._portalFd&&APP._portalFd.S)||{};
@@ -21517,7 +21524,7 @@ function _cpMatchExisting(a){
   // for the rest of this cycle. Only set the claim when there was actually
   // something to claim — a zero-balance, zero-contrib match shouldn't lock the
   // bucket against another allocation that might find data.
-  if((bal>0||contrib>0)&&!_cpMatchClaims[_claimKey])_cpMatchClaims[_claimKey]=_aId;
+  if(!_inspect&&(bal>0||contrib>0)&&!_cpMatchClaims[_claimKey])_cpMatchClaims[_claimKey]=_aId;
   return{
     currentBalance:Math.round(bal),
     currentContrib:Math.round(contrib),
@@ -30961,9 +30968,56 @@ function _cpExtractRedFlags(){
   if(hiDebts.length>0){var hiTotal=hiDebts.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);var hiInt=hiDebts.reduce(function(t,x){return t+((parseFloat(x.balance)||0)*(parseFloat(x.rate)||0)/100/12);},0);
     flags.push({type:'crit',icon:'💳',title:'High-interest debt: '+fmtK(hiTotal),desc:hiDebts.length+' account'+(hiDebts.length>1?'s':'')+' above 15% APR costing '+fmt(Math.round(hiInt))+'/mo in interest.',action:'debt'});}
   else if(d.totalDebt>0)flags.push({type:'warn',icon:'💳',title:'Outstanding debt: '+fmtK(d.totalDebt),desc:d.debts.length+' account'+(d.debts.length>1?'s':'')+' — a payoff strategy could save thousands in interest.',action:'debt'});
-  // No employer match capture
-  if(d.employer&&!CPLAN.allocations.some(function(a){return a.type==='401k'&&a.amount>0;}))
-    flags.push({type:'warn',icon:'💼',title:'Employer match not captured',desc:'Your employer'+(d.employer?' ('+d.employer+')':'')+' may offer free matching contributions — this is the highest guaranteed return available.',action:'401k'});
+  // ── Employer match capture ─────────────────────────────────────────────
+  // Fires only when there's genuine free money left on the table. Three pieces
+  // of state matter:
+  //   1. Does the user have a real-world 401(k) with a match available?
+  //      (employer exists AND a retAccount with matchPct > 0)
+  //   2. What's the user already contributing in real life? (retAccount.contrib
+  //      OR derived from contribPct × income)
+  //   3. What does the plan add on top? (CPLAN.allocations with type '401k'
+  //      → a.amount is the EXTRA per extras-semantics)
+  //
+  // Match-captured = (current real contrib) + (plan extra) >= (match dollars).
+  // When that's true, the flag stays suppressed because the user is fully
+  // capturing the free money. Otherwise we surface a warning, framed by the
+  // actual gap — "$Y more needed to capture the full match" — rather than the
+  // vague "may offer free matching contributions" wording, which felt wrong
+  // when paired with a card already showing match-captured status.
+  if(d.employer){
+    // Use _cpMatchExisting to read existing real-world 401(k) data. Self/joint
+    // scope only — partner match is a separate concern handled elsewhere if
+    // needed. _cpMatchExisting returns matchPct + monthlyIncome on the result
+    // object (added when contribPct fallback was introduced).
+    var _matchInfo=(typeof _cpMatchExisting==='function')?_cpMatchExisting({type:'401k',owner:'self'},{inspect:true}):null;
+    var _curContrib=_matchInfo?(parseFloat(_matchInfo.currentContrib)||0):0;
+    var _matchPct=_matchInfo?(parseFloat(_matchInfo.matchPct)||0):0;
+    var _incForMatch=_matchInfo?(parseFloat(_matchInfo.monthlyIncome)||0):0;
+    var _matchDollars=Math.round(_incForMatch*(_matchPct/100));
+    // Plan extra: sum of all '401k'-typed allocations the user owns. Joint
+    // 401(k)s aren't possible (one-owner IRS rule), so just self-owned matter.
+    var _planExtra=CPLAN.allocations.reduce(function(t,a){
+      if(!a||a.type!=='401k')return t;
+      if(a.owner&&a.owner!=='self')return t;
+      return t+(parseFloat(a.amount)||0);
+    },0);
+    var _totalContrib=_curContrib+_planExtra;
+    // Decision: only flag when match exists AND total contribution falls short.
+    // If no match info (no retAccount yet), keep the original "may offer"
+    // framing so the flag still nudges users who haven't entered their 401(k)
+    // details. If match info exists and is fully captured, no flag.
+    if(_matchDollars>0&&_totalContrib<_matchDollars){
+      var _gap=Math.round(_matchDollars-_totalContrib);
+      flags.push({type:'warn',icon:'💼',title:'Employer match partially captured',desc:'Contribute '+fmt(_gap)+'/mo more to capture the full '+_matchPct+'% match ('+fmt(_matchDollars)+'/mo) at '+d.employer+' — free money you\'re leaving on the table.',action:'401k'});
+    } else if(_matchDollars===0 && _curContrib===0 && _planExtra===0){
+      // No retAccount has match info AND no current contribution AND nothing
+      // in the plan. The employer existing means a match MIGHT be available.
+      // This is the original "may offer" path — kept for users who haven't
+      // entered 401(k) details yet.
+      flags.push({type:'warn',icon:'💼',title:'Employer match not captured',desc:'Your employer ('+d.employer+') may offer free matching contributions — this is the highest guaranteed return available. Add your 401(k) details so we can confirm.',action:'401k'});
+    }
+    // Implicit: match fully captured OR no employer match offered → no flag.
+  }
   // No life insurance — fires for any adult with income. Framing differs by
   // life stage: breadwinners with dependents have an active income-replacement
   // gap; single filers with no dependents have an insurability + final-expense
