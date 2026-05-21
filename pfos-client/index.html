@@ -27779,7 +27779,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   // Completed items get a soft opacity so users can scan a phase and immediately see what's done.
   // Card is still interactive (Remove still works) but the wrapper communicates "this is checked off".
   var _completedStyle=a._completed?';opacity:0.55;filter:saturate(0.7)':'';
-  var h='<div style="margin-bottom:10px;border-left:4px solid '+color+';background:'+_cpHex2Rgba(color,0.10)+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_cpHex2Rgba(color,0.18)+';border-right:1px solid '+_cpHex2Rgba(color,0.18)+';border-bottom:1px solid '+_cpHex2Rgba(color,0.18)+';position:relative;overflow:hidden;transition:border-color .2s'+_completedStyle+'">';
+  var h='<div id="cpCardWrap'+idx+'" data-alloc-idx="'+idx+'" style="margin-bottom:10px;border-left:4px solid '+color+';background:'+_cpHex2Rgba(color,0.10)+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_cpHex2Rgba(color,0.18)+';border-right:1px solid '+_cpHex2Rgba(color,0.18)+';border-bottom:1px solid '+_cpHex2Rgba(color,0.18)+';position:relative;overflow:hidden;transition:border-color .2s,box-shadow .2s'+_completedStyle+'">';
   // Red flag source
   if(a.flagTitle){h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;padding:7px 10px;border-radius:3px;background:'+(a.flagType==='crit'?'rgba(239,68,68,.08)':'rgba(234,179,8,.05)')+';border:1px solid '+(a.flagType==='crit'?'rgba(239,68,68,.15)':'rgba(234,179,8,.12)')+'"><span style="font-size:13px">'+(a.flagIcon||'⚠️')+'</span><span style="font-size:12px;font-weight:600;color:'+(a.flagType==='crit'?'var(--rd)':'var(--yl)')+'">'+a.flagTitle+'</span></div>';}
   // Header
@@ -31017,6 +31017,58 @@ function _cpExtractRedFlags(){
       flags.push({type:'warn',icon:'💼',title:'Employer match not captured',desc:'Your employer ('+d.employer+') may offer free matching contributions — this is the highest guaranteed return available. Add your 401(k) details so we can confirm.',action:'401k'});
     }
     // Implicit: match fully captured OR no employer match offered → no flag.
+
+    // ── 401(k) MAX-OUT OPPORTUNITY ───────────────────────────────────────
+    // Different intent from the match flag: match is "free money, don't leave
+    // it." Max-out is "you have IRS room left and the tax efficiency could
+    // compound significantly." Not a problem to fix — an opportunity to
+    // consider. Surfaced as info-level only, not warn or crit.
+    //
+    // Gates (all must be true to fire):
+    //   1. User has a 401(k) account on file (we know the current contribution)
+    //   2. Match is either fully captured OR no match offered — don't push
+    //      max-out before the more obvious match priority is handled
+    //   3. No critical-priority problems: high-interest debt above 15% APR
+    //      adds up to a guaranteed-loss situation that beats tax-deferred
+    //      compounding in nearly all cases; EF below 25% of target is the
+    //      same kind of resilience-first concern. Both override max-out.
+    //   4. There's actually IRS room left — current + plan extra is below the
+    //      age-appropriate annual limit
+    //   5. The user has enough surplus to plausibly act on it — at least
+    //      $200/mo of surplus beyond what's already in the plan. Below that,
+    //      a max-out suggestion is just noise.
+    //
+    // The flag uses action:'401k' so the existing "+ Add to Plan" button
+    // works — it lands a 401(k) card the user can then slide up.
+    if(_matchInfo && _curContrib>0){
+      // Age-based annual limit (2026):
+      //   <50:        $24,500
+      //   50-59, 64+: $32,500 (50+ catch-up)
+      //   60-63:      $35,750 (SECURE 2.0 super catch-up)
+      var _age=parseInt(CPLAN.age)||30;
+      var _annualLimit=24500;
+      if(_age>=50)_annualLimit=32500;
+      if(_age>=60&&_age<=63)_annualLimit=35750;
+      var _monthlyLimit=Math.round(_annualLimit/12);
+      var _matchOk=(_matchDollars===0)||(_totalContrib>=_matchDollars);
+      var _hasUrgentDebt=hiDebts.length>0;
+      var _efOk=d.efBal>=d.efTarget*0.25;// at least 25% of EF target
+      var _hasRoom=_totalContrib<_monthlyLimit;
+      var _hasSurplus=(d.surplus||0)>=200;
+      if(_matchOk && !_hasUrgentDebt && _efOk && _hasRoom && _hasSurplus){
+        var _gapToMax=Math.round(_monthlyLimit-_totalContrib);
+        var _ageNote='';
+        if(_age>=60&&_age<=63)_ageNote=' (includes SECURE 2.0 super catch-up for ages 60–63)';
+        else if(_age>=50)_ageNote=' (includes 50+ catch-up)';
+        flags.push({
+          type:'info',
+          icon:'💰',
+          title:'Room to max your 401(k)',
+          desc:'You\'re contributing '+fmt(_totalContrib)+'/mo. The 2026 limit is '+fmt(_monthlyLimit)+'/mo ('+fmtK(_annualLimit)+'/yr)'+_ageNote+'. Contributing '+fmt(_gapToMax)+'/mo more would max out the account and capture the full tax benefit. Worth considering if your goal is tax-deferred retirement growth — but not required: many people hit retirement targets without maxing.',
+          action:'401k'
+        });
+      }
+    }
   }
   // No life insurance — fires for any adult with income. Framing differs by
   // life stage: breadwinners with dependents have an active income-replacement
@@ -31374,9 +31426,14 @@ function _cpRenderRedFlags_LEGACY(){
   // can reference from the checkbox + bulk-add button.
   var _directAddFlags=[];
   flags.forEach(function(f,fi){
-    var bg=f.type==='crit'?'rgba(239,68,68,.06)':f.type==='warn'?'rgba(234,179,8,.04)':'rgba(34,197,94,.04)';
-    var bd=f.type==='crit'?'rgba(239,68,68,.18)':f.type==='warn'?'rgba(234,179,8,.15)':'rgba(34,197,94,.15)';
-    var titleCol=f.type==='crit'?'var(--rd)':f.type==='warn'?'var(--yl)':'var(--gr)';
+    // Color scheme by flag type:
+    //   crit (red)   — must address; safety/cashflow/critical risk
+    //   warn (yellow)— should address; meaningful but not emergency
+    //   info (blue)  — opportunity worth considering; not a problem to fix
+    //   default (green) — addressed / good news / completion confirmation
+    var bg=f.type==='crit'?'rgba(239,68,68,.06)':f.type==='warn'?'rgba(234,179,8,.04)':f.type==='info'?'rgba(91,155,255,.05)':'rgba(34,197,94,.04)';
+    var bd=f.type==='crit'?'rgba(239,68,68,.18)':f.type==='warn'?'rgba(234,179,8,.15)':f.type==='info'?'rgba(91,155,255,.2)':'rgba(34,197,94,.15)';
+    var titleCol=f.type==='crit'?'var(--rd)':f.type==='warn'?'var(--yl)':f.type==='info'?'#5B9BFF':'var(--gr)';
     var sol=solMap[f.action];
     // Determine if already addressed (so we know whether to show a checkbox at all)
     // Action-only flags are "addressed" by being IN THE PLAN (any amount, including 0) —
@@ -31428,9 +31485,13 @@ function _cpRenderRedFlags_LEGACY(){
     // For direct-add flags it ALSO stays as a single-item action so users can add one at a time
     // without using the bulk bar — preserves the original behavior and gives users a choice.
     if(sol){
-      if(existing){
+      if(existing&&f.type!=='info'){
         // Two flavors of "addressed": funded contributions (show $/mo) vs action-only items
         // (show phase + completion status). Action-only items don't have a meaningful $/mo.
+        // EXCLUDED for info-type flags: those describe optimization opportunities ON
+        // existing allocations (e.g. max-out 401k), so "✓ Addressed" would be
+        // misleading — the user can address the underlying need further by adjusting
+        // the existing card. See the info-type branch below for that affordance.
         h+='<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:rgba(34,197,94,.04);border-top:1px solid '+bd+'">';
         h+='<span style="color:var(--gr);font-size:13px">✓</span>';
         if(sol.actionOnly){
@@ -31440,6 +31501,16 @@ function _cpRenderRedFlags_LEGACY(){
         } else {
           h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--gr)">Addressed: '+fmt(existing.amount)+'/mo → '+(existing.customName||CP_NM[existing.type]||sol.label)+'</span></div>';
         }
+      } else if(existing&&f.type==='info'){
+        // Info flag pointing to an existing allocation — offer a scroll-to
+        // affordance so the user can jump to the card and adjust it directly.
+        // Hooks into _cpScrollToAllocation if available, falls back to phase
+        // tab activation + smooth scroll otherwise.
+        var _existIdx=CPLAN.allocations.indexOf(existing);
+        h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:rgba(91,155,255,.04);border-top:1px solid '+bd+'">';
+        h+='<div style="display:flex;align-items:center;gap:6px"><span style="font-size:13px">'+sol.icon+'</span><span style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF">You already have a '+(CP_NM[existing.type]||sol.label)+' card · adjust it to act on this</span></div>';
+        h+='<button onclick="_cpScrollToAllocation('+_existIdx+')" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:28px;white-space:nowrap">Go to card →</button>';
+        h+='</div>';
       } else {
         h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 12px;background:rgba(91,155,255,.04);border-top:1px solid '+bd+'">';
         h+='<div style="display:flex;align-items:center;gap:6px"><span style="font-size:13px">'+sol.icon+'</span><span style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF">Recommended: '+sol.label+'</span></div>';
@@ -37345,6 +37416,42 @@ function _cpSetEFMonthsTarget(mo){
   if(typeof cplanSave==='function')cplanSave();
   if(typeof _cpRender==='function')_cpRender();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCROLL TO ALLOCATION CARD
+// ─────────────────────────────────────────────────────────────────────────────
+// Activates the right phase tab (cards are partitioned by phase) and scrolls
+// the allocation's card into view with a brief highlight pulse so the eye can
+// find it. Called from info-level red flags that point to existing cards
+// ("you have a 401(k) running, here's room to grow it").
+function _cpScrollToAllocation(idx){
+  var a=CPLAN.allocations&&CPLAN.allocations[idx];
+  if(!a)return;
+  // Activate the phase tab that contains this allocation. Unassigned cards
+  // (phase 0 or missing) live in the Unassigned section, which is always
+  // visible regardless of active tab, so we only need to re-render when the
+  // card has a real phase.
+  var _targetPhase=parseInt(a.phase)||0;
+  if(_targetPhase>0&&CPLAN._activePhaseTab!==_targetPhase){
+    CPLAN._activePhaseTab=_targetPhase;
+    if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  }
+  // After the render settles, find the card and scroll it into view.
+  setTimeout(function(){
+    var el=document.getElementById('cpCardWrap'+idx);
+    if(!el)return;
+    el.scrollIntoView({behavior:'smooth',block:'center'});
+    // Brief highlight pulse — 2s ring that fades out. Uses box-shadow rather
+    // than a class swap so we don't have to add a stylesheet rule.
+    var _prior=el.style.boxShadow;
+    el.style.boxShadow='0 0 0 3px #5B9BFF, 0 0 18px rgba(91,155,255,.4)';
+    setTimeout(function(){
+      el.style.transition='box-shadow .8s ease-out';
+      el.style.boxShadow=_prior||'';
+    },1400);
+  },80);
+}
+
 function _cpAdd(type){
   if(type!=='custom'&&CPLAN.allocations.some(function(a){return a.type===type;}))return;
   // Hybrid couples: route through the owner picker so red-flag-spawned cards
