@@ -26271,10 +26271,17 @@ async function _cpLoadPartnerForAI(){
       var pPolicies=((sharedRawS.policies||sharedRawS.insurancePolicies)||[]).filter(function(p){return(p.owner||'')==='spouse';});
       // Joint plan stored on client_a's profile — same allocation_plan
       pPlan=sharedFd.allocation_plan||{};
+      // Resolve spouse first name from the shared joint profile. Priority:
+      //   1. S.spouseInfo.firstName (canonical — entered in pfos-main spouse panel)
+      //   2. S.profile.spFirstName (alternate location for the same data)
+      //   3. clients.name split (fallback if neither is set)
+      //   4. 'Spouse' as last resort
+      var _spInfo=(sharedRawS.spouseInfo)||{};
+      var _spouseFirstName=_spInfo.firstName||sharedProfile.spFirstName||((pName||'').split(' ')[0])||'Spouse';
       partner={
         clientId:partnerId,
         name:pName,
-        firstName:(pName||'Partner').split(' ')[0],
+        firstName:_spouseFirstName,
         age:pAge,
         retirementAge:pRetAge,
         ssBenefit:pSsBenefit,
@@ -26312,10 +26319,17 @@ async function _cpLoadPartnerForAI(){
       var pExp=pCalcs.baseExp||pCalcs.expenses||0;
       if(!pExp&&pRawS.expData)Object.keys(pRawS.expData).forEach(function(k){pExp+=(parseFloat((pRawS.expData[k]||{}).amount)||0);});
       pPlan=(pProfRes&&pProfRes.data&&pProfRes.data.allocation_plan)||{};
+      // Resolve partner's display first name. Priority:
+      //   1. partner's own pfos-main S.profile.firstName (canonical — they
+      //      entered this in their First Name field)
+      //   2. first space-separated word of clients.name (works for "Riley Davis"
+      //      → "Riley" but is brittle on titles like "Dr. Riley")
+      //   3. 'Partner' as last-resort fallback
+      var _partnerFirstName=(pProfile&&pProfile.firstName)||((pName||'').split(' ')[0])||'Partner';
       partner={
         clientId:partnerId,
         name:pName,
-        firstName:(pName||'Partner').split(' ')[0],
+        firstName:_partnerFirstName,
         age:parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35,
         // Phase D multi-partner: retirement age + SS benefit from partner's own profile.
         // Defaults to 65 if not set so projections stay valid. Reads from partner's S.profile.retAge.
@@ -35985,6 +35999,57 @@ function _cpRunSimulation(){
     netWorthJointData.push(Math.round(_jointAssetsThisYr));
   }
 
+  // ── Per-bucket baselines (the 'Do nothing' line on each chart) ─────────────
+  // For each bucket, the baseline is: that bucket's existing real-world assets
+  // compounding passively at a moderate unmanaged rate, with no new
+  // contributions. This produces a per-chart trajectory that's actually
+  // comparable to the per-chart plan trajectory — instead of overlaying the
+  // household-wide baseline on every chart, which made empty spouse/joint
+  // buckets look like they were "missing out" on the household total.
+  //
+  // Source of seed assets per bucket:
+  //   self    → user's own retAccounts + investments + (in NW view) liquid
+  //             savings + checking + home equity
+  //   spouse  → partner's retAccounts + investments (assets shared with
+  //             primary in joint households so we don't double-count)
+  //   joint   → joint-tagged investments + joint retirement balances if any
+  // For households without a partner, spouse/joint baselines stay at 0.
+  var _rawSBase=(APP._portalFd&&APP._portalFd.S)||{};
+  var _baseRateNW=0.04;// 4% — unmanaged mixed-asset growth, real terms
+  var _baseRateRet=0.05;// 5% — same idea, retirement-account flavored
+  function _bucketSeed(b,isRet){
+    var seed=0;
+    if(b==='self'){
+      seed+=( _rawSBase.retAccounts||[]).filter(function(r){return(r.owner||'personal')!=='spouse'&&(r.owner||'personal')!=='joint';}).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
+      seed+=( _rawSBase.investments||[]).filter(function(i){return(i.owner||'personal')!=='spouse'&&(i.owner||'personal')!=='joint';}).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+      if(!isRet){
+        // Net worth view: include liquid + home equity for self
+        seed+=parseFloat((_rawSBase.assets||{}).savings)||0;
+        seed+=parseFloat((_rawSBase.assets||{}).checking)||0;
+        seed+=Math.max(0,_homeValue-_mortgageBal);
+      }
+    } else if(b==='spouse'&&CPLAN._partner){
+      seed+=(CPLAN._partner.retAccounts||[]).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
+      seed+=(CPLAN._partner.investments||[]).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+    } else if(b==='joint'){
+      seed+=( _rawSBase.retAccounts||[]).filter(function(r){return(r.owner||'')==='joint';}).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
+      seed+=( _rawSBase.investments||[]).filter(function(i){return(i.owner||'')==='joint';}).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+    }
+    return seed;
+  }
+  var baselineSelfNW=[],baselineSpouseNW=[],baselineJointNW=[];
+  var baselineSelfRet=[],baselineSpouseRet=[],baselineJointRet=[];
+  var _seedSelfNW=_bucketSeed('self',false),_seedSpouseNW=_bucketSeed('spouse',false),_seedJointNW=_bucketSeed('joint',false);
+  var _seedSelfRet=_bucketSeed('self',true),_seedSpouseRet=_bucketSeed('spouse',true),_seedJointRet=_bucketSeed('joint',true);
+  for(var _byr=0;_byr<=years;_byr++){
+    baselineSelfNW.push(Math.round(_seedSelfNW*Math.pow(1+_baseRateNW,_byr)));
+    baselineSpouseNW.push(Math.round(_seedSpouseNW*Math.pow(1+_baseRateNW,_byr)));
+    baselineJointNW.push(Math.round(_seedJointNW*Math.pow(1+_baseRateNW,_byr)));
+    baselineSelfRet.push(Math.round(_seedSelfRet*Math.pow(1+_baseRateRet,_byr)));
+    baselineSpouseRet.push(Math.round(_seedSpouseRet*Math.pow(1+_baseRateRet,_byr)));
+    baselineJointRet.push(Math.round(_seedJointRet*Math.pow(1+_baseRateRet,_byr)));
+  }
+
   // ── 4. Calculate trajectory metrics for health score ──
   var fullFundingMonth=0;
   var allItemsFunded=true;
@@ -36060,6 +36125,18 @@ function _cpRunSimulation(){
     retirement_self:retirementSelfData,
     retirement_spouse:retirementSpouseData,
     retirement_joint:retirementJointData,
+    // Per-bucket baselines (the 'Do nothing' dashed line on each chart). NW
+    // variants include liquid + home equity for self; retirement variants
+    // include only retirement-account + investment balances. Seeds are
+    // partitioned per bucket so the dashed line shows what THAT bucket's
+    // existing real-world assets compound to passively — not the household
+    // total, which made empty buckets look like missed opportunities.
+    baseline_self:baselineSelfNW,
+    baseline_spouse:baselineSpouseNW,
+    baseline_joint:baselineJointNW,
+    baselineRet_self:baselineSelfRet,
+    baselineRet_spouse:baselineSpouseRet,
+    baselineRet_joint:baselineJointRet,
     projRetValue_self:_projRetValue_self,
     projRetValue_spouse:_projRetValue_spouse,
     projRetValue_joint:_projRetValue_joint,
@@ -36133,6 +36210,36 @@ function _cpRenderChart(targetId,bucket){
     var _bucketLabel=bucket==='self'?'You':bucket==='spouse'?(CPLAN._partner&&CPLAN._partner.firstName||'Spouse'):'Joint';
     var _bucketColor=bucket==='self'?'#5B9BFF':bucket==='spouse'?'#A855F7':'#22C55E';
     _toggleH='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:'+_bucketColor+';margin-bottom:6px">'+_bucketLabel+'</div>';
+
+    // ── Empty-bucket detection ─────────────────────────────────────────────
+    // A bucket is "empty" if (a) no allocations are tagged for it AND (b) no
+    // existing real-world assets seed its baseline. Showing a flat $0 line for
+    // an empty bucket is worse than useless — it implies the bucket is failing
+    // when really it just has nothing in it yet. Replace with a short empty-
+    // state message explaining what would populate it.
+    var _bucketHasAllocs=CPLAN.allocations.some(function(a){
+      var _aOwn=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
+      return _aOwn===bucket && (parseFloat(a.amount)||0)>0;
+    });
+    var _bucketHasSeed=false;
+    if(CPLAN._sim){
+      var _baseArr=_isRetView?CPLAN._sim['baselineRet_'+bucket]:CPLAN._sim['baseline_'+bucket];
+      _bucketHasSeed=Array.isArray(_baseArr)&&_baseArr.length>0&&_baseArr[0]>0;
+    }
+    if(!_bucketHasAllocs&&!_bucketHasSeed){
+      var _emptyHint=bucket==='self'
+        ? 'Add a self-owned allocation to populate this view. Use the owner picker when adding from a red flag, or click "↶ Make personal" on a joint card to move it here.'
+        : bucket==='spouse'
+        ? (_bucketLabel+' has no allocations tagged to them yet. Add via the owner picker or have '+_bucketLabel+' share a card from their plan.')
+        : 'No joint allocations yet. Click "💑 Make joint" on eligible cards (EF, debt, 529, custom goals) to create co-owned items here.';
+      el.innerHTML=_toggleH
+        +'<div style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:260px;padding:20px;text-align:center;border:1px dashed '+_cpHex2Rgba(_bucketColor,0.25)+';border-radius:4px;background:'+_cpHex2Rgba(_bucketColor,0.03)+'">'
+        +'<div style="font-size:30px;margin-bottom:8px;opacity:.5">📊</div>'
+        +'<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+_bucketColor+';margin-bottom:6px;letter-spacing:.06em">No data in this bucket</div>'
+        +'<div style="font-size:11px;color:var(--mu);line-height:1.5;max-width:240px">'+_emptyHint+'</div>'
+        +'</div>';
+      return;
+    }
   }
   var W=600,H=260,padL=50,padR=55,padT=24,padB=28;var years=30;
 
@@ -36167,17 +36274,32 @@ function _cpRenderChart(targetId,bucket){
       // that cash baseline against retirement-only data made "Do nothing"
       // look almost as good as "Plan" in the retirement view, suggesting
       // the user could skip retirement planning and still be fine.
-      var _rawSrcRet=(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)||{};
-      var _existingRetBal=(_rawSrcRet.retAccounts||[]).reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
-      var _existingInvestBal=parseFloat((_rawSrcRet.assets&&_rawSrcRet.assets.invest)||0);
-      var _existingRetSeed=_existingRetBal+_existingInvestBal;
-      var _retBaseRate=0.05;// unmanaged net rate after typical drag/fees
-      baselineData=[];
-      for(var _ry=0;_ry<=sim.netWorth.length-1;_ry++){
-        baselineData.push(Math.round(_existingRetSeed*Math.pow(1+_retBaseRate,_ry)));
+      if(bucket!=='all'&&sim['baselineRet_'+bucket]){
+        // Per-bucket retirement baseline computed in _cpRunSimulation. Reflects
+        // ONLY that bucket's existing assets compounding passively — household-
+        // wide assets don't bleed into empty buckets.
+        baselineData=sim['baselineRet_'+bucket];
+      } else {
+        var _rawSrcRet=(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)||{};
+        var _existingRetBal=(_rawSrcRet.retAccounts||[]).reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+        var _existingInvestBal=parseFloat((_rawSrcRet.assets&&_rawSrcRet.assets.invest)||0);
+        var _existingRetSeed=_existingRetBal+_existingInvestBal;
+        var _retBaseRate=0.05;// unmanaged net rate after typical drag/fees
+        baselineData=[];
+        for(var _ry=0;_ry<=sim.netWorth.length-1;_ry++){
+          baselineData.push(Math.round(_existingRetSeed*Math.pow(1+_retBaseRate,_ry)));
+        }
       }
     } else {
-      baselineData=sim.baseline;
+      // Net worth view: 'all' uses household-wide baseline (passive cash +
+      // debt amortization). Per-bucket uses the bucket-scoped baseline so
+      // an empty spouse/joint chart shows that bucket's actual $0 starting
+      // point compounded, not the household-wide $1.9M misleading dashed line.
+      if(bucket!=='all'&&sim['baseline_'+bucket]){
+        baselineData=sim['baseline_'+bucket];
+      } else {
+        baselineData=sim.baseline;
+      }
     }
     // Build rawSeries from sim.allocSeries for displacement bands
     rawSeries={};
