@@ -21236,13 +21236,33 @@ function _cpMatchExisting(a){
     incomeSources=rawS.incomeSources||[];
   }
   var bal=0,contrib=0,labels=[];
+  // Normalize retAccount.type values so the matcher accepts both canonical
+  // snake_case vals ('401k_current', 'roth_ira', etc.) AND legacy/imported
+  // data where display labels were stored where vals should have been
+  // (e.g. "Roth IRA", "Solo 401k", "Pension"). Strips parentheticals,
+  // punctuation, em-dashes, and whitespace, then lowercases. Output is
+  // a stable lookup key used inside _retMatchTypes' arrays.
+  function _normRetType(t){
+    if(!t)return '';
+    return String(t).toLowerCase().replace(/[()—–\-_]/g,'').replace(/\s+/g,'');
+  }
   function _retMatchTypes(allocType){
-    if(allocType==='roth')return['roth_ira'];
-    if(allocType==='401k')return['401k_current','403b_current','tsp_current'];
-    if(allocType==='roth401k')return['roth401k_current'];
-    if(allocType==='trad_ira')return['trad_ira'];
-    if(allocType==='solo401k')return['solo_401k','roth_solo_401k'];
-    if(allocType==='sep_ira')return['sep_ira'];
+    // Each plan allocation type maps to a set of normalized retAccount.type
+    // values. The normalizer above squashes "Roth IRA" / "roth_ira" / "Roth-IRA"
+    // all to "rothira" so legacy data and canonical data both match.
+    //
+    // _current AND _old variants are both included where they exist. _old
+    // accounts have no current contribution (allowContrib:false in RET_TYPES)
+    // but they DO have a balance that informs the projection. Without the
+    // _old variants here, a user with a $50K rollover-eligible 401(k) old
+    // employer account gets a plan card showing $0 existing balance, hiding
+    // their real starting point.
+    if(allocType==='roth')return['rothira','roth'];
+    if(allocType==='401k')return['401kcurrent','401kold','401k','403bcurrent','403bold','403b','tspcurrent','tspold','tsp'];
+    if(allocType==='roth401k')return['roth401kcurrent','roth401kold','roth401k'];
+    if(allocType==='trad_ira')return['tradira','ira','traditionalira'];
+    if(allocType==='solo401k')return['solo401k','rothsolo401k'];
+    if(allocType==='sep_ira')return['sepira','sep'];
     return[];
   }
   // Match-account aggregates — populated during the retirement-accounts loop
@@ -21262,7 +21282,11 @@ function _cpMatchExisting(a){
       _outMonthlyInc=parseFloat(CPLAN.income)||parseFloat((rawS.calcs||{}).inc)||0;
     }
     retAccts.forEach(function(r){
-      if(matchTypes.indexOf(r.type)<0)return;
+      // Normalize the stored retAccount.type before comparison so legacy data
+      // ("Roth IRA", "Solo 401k") matches alongside canonical vals ("roth_ira",
+      // "solo_401k"). matchTypes is already in normalized form.
+      var rTypeNorm=_normRetType(r.type);
+      if(matchTypes.indexOf(rTypeNorm)<0)return;
       // Owner filter: personal allocs match personal+joint retirement accounts.
       // Spouse allocs flow through the partner branch above (different retAccts source).
       // Joint accounts contribute to BOTH partners' views since both partially own them.
@@ -21295,7 +21319,7 @@ function _cpMatchExisting(a){
       var pIbc=p.ibcFlag==='yes';
       var matches=false;
       if(a.type==='iul')matches=(pType.indexOf('iul')>=0||pType.indexOf('indexed universal')>=0)&&!pIbc;
-      else if(a.type==='wl')matches=pType==='whole life'&&!pIbc;
+      else if(a.type==='wl')matches=(pType.indexOf('whole life')>=0||pType==='wl')&&!pIbc;
       else if(a.type==='ibc')matches=pIbc;
       if(matches){
         bal+=parseFloat(p.cashValue)||0;
@@ -21339,6 +21363,22 @@ function _cpMatchExisting(a){
       // Legacy fallback: pre-migration S.assets.invest is the only source
       bal+=parseFloat(assets.invest)||0;
     }
+    // Some users file taxable brokerage / mutual fund accounts under the
+    // Retirement section of pfos-main (RET_TYPES includes 'brokerage' and
+    // 'mutual_fund' for taxable accounts). Those land in S.retAccounts, not
+    // S.investments. Pull them in here so the plan card for 'invest'
+    // reflects the user's full taxable position regardless of which section
+    // they entered it in.
+    retAccts.forEach(function(r){
+      var rTypeNorm=_normRetType(r.type);
+      if(rTypeNorm!=='brokerage'&&rTypeNorm!=='mutualfund'&&rTypeNorm!=='mutualfunds'&&rTypeNorm!=='taxable')return;
+      var rOwner=r.owner||'personal';
+      if(rOwner==='spouse')return;
+      bal+=parseFloat(r.balance)||0;
+      contrib+=parseFloat(r.contrib)||0;
+      var lbl=r.provider||r.label||'';
+      if(lbl)labels.push(lbl);
+    });
   }
   if(a.type==='edu'){
     children.forEach(function(c){
@@ -21402,6 +21442,21 @@ function _cpMatchExisting(a){
       bal+=parseFloat(iv.balance)||0;
       contrib+=parseFloat(iv.monthlyContrib)||0;
       var lbl=iv.provider||iv.accountLabel||'';
+      if(lbl)labels.push(lbl);
+    });
+    // Some users file HSA under the Retirement section of pfos-main rather
+    // than the Investments section. The HSA entry shows up in S.retAccounts
+    // with type 'hsa' (or display label 'HSA'). Pull from there too so the
+    // plan card reflects the full HSA position regardless of where the user
+    // entered it.
+    retAccts.forEach(function(r){
+      var rTypeNorm=_normRetType(r.type);
+      if(rTypeNorm!=='hsa')return;
+      var rOwner=r.owner||'personal';
+      if(rOwner==='spouse')return;
+      bal+=parseFloat(r.balance)||0;
+      contrib+=parseFloat(r.contrib)||0;
+      var lbl=r.provider||r.label||'';
       if(lbl)labels.push(lbl);
     });
   }
