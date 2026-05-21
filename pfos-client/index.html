@@ -20853,6 +20853,13 @@ function _cpEnsurePlanLoaded(){
   // already saved under the new format. See _cpMigrateAllocationsToExtras.
   if(typeof _cpMigrateAllocationsToExtras==='function')_cpMigrateAllocationsToExtras(saved);
   CPLAN.allocations=JSON.parse(JSON.stringify(saved.allocations));
+  // Backfill owner field on legacy cards. Cards added before owner-tagging was
+  // wired up (e.g., via _cpAdd from red flags, or pre-Hybrid AI plans) have
+  // owner:undefined. The simulator and budget math treat undefined as 'self'
+  // implicitly, but several explicit owner checks (Make joint button, dual
+  // slider, sharing UI) compare with === 'self', so the missing field hides
+  // controls that should be visible. Default to 'self' on load.
+  CPLAN.allocations.forEach(function(a){if(a&&!a.owner)a.owner='self';});
   if(saved.debtStrategy)CPLAN.debtStrategy=saved.debtStrategy;
   if(saved.approaches)CPLAN._approaches=saved.approaches;
   if(saved.selectedApproach)CPLAN._selectedApproach=saved.selectedApproach;
@@ -21179,14 +21186,14 @@ var _cpMatchClaims = {};
 function _cpResetMatchClaims(){ _cpMatchClaims = {}; }
 
 function _cpMatchExisting(a){
-  if(!a)return{currentBalance:0,currentContrib:0,sourceLabel:''};
+  if(!a)return{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
   // Early-return for types with no matchable real-world source:
   //   debt        — handled by debt simulator, not balance-projection
   //   protection  — action-only, no balance to track
   //   rollover    — typed allocation but no persistent rollover-balance field
   // ef, hsa, custom were previously here too but have data sources — see branches below.
   if(a.type==='debt'||a.type==='protection'||a.type==='rollover'){
-    return{currentBalance:0,currentContrib:0,sourceLabel:''};
+    return{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
   }
   var owner=a.owner||'self';
   // Identify this allocation by its array index. If the allocation isn't in
@@ -21201,7 +21208,7 @@ function _cpMatchExisting(a){
   // because the same _aId still owns the claim).
   var _claimKey=owner+':'+a.type;
   if(_cpMatchClaims[_claimKey]&&_cpMatchClaims[_claimKey]!==_aId){
-    return{currentBalance:0,currentContrib:0,sourceLabel:''};
+    return{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
   }
   var rawS=(APP._portalFd&&APP._portalFd.S)||{};
   // Resolve per-owner data sources. Spouse pulls from CPLAN._partner (loaded
@@ -21238,8 +21245,22 @@ function _cpMatchExisting(a){
     if(allocType==='sep_ira')return['sep_ira'];
     return[];
   }
+  // Match-account aggregates — populated during the retirement-accounts loop
+  // and returned on the result object. Initialized here so all return paths
+  // include consistent fields even when no retirement matching ran.
+  var _outMatchPct=0;
+  var _outMonthlyInc=0;
   if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira'].indexOf(a.type)>=0){
     var matchTypes=_retMatchTypes(a.type);
+    // Per-owner monthly income for the contribPct fallback. The retAccount in
+    // pfos-main captures both a dollar field (`contrib`) and percentage fields
+    // (`contribPct`, `matchPct`). Users who fill ONLY the percentage end up
+    // with `contrib: 0` even though they have a real contribution running.
+    if(owner==='spouse'&&CPLAN._partner){
+      _outMonthlyInc=parseFloat(CPLAN._partner.income)||0;
+    } else {
+      _outMonthlyInc=parseFloat(CPLAN.income)||parseFloat((rawS.calcs||{}).inc)||0;
+    }
     retAccts.forEach(function(r){
       if(matchTypes.indexOf(r.type)<0)return;
       // Owner filter: personal allocs match personal+joint retirement accounts.
@@ -21248,7 +21269,22 @@ function _cpMatchExisting(a){
       var rOwner=r.owner||'personal';
       if(rOwner==='spouse')return;// not personal scope
       bal+=parseFloat(r.balance)||0;
-      contrib+=parseFloat(r.contrib)||0;
+      var rContrib=parseFloat(r.contrib)||0;
+      // Fallback: if dollar contrib is missing but percent is set, derive
+      // the dollar amount from contribPct × income. This catches the common
+      // case where a user enters "3%" in the contribution-percent field but
+      // never fills the dollar field — pfos-main displays both fields side-by-
+      // side without auto-linking, so single-entry users leave one blank.
+      if(rContrib<=0){
+        var rPct=parseFloat(r.contribPct)||0;
+        if(rPct>0&&_outMonthlyInc>0){
+          rContrib=_outMonthlyInc*(rPct/100);
+        }
+      }
+      contrib+=rContrib;
+      // Surface the employer match percentage so the card can display "up to
+      // X% match available" alongside the contribution line.
+      _outMatchPct=Math.max(_outMatchPct,parseFloat(r.matchPct)||0);
       var lbl=r.provider||r.label||'';
       if(lbl)labels.push(lbl);
     });
@@ -21430,7 +21466,13 @@ function _cpMatchExisting(a){
   return{
     currentBalance:Math.round(bal),
     currentContrib:Math.round(contrib),
-    sourceLabel:labels.slice(0,2).join(', ')
+    sourceLabel:labels.slice(0,2).join(', '),
+    // Retirement-only: surfaces employer match availability and the income
+    // basis used for the contribPct fallback. Cards can display "Match up to
+    // X% available" using these fields when matchPct > 0. Non-retirement
+    // allocation types return zeros for these (no effect on existing readers).
+    matchPct:_outMatchPct,
+    monthlyIncome:_outMonthlyInc
   };
 }
 // ── Migrate legacy "total" semantics to "extras" on load ───────────────────
@@ -27668,7 +27710,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   // and the displayed number is identical to before. Reset match claims so this
   // call gets a clean ledger; the later slider block also calls _cpMatchExisting
   // and the claim ledger handles repeat calls within the same render correctly.
-  var _matchBuildCard=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0,sourceLabel:''};
+  var _matchBuildCard=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
   var _curContribCard=parseInt((_matchBuildCard&&_matchBuildCard.currentContrib)||0)||0;
   var _displayTotal=_curContribCard+(parseFloat(a.amount)||0);
   var isD=CPLAN.mode==='detailed';
@@ -27807,8 +27849,8 @@ function _cpBuildCard(a,idx,isUnassigned){
   // dormant Roth IRA, or taxable brokerage), we show only the existing balance
   // so users see their starting point. New accounts (no match) show nothing,
   // preserving the original UI.
-  var _match=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0,sourceLabel:''};
-  if(_match.currentContrib>0||_match.currentBalance>0){
+  var _match=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0,sourceLabel:'',matchPct:0,monthlyIncome:0};
+  if(_match.currentContrib>0||_match.currentBalance>0||_match.matchPct>0){
     var _total=(_match.currentContrib||0)+(parseFloat(a.amount)||0);
     h+='<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0;padding:8px 10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:3px;font-size:12px">';
     if(_match.currentContrib>0){
@@ -27816,7 +27858,8 @@ function _cpBuildCard(a,idx,isUnassigned){
       h+='<span style="color:var(--mu)">+ Extra:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+color+';font-weight:600">'+fmt(a.amount)+'/mo</span>';
       h+='<span style="color:var(--mu)">= Total:</span> <span id="cpTotal'+idx+'" style="font-family:var(--fd);color:var(--gr);font-weight:700">'+fmt(_total)+'/mo</span>';
     } else {
-      // Balance present but no current monthly contribution — show as starting point
+      // No current monthly contribution. Show balance or match availability
+      // alone if either is present — both are useful starting context.
       h+='<span style="color:var(--mu)">No current contribution</span>';
       h+='<span style="color:var(--mu)">· Extra:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+color+';font-weight:600">'+fmt(a.amount)+'/mo</span>';
     }
@@ -27825,6 +27868,24 @@ function _cpBuildCard(a,idx,isUnassigned){
     }
     if(_match.sourceLabel){
       h+='<div style="flex-basis:100%;font-size:10px;color:var(--mu);margin-top:2px">at '+_match.sourceLabel+'</div>';
+    }
+    // Employer match availability — surfaces the matchPct from the user's
+    // retirement account so the card shows "Up to X% employer match available
+    // ($Y/mo if you contribute the full match)" alongside the current state.
+    // Highest-guaranteed-return context for the user, especially when their
+    // current contribution is zero.
+    if(_match.matchPct>0&&_match.monthlyIncome>0){
+      var _matchDollarsMo=Math.round(_match.monthlyIncome*(_match.matchPct/100));
+      var _captured=_match.currentContrib>=_matchDollarsMo;
+      h+='<div style="flex-basis:100%;display:flex;align-items:center;gap:6px;margin-top:4px;padding-top:4px;border-top:1px dashed rgba(91,155,255,.15);font-size:11px">';
+      if(_captured){
+        h+='<span style="color:var(--gr);font-weight:700">✓ Match captured</span>';
+        h+='<span style="color:var(--mu)">'+_match.matchPct+'% employer match ('+fmt(_matchDollarsMo)+'/mo) is fully covered by your current contribution.</span>';
+      } else {
+        h+='<span style="color:var(--yl);font-weight:700">⚠ Match available:</span>';
+        h+='<span style="color:var(--mu)">Up to '+_match.matchPct+'% employer match — contribute at least <strong style="color:var(--wh)">'+fmt(_matchDollarsMo)+'/mo</strong> to capture the full match.</span>';
+      }
+      h+='</div>';
     }
     h+='</div>';
   }
@@ -27987,7 +28048,12 @@ function _cpBuildCard(a,idx,isUnassigned){
   // be joint (joint savings, joint mortgage, joint debt, etc).
   var _jointEligible={ef:1,edu:1,house:1,custom:1,invest:1,debt:1};
   var _jointEligible_isType=_jointEligible[a.type]===1;
-  if(_hh==='hybrid'&&a.owner==='self'&&!_renderDual&&!_renderRequest){
+  // Treat undefined/missing owner as 'self' so legacy cards (added before
+  // owner-tagging was wired up) still get the Hybrid sharing controls.
+  // Backfill is handled at load time too (see _cpEnsurePlanLoaded), but
+  // belt-and-suspenders the gate here.
+  var _aOwnForBtns=a.owner||'self';
+  if(_hh==='hybrid'&&_aOwnForBtns==='self'&&!_renderDual&&!_renderRequest){
     h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">';
     if(_jointEligible_isType){
       h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Make joint</button>';
