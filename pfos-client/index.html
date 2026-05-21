@@ -35683,7 +35683,20 @@ function _cpRunSimulation(){
   var netWorthSelfData=[],netWorthSpouseData=[],netWorthJointData=[];
   // Home equity tracking — get home value from profile if homeowner
   var _rawS2=(APP._portalFd&&APP._portalFd.S)||{};
-  var _homeValue=parseFloat((_rawS2.assets&&_rawS2.assets.re)||0);
+  // Home value may be a scalar (legacy pfos-main shape: assets.re is a number)
+  // or an array (newer shape: assets.re is an array of real-estate entries).
+  // parseFloat on an array returns NaN, which then poisons the entire seed
+  // computation via NaN propagation (seed += NaN → seed becomes NaN). Guard
+  // against both: detect the array shape and sum entry balances; fall back to
+  // scalar parsing for legacy data; force any NaN result to 0.
+  var _rawAssetsRE=(_rawS2.assets&&_rawS2.assets.re);
+  var _homeValue=0;
+  if(Array.isArray(_rawAssetsRE)){
+    _homeValue=_rawAssetsRE.reduce(function(t,e){return t+(parseFloat(e&&e.balance)||parseFloat(e&&e.value)||0);},0);
+  } else {
+    _homeValue=parseFloat(_rawAssetsRE)||0;
+  }
+  if(isNaN(_homeValue))_homeValue=0;
   var _homeAppreciation=0.035;// 3.5% annual appreciation
   var _mortgageBal=loRateDebts.filter(function(d){var nm=(d.name||d.type||'').toLowerCase();return nm.indexOf('house')>=0||nm.indexOf('mortgage')>=0||nm.indexOf('home')>=0;}).reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
 
@@ -36017,37 +36030,193 @@ function _cpRunSimulation(){
   var _rawSBase=(APP._portalFd&&APP._portalFd.S)||{};
   var _baseRateNW=0.04;// 4% — unmanaged mixed-asset growth, real terms
   var _baseRateRet=0.05;// 5% — same idea, retirement-account flavored
+  // Helper: sum cash entries (savings/checking) from assets, by owner. pfos-main
+  // has two shapes for cash assets:
+  //   • Legacy scalar: S.assets.savings, S.assets.checking (numbers, no owner)
+  //   • Array: S.assets.cash[] (entries with .balance + .owner per entry)
+  // The scalar form has no owner tag, so it's treated as self/personal. The
+  // array form's owner tag routes entries to the right bucket. Same for invest.
+  function _sumCashForOwner(b){
+    var total=0;
+    var assets=_rawSBase.assets||{};
+    if(Array.isArray(assets.cash)){
+      assets.cash.forEach(function(c){
+        if(!c)return;
+        var co=c.owner||'personal';
+        var bucketMatch=(b==='self'&&co!=='spouse'&&co!=='joint')
+                     || (b==='joint'&&co==='joint')
+                     || (b==='spouse'&&co==='spouse');
+        if(bucketMatch)total+=(parseFloat(c.balance)||0);
+      });
+    } else if(b==='self'){
+      // Legacy scalars are untagged → self bucket only
+      total+=parseFloat(assets.savings)||0;
+      total+=parseFloat(assets.checking)||0;
+    }
+    return total;
+  }
+  function _sumInvestForOwner(b){
+    var total=0;
+    var assets=_rawSBase.assets||{};
+    if(Array.isArray(assets.inv)){
+      assets.inv.forEach(function(i){
+        if(!i)return;
+        var io=i.owner||'personal';
+        var bucketMatch=(b==='self'&&io!=='spouse'&&io!=='joint')
+                     || (b==='joint'&&io==='joint')
+                     || (b==='spouse'&&io==='spouse');
+        if(bucketMatch)total+=(parseFloat(i.balance)||0);
+      });
+    } else if(b==='self'){
+      // Legacy scalar — untagged → self bucket
+      total+=parseFloat(assets.invest)||0;
+    }
+    return total;
+  }
   function _bucketSeed(b,isRet){
     var seed=0;
     if(b==='self'){
       seed+=( _rawSBase.retAccounts||[]).filter(function(r){return(r.owner||'personal')!=='spouse'&&(r.owner||'personal')!=='joint';}).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
       seed+=( _rawSBase.investments||[]).filter(function(i){return(i.owner||'personal')!=='spouse'&&(i.owner||'personal')!=='joint';}).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+      // Self-tagged taxable investments from assets.inv array (or legacy scalar)
+      seed+=_sumInvestForOwner('self');
       if(!isRet){
-        // Net worth view: include liquid + home equity for self
-        seed+=parseFloat((_rawSBase.assets||{}).savings)||0;
-        seed+=parseFloat((_rawSBase.assets||{}).checking)||0;
+        // Net worth view: include liquid (cash) + home equity for self
+        seed+=_sumCashForOwner('self');
         seed+=Math.max(0,_homeValue-_mortgageBal);
       }
     } else if(b==='spouse'&&CPLAN._partner){
       seed+=(CPLAN._partner.retAccounts||[]).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
       seed+=(CPLAN._partner.investments||[]).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+      if(!isRet){
+        // Spouse-tagged cash on the SHARED state (visible to current user's
+        // _rawSBase only in joint households where data is co-located). In
+        // hybrid/separate, partner cash lives in partner's own profile and is
+        // reachable via CPLAN._partner.assets when available.
+        seed+=_sumCashForOwner('spouse');
+        var pAssets=(CPLAN._partner&&CPLAN._partner.assets)||{};
+        if(Array.isArray(pAssets.cash)){
+          pAssets.cash.forEach(function(c){if(c)seed+=(parseFloat(c.balance)||0);});
+        } else {
+          seed+=parseFloat(pAssets.savings)||0;
+          seed+=parseFloat(pAssets.checking)||0;
+        }
+      }
     } else if(b==='joint'){
       seed+=( _rawSBase.retAccounts||[]).filter(function(r){return(r.owner||'')==='joint';}).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
       seed+=( _rawSBase.investments||[]).filter(function(i){return(i.owner||'')==='joint';}).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+      seed+=_sumInvestForOwner('joint');
+      if(!isRet){
+        seed+=_sumCashForOwner('joint');
+      }
     }
+    if(isNaN(seed))seed=0;// defensive — NaN poisoning would zero the whole baseline
     return seed;
+  }
+  // Per-bucket existing monthly contribution. The 'Do nothing' baseline isn't
+  // "stop contributing entirely" — it's "keep doing what you're already doing,
+  // just don't add anything from this plan." That includes the user's current
+  // 401(k) contribution + any employer match they're capturing. Spouse bucket
+  // does the same for spouse-side accounts. Joint bucket — no per-account
+  // ongoing contributions tracked yet (joint cash typically isn't "auto-funded"
+  // in the data model; if you want it to grow, the plan EF/savings card does it).
+  function _bucketCurrentContrib(b){
+    var monthly=0;
+    if(b==='self'){
+      (_rawSBase.retAccounts||[]).forEach(function(r){
+        if(!r)return;
+        var ro=r.owner||'personal';
+        if(ro==='spouse'||ro==='joint')return;
+        var c=parseFloat(r.contrib)||0;
+        if(c<=0){
+          // contribPct fallback — same logic as in _cpMatchExisting
+          var pct=parseFloat(r.contribPct)||0;
+          var inc=parseFloat(CPLAN.income)||0;
+          if(pct>0&&inc>0)c=inc*(pct/100);
+        }
+        monthly+=c;
+        // Employer match: dollar value of matchPct × income. The match dollars
+        // only flow in when the user contributes at least matchPct of their
+        // income; otherwise the match is partial / not captured.
+        var mPct=parseFloat(r.matchPct)||0;
+        if(mPct>0){
+          var inc2=parseFloat(CPLAN.income)||0;
+          var cPct=parseFloat(r.contribPct)||0;
+          if(cPct<=0&&c>0&&inc2>0)cPct=(c/inc2)*100;
+          // Capped at matchPct — match never exceeds the announced cap
+          var matchedPct=Math.min(cPct,mPct);
+          monthly+=inc2*(matchedPct/100);
+        }
+      });
+      (_rawSBase.investments||[]).forEach(function(i){
+        if(!i)return;
+        var io=i.owner||'personal';
+        if(io==='spouse'||io==='joint')return;
+        monthly+=parseFloat(i.monthlyContrib)||0;
+      });
+    } else if(b==='spouse'&&CPLAN._partner){
+      (CPLAN._partner.retAccounts||[]).forEach(function(r){
+        if(!r)return;
+        var c=parseFloat(r.contrib)||0;
+        if(c<=0){
+          var pct=parseFloat(r.contribPct)||0;
+          var inc=parseFloat(CPLAN._partner.income)||0;
+          if(pct>0&&inc>0)c=inc*(pct/100);
+        }
+        monthly+=c;
+        var mPct=parseFloat(r.matchPct)||0;
+        if(mPct>0){
+          var inc2=parseFloat(CPLAN._partner.income)||0;
+          var cPct=parseFloat(r.contribPct)||0;
+          if(cPct<=0&&c>0&&inc2>0)cPct=(c/inc2)*100;
+          var matchedPct=Math.min(cPct,mPct);
+          monthly+=inc2*(matchedPct/100);
+        }
+      });
+      (CPLAN._partner.investments||[]).forEach(function(i){
+        if(!i)return;
+        monthly+=parseFloat(i.monthlyContrib)||0;
+      });
+    }
+    if(isNaN(monthly))monthly=0;
+    return monthly;
   }
   var baselineSelfNW=[],baselineSpouseNW=[],baselineJointNW=[];
   var baselineSelfRet=[],baselineSpouseRet=[],baselineJointRet=[];
   var _seedSelfNW=_bucketSeed('self',false),_seedSpouseNW=_bucketSeed('spouse',false),_seedJointNW=_bucketSeed('joint',false);
   var _seedSelfRet=_bucketSeed('self',true),_seedSpouseRet=_bucketSeed('spouse',true),_seedJointRet=_bucketSeed('joint',true);
+  // Existing monthly contributions per bucket — projected forward in the
+  // baseline so 'Do nothing' actually represents the user's current trajectory.
+  var _contribSelf=_bucketCurrentContrib('self');
+  var _contribSpouse=_bucketCurrentContrib('spouse');
+  var _contribJoint=_bucketCurrentContrib('joint');
+  // Year-walk projection: each year, balance compounds at the bucket's growth
+  // rate AND receives 12 months of current contribution. The result reflects
+  // "keep doing exactly what you're doing today" — the honest 'Do nothing' line.
+  var _balSelfNW=_seedSelfNW,_balSpouseNW=_seedSpouseNW,_balJointNW=_seedJointNW;
+  var _balSelfRet=_seedSelfRet,_balSpouseRet=_seedSpouseRet,_balJointRet=_seedJointRet;
   for(var _byr=0;_byr<=years;_byr++){
-    baselineSelfNW.push(Math.round(_seedSelfNW*Math.pow(1+_baseRateNW,_byr)));
-    baselineSpouseNW.push(Math.round(_seedSpouseNW*Math.pow(1+_baseRateNW,_byr)));
-    baselineJointNW.push(Math.round(_seedJointNW*Math.pow(1+_baseRateNW,_byr)));
-    baselineSelfRet.push(Math.round(_seedSelfRet*Math.pow(1+_baseRateRet,_byr)));
-    baselineSpouseRet.push(Math.round(_seedSpouseRet*Math.pow(1+_baseRateRet,_byr)));
-    baselineJointRet.push(Math.round(_seedJointRet*Math.pow(1+_baseRateRet,_byr)));
+    if(_byr===0){
+      baselineSelfNW.push(Math.round(_balSelfNW));
+      baselineSpouseNW.push(Math.round(_balSpouseNW));
+      baselineJointNW.push(Math.round(_balJointNW));
+      baselineSelfRet.push(Math.round(_balSelfRet));
+      baselineSpouseRet.push(Math.round(_balSpouseRet));
+      baselineJointRet.push(Math.round(_balJointRet));
+    } else {
+      _balSelfNW=(_balSelfNW+_contribSelf*12)*(1+_baseRateNW);
+      _balSpouseNW=(_balSpouseNW+_contribSpouse*12)*(1+_baseRateNW);
+      _balJointNW=(_balJointNW+_contribJoint*12)*(1+_baseRateNW);
+      _balSelfRet=(_balSelfRet+_contribSelf*12)*(1+_baseRateRet);
+      _balSpouseRet=(_balSpouseRet+_contribSpouse*12)*(1+_baseRateRet);
+      _balJointRet=(_balJointRet+_contribJoint*12)*(1+_baseRateRet);
+      baselineSelfNW.push(Math.round(_balSelfNW));
+      baselineSpouseNW.push(Math.round(_balSpouseNW));
+      baselineJointNW.push(Math.round(_balJointNW));
+      baselineSelfRet.push(Math.round(_balSelfRet));
+      baselineSpouseRet.push(Math.round(_balSpouseRet));
+      baselineJointRet.push(Math.round(_balJointRet));
+    }
   }
 
   // ── 4. Calculate trajectory metrics for health score ──
@@ -36224,7 +36393,12 @@ function _cpRenderChart(targetId,bucket){
     var _bucketHasSeed=false;
     if(CPLAN._sim){
       var _baseArr=_isRetView?CPLAN._sim['baselineRet_'+bucket]:CPLAN._sim['baseline_'+bucket];
-      _bucketHasSeed=Array.isArray(_baseArr)&&_baseArr.length>0&&_baseArr[0]>0;
+      // A bucket has data if the baseline is non-zero at any point along the
+      // curve — either the seed (year 0) is positive (existing assets) OR the
+      // year-30 endpoint is positive (ongoing current contributions accumulate
+      // even when the starting balance is zero, e.g. a fresh 401k with no
+      // balance yet but $321/mo contribution running).
+      _bucketHasSeed=Array.isArray(_baseArr)&&_baseArr.length>0&&(_baseArr[0]>0||_baseArr[_baseArr.length-1]>0);
     }
     if(!_bucketHasAllocs&&!_bucketHasSeed){
       var _emptyHint=bucket==='self'
