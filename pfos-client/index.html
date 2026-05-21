@@ -4491,11 +4491,33 @@ async function loadClientDataIntoPFOS(clientId){
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
   // Small delay to let flush complete
   await new Promise(function(r){setTimeout(r,50);});
-  // Detect couple link for this client
+  // Detect couple link for this client. The in-memory APP_COUPLES list is only
+  // populated for advisors via loadCouples() (which uses APP.myClients — empty
+  // for logged-in clients). For client mode, do a direct DB lookup so the
+  // couple link is found regardless of which path led us here.
   var couple = getCoupleForClient(clientId);
+  if(!couple && APP.role==='client'){
+    try{
+      const { data: cl } = await db.from('couple_links').select('*')
+        .or('client_a_id.eq.'+clientId+',client_b_id.eq.'+clientId)
+        .limit(1).maybeSingle();
+      if(cl){
+        couple = cl;
+        // Populate APP_COUPLES so other helpers (getPartnerClientId, etc.) find it
+        if(!APP_COUPLES)APP_COUPLES=[];
+        if(!APP_COUPLES.find(function(c){return c.id===couple.id;}))APP_COUPLES.push(couple);
+      }
+    }catch(e){console.warn('Client couple lookup:',e);}
+  }
   var coupleData = null;
 
   if(couple){
+    // ── Stash for client-side reads ──
+    // Make sure APP._clientCoupleLink is set so the eager household-type
+    // detection in _cpEnsurePlanLoaded picks it up on the next render.
+    APP._clientCoupleLink = couple;
+    if(!APP_COUPLES)APP_COUPLES=[];
+    if(!APP_COUPLES.find(function(c){return c.id===couple.id;}))APP_COUPLES.push(couple);
     var partnerId   = getPartnerClientId(couple, clientId);
     var partnerName = getClientName(partnerId);
     var myName      = getClientName(clientId);
@@ -4596,15 +4618,42 @@ async function loadClientCoupleStatus(){
   if(!APP.currentClientId) return;
   var card = document.getElementById('clientCoupleCard');
   var infoEl = document.getElementById('clientCoupleInfo');
-  if(!card) return;
   try{
     // Load couple links for this client
     var clientId = APP.currentClientId;
     const { data: couples } = await db.from('couple_links').select('*')
       .or('client_a_id.eq.'+clientId+',client_b_id.eq.'+clientId)
       .limit(1).maybeSingle();
-    if(!couples){ card.style.display='none'; return; }
+    if(!couples){
+      APP._clientCoupleLink = null;
+      if(card) card.style.display='none';
+      return;
+    }
     var couple = couples;
+    // ── Store for global access ──
+    // Client portal doesn't populate APP_COUPLES via loadCouples (that path uses
+    // APP.myClients, which is the advisor's client list — empty for logged-in
+    // clients). Stash the couple link on APP so getCoupleForClient and other
+    // shared helpers can find it. This is the canonical client-side couple ref.
+    APP._clientCoupleLink = couple;
+    if(!APP_COUPLES)APP_COUPLES=[];
+    // Avoid duplicate entries on repeated calls
+    if(!APP_COUPLES.find(function(c){return c.id===couple.id;}))APP_COUPLES.push(couple);
+    // ── Refresh CPLAN household type immediately ──
+    // If CPLAN exists (plan page was already initialized) and was set to
+    // 'individual' because this couple data wasn't loaded yet, upgrade now and
+    // re-trigger plan hydration so partner sharing, joint cards, three-chart
+    // display, and "Make joint" buttons all activate without requiring a reload.
+    if(typeof CPLAN!=='undefined'){
+      if(CPLAN._householdType!==couple.household_type){
+        CPLAN._householdType=couple.household_type;
+        CPLAN._coupleLink=couple;
+        // Re-run plan ensure so the partner-load + shared-cards hydration fires
+        try{if(typeof _cpEnsurePlanLoaded==='function')_cpEnsurePlanLoaded();}catch(e){}
+        try{if(typeof _cpRenderPlanV2==='function'&&document.getElementById('cplanRoot'))_cpRenderPlanV2();}catch(e){}
+      }
+    }
+    if(!card) return;
     var partnerId = couple.client_a_id===clientId ? couple.client_b_id : couple.client_a_id;
     const { data: partner } = await db.from('clients').select('name,email').eq('id',partnerId).maybeSingle();
     var partnerName = partner ? (partner.name||partner.email||'Partner') : 'Partner';
@@ -20744,9 +20793,22 @@ function _cpEnsurePlanLoaded(){
   // on first paint rather than after the lazy partner load completes. The
   // partner profile data still loads asynchronously via _cpLoadPartnerForAI;
   // this just establishes the household type up-front.
+  //
+  // Lookup priority:
+  //   1. getCoupleForClient(currentClientId) — works for advisor-loaded data
+  //      where APP_COUPLES is populated via loadCouples()
+  //   2. APP._clientCoupleLink — populated for the client portal by
+  //      loadClientDataIntoPFOS (direct DB fetch) and loadClientCoupleStatus
+  //   3. Fallback to 'individual' if neither found
   try{
-    if(APP&&APP.currentClientId&&typeof getCoupleForClient==='function'){
-      var _earlyCouple=getCoupleForClient(APP.currentClientId);
+    if(APP&&APP.currentClientId){
+      var _earlyCouple=null;
+      if(typeof getCoupleForClient==='function'){
+        _earlyCouple=getCoupleForClient(APP.currentClientId);
+      }
+      if(!_earlyCouple&&APP._clientCoupleLink){
+        _earlyCouple=APP._clientCoupleLink;
+      }
       if(_earlyCouple&&_earlyCouple.household_type){
         CPLAN._householdType=_earlyCouple.household_type;
         CPLAN._coupleLink=_earlyCouple;
@@ -26730,14 +26792,24 @@ function _cpRenderPlanV2(){
   }catch(e){}
   if(!CPLAN.allocations.length&&!CPLAN.hasAdvisor){_cpRenderFork();return;}
   var h='';
-  // Sum of allocations representing THIS user's deployment. Partner-shared self
-  // cards (visible only for review/request) don't count — they're the partner's
-  // commitments. Joint cards DO count (this user contributes their amountSelf
-  // portion). To keep the existing single-number simple, we just sum a.amount
-  // for non-partner-owned cards. Per-spouse split refinement happens in the
-  // dual-slider math, not this top-line number.
+  // Sum of allocations representing THIS user's deployment. Three buckets:
+  //   • Partner-shared self cards (visible only for review/request) — don't
+  //     count. They're the partner's commitments.
+  //   • Joint cards in Hybrid households — count only THIS user's portion
+  //     (a.amountSelf), since the partner contributes a.amountSpouse from
+  //     their own surplus.
+  //   • Self-owned cards — count the full a.amount as before.
+  var _isHybridHH=(CPLAN._householdType==='hybrid');
   var allocated=CPLAN.allocations.reduce(function(t,a){
     if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return t;
+    if(_isHybridHH&&a.owner==='joint'){
+      // Use this user's portion of the joint contribution. Fall back to half
+      // the combined amount when amountSelf isn't set yet (newly-converted or
+      // pre-dual-slider data).
+      var selfPart=parseFloat(a.amountSelf);
+      if(isNaN(selfPart)||selfPart===0)selfPart=(parseFloat(a.amount)||0)/2;
+      return t+selfPart;
+    }
     return t+(parseFloat(a.amount)||0);
   },0);
   // Recurring static premiums on completed action-only items (life, disability, umbrella,
@@ -27850,8 +27922,19 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _curSpousePart=parseFloat(a.amountSpouse)||(parseFloat(a.amount)||0)/2;
     var _spouseName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
     var _jointMax=_sliderTotalMax;// Use overall slider max as ceiling for combined
+    // Can the current user unjoint this card? Only if they created/own it
+    // (no _sharedOwnerClientId set, OR it's set to themselves). Joint cards
+    // received from the partner via hydration have _sharedOwnerClientId === partnerId
+    // and shouldn't be unjointable by the receiver (the original creator
+    // should make that call from their side).
+    var _canUnjoint=!a._sharedOwnerClientId||a._sharedOwnerClientId===APP.currentClientId;
     h+='<div style="display:grid;grid-template-columns:1fr;gap:6px;margin:4px 0;padding:8px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:3px">';
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px">';
     h+='<div style="font-size:10px;color:rgba(34,197,94,.85);font-family:var(--fh);font-weight:700;letter-spacing:.1em;text-transform:uppercase">JOINT CARD — split contribution</div>';
+    if(_canUnjoint){
+      h+='<button onclick="_cpRevertFromJoint('+idx+')" title="Convert back to a personal card owned only by you" style="padding:3px 9px;font-family:var(--fh);font-size:10px;font-weight:700;background:transparent;border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:22px;letter-spacing:.04em">↶ Make personal</button>';
+    }
+    h+='</div>';
     // Your portion
     h+='<div style="display:flex;align-items:center;gap:8px">';
     h+='<div style="width:80px;font-size:11px;color:#5B9BFF;font-weight:700">You</div>';
@@ -27888,13 +27971,33 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='</div>';
   }
   }
-  // Share-with-spouse button: visible on self-owned cards in Hybrid households,
-  // not already shared. Initiates the sharing flow (sets sharedId, mirrors card
-  // into shared_plan_cards, grants partner access).
-  if(_hh==='hybrid'&&a.owner==='self'&&!a._sharedId&&!_renderDual&&!_renderRequest){
-    h+='<div style="margin-top:6px"><button onclick="_cpShareCardWithPartner('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:transparent;border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Share with spouse</button></div>';
-  } else if(_hh==='hybrid'&&a.owner==='self'&&a._sharedId&&!_renderDual&&!_renderRequest){
-    h+='<div style="margin-top:6px;font-size:11px;color:rgba(168,85,247,.7)">💑 Shared with your spouse</div>';
+  // Hybrid couples: two ownership controls available on self-owned cards.
+  //
+  // 1. "💑 Make joint" — converts the card to owner='joint' with co-ownership
+  //    and a dual slider. Only available for types where joint co-ownership is
+  //    legally and practically real (shared accounts, household goals).
+  // 2. "💑 Share with spouse" — keeps owner='self' but grants partner view or
+  //    edit access. Used when a card stays one-owner (insurance, retirement
+  //    accounts that are one-owner-per-IRS).
+  //
+  // The allowlist + excludelist below splits the two paths. Insurance, all
+  // tax-advantaged retirement accounts, HSA, protection, and annuity products
+  // are excluded from joint conversion because IRS rules require a single
+  // owner. EF, education, house, custom goals, taxable invest, and debt CAN
+  // be joint (joint savings, joint mortgage, joint debt, etc).
+  var _jointEligible={ef:1,edu:1,house:1,custom:1,invest:1,debt:1};
+  var _jointEligible_isType=_jointEligible[a.type]===1;
+  if(_hh==='hybrid'&&a.owner==='self'&&!_renderDual&&!_renderRequest){
+    h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">';
+    if(_jointEligible_isType){
+      h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Make joint</button>';
+    }
+    if(!a._sharedId){
+      h+='<button onclick="_cpShareCardWithPartner('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:transparent;border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Share with spouse</button>';
+    } else {
+      h+='<span style="font-size:11px;color:rgba(168,85,247,.7);align-self:center">💑 Shared with your spouse</span>';
+    }
+    h+='</div>';
   }
   // IRS note — skip for insurance products (no IRS contribution limit)
   var _isInsType=a.type==='iul'||a.type==='wl'||a.type==='ibc';
@@ -29892,22 +29995,14 @@ function _cpAddToPhase(type,phase){
 function _cpAddToPhaseInternal(type,phase,owner){
   owner=owner||'self';
   var t=0;if(type==='ef')t=Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal));
-  // Pre-fill amount for retirement types based on the user's existing
-  // contribution detected from their financial data. Without this, picking
-  // 401k from a chooser added a $0 card even when the user already
-  // contributes — they'd have to know their own current contribution and
-  // manually set the slider. _cpMatchExisting reads retAccts and returns the
-  // matched contribution if any.
+  // Allocation amount starts at $0. The user's existing real-world contribution
+  // is already surfaced separately in the card UI via _cpMatchExisting (the
+  // "Currently: $X/mo + Extra: $Y/mo = Total" line in _cpBuildCard). The
+  // a.amount slider represents the EXTRA on top of current contributions
+  // (see _cpMigrateAllocationsToExtras for the extras-semantics rationale),
+  // so pre-filling it with the current contribution would double-count.
+  // Existing balance is displayed in the card too — also via _cpMatchExisting.
   var startAmount=0;
-  var _retTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira'];
-  if(_retTypes.indexOf(type)>=0 && typeof _cpMatchExisting==='function'){
-    try{
-      var _match=_cpMatchExisting({type:type});
-      if(_match && _match.currentContrib > 0){
-        startAmount=Math.round(_match.currentContrib);
-      }
-    }catch(_eM){console.warn('Existing contrib detect:',_eM);}
-  }
   CPLAN.allocations.push({type:type,amount:startAmount,target:t,phase:phase,cascade:'',customName:type==='custom'?'My goal':'',owner:owner});
   var newIdx=CPLAN.allocations.length-1;
   // ── Cascade prompt resolution path ──
@@ -30468,7 +30563,17 @@ function _cpAvailableBudget(excludeIdx){
     // AI-emitted absorbers are NOT filtered out — their amount is a legitimate
     // pool draw the AI chose as the destination for freed minimums.
     if(a&&a._cascadeSpawned===true)return;
-    deployed+=(parseFloat(a.amount)||0);
+    // Joint cards in Hybrid: only THIS user's portion (amountSelf) consumes
+    // THIS user's surplus. The spouse's portion comes from spouse's own
+    // surplus. Without this, the user's available pool would double-count
+    // joint contributions, making other sliders artificially constrained.
+    if(CPLAN._householdType==='hybrid'&&a&&a.owner==='joint'){
+      var jSelf=parseFloat(a.amountSelf);
+      if(isNaN(jSelf)||jSelf===0)jSelf=(parseFloat(a.amount)||0)/2;
+      deployed+=jSelf;
+    } else {
+      deployed+=(parseFloat(a.amount)||0);
+    }
     // Policy-loan repayment competes for the same pool as the regular sliders.
     // Without this, dragging the IBC loan-repayment slider up doesn't shrink
     // other sliders' available budget — pool double-spends. (The IBC slider's
@@ -36734,6 +36839,123 @@ async function _cpShareCardWithPartner(i){
   if(ok){_cpToast('Shared with '+partnerName);}else{_cpToast('Share failed');}
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CONVERT TO JOINT — Hybrid couples
+// ─────────────────────────────────────────────────────────────────────────────
+// One-click conversion from owner='self' → owner='joint' for cards where joint
+// co-ownership is legally and practically real (EF, education, house, custom
+// goals, taxable invest, joint debt). Splits the existing amount 50/50 into
+// amountSelf/amountSpouse so the dual slider has a sensible starting point;
+// the spouses adjust from there.
+//
+// Drops the existing _sharedId (if any) so syncJointCards regenerates it with
+// the 'joint:' prefix. Removes any prior self-share grants/mirror entries
+// since the joint flow handles visibility through shared_plan_cards directly.
+async function _cpConvertToJoint(i){
+  var a=CPLAN.allocations[i];if(!a)return;
+  if(CPLAN._householdType!=='hybrid'){_cpToast('Joint cards require a Hybrid couple');return;}
+  if(a.owner!=='self'){_cpToast('This card is already joint or spouse-owned');return;}
+  // Type allowlist mirrors the UI gating so this is hard to misuse even if
+  // the button is somehow rendered on an excluded type.
+  var _jointEligible={ef:1,edu:1,house:1,custom:1,invest:1,debt:1};
+  if(!_jointEligible[a.type]){_cpToast('This card type can\'t be made joint');return;}
+  var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
+  var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
+  if(!confirm('Convert "'+cardName+'" to a joint card with '+partnerName+'?\n\nBoth of you will be co-owners with separate contribution amounts. The current amount will start split 50/50; you can adjust from there.\n\nThis writes to your shared couple record so '+partnerName+' will see the card on their plan.'))return;
+  // ── Mutate the local allocation to joint ──
+  var prevAmt=parseFloat(a.amount)||0;
+  a.owner='joint';
+  a.amountSelf=Math.round(prevAmt/2);
+  a.amountSpouse=prevAmt-a.amountSelf;// keeps total exactly == prevAmt
+  // If the card had been self-shared previously, clean up old grants on
+  // best-effort basis. The previous _sharedId used the 'self:' prefix; we drop
+  // it so syncJointCards regenerates with 'joint:' on next save.
+  var _oldSharedId=a._sharedId;
+  a._sharedId=null;
+  if(_oldSharedId&&_cpSharedCardsApi){
+    try{
+      var row=await _cpSharedCardsApi.fetchCoupleRow();
+      if(row){
+        var arr=Array.isArray(row.shared_plan_cards)?row.shared_plan_cards:[];
+        var grants=row.shared_card_grants||{};
+        // Remove the old self-share entry from shared_plan_cards
+        var newArr=arr.filter(function(c){return !(c&&c.sharedId===_oldSharedId);});
+        // Drop the grant
+        if(grants[_oldSharedId])delete grants[_oldSharedId];
+        await _cpSharedCardsApi.updateCouple({shared_plan_cards:newArr,shared_card_grants:grants});
+      }
+    }catch(e){console.warn('Old self-share cleanup:',e);}
+  }
+  _cpMarkModified();
+  // Re-render so the dual slider replaces the single one immediately
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  // Persist + sync the joint card to couple_links so the partner sees it.
+  // cplanSave already calls syncJointCards in its success branch for Hybrid.
+  if(typeof cplanSave==='function')cplanSave();
+  _cpToast('Converted to joint — '+partnerName+' will see this card');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REVERT JOINT → SELF — Hybrid couples
+// ─────────────────────────────────────────────────────────────────────────────
+// One-click conversion from owner='joint' back to owner='self'. Reverses what
+// _cpConvertToJoint did:
+//   • owner: 'joint' → 'self'
+//   • amount = amountSelf (the user keeps their portion; spouse's portion is
+//     released — the partner's view will see the card disappear because we
+//     remove it from shared_plan_cards)
+//   • amountSelf / amountSpouse → 0 (no longer relevant)
+//   • _sharedId dropped + shared_plan_cards entry removed so the partner's
+//     realtime fires and they no longer see the card on their plan
+//
+// Authority: only the user who originally created the joint card (or who has
+// no _sharedOwnerClientId tag because they created it directly) can unjoint.
+// Joint cards received via hydration (where _sharedOwnerClientId === partnerId)
+// are blocked — let the originator make that call.
+async function _cpRevertFromJoint(i){
+  var a=CPLAN.allocations[i];if(!a)return;
+  if(a.owner!=='joint'){_cpToast('This card isn\'t joint');return;}
+  if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId){
+    _cpToast('Only your spouse can unjoint this — they created it');
+    return;
+  }
+  var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
+  var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
+  var selfPart=parseFloat(a.amountSelf)||0;
+  var spousePart=parseFloat(a.amountSpouse)||0;
+  if(!confirm('Convert "'+cardName+'" back to a personal card?\n\n• You\'ll keep your portion ($'+fmt(selfPart)+'/mo)\n• '+partnerName+'\'s portion ($'+fmt(spousePart)+'/mo) will be released\n• '+partnerName+' will no longer see this card on their plan\n\nThey can add their own version if they still want to contribute separately.'))return;
+  // ── Mutate the local allocation back to self ──
+  a.owner='self';
+  a.amount=selfPart;// drop the spouse's portion; keep ONLY this user's
+  a.amountSelf=0;
+  a.amountSpouse=0;
+  var _oldSharedId=a._sharedId;
+  a._sharedId=null;
+  a._sharedOwnerClientId=null;
+  // Clean up the shared_plan_cards entry so the partner's realtime sees the
+  // card disappear from their view. Also clear any leftover grants/requests
+  // tied to this sharedId (defensive — joint cards usually don't have grants
+  // but the data path is identical).
+  if(_oldSharedId&&_cpSharedCardsApi){
+    try{
+      var row=await _cpSharedCardsApi.fetchCoupleRow();
+      if(row){
+        var arr=Array.isArray(row.shared_plan_cards)?row.shared_plan_cards:[];
+        var grants=row.shared_card_grants||{};
+        var pending=row.pending_change_requests||{};
+        var newArr=arr.filter(function(c){return !(c&&c.sharedId===_oldSharedId);});
+        if(grants[_oldSharedId])delete grants[_oldSharedId];
+        if(pending[_oldSharedId])delete pending[_oldSharedId];
+        await _cpSharedCardsApi.updateCouple({shared_plan_cards:newArr,shared_card_grants:grants,pending_change_requests:pending});
+      }
+    }catch(e){console.warn('Joint-revert cleanup:',e);}
+  }
+  _cpMarkModified();
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  if(typeof cplanSave==='function')cplanSave();
+  _cpToast('Reverted to personal — '+partnerName+'\'s view updated');
+}
+
 function _cpSlide(i,v){
   // Snapshot debt amounts BEFORE this slide so _cpSlideEnd can detect a
   // zero-crossing on any debt allocation (positive → 0 OR 0 → positive).
@@ -36950,10 +37172,70 @@ function _cpSetEFMonthsTarget(mo){
 }
 function _cpAdd(type){
   if(type!=='custom'&&CPLAN.allocations.some(function(a){return a.type===type;}))return;
+  // Hybrid couples: route through the owner picker so red-flag-spawned cards
+  // (EF, 401k, etc.) get the right owner tag at creation time. Skip the picker
+  // for action-only types and 'custom' (which use their own flow), and bail
+  // early if we're already mid-picker so we don't loop.
+  if(CPLAN._householdType==='hybrid'&&!CPLAN._addOwnerInFlight&&type!=='custom'){
+    // Use phase 0 (unassigned) since _cpAdd doesn't take a phase param —
+    // the existing _cpAdd flow doesn't set a phase. Owner picker passes
+    // through to _cpAddInternal so we preserve the rest of the behavior.
+    _cpShowAddOwnerPickerForAdd(type);
+    return;
+  }
+  // Clear in-flight flag if the picker set it
+  var _ownerForAdd=CPLAN._addOwnerChoice||'self';
+  CPLAN._addOwnerInFlight=false;
+  CPLAN._addOwnerChoice=null;
+  _cpAddInternal(type,_ownerForAdd);
+}
+
+// Owner picker for the _cpAdd path. Same modal pattern as _cpShowAddOwnerPicker
+// but routes back through _cpAdd (which uses _cpRender, not _cpRenderPlanV2).
+function _cpShowAddOwnerPickerForAdd(type){
+  CPLAN._addOwnerInFlight=true;
+  var spouseName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
+  var typeName=(CP_NM&&CP_NM[type])||type;
+  var m='<div id="ownerPickerOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px" onclick="if(event.target===this){this.remove();CPLAN._addOwnerInFlight=false;CPLAN._addOwnerChoice=null;}">';
+  m+='<div style="background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:24px;max-width:420px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.35)">';
+  m+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);margin-bottom:6px">Who is this '+esc(typeName)+' card for?</div>';
+  m+='<div style="font-size:13px;color:var(--mu);margin-bottom:16px">Choose ownership so it shows up in the right bucket on the projection charts and the partner can see (or not see) the card as appropriate.</div>';
+  m+='<button onclick="_cpFinishAddOwnerForAdd(\''+esc(type)+'\',\'self\')" style="display:block;width:100%;padding:12px 14px;margin-bottom:8px;text-align:left;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:4px;font-family:var(--fh);font-weight:700;font-size:13px;min-height:48px"><div>👤 Me</div><div style="font-size:11px;color:var(--mu);font-weight:400;margin-top:2px">Your card · only you see it · counts in your bucket</div></button>';
+  m+='<button onclick="_cpFinishAddOwnerForAdd(\''+esc(type)+'\',\'spouse\')" style="display:block;width:100%;padding:12px 14px;margin-bottom:8px;text-align:left;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:4px;font-family:var(--fh);font-weight:700;font-size:13px;min-height:48px"><div>👫 '+esc(spouseName)+'</div><div style="font-size:11px;color:var(--mu);font-weight:400;margin-top:2px">Tag as your spouse\'s · counts in their bucket on your charts</div></button>';
+  m+='<button onclick="_cpFinishAddOwnerForAdd(\''+esc(type)+'\',\'joint\')" style="display:block;width:100%;padding:12px 14px;margin-bottom:14px;text-align:left;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);color:var(--gr);cursor:pointer;border-radius:4px;font-family:var(--fh);font-weight:700;font-size:13px;min-height:48px"><div>💑 Joint</div><div style="font-size:11px;color:var(--mu);font-weight:400;margin-top:2px">Shared with '+esc(spouseName)+' · both contribute · auto-syncs to their plan</div></button>';
+  m+='<div style="text-align:right"><button onclick="document.getElementById(\'ownerPickerOverlay\').remove();CPLAN._addOwnerInFlight=false;CPLAN._addOwnerChoice=null" style="padding:8px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:3px;min-height:32px">Cancel</button></div>';
+  m+='</div></div>';
+  var prior=document.getElementById('ownerPickerOverlay');if(prior)prior.remove();
+  document.body.insertAdjacentHTML('beforeend',m);
+}
+
+function _cpFinishAddOwnerForAdd(type,owner){
+  var overlay=document.getElementById('ownerPickerOverlay');if(overlay)overlay.remove();
+  CPLAN._addOwnerChoice=owner;
+  _cpAdd(type);
+}
+
+// Internal add that takes an explicit owner. Also pre-fills retirement-vehicle
+// contribution amounts from existing real-world data so a red-flag-spawned
+// 401k card lands at the user's current contribution instead of $0. Same
+// pre-fill logic as _cpAddToPhaseInternal — kept in sync.
+function _cpAddInternal(type,owner){
+  owner=owner||'self';
   var t=0;if(type==='ef')t=Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal));if(type==='house')t=80000;
   var rp=(CPLAN.riskProfile||'moderate').toLowerCase();
   var eduVeh=type==='edu'?(rp==='conservative'?'wl':'529'):'';
-  CPLAN.allocations.push({type:type,amount:0,target:t,cascade:'',customName:type==='custom'?'My goal':'',eduVehicle:eduVeh});
+  // Allocation amount starts at $0. The user's existing real-world contribution
+  // is already surfaced separately in the card UI via _cpMatchExisting (the
+  // "Currently: $X/mo + Extra: $Y/mo = Total" line in _cpBuildCard). The
+  // a.amount slider represents the EXTRA on top of current contributions
+  // (see _cpMigrateAllocationsToExtras for the extras-semantics rationale),
+  // so pre-filling it with the current contribution would double-count.
+  // Existing balance is displayed in the card too — also via _cpMatchExisting.
+  // This covers ALL vehicles where _cpMatchExisting reads data: retirement
+  // accounts (401k/IRA family), brokerage (invest), HSA, education (529),
+  // insurance (IUL/WL/IBC), EF (savings/checking), and custom goals.
+  var startAmount=0;
+  CPLAN.allocations.push({type:type,amount:startAmount,target:t,cascade:'',customName:type==='custom'?'My goal':'',eduVehicle:eduVeh,owner:owner});
   var newIdx=CPLAN.allocations.length-1;
   // Cascade prompt resolution — same path as _cpAddToPhase
   if(typeof CPLAN._cascadePendingFor==='number'){
