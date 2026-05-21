@@ -1205,6 +1205,9 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
   #addMenuOverlay>div:last-child,#compareOverlay>div:last-child{max-width:100%!important;margin:10px!important;max-height:85vh!important}
   #cplanRoot input[type=range]::-webkit-slider-thumb{width:22px!important;height:22px!important}
   #cplanRoot [style*="grid-template-columns:repeat(3,1fr)"][style*="margin-bottom:10px"]{grid-template-columns:1fr!important;gap:6px!important}
+  /* Three-chart layout (Hybrid couples): stack vertically on narrow viewports
+     so each chart gets full width instead of being cramped side-by-side. */
+  #cplanRoot [style*="grid-template-columns:repeat(3,1fr);gap:10px"]{grid-template-columns:1fr!important;gap:8px!important}
   #clientTrackingContent button[style*="width:28px"]{width:36px!important;height:36px!important;font-size:14px!important}
 }
 @media(max-width:420px){
@@ -1297,7 +1300,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="sb-item" id="cnav-getadvisor" onclick="openFreeReviewRequest()" style="display:none"><span class="icon">🤝</span> Get an Advisor</div>
       <div class="sb-item" id="cnav-myadvisor" style="display:none;cursor:default;opacity:.7"><span class="icon">👤</span> <span id="myAdvisorLabel">My Advisor</span></div>
       <div class="sb-item" id="cnav-learn" onclick="showClientPage('learn')"><span class="icon">📚</span> Learn</div>
-      <div class="sb-section" id="secAdvisorResources" style="display:none;margin-top:8px">Advisor Resources</div>
+      <div class="sb-section" id="secAdvisorResources" style="margin-top:8px;display:none">Advisor Resources</div>
       <div class="sb-item" id="cnav-reports" onclick="showClientPage('reports')" style="display:none"><span class="icon">📄</span> My Reports</div>
       <div class="sb-item" id="cnav-messages" onclick="showClientPage('messages');loadClientMessages()" style="display:none"><span class="icon">💬</span> Messages <span id="msgBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:11px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
       <div class="sb-item" id="cnav-privacy" onclick="showClientPage('privacy')" style="display:none"><span class="icon">🔒</span> Privacy & Sharing</div>
@@ -4583,6 +4586,9 @@ async function loadClientDataIntoPFOS(clientId){
   _pfosDataLoaded=true;
   // Sync plan data to pfos-main iframe after plan initializes
   setTimeout(function(){_cpEnsurePlanLoaded();_syncPlanToMain();},500);
+  // Apply advisor-nav visibility based on this client's client_type
+  // (default markup hides advisor items; reveal them here if advisory)
+  if(typeof _cpUpdateAdvisoryNav==='function')_cpUpdateAdvisoryNav();
   // Load calculator tier access and send to iframe
   if(mode==='client'&&APP.currentClientId) loadCalcTiers(APP.currentClientId);
 }
@@ -4766,12 +4772,6 @@ async function loadClientPortalData(){
     item.addEventListener('click',function(){viewClientReport(this.dataset.reportId);});
   });
   }catch(e){ console.error('loadClientPortalData error:',e); }
-  // Apply advisor-resource sidebar gating now that APP.currentClient is set. Without this,
-  // the "Advisor Resources" section + items and the "My Situation Changed" button stay in
-  // their HTML default visibility state until the user navigates between pages (which is
-  // the only other thing that calls _cpUpdateAdvisoryNav). This caused product-tier clients
-  // to see advisor sidebar items on the Dashboard right after sign-in.
-  if(typeof _cpUpdateAdvisoryNav==='function')_cpUpdateAdvisoryNav();
   // Show satisfaction pulse after 30 seconds on the page
   setTimeout(function(){showSatisfactionPulse();},30000);
   // Check if client is part of a couple
@@ -20738,9 +20738,55 @@ async function resendPartnerInvite(partnerId,email){
 // ── PLAN AUTO-LOAD ───────────────────────────────────
 function _cpEnsurePlanLoaded(){
   if(typeof CPLAN==='undefined')return false;
+  // ── Eager household-type detection ───────────────────────────────────────
+  // Set CPLAN._householdType from the couple link BEFORE the first render so
+  // Hybrid-gated UI (dual sliders, share buttons, three charts, banners) fires
+  // on first paint rather than after the lazy partner load completes. The
+  // partner profile data still loads asynchronously via _cpLoadPartnerForAI;
+  // this just establishes the household type up-front.
+  try{
+    if(APP&&APP.currentClientId&&typeof getCoupleForClient==='function'){
+      var _earlyCouple=getCoupleForClient(APP.currentClientId);
+      if(_earlyCouple&&_earlyCouple.household_type){
+        CPLAN._householdType=_earlyCouple.household_type;
+        CPLAN._coupleLink=_earlyCouple;
+      } else {
+        CPLAN._householdType='individual';
+      }
+    }
+  }catch(_hh){console.warn('Early household type detect:',_hh);}
   if(CPLAN.allocations&&CPLAN.allocations.length&&CPLAN._sim)return true;
   var saved=APP._portalFd&&APP._portalFd.allocation_plan;
-  if(!saved||!saved.allocations||!saved.allocations.length)return false;
+  // ── Hybrid couples with no own plan ──
+  // A Hybrid spouse may not have generated their own plan yet, but if the
+  // partner has shared cards (joint or self-shared), we should still proceed
+  // — the partner hydration code below will populate CPLAN.allocations with
+  // shared cards so the user sees what the partner created. Returning early
+  // here would force the user to generate their own plan first, blocking
+  // visibility into shared work.
+  if(!saved||!saved.allocations||!saved.allocations.length){
+    if(CPLAN._householdType==='hybrid'){
+      // Initialize empty plan state so the eager partner load can populate it
+      if(!CPLAN.allocations)CPLAN.allocations=[];
+      // Still need basic financial profile data for the simulator and budget calc
+      var fd0=APP._portalFd;
+      if(fd0&&fd0.calcs){
+        CPLAN.income=fd0.calcs.inc||0;CPLAN.expenses=fd0.calcs.baseExp||0;
+        CPLAN.surplus=Math.max(0,(fd0.calcs.netCF||0));CPLAN.totalDebt=fd0.calcs.totalDebt||0;
+        CPLAN.age=fd0.age||parseInt((fd0.S||{}).age)||35;
+        CPLAN.debts=(fd0.S||{}).debts||[];
+        CPLAN.retirementAge=parseInt((fd0.S&&fd0.S.profile&&fd0.S.profile.retAge))||CPLAN.retirementAge||65;
+        CPLAN.retIncome=parseFloat((fd0.S&&fd0.S.profile&&fd0.S.profile.retIncome))||0;
+        CPLAN.spRetIncome=parseFloat((fd0.S&&fd0.S.profile&&fd0.S.profile.spRetIncome))||0;
+      }
+      // Continue into the partner-load + shared-cards hydration block below.
+      // After hydration completes, if allocations is still empty the user will
+      // simply see no shared cards (partner hasn't shared anything yet) and
+      // the normal "generate your plan" fork can show.
+    } else {
+      return false;
+    }
+  } else {
   // Legacy total-semantics → extras-semantics migration. No-op if the plan was
   // already saved under the new format. See _cpMigrateAllocationsToExtras.
   if(typeof _cpMigrateAllocationsToExtras==='function')_cpMigrateAllocationsToExtras(saved);
@@ -20791,15 +20837,159 @@ function _cpEnsurePlanLoaded(){
   if(typeof _cpLoadPartnerForAI==='function'&&!CPLAN._partnerForAILoaded){
     _cpLoadPartnerForAI().then(function(res){
       if(res&&res.partner){
-        try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
-        try{if(typeof _cpRenderChart==='function')_cpRenderChart();}catch(e){}
-        try{if(typeof _cpRenderHealthScore==='function')_cpRenderHealthScore();}catch(e){}
-        try{if(typeof _cpRenderEFRunway==='function')_cpRenderEFRunway();}catch(e){}
-        try{if(typeof _cpRenderIncomeReplacement==='function')_cpRenderIncomeReplacement();}catch(e){}
-        try{if(typeof _cpRenderOutcomes==='function')_cpRenderOutcomes();}catch(e){}
-        try{if(typeof _cpRenderStressTests==='function')_cpRenderStressTests();}catch(e){}
+        // Hybrid couples: hydrate shared cards from couple_links BEFORE re-running
+        // the sim so any joint cards owned by the partner appear in this user's
+        // plan. Joint cards from couple_links that aren't already in local
+        // allocations get inserted (Path B architecture: keep them in a separate
+        // _jointSharedCards array, plus expose to allocations via load only when
+        // not already represented by an a._sharedId match).
+        if(CPLAN._householdType==='hybrid'&&_cpSharedCardsApi){
+          _cpSharedCardsApi.loadForCurrentUser().then(function(sharedData){
+            if(sharedData){
+              CPLAN.partnerSharedCards=sharedData.partnerSharedCards||[];
+              CPLAN._jointSharedCards=sharedData.jointCards||[];
+              // Merge joint cards owned by the PARTNER into local allocations
+              // so this user can see them on their plan. Cards we already have
+              // (matching _sharedId) skip — the local copy is authoritative.
+              var existingIds={};
+              (CPLAN.allocations||[]).forEach(function(a){if(a._sharedId)existingIds[a._sharedId]=true;});
+              (sharedData.jointCards||[]).forEach(function(c){
+                if(!c||!c.sharedId||existingIds[c.sharedId])return;
+                if(c.ownerClientId===APP.currentClientId)return;// my own joint cards already in plan
+                CPLAN.allocations.push({
+                  type:c.type,owner:'joint',_sharedId:c.sharedId,
+                  _sharedOwnerClientId:c.ownerClientId||null,
+                  amount:parseFloat(c.amount)||0,
+                  amountSelf:parseFloat(c.amountSelf)||0,
+                  amountSpouse:parseFloat(c.amountSpouse)||0,
+                  target:parseFloat(c.target)||0,phase:parseInt(c.phase)||2,
+                  cascade:c.cascade||'',customName:c.customName||'',
+                  eduVehicle:c.eduVehicle||'',reason:c.reason||'',
+                  _ibcDebtStrategy:c._ibcDebtStrategy===true,
+                  _ibcUnderlyingType:c._ibcUnderlyingType||null,
+                  _state:c._state||'proposed',
+                  _policyNumber:c._policyNumber||null,
+                  _lockedPremium:c._lockedPremium||null
+                });
+                existingIds[c.sharedId]=true;
+              });
+              // ── Partner-shared self cards ──
+              // Cards the partner explicitly shared with me. Insert into local
+              // allocations so they're visible on this user's plan. They get a
+              // synthetic owner of 'spouse' (this user's perspective) and the
+              // _sharedOwnerClientId field set so _cpBuildCard renders them
+              // with the request-change UI rather than direct-edit UI.
+              (sharedData.partnerSharedCards||[]).forEach(function(c){
+                if(!c||!c.sharedId||existingIds[c.sharedId])return;
+                CPLAN.allocations.push({
+                  type:c.type,owner:'spouse',_sharedId:c.sharedId,
+                  _sharedOwnerClientId:c.ownerClientId||null,
+                  amount:parseFloat(c.amount)||0,
+                  amountSelf:0,amountSpouse:0,// not split for self-shared
+                  target:parseFloat(c.target)||0,phase:parseInt(c.phase)||2,
+                  cascade:c.cascade||'',customName:c.customName||'',
+                  eduVehicle:c.eduVehicle||'',reason:c.reason||'',
+                  _ibcDebtStrategy:c._ibcDebtStrategy===true,
+                  _ibcUnderlyingType:c._ibcUnderlyingType||null,
+                  _state:c._state||'proposed',
+                  _policyNumber:c._policyNumber||null,
+                  _lockedPremium:c._lockedPremium||null
+                });
+                existingIds[c.sharedId]=true;
+              });
+              // Check pending requests targeting THIS user (i.e., where I am the
+              // OWNER of the card whose change was requested by my partner).
+              try{_cpCheckPendingApprovals(sharedData.pendingRequests||{});}catch(e){console.warn('[shared] pending approval check:',e);}
+              // Subscribe to realtime so future cross-spouse edits flow in live
+              try{_cpSubscribeToShared();}catch(e){console.warn('[shared] subscribe failed:',e);}
+            }
+            try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
+            // Re-render the full plan (not just sub-components) so newly-merged
+            // shared cards become visible. _cpRenderPlanV2 internally re-runs
+            // sim + sub-renderers, so this single call refreshes everything.
+            try{if(typeof _cpRenderPlanV2==='function'&&document.getElementById('cplanRoot'))_cpRenderPlanV2();
+                else{
+                  if(typeof _cpRenderCharts==='function')_cpRenderCharts();else if(typeof _cpRenderChart==='function')_cpRenderChart();
+                  if(typeof _cpRenderHealthScore==='function')_cpRenderHealthScore();
+                  if(typeof _cpRenderEFRunway==='function')_cpRenderEFRunway();
+                  if(typeof _cpRenderIncomeReplacement==='function')_cpRenderIncomeReplacement();
+                  if(typeof _cpRenderOutcomes==='function')_cpRenderOutcomes();
+                  if(typeof _cpRenderStressTests==='function')_cpRenderStressTests();
+                }
+            }catch(e){}
+          }).catch(function(e){console.warn('Shared cards hydration failed:',e);});
+        } else {
+          try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
+          try{if(typeof _cpRenderCharts==='function')_cpRenderCharts();else if(typeof _cpRenderChart==='function')_cpRenderChart();}catch(e){}
+          try{if(typeof _cpRenderHealthScore==='function')_cpRenderHealthScore();}catch(e){}
+          try{if(typeof _cpRenderEFRunway==='function')_cpRenderEFRunway();}catch(e){}
+          try{if(typeof _cpRenderIncomeReplacement==='function')_cpRenderIncomeReplacement();}catch(e){}
+          try{if(typeof _cpRenderOutcomes==='function')_cpRenderOutcomes();}catch(e){}
+          try{if(typeof _cpRenderStressTests==='function')_cpRenderStressTests();}catch(e){}
+        }
       }
     }).catch(function(e){console.warn('Eager partner load failed:',e);});
+  }
+  }
+  // For Hybrid couples without their own plan, also kick off the partner-load
+  // hydration so shared cards can populate the empty plan. The block below
+  // duplicates the eager-load logic for the branch where we skipped past the
+  // saved-plan loading because there was no own plan to load.
+  if(CPLAN._householdType==='hybrid'&&(!CPLAN.allocations||CPLAN.allocations.length===0)){
+    if(typeof _cpLoadPartnerForAI==='function'&&!CPLAN._partnerForAILoaded){
+      _cpLoadPartnerForAI().then(function(res){
+        if(res&&res.partner&&_cpSharedCardsApi){
+          _cpSharedCardsApi.loadForCurrentUser().then(function(sharedData){
+            if(!sharedData)return;
+            CPLAN.partnerSharedCards=sharedData.partnerSharedCards||[];
+            CPLAN._jointSharedCards=sharedData.jointCards||[];
+            if(!CPLAN.allocations)CPLAN.allocations=[];
+            // Insert joint cards owned by the partner
+            (sharedData.jointCards||[]).forEach(function(c){
+              if(!c||!c.sharedId)return;
+              if(c.ownerClientId===APP.currentClientId)return;
+              CPLAN.allocations.push({
+                type:c.type,owner:'joint',_sharedId:c.sharedId,
+                _sharedOwnerClientId:c.ownerClientId||null,
+                amount:parseFloat(c.amount)||0,
+                amountSelf:parseFloat(c.amountSelf)||0,
+                amountSpouse:parseFloat(c.amountSpouse)||0,
+                target:parseFloat(c.target)||0,phase:parseInt(c.phase)||2,
+                cascade:c.cascade||'',customName:c.customName||'',
+                eduVehicle:c.eduVehicle||'',reason:c.reason||'',
+                _ibcDebtStrategy:c._ibcDebtStrategy===true,
+                _ibcUnderlyingType:c._ibcUnderlyingType||null,
+                _state:c._state||'proposed',
+                _policyNumber:c._policyNumber||null,
+                _lockedPremium:c._lockedPremium||null
+              });
+            });
+            // Insert partner-shared self cards
+            (sharedData.partnerSharedCards||[]).forEach(function(c){
+              if(!c||!c.sharedId)return;
+              CPLAN.allocations.push({
+                type:c.type,owner:'spouse',_sharedId:c.sharedId,
+                _sharedOwnerClientId:c.ownerClientId||null,
+                amount:parseFloat(c.amount)||0,
+                amountSelf:0,amountSpouse:0,
+                target:parseFloat(c.target)||0,phase:parseInt(c.phase)||2,
+                cascade:c.cascade||'',customName:c.customName||'',
+                eduVehicle:c.eduVehicle||'',reason:c.reason||'',
+                _ibcDebtStrategy:c._ibcDebtStrategy===true,
+                _ibcUnderlyingType:c._ibcUnderlyingType||null,
+                _state:c._state||'proposed',
+                _policyNumber:c._policyNumber||null,
+                _lockedPremium:c._lockedPremium||null
+              });
+            });
+            try{_cpCheckPendingApprovals(sharedData.pendingRequests||{});}catch(e){}
+            try{_cpSubscribeToShared();}catch(e){}
+            try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
+            try{if(typeof _cpRenderPlanV2==='function'&&document.getElementById('cplanRoot'))_cpRenderPlanV2();}catch(e){}
+          }).catch(function(e){console.warn('Shared-cards-only hydration failed:',e);});
+        }
+      }).catch(function(e){console.warn('Partner load failed (no-plan branch):',e);});
+    }
   }
   return CPLAN.allocations.length>0;
 }
@@ -21339,7 +21529,23 @@ function _mtConfirm(){
   var actual=parseFloat(document.getElementById('mtActual').value)||0;
   var note=document.getElementById('mtNote').value.trim();
   var mk=_trackKey();if(!_cpTracking[mk])_cpTracking[mk]={};
-  _cpTracking[mk][idx]={done:true,actual:actual,ts:Date.now(),note:note,source:'client'};
+  // For joint cards in Hybrid couples: tag which spouse logged this check-in
+  // so the partner's view shows attribution ("You logged $500" vs "Spouse logged $500").
+  // Non-joint cards: whoCheckedIn left undefined (single-owner attribution is implicit).
+  var _whoCheckedIn=(a.owner==='joint'&&CPLAN._householdType==='hybrid')?APP.currentClientId:null;
+  if(_whoCheckedIn){
+    // Joint card check-in: preserve any existing entry from the OTHER spouse so
+    // both spouses' contributions are tracked separately. The top-level done/
+    // actual fields aggregate across both for legacy reader compatibility.
+    var _prevJoint=_cpTracking[mk][idx]||{};
+    var _byOwner=_prevJoint.byOwner||{};
+    _byOwner[_whoCheckedIn]={done:true,actual:actual,ts:Date.now(),note:note};
+    var _aggActual=0,_aggDone=false;
+    Object.keys(_byOwner).forEach(function(cid){_aggActual+=parseFloat(_byOwner[cid].actual)||0;if(_byOwner[cid].done)_aggDone=true;});
+    _cpTracking[mk][idx]={done:_aggDone,actual:_aggActual,ts:Date.now(),note:note,source:'client',whoCheckedIn:_whoCheckedIn,byOwner:_byOwner};
+  } else {
+    _cpTracking[mk][idx]={done:true,actual:actual,ts:Date.now(),note:note,source:'client',whoCheckedIn:_whoCheckedIn};
+  }
   // Phase D: mirror this entry into CPLAN._checkIns so plan projections + the
   // accountability banner see it without requiring the user to also use the Phase B modal.
   // Status follows the partial/full convention: actual >= planned → 'on', else 'partial'.
@@ -21396,7 +21602,19 @@ function _trackMiss(idx){
   var a=CPLAN.allocations[idx];
   var mk=_trackKey();
   if(!_cpTracking[mk])_cpTracking[mk]={};
-  _cpTracking[mk][idx]={done:false,actual:0,ts:Date.now(),source:'client'};
+  var _whoCheckedIn=(a&&a.owner==='joint'&&CPLAN._householdType==='hybrid')?APP.currentClientId:null;
+  if(_whoCheckedIn){
+    var _prevJoint=_cpTracking[mk][idx]||{};
+    var _byOwner=_prevJoint.byOwner||{};
+    _byOwner[_whoCheckedIn]={done:false,actual:0,ts:Date.now()};
+    // Aggregate: 'done' stays true only if at least one spouse logged completion;
+    // miss for me doesn't undo my partner's completion. Aggregate actual sums.
+    var _aggActual=0,_aggDone=false;
+    Object.keys(_byOwner).forEach(function(cid){_aggActual+=parseFloat(_byOwner[cid].actual)||0;if(_byOwner[cid].done)_aggDone=true;});
+    _cpTracking[mk][idx]={done:_aggDone,actual:_aggActual,ts:Date.now(),source:'client',whoCheckedIn:_whoCheckedIn,byOwner:_byOwner};
+  } else {
+    _cpTracking[mk][idx]={done:false,actual:0,ts:Date.now(),source:'client',whoCheckedIn:_whoCheckedIn};
+  }
   CPLAN._missedMonths=CPLAN._missedMonths||{};
   if(!CPLAN._missedMonths[mk])CPLAN._missedMonths[mk]=[];
   if(CPLAN._missedMonths[mk].indexOf(idx)<0)CPLAN._missedMonths[mk].push(idx);
@@ -21488,6 +21706,11 @@ function renderClientPlanTracking(){
       }
     }
     else if(isMiss)h+='<div style="padding:8px 16px;background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.25);border-radius:4px;font-family:var(--fh);font-size:13px;font-weight:700;color:var(--rd)">✗ Missed</div>';
+    else if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint'){
+      // Partner-owned shared card — only the owner can log execution. Show a
+      // read-only indicator instead of action buttons.
+      h+='<div style="padding:6px 12px;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.2);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:#A855F7;letter-spacing:.04em">SPOUSE\'S</div>';
+    }
     else{h+='<div style="display:flex;flex-direction:column;gap:4px"><button onclick="_trackComplete('+idx+')" style="padding:8px 16px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:4px;font-family:var(--fh);font-size:13px;font-weight:700;color:var(--gr);cursor:pointer;min-height:34px;transition:.15s" onmouseover="this.style.background=\'rgba(34,197,94,.2)\'" onmouseout="this.style.background=\'rgba(34,197,94,.08)\'">✓ Done</button><button onclick="_trackMiss('+idx+')" style="padding:5px 16px;background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.12);border-radius:4px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--rd);cursor:pointer;opacity:.7;transition:.15s" onmouseover="this.style.opacity=\'1\'" onmouseout="this.style.opacity=\'.7\'">✗ Miss</button></div>';}
     h+='</div>';
   });
@@ -22717,7 +22940,7 @@ function _cpHelpPanelHtml(audience){
 
       h+='<div style="margin-bottom:18px">';
       h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Tools available to you</div>';
-      h+='<div style="font-size:13px;color:rgba(226,232,240,.78);line-height:1.7">Compare deployment scenarios, upload policy illustrations for AI audits, and surface allocation details for client conversations. Switch to <strong style="color:var(--wh)">Detailed</strong> to expose per-allocation growth and fee rates so you can model alternatives with the client live.</div></div>';
+      h+='<div style="font-size:13px;color:rgba(226,232,240,.78);line-height:1.7">Compare deployment scenarios, upload policy illustrations for AI audits. Switch to <strong style="color:var(--wh)">Detailed</strong> to expose per-allocation growth and fee rates so you can model alternatives with the client live.</div></div>';
     }
 
     // Common things-to-know (all modes)
@@ -22735,7 +22958,7 @@ function _cpHelpPanelHtml(audience){
     if(audience!=='ai'){
       h+='<div style="padding-top:14px;border-top:1px solid rgba(91,155,255,.12)">';
       h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:'+kncolor+';margin-bottom:8px">Need help?</div>';
-      if(audience==='agent')h+='<div style="font-size:13px;color:rgba(226,232,240,.78);line-height:1.7">If your client wants more context on a specific allocation, use the comparison tools or walk them through the projection chart to show the impact.</div>';
+      if(audience==='agent')h+='<div style="font-size:13px;color:rgba(226,232,240,.78);line-height:1.7">If your client wants more context on a specific allocation, use the comparison tools or the projection chart to show the impact.</div>';
       else if(audience==='advisory')h+='<div style="font-size:13px;color:rgba(226,232,240,.78);line-height:1.7">Your advisor is available — schedule a meeting from the page header if you want to discuss the plan in detail before responding.</div>';
       else h+='<div style="font-size:13px;color:rgba(226,232,240,.78);line-height:1.7">If after reading this it still feels like a lot, that\'s normal — financial planning has real complexity. You can request a free consultation with a licensed professional from the page header, and they\'ll build it with you.</div>';
       h+='</div>';
@@ -22927,10 +23150,6 @@ function _cpRenderFork(){
   h+='<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.5">Schedule a call with a licensed financial professional who will build your plan with you</div></div>';
   h+='<div style="color:rgba(34,197,94,.8);font-size:20px;flex-shrink:0">→</div></div></div>';
   h+='</div>';
-  // Red flag preview removed 2026-05-19 — the fork is purely for choosing how to build
-  // the plan (DIY / AI / consultation). Red flags surface inside the DIY builder and
-  // on the Analysis page; rendering them again on the fork was redundant and turned a
-  // clean three-card choice screen into a long scrolling page.
   root.innerHTML=h;
 }
 
@@ -23067,6 +23286,7 @@ function _cpStartSelfBuild(){
       phase:3,
       cascade:'',
       customName:displayName,
+      owner:p.owner||'self',
       reason:'Existing policy detected from your financial data. Current premium preset; adjust as needed.'
     });
   });
@@ -23234,7 +23454,7 @@ function _cpSyncFlagsToUnassigned(){
       'No long-term care planning':'Long-Term Care Review'
     };
     // Stage a new card with flag context + appropriate type/markers
-    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,reason:f.desc||''};
+    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:'self',reason:f.desc||''};
     // Allow disability-gap title which is dynamic ('Disability coverage gap: $X/mo')
     if(act==='protection'){
       var _customNm=_protectionTitleMap[f.title];
@@ -23831,6 +24051,12 @@ function _cpConfirmedAIGen(){
 // ── AI GENERATE (uses local logic for structure, can later add API for reasoning) ──
 // ── Convert AI recs to CPLAN allocations (reusable) ──
 function _cpConvertAIRecs(aiData){
+  // Preserve partner-shared cards before clearing — they belong to the partner
+  // and shouldn't be wiped by an AI regeneration. We splice them back in at the
+  // end so the user still sees what their spouse contributed.
+  var _preservedShared=(CPLAN.allocations||[]).filter(function(a){
+    return a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId;
+  });
   CPLAN.allocations=[];
   var brPct3=CPLAN._breathingPct||15;var pool=Math.round(CPLAN.surplus*(1-brPct3/100));
   var secMap={emergency_fund:{type:'ef',phase:1},debt:{type:'debt',phase:1},protection:{type:'protection',phase:1},retirement:{type:'roth',phase:3},investment:{type:'invest',phase:3},insurance:{type:'protection',phase:1},education:{type:'edu',phase:3},tax:{type:'invest',phase:4},estate:{type:'custom',phase:2},general:{type:'custom',phase:3}};
@@ -24650,6 +24876,12 @@ function _cpConvertAIRecs(aiData){
   // calls from sliders use default opts (allowScale=false) so individual edits
   // don't shift other sliders proportionally.
   try{_cpEnforce({allowScale:true});}catch(e){console.warn('Load-time enforce:',e);}
+  // Re-append partner-shared cards (preserved at the top of this function)
+  // so AI regeneration doesn't wipe visibility into what the spouse contributed.
+  // These are appended AFTER enforce so they don't get scaled like AI-emitted cards.
+  if(_preservedShared&&_preservedShared.length){
+    _preservedShared.forEach(function(a){CPLAN.allocations.push(a);});
+  }
 }
 
 // ── Select an approach from the 3 generated options ──
@@ -25310,6 +25542,13 @@ function _cpRetryApproach(key){
   // Phase D: forward partner data so AI can produce owner-tagged recs
   _cpLoadPartnerForAI().then(function(partnerInfo){
     if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
+    // Pass partner-shared cards (joint cards + cards partner shared with me)
+    // so the AI doesn't recommend duplicates of vehicles already in the
+    // household's combined plan.
+    if(CPLAN._householdType==='hybrid'){
+      var pSharedList=[].concat(CPLAN._jointSharedCards||[]).concat(CPLAN.partnerSharedCards||[]);
+      if(pSharedList.length)baseBody.partnerSharedCards=pSharedList.map(function(c){return{type:c.type,owner:c.owner,amount:c.amount,customName:c.customName||''};});
+    }
     if(!CPLAN._approachErrors)CPLAN._approachErrors={};
     delete CPLAN._approaches[key];// Set back to loading
     delete CPLAN._approachErrors[key];// Clear prior error if any
@@ -25335,6 +25574,486 @@ function _cpRetryApproach(key){
   });
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// SHARED CARDS API — Hybrid couple sharing + approval workflow
+// ════════════════════════════════════════════════════════════════════════════
+// Reads and writes the three couple_links jsonb columns added for couples:
+//   - shared_plan_cards: array of joint-bucket cards (single source of truth)
+//   - shared_card_grants: object keyed by sharedId, mapping to grant metadata
+//   - pending_change_requests: object keyed by sharedId, latest pending request
+//
+// Architecture notes (Path B):
+//   Joint cards live in shared_plan_cards. Self-shared cards stay on the owner's
+//   allocation_plan and are exposed to the partner via shared_card_grants. When a
+//   user loads, we merge cards-the-partner-shared-with-me into a SEPARATE in-
+//   memory array (CPLAN.partnerSharedCards) — never into CPLAN.allocations, to
+//   avoid polluting every owner-tagged consumer.
+//
+// sharedId conventions:
+//   - For joint cards created from CPLAN.allocations:  'joint:' + allocation_uuid
+//   - For self-shared cards:                            'self:' + allocation_uuid
+//   - Allocations gain a stable a._sharedId when first synced. Generated once,
+//     persisted on the allocation, never regenerated.
+var _cpSharedCardsApi={
+  // Ensure the current user's couple link is loaded.
+  _ensureCouple:function(){
+    if(!APP.currentClientId||typeof getCoupleForClient!=='function')return null;
+    return getCoupleForClient(APP.currentClientId);
+  },
+  // Generate a stable shared id for an allocation. Idempotent — returns existing
+  // a._sharedId if one is already set.
+  ensureSharedId:function(a,kind){
+    if(!a)return null;
+    if(a._sharedId)return a._sharedId;
+    var rnd=(typeof crypto!=='undefined'&&crypto.randomUUID)?crypto.randomUUID():(Date.now()+'-'+Math.random().toString(36).slice(2,10));
+    a._sharedId=(kind||'self')+':'+rnd;
+    return a._sharedId;
+  },
+  // Fetch the live couple_links row for this user (shared_plan_cards, grants, requests).
+  // Returns the raw row or null on failure.
+  fetchCoupleRow:async function(){
+    var couple=this._ensureCouple();
+    if(!couple)return null;
+    try{
+      var res=await db.from('couple_links').select('id,shared_plan_cards,shared_card_grants,pending_change_requests,updated_at').eq('id',couple.id).maybeSingle();
+      return (res&&res.data)||null;
+    }catch(e){console.warn('[shared] fetchCoupleRow failed:',e);return null;}
+  },
+  // Update specific fields on couple_links. fields is an object of column→value.
+  // Always bumps updated_at to NOW().
+  updateCouple:async function(fields){
+    var couple=this._ensureCouple();
+    if(!couple)return false;
+    fields=fields||{};
+    fields.updated_at=new Date().toISOString();
+    try{
+      var res=await db.from('couple_links').update(fields).eq('id',couple.id);
+      // Track most recent self-write to suppress realtime echoes
+      CPLAN._lastSelfSharedSaveAt=Date.now();
+      return !(res&&res.error);
+    }catch(e){console.warn('[shared] updateCouple failed:',e);return false;}
+  },
+  // Build a portable shared-card record from an allocation. Drops UI-only fields.
+  serializeCard:function(a,ownerClientId){
+    if(!a)return null;
+    return {
+      sharedId:a._sharedId,
+      ownerClientId:ownerClientId||null,
+      type:a.type,
+      owner:a.owner||'self',// the OWNER tag from the allocation (self/spouse/joint)
+      amount:parseFloat(a.amount)||0,
+      target:parseFloat(a.target)||0,
+      phase:parseInt(a.phase)||1,
+      cascade:a.cascade||'',
+      customName:a.customName||'',
+      eduVehicle:a.eduVehicle||'',
+      reason:a.reason||'',
+      _ibcDebtStrategy:a._ibcDebtStrategy===true,
+      _ibcUnderlyingType:a._ibcUnderlyingType||null,
+      _state:a._state||'proposed',
+      _policyNumber:a._policyNumber||null,
+      _lockedPremium:a._lockedPremium||null,
+      // For joint cards: each spouse's portion of the combined contribution.
+      // If absent (legacy data), treat the full amount as primary's portion.
+      amountSelf:parseFloat(a.amountSelf)||(a.owner==='joint'?(parseFloat(a.amount)||0)/2:0),
+      amountSpouse:parseFloat(a.amountSpouse)||(a.owner==='joint'?(parseFloat(a.amount)||0)/2:0),
+      updatedAt:new Date().toISOString()
+    };
+  },
+  // Sync the user's owner==='joint' allocations into shared_plan_cards.
+  // For each joint allocation: ensure sharedId, serialize, then upsert into the
+  // shared array by sharedId. Removes shared cards that no longer exist locally.
+  syncJointCards:async function(){
+    var couple=this._ensureCouple();
+    if(!couple)return false;
+    var row=await this.fetchCoupleRow();
+    if(!row)return false;
+    var existing=Array.isArray(row.shared_plan_cards)?row.shared_plan_cards:[];
+    // Build a map of existing by sharedId for upsert
+    var byId={};
+    existing.forEach(function(c){if(c&&c.sharedId)byId[c.sharedId]=c;});
+    // Walk local joint allocations, upserting each. Skip cards whose
+    // _sharedOwnerClientId points to the partner — those are joint cards we
+    // received via hydration; the partner manages them, not us. Re-syncing
+    // would corrupt the ownerClientId field on the shared row.
+    var localJointIds={};
+    var localJointAllocs=(CPLAN.allocations||[]).filter(function(a){
+      if(a.owner!=='joint')return false;
+      if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId)return false;
+      return true;
+    });
+    var self=this;
+    localJointAllocs.forEach(function(a){
+      var sid=self.ensureSharedId(a,'joint');
+      localJointIds[sid]=true;
+      byId[sid]=self.serializeCard(a,APP.currentClientId);
+    });
+    // Remove cards that this user owns (joint) but are no longer in local
+    // allocations (deleted). Preserve cards whose ownerClientId is the PARTNER
+    // — those are the partner's joint cards we don't manage.
+    Object.keys(byId).forEach(function(sid){
+      if(byId[sid]&&byId[sid].ownerClientId===APP.currentClientId&&!localJointIds[sid]){
+        delete byId[sid];
+      }
+    });
+    var newArr=Object.keys(byId).map(function(k){return byId[k];}).filter(Boolean);
+    return await this.updateCouple({shared_plan_cards:newArr});
+  },
+  // Read the partner's joint + self-shared cards out of couple_links.
+  // Returns {jointCards:[...], partnerSharedCards:[...]} or null.
+  loadForCurrentUser:async function(){
+    var row=await this.fetchCoupleRow();
+    if(!row)return null;
+    var arr=Array.isArray(row.shared_plan_cards)?row.shared_plan_cards:[];
+    var grants=row.shared_card_grants||{};
+    var jointCards=arr.filter(function(c){return c&&c.owner==='joint';});
+    // Self-shared: cards in shared_plan_cards whose owner is 'self'/'spouse' AND
+    // whose sharedId appears in grants with the current user as a grantee.
+    var partnerSharedCards=arr.filter(function(c){
+      if(!c||c.owner==='joint')return false;
+      var g=grants[c.sharedId];
+      if(!g||!Array.isArray(g.grantees))return false;
+      return g.grantees.indexOf(APP.currentClientId)>=0;
+    });
+    return {jointCards:jointCards,partnerSharedCards:partnerSharedCards,pendingRequests:row.pending_change_requests||{},rowUpdatedAt:row.updated_at};
+  },
+  // Submit a change request — non-owner edited a shared card. Stored on the
+  // couple_links row keyed by sharedId so only the latest pending request per
+  // card persists.
+  submitChangeRequest:async function(sharedId,cardName,cardType,oldAmount,newAmount){
+    var row=await this.fetchCoupleRow();
+    if(!row)return false;
+    var pending=row.pending_change_requests||{};
+    pending[sharedId]={
+      requesterId:APP.currentClientId,
+      sharedId:sharedId,
+      cardType:cardType,
+      cardName:cardName,
+      oldAmount:oldAmount,
+      newAmount:newAmount,
+      createdAt:new Date().toISOString()
+    };
+    return await this.updateCouple({pending_change_requests:pending});
+  },
+  // Approve a pending request: apply the new amount to the underlying card
+  // (in shared_plan_cards for joint or for self-shared owned by partner — note:
+  // the OWNER must apply this to their own allocation_plan, this helper only
+  // mutates the shared_plan_cards mirror). Then clear the pending entry.
+  approveChangeRequest:async function(sharedId){
+    var row=await this.fetchCoupleRow();
+    if(!row)return {ok:false};
+    var pending=row.pending_change_requests||{};
+    var req=pending[sharedId];
+    if(!req)return {ok:false};
+    var arr=Array.isArray(row.shared_plan_cards)?row.shared_plan_cards:[];
+    var newArr=arr.map(function(c){
+      if(c&&c.sharedId===sharedId){
+        c.amount=req.newAmount;
+        c.updatedAt=new Date().toISOString();
+      }
+      return c;
+    });
+    delete pending[sharedId];
+    var ok=await this.updateCouple({shared_plan_cards:newArr,pending_change_requests:pending});
+    return {ok:ok,request:req};
+  },
+  // Decline a pending request: just clear the entry. The requester's side will
+  // detect the missing pending entry on next realtime/refresh and snap back.
+  declineChangeRequest:async function(sharedId){
+    var row=await this.fetchCoupleRow();
+    if(!row)return {ok:false};
+    var pending=row.pending_change_requests||{};
+    var req=pending[sharedId];
+    if(!req)return {ok:false};
+    delete pending[sharedId];
+    var ok=await this.updateCouple({pending_change_requests:pending});
+    return {ok:ok,request:req};
+  },
+  // Grant a partner edit access to one of your self-owned cards.
+  // mode: 'view' (read-only) or 'edit' (can request changes).
+  grantShare:async function(sharedId,partnerClientId,mode){
+    var row=await this.fetchCoupleRow();
+    if(!row)return false;
+    var grants=row.shared_card_grants||{};
+    var g=grants[sharedId]||{grantees:[],mode:mode||'view',createdAt:new Date().toISOString()};
+    if(g.grantees.indexOf(partnerClientId)<0)g.grantees.push(partnerClientId);
+    g.mode=mode||g.mode||'view';
+    grants[sharedId]=g;
+    return await this.updateCouple({shared_card_grants:grants});
+  },
+  // Revoke a grant.
+  revokeShare:async function(sharedId,partnerClientId){
+    var row=await this.fetchCoupleRow();
+    if(!row)return false;
+    var grants=row.shared_card_grants||{};
+    var g=grants[sharedId];
+    if(!g)return true;
+    g.grantees=(g.grantees||[]).filter(function(id){return id!==partnerClientId;});
+    if(!g.grantees.length)delete grants[sharedId];
+    else grants[sharedId]=g;
+    return await this.updateCouple({shared_card_grants:grants});
+  },
+  // Subscribe to realtime changes on this couple's row. Calls handler({type,row}).
+  // Returns the channel for unsubscribe.
+  subscribe:function(handler){
+    var couple=this._ensureCouple();
+    if(!couple||!db||!db.channel)return null;
+    try{
+      var channel=db.channel('couple_link:'+couple.id).on('postgres_changes',{event:'UPDATE',schema:'public',table:'couple_links',filter:'id=eq.'+couple.id},function(payload){
+        // Echo suppression: if this update happened within 1.2s of our own
+        // write, skip — we already have the data we just wrote locally.
+        var lastSelf=CPLAN._lastSelfSharedSaveAt||0;
+        if(Date.now()-lastSelf<1200)return;
+        if(typeof handler==='function')handler({type:'update',row:payload.new});
+      }).subscribe();
+      return channel;
+    }catch(e){console.warn('[shared] subscribe failed:',e);return null;}
+  }
+};
+
+// ── Phase D: lazy-load partner data once for AI calls. Returns a promise. ──
+
+// ════════════════════════════════════════════════════════════════════════════
+// APPROVAL POPUP — Pending change request notifications
+// ════════════════════════════════════════════════════════════════════════════
+// Shown on first login (after shared cards hydration) when the partner has
+// proposed a change to a card this user owns. Modal with the card name, old
+// and new amount, and Approve / Decline buttons. Only the latest pending
+// request per card is shown (older are overwritten in storage).
+//
+// A request "targets this user" if the request is for a sharedId on a card
+// THIS USER owns (the requester is the partner). For joint cards, ownership is
+// shared — by default the primary (client_a) is the approver for joint cards
+// the secondary requested changes to, and vice versa. This convention prevents
+// circular approval flows.
+function _cpCheckPendingApprovals(pendingMap){
+  if(!pendingMap||!APP.currentClientId)return;
+  var couple=getCoupleForClient(APP.currentClientId);
+  if(!couple)return;
+  var partnerId=getPartnerClientId(couple,APP.currentClientId);
+  // Find requests where partner is the requester (not me) AND I am the owner
+  // of the target card. For joint cards, the "owner" approver is whichever
+  // spouse didn't make the request.
+  var targetsForMe=[];
+  Object.keys(pendingMap).forEach(function(sid){
+    var req=pendingMap[sid];
+    if(!req||req.requesterId===APP.currentClientId)return;
+    if(req.requesterId!==partnerId)return;
+    targetsForMe.push(req);
+  });
+  if(!targetsForMe.length)return;
+  // Sort newest first
+  targetsForMe.sort(function(a,b){return (b.createdAt||'').localeCompare(a.createdAt||'');});
+  // Show ONE modal at a time. If there's more than one pending, the user can
+  // approve/decline the first, and the next will appear on the next render.
+  // (Single-modal pattern avoids stacking visual clutter.)
+  _cpShowApprovalModal(targetsForMe[0]);
+}
+
+function _cpShowApprovalModal(req){
+  if(!req)return;
+  // Build modal
+  var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'Your spouse';
+  var cardName=req.cardName||(CP_NM&&CP_NM[req.cardType])||req.cardType||'a shared card';
+  var oldAmt=parseFloat(req.oldAmount)||0;
+  var newAmt=parseFloat(req.newAmount)||0;
+  var diff=newAmt-oldAmt;
+  var diffCol=diff>0?'var(--gr)':diff<0?'var(--rd)':'var(--mu)';
+  var m='<div id="approvalOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px">';
+  m+='<div style="background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:24px;max-width:480px;width:100%;max-height:80vh;overflow-y:auto;box-shadow:0 12px 40px rgba(0,0,0,.35)">';
+  m+='<div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">';
+  m+='<span style="font-size:24px">📋</span>';
+  m+='<div style="flex:1"><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh)">Plan change request</div>';
+  m+='<div style="font-size:12px;color:var(--mu);margin-top:2px">from '+esc(partnerName)+'</div></div>';
+  m+='</div>';
+  m+='<div style="padding:14px 16px;background:rgba(91,155,255,.05);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:14px">';
+  m+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.6">'+esc(partnerName)+' proposed changing <strong style="color:var(--wh)">'+esc(cardName)+'</strong>:</div>';
+  m+='<div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:10px">';
+  m+='<div style="text-align:center"><div style="font-size:11px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em;font-weight:700">From</div><div style="font-family:var(--fd);font-size:18px;color:var(--mu)">'+fmt(oldAmt)+'/mo</div></div>';
+  m+='<div style="font-size:18px;color:'+diffCol+'">→</div>';
+  m+='<div style="text-align:center"><div style="font-size:11px;color:'+diffCol+';text-transform:uppercase;letter-spacing:.06em;font-weight:700">To</div><div style="font-family:var(--fd);font-size:18px;color:'+diffCol+'">'+fmt(newAmt)+'/mo</div></div>';
+  m+='</div>';
+  if(diff!==0)m+='<div style="text-align:center;font-size:12px;color:'+diffCol+';margin-top:6px">'+(diff>0?'+':'')+fmt(diff)+'/mo</div>';
+  m+='</div>';
+  m+='<div style="display:flex;gap:10px;justify-content:flex-end">';
+  m+='<button onclick="_cpHandleApproval(\''+esc(req.sharedId)+'\',false)" style="padding:9px 18px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:var(--rd);cursor:pointer;border-radius:4px;min-height:38px">Decline</button>';
+  m+='<button onclick="_cpHandleApproval(\''+esc(req.sharedId)+'\',true)" style="padding:9px 18px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:var(--gr);cursor:pointer;border-radius:4px;min-height:38px">Approve</button>';
+  m+='</div></div></div>';
+  // Remove any prior modal first
+  var prior=document.getElementById('approvalOverlay');if(prior)prior.remove();
+  document.body.insertAdjacentHTML('beforeend',m);
+}
+
+async function _cpHandleApproval(sharedId,approve){
+  var overlay=document.getElementById('approvalOverlay');if(overlay)overlay.remove();
+  if(!sharedId||!_cpSharedCardsApi)return;
+  try{
+    var result=approve?
+      await _cpSharedCardsApi.approveChangeRequest(sharedId):
+      await _cpSharedCardsApi.declineChangeRequest(sharedId);
+    if(result&&result.ok){
+      if(approve&&result.request){
+        // Apply the new amount to the local allocation matching this sharedId
+        // so the change appears immediately in the plan view.
+        var a=(CPLAN.allocations||[]).find(function(x){return x._sharedId===sharedId;});
+        if(a){
+          a.amount=parseFloat(result.request.newAmount)||0;
+          // Re-render so the slider and projections reflect the new value
+          try{if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();}catch(e){}
+        }
+        _cpToast('Change approved');
+      } else {
+        _cpToast('Change declined');
+      }
+    }
+  }catch(e){console.warn('approval handle failed:',e);_cpToast('Action failed');}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// REALTIME SUBSCRIPTION — cross-spouse sync
+// ════════════════════════════════════════════════════════════════════════════
+// Subscribes to UPDATE events on this user's couple_links row. When the partner
+// edits a joint card or sends a change request, this fires and refreshes the
+// in-memory shared state. Echo-suppressed against our own writes (1.2s window
+// after _lastSelfSharedSaveAt).
+function _cpSubscribeToShared(){
+  if(CPLAN._sharedRealtimeChannel)return;// already subscribed
+  if(!_cpSharedCardsApi)return;
+  var ch=_cpSharedCardsApi.subscribe(function(evt){
+    if(!evt||!evt.row)return;
+    var row=evt.row;
+    var couple=getCoupleForClient(APP.currentClientId);
+    if(!couple)return;
+    var partnerId=getPartnerClientId(couple,APP.currentClientId);
+    var arr=Array.isArray(row.shared_plan_cards)?row.shared_plan_cards:[];
+    var grants=row.shared_card_grants||{};
+    var pending=row.pending_change_requests||{};
+    // Sync joint cards: detect partner-owned joint cards updated since our snapshot
+    var jointCards=arr.filter(function(c){return c&&c.owner==='joint';});
+    var partnerSharedCards=arr.filter(function(c){
+      if(!c||c.owner==='joint')return false;
+      var g=grants[c.sharedId];
+      if(!g||!Array.isArray(g.grantees))return false;
+      return g.grantees.indexOf(APP.currentClientId)>=0;
+    });
+    var changed=false;
+    var inserted=false;
+    jointCards.forEach(function(c){
+      if(!c.sharedId)return;
+      var localAlloc=(CPLAN.allocations||[]).find(function(a){return a._sharedId===c.sharedId;});
+      if(localAlloc){
+        var localAmt=parseFloat(localAlloc.amount)||0;
+        var newAmt=parseFloat(c.amount)||0;
+        if(Math.abs(localAmt-newAmt)>0.01){
+          localAlloc.amount=newAmt;
+          localAlloc.amountSelf=parseFloat(c.amountSelf)||0;
+          localAlloc.amountSpouse=parseFloat(c.amountSpouse)||0;
+          changed=true;
+        }
+      } else if(c.ownerClientId&&c.ownerClientId!==APP.currentClientId){
+        // NEW joint card created by the partner — insert into local allocations
+        // so it shows up on this user's view without requiring a manual reload.
+        if(!CPLAN.allocations)CPLAN.allocations=[];
+        CPLAN.allocations.push({
+          type:c.type,owner:'joint',_sharedId:c.sharedId,
+          _sharedOwnerClientId:c.ownerClientId||null,
+          amount:parseFloat(c.amount)||0,
+          amountSelf:parseFloat(c.amountSelf)||0,
+          amountSpouse:parseFloat(c.amountSpouse)||0,
+          target:parseFloat(c.target)||0,phase:parseInt(c.phase)||2,
+          cascade:c.cascade||'',customName:c.customName||'',
+          eduVehicle:c.eduVehicle||'',reason:c.reason||'',
+          _ibcDebtStrategy:c._ibcDebtStrategy===true,
+          _ibcUnderlyingType:c._ibcUnderlyingType||null,
+          _state:c._state||'proposed',
+          _policyNumber:c._policyNumber||null,
+          _lockedPremium:c._lockedPremium||null
+        });
+        inserted=true;
+      }
+    });
+    // Partner-shared self cards: patch existing amount OR insert if new.
+    partnerSharedCards.forEach(function(c){
+      if(!c.sharedId)return;
+      var localAlloc=(CPLAN.allocations||[]).find(function(a){return a._sharedId===c.sharedId;});
+      if(localAlloc){
+        var localAmt=parseFloat(localAlloc.amount)||0;
+        var newAmt=parseFloat(c.amount)||0;
+        if(Math.abs(localAmt-newAmt)>0.01){
+          localAlloc.amount=newAmt;
+          changed=true;
+        }
+      } else {
+        // NEW self-shared card from partner — insert as spouse-owned allocation
+        if(!CPLAN.allocations)CPLAN.allocations=[];
+        CPLAN.allocations.push({
+          type:c.type,owner:'spouse',_sharedId:c.sharedId,
+          _sharedOwnerClientId:c.ownerClientId||null,
+          amount:parseFloat(c.amount)||0,
+          amountSelf:0,amountSpouse:0,
+          target:parseFloat(c.target)||0,phase:parseInt(c.phase)||2,
+          cascade:c.cascade||'',customName:c.customName||'',
+          eduVehicle:c.eduVehicle||'',reason:c.reason||'',
+          _ibcDebtStrategy:c._ibcDebtStrategy===true,
+          _ibcUnderlyingType:c._ibcUnderlyingType||null,
+          _state:c._state||'proposed',
+          _policyNumber:c._policyNumber||null,
+          _lockedPremium:c._lockedPremium||null
+        });
+        inserted=true;
+      }
+    });
+    // Also detect REMOVED shared cards — partner deleted a joint or unshared
+    // a self card. Remove the local copy too.
+    var validSharedIds={};
+    jointCards.forEach(function(c){if(c&&c.sharedId)validSharedIds[c.sharedId]=true;});
+    partnerSharedCards.forEach(function(c){if(c&&c.sharedId)validSharedIds[c.sharedId]=true;});
+    var beforeLen=CPLAN.allocations?CPLAN.allocations.length:0;
+    if(CPLAN.allocations){
+      CPLAN.allocations=CPLAN.allocations.filter(function(a){
+        // Only remove cards we know are partner-managed AND no longer in the shared set
+        if(!a._sharedId)return true;
+        if(!a._sharedOwnerClientId||a._sharedOwnerClientId===APP.currentClientId)return true;
+        if(validSharedIds[a._sharedId])return true;
+        return false;
+      });
+      if(CPLAN.allocations.length<beforeLen)inserted=true;
+    }
+    CPLAN.partnerSharedCards=partnerSharedCards;
+    CPLAN._jointSharedCards=jointCards;
+    if(changed||inserted){
+      // Show notification banner
+      CPLAN._partnerUpdatedBanner={at:Date.now()};
+      try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
+      try{if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();}catch(e){}
+    }
+    // Check pending requests targeting me (partner sent a new one)
+    try{_cpCheckPendingApprovals(pending);}catch(e){}
+    // Detect decisions on MY outstanding requests. If I sent a request
+    // (tracked in CPLAN._myOutstandingRequests) and it's no longer in pending,
+    // the partner has decided. We can tell approve vs decline by whether the
+    // shared card's amount matches what I requested (approve) or not (decline).
+    if(CPLAN._myOutstandingRequests){
+      Object.keys(CPLAN._myOutstandingRequests).forEach(function(sid){
+        if(pending[sid])return;// still pending
+        var mine=CPLAN._myOutstandingRequests[sid];
+        // Look up the shared card to see if my requested amount was applied
+        var card=arr.find(function(c){return c&&c.sharedId===sid;});
+        if(card){
+          var newAmt=parseFloat(card.amount)||0;
+          if(Math.abs(newAmt-(mine.newAmount||0))<0.01){
+            _cpToast('Your request for '+mine.cardName+' was approved');
+          } else {
+            _cpToast('Your request for '+mine.cardName+' was declined');
+          }
+        }
+        delete CPLAN._myOutstandingRequests[sid];
+      });
+    }
+  });
+  if(ch)CPLAN._sharedRealtimeChannel=ch;
+}
+
 // ── Phase D: lazy-load partner data once for AI calls. Returns a promise. ──
 async function _cpLoadPartnerForAI(){
   if(CPLAN._partnerForAILoaded)return CPLAN._partnerForAICache||null;
@@ -25351,47 +26070,112 @@ async function _cpLoadPartnerForAI(){
     if(!partnerId)return null;
     var pNameRes=await db.from('clients').select('name').eq('id',partnerId).maybeSingle();
     var pName=(pNameRes&&pNameRes.data&&pNameRes.data.name)||'Partner';
-    var pProfRes=await db.from('client_profiles').select('financial_data,allocation_plan').eq('client_id',partnerId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    var pFd=(pProfRes&&pProfRes.data&&pProfRes.data.financial_data)||{};
-    var pCalcs=pFd.calcs||(pFd.S&&pFd.S.calcs)||{};
-    var pRawS=pFd.S||{};
-    var pProfile=pRawS.profile||{};
-    var pInc=pCalcs.inc||pCalcs.income||(pRawS.incomeSources?pRawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0):0);
-    // Gross income for IRS phase-outs / tax bracket / employer-match calcs in the
-    // edge function. Computed by partner's own calc() via _estimateGrossFromNet and
-    // stored as pCalcs.incGross. Falls back to take-home for old saved profiles.
-    var pIncGross=pCalcs.incGross||pCalcs.inc||pInc;
-    var pExp=pCalcs.baseExp||pCalcs.expenses||0;
-    if(!pExp&&pRawS.expData)Object.keys(pRawS.expData).forEach(function(k){pExp+=(parseFloat((pRawS.expData[k]||{}).amount)||0);});
-    var pPlan=(pProfRes&&pProfRes.data&&pProfRes.data.allocation_plan)||{};
-    var partner={
-      clientId:partnerId,
-      name:pName,
-      firstName:(pName||'Partner').split(' ')[0],
-      age:parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35,
-      // Phase D multi-partner: retirement age + SS benefit from partner's own profile.
-      // Defaults to 65 if not set so projections stay valid. Reads from partner's S.profile.retAge.
-      retirementAge:parseInt(pProfile.retAge)||65,
-      ssBenefit:parseFloat(pProfile.ssBenefit)||0,
-      retirementIncome:parseFloat(pProfile.retIncome)||0,
-      income:pInc,
-      incomeGross:pIncGross,
-      expenses:pExp,
-      surplus:Math.max(0,pInc-pExp),
-      employer:pRawS.employer||pProfile.employer||'',
-      employmentType:pProfile.employmentType||'',
-      healthStatus:pProfile.healthStatus||'',
-      creditScore:pProfile.creditScore||null,
-      taxFilingStatus:pProfile.taxFilingStatus||'',
-      retAccounts:pRawS.retAccounts||pFd.retAccounts||[],
-      investments:pRawS.investments||pFd.investments||[],
-      debts:pRawS.debts||[],
-      policies:pRawS.policies||pRawS.insurancePolicies||[],
-      children:pRawS.children||pFd.children||[],
-      incomeSources:pRawS.incomeSources||pFd.incomeSources||[],
-      assets:pRawS.assets||pFd.assets||{},
-      currentAllocations:(pPlan.allocations||[]).slice()
-    };
+    var partner=null;
+    var pPlan={};
+
+    if(householdType==='joint'){
+      // Joint households share ONE client_profiles row on client_a_id. The partner
+      // has no profile row of their own — querying WHERE client_id=partnerId returns
+      // nothing, producing default-everything (age 35, retirementAge 65, empty arrays).
+      // Instead: read from the SHARED profile (already in APP._portalFd because the
+      // load path routes Joint to client_a) and pull the partner's fields from the
+      // spouse-prefixed columns on profile (spCurrentAge, spRetAge, spIncome, spRetIncome,
+      // spouseEmploymentType) and the owner='spouse' subset of shared arrays
+      // (retAccounts, policies, incomeSources, investments, debts).
+      var sharedFd=(APP._portalFd)||{};
+      var sharedRawS=sharedFd.S||{};
+      var sharedProfile=sharedRawS.profile||{};
+      var pAge=parseInt(sharedProfile.spCurrentAge)||parseInt(sharedProfile.spAge)||35;
+      var pRetAge=parseInt(sharedProfile.spRetAge)||65;
+      var pSsBenefit=parseFloat(sharedProfile.spSsBenefit)||0;
+      var pRetIncome=parseFloat(sharedProfile.spRetIncome)||0;
+      // Income split: in Joint households the spouse's income is recorded on
+      // incomeSources entries with owner==='spouse'. Sum those for spouse take-home.
+      var spIncomeSources=(sharedRawS.incomeSources||[]).filter(function(s){return(s.owner||'')==='spouse';});
+      var pInc=spIncomeSources.reduce(function(t,s){return t+(typeof _incSrcMonthlyTakeHome==='function'?_incSrcMonthlyTakeHome(s):(parseFloat(s.net)||0));},0);
+      if(!pInc)pInc=parseFloat(sharedProfile.spIncome)||0;
+      var pIncGross=spIncomeSources.reduce(function(t,s){return t+(parseFloat(s.gross)||0);},0)||pInc;
+      // Expenses on joint share with primary — partner-only expense subset is not
+      // typically separated in joint mode, so leave expenses at 0 and let surplus
+      // reflect just income (caller can derive household expenses elsewhere).
+      var pExp=0;
+      // Per-owner subsets of joint arrays
+      var pRetAccts=(sharedRawS.retAccounts||[]).filter(function(r){return(r.owner||'')==='spouse';});
+      var pInvestments=(sharedRawS.investments||[]).filter(function(i){return(i.owner||'')==='spouse';});
+      var pPolicies=((sharedRawS.policies||sharedRawS.insurancePolicies)||[]).filter(function(p){return(p.owner||'')==='spouse';});
+      // Joint plan stored on client_a's profile — same allocation_plan
+      pPlan=sharedFd.allocation_plan||{};
+      partner={
+        clientId:partnerId,
+        name:pName,
+        firstName:(pName||'Partner').split(' ')[0],
+        age:pAge,
+        retirementAge:pRetAge,
+        ssBenefit:pSsBenefit,
+        retirementIncome:pRetIncome,
+        income:pInc,
+        incomeGross:pIncGross,
+        expenses:pExp,
+        surplus:Math.max(0,pInc-pExp),
+        employer:sharedProfile.spEmployer||'',
+        employmentType:sharedProfile.spouseEmploymentType||sharedProfile.spEmploymentType||'',
+        healthStatus:sharedProfile.spHealthStatus||'',
+        creditScore:sharedProfile.spCreditScore||null,
+        taxFilingStatus:sharedProfile.taxFilingStatus||'',
+        retAccounts:pRetAccts,
+        investments:pInvestments,
+        debts:[],// debts not owner-tagged in current data model — keep empty for now
+        policies:pPolicies,
+        children:sharedRawS.children||[],// shared in joint
+        incomeSources:spIncomeSources,
+        assets:{},// shared assets in joint — treated as primary's
+        currentAllocations:(pPlan.allocations||[]).slice()
+      };
+    } else {
+      // Hybrid / Separate: partner has their own client_profiles row. Query it.
+      var pProfRes=await db.from('client_profiles').select('financial_data,allocation_plan').eq('client_id',partnerId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var pFd=(pProfRes&&pProfRes.data&&pProfRes.data.financial_data)||{};
+      var pCalcs=pFd.calcs||(pFd.S&&pFd.S.calcs)||{};
+      var pRawS=pFd.S||{};
+      var pProfile=pRawS.profile||{};
+      var pInc=pCalcs.inc||pCalcs.income||(pRawS.incomeSources?pRawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0):0);
+      // Gross income for IRS phase-outs / tax bracket / employer-match calcs in the
+      // edge function. Computed by partner's own calc() via _estimateGrossFromNet and
+      // stored as pCalcs.incGross. Falls back to take-home for old saved profiles.
+      var pIncGross=pCalcs.incGross||pCalcs.inc||pInc;
+      var pExp=pCalcs.baseExp||pCalcs.expenses||0;
+      if(!pExp&&pRawS.expData)Object.keys(pRawS.expData).forEach(function(k){pExp+=(parseFloat((pRawS.expData[k]||{}).amount)||0);});
+      pPlan=(pProfRes&&pProfRes.data&&pProfRes.data.allocation_plan)||{};
+      partner={
+        clientId:partnerId,
+        name:pName,
+        firstName:(pName||'Partner').split(' ')[0],
+        age:parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35,
+        // Phase D multi-partner: retirement age + SS benefit from partner's own profile.
+        // Defaults to 65 if not set so projections stay valid. Reads from partner's S.profile.retAge.
+        retirementAge:parseInt(pProfile.retAge)||65,
+        ssBenefit:parseFloat(pProfile.ssBenefit)||0,
+        retirementIncome:parseFloat(pProfile.retIncome)||0,
+        income:pInc,
+        incomeGross:pIncGross,
+        expenses:pExp,
+        surplus:Math.max(0,pInc-pExp),
+        employer:pRawS.employer||pProfile.employer||'',
+        employmentType:pProfile.employmentType||'',
+        healthStatus:pProfile.healthStatus||'',
+        creditScore:pProfile.creditScore||null,
+        taxFilingStatus:pProfile.taxFilingStatus||'',
+        retAccounts:pRawS.retAccounts||pFd.retAccounts||[],
+        investments:pRawS.investments||pFd.investments||[],
+        debts:pRawS.debts||[],
+        policies:pRawS.policies||pRawS.insurancePolicies||[],
+        children:pRawS.children||pFd.children||[],
+        incomeSources:pRawS.incomeSources||pFd.incomeSources||[],
+        assets:pRawS.assets||pFd.assets||{},
+        currentAllocations:(pPlan.allocations||[]).slice()
+      };
+    }
+
     // Cache the partner for use by both _cpRender and AI calls
     CPLAN._partner=partner;
     CPLAN._householdType=householdType;
@@ -25415,6 +26199,13 @@ function _cpDoAIGenerate(){
   // Phase D: forward partner data so AI can produce owner-tagged recs
   _cpLoadPartnerForAI().then(function(partnerInfo){
     if(partnerInfo){baseBody.partner=partnerInfo.partner;baseBody.partnerPreviousPlan=partnerInfo.partnerPreviousPlan;baseBody.householdType=partnerInfo.householdType||baseBody.householdType;}
+    // Pass partner-shared cards (joint cards + cards partner shared with me)
+    // so the AI doesn't recommend duplicates of vehicles already in the
+    // household's combined plan.
+    if(CPLAN._householdType==='hybrid'){
+      var pSharedList=[].concat(CPLAN._jointSharedCards||[]).concat(CPLAN.partnerSharedCards||[]);
+      if(pSharedList.length)baseBody.partnerSharedCards=pSharedList.map(function(c){return{type:c.type,owner:c.owner,amount:c.amount,customName:c.customName||''};});
+    }
     // Initialize approaches as undefined (=loading). Do NOT call
     // _cpShowApproachFork() yet — that would overwrite the checkmark
     // progress page (rendered by _cpConfirmedAIGen) with loading-state
@@ -25939,7 +26730,16 @@ function _cpRenderPlanV2(){
   }catch(e){}
   if(!CPLAN.allocations.length&&!CPLAN.hasAdvisor){_cpRenderFork();return;}
   var h='';
-  var allocated=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
+  // Sum of allocations representing THIS user's deployment. Partner-shared self
+  // cards (visible only for review/request) don't count — they're the partner's
+  // commitments. Joint cards DO count (this user contributes their amountSelf
+  // portion). To keep the existing single-number simple, we just sum a.amount
+  // for non-partner-owned cards. Per-spouse split refinement happens in the
+  // dual-slider math, not this top-line number.
+  var allocated=CPLAN.allocations.reduce(function(t,a){
+    if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return t;
+    return t+(parseFloat(a.amount)||0);
+  },0);
   // Recurring static premiums on completed action-only items (life, disability, umbrella,
   // estate-recurring, annuity-recurring) eat into ongoing budget alongside the slider
   // allocations. Subtract them here so the deployment bar legend's "available to allocate"
@@ -26073,6 +26873,18 @@ function _cpRenderPlanV2(){
     h+='</div>';
   }
 
+  // ── Partner-updated Banner (Hybrid couples — joint card edited by spouse) ──
+  // Set by the realtime subscription handler when the partner saves a joint
+  // card change. Auto-dismisses on the next manual render or after the user
+  // explicitly closes it. Doesn't block editing — informational only.
+  if(CPLAN._partnerUpdatedBanner){
+    var _spName=(CPLAN._partner&&CPLAN._partner.firstName)||'Your spouse';
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;margin-bottom:12px;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.3);border-left:4px solid #A855F7;border-radius:4px;flex-wrap:wrap;gap:10px">';
+    h+='<div style="display:flex;align-items:center;gap:10px"><span style="font-size:18px">🔄</span><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#A855F7">Plan updated by '+esc(_spName)+'</div><div style="font-size:13px;color:var(--mu)">A joint card was just edited. Your view has been refreshed automatically.</div></div></div>';
+    h+='<button onclick="CPLAN._partnerUpdatedBanner=null;_cpRenderPlanV2()" style="padding:6px 12px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:30px">Dismiss</button>';
+    h+='</div>';
+  }
+
   // Couple combined view
   if(_cpPlanView==='ours'&&CPLAN._partnerCalcs){
     var pC2=CPLAN._partnerCalcs;var pNm=CPLAN._partnerName||'Partner';
@@ -26091,6 +26903,19 @@ function _cpRenderPlanV2(){
     h+='<div style="display:flex;gap:2px;height:8px;border-radius:4px;overflow:hidden;margin-bottom:6px">';
     h+='<div style="width:'+myPct2+'%;background:#5B9BFF"></div><div style="width:'+(100-myPct2)+'%;background:#A855F7"></div></div>';
     h+='<div style="display:flex;justify-content:space-between;font-size:12px"><span style="color:#5B9BFF">You: '+myPct2+'% ('+fmt(myC2.inc||0)+')</span><span style="color:#A855F7">'+esc(pNm)+': '+(100-myPct2)+'% ('+fmt(pC2.inc||0)+')</span></div>';
+    // Per-bucket retirement summary (only shown when per-bucket sim is available
+    // — i.e., simulator has run and produced bucket-split projections, which is
+    // standard for Hybrid couples after partner load).
+    if(CPLAN._sim&&CPLAN._sim.projRetIncome_self!=null){
+      var _sm=CPLAN._sim;
+      h+='<div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(168,85,247,.12)">';
+      h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">RETIREMENT PROJECTION BY BUCKET</div>';
+      h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:12px">';
+      h+='<div style="text-align:center;padding:8px;background:rgba(91,155,255,.05);border-radius:2px"><div style="font-size:10px;color:#5B9BFF;font-weight:700">YOU</div><div style="font-family:var(--fd);font-size:14px;color:#5B9BFF;margin-top:2px">'+fmt(_sm.projRetIncome_self||0)+'/mo</div></div>';
+      h+='<div style="text-align:center;padding:8px;background:rgba(168,85,247,.05);border-radius:2px"><div style="font-size:10px;color:#A855F7;font-weight:700">'+esc((pNm||'PARTNER').toUpperCase())+'</div><div style="font-family:var(--fd);font-size:14px;color:#A855F7;margin-top:2px">'+fmt(_sm.projRetIncome_spouse||0)+'/mo</div></div>';
+      h+='<div style="text-align:center;padding:8px;background:rgba(34,197,94,.05);border-radius:2px"><div style="font-size:10px;color:var(--gr);font-weight:700">JOINT</div><div style="font-family:var(--fd);font-size:14px;color:var(--gr);margin-top:2px">'+fmt(_sm.projRetIncome_joint||0)+'/mo</div></div>';
+      h+='</div></div>';
+    }
     h+='</div>';
   }
 
@@ -26683,6 +27508,12 @@ function _cpRenderPlanV2(){
     // Confirmation prompt since it's destructive.
     h+='<button onclick="if(confirm(\'Discard your DIY plan and start over?\')){CPLAN.allocations=[];CPLAN._diyPlan=null;CPLAN.planMode=null;cplanSave();_cpRenderFork();}" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(100,116,139,.06);border:1px solid rgba(100,116,139,.15);color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px">Start Over</button>';
   }
+  // Persistent Regenerate AI button — visible whenever the user has AI mode active
+  // (committed or not). Re-uses _cpStartAIRec which has its own remaining-generations
+  // and cooldown gates, so we don't have to duplicate that logic here.
+  if(CPLAN.planMode==='ai' && !CPLAN.hasAdvisor){
+    h+='<button onclick="if(confirm(\'Regenerate AI recommendations? This uses one of your AI generations.\')){_cpStartAIRec();}" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:2px;min-height:36px">⚡ Regenerate AI</button>';
+  }
   if(!CPLAN._planCommitted && CPLAN._originalAIPlan && CPLAN._selectedApproach && CPLAN._editedApproaches && CPLAN._editedApproaches[CPLAN._selectedApproach]){
     h+='<button onclick="_cpShowPlanComparison()" style="padding:8px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.15);color:#A855F7;cursor:pointer;border-radius:2px;min-height:36px">Compare to AI Original</button>';
   }
@@ -26692,7 +27523,7 @@ function _cpRenderPlanV2(){
   // Refresh over-budget banner state on every render
   _cpUpdateOverBudgetBanner();
   // Render sub-components
-  setTimeout(function(){_cpRunSimulation();_cpRenderChart();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();if(CPLAN.mode==='detailed'){_cpRenderOutcomes();_cpRenderStressTests();_cpRenderRebalanceTriggers();}
+  setTimeout(function(){_cpRunSimulation();_cpRenderCharts();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();if(CPLAN.mode==='detailed'){_cpRenderOutcomes();_cpRenderStressTests();_cpRenderRebalanceTriggers();}
     // Populate the red-flag panel with detected issues + Choose… / + Add to Plan buttons
     try{if(typeof _cpRenderRedFlags==='function')_cpRenderRedFlags();}catch(e){console.warn('_cpRenderRedFlags:',e);}
     // Scroll-triggered animations — phases fade in as they enter viewport
@@ -27000,16 +27831,70 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _cascadeBoostHere=Math.max(0,_sliderEffective-(parseInt(a.amount)||0));
   var _sliderTotalMax=_slMax+_curContribSlide+_cascadeBoostHere;
   var _sliderTotalMin=_curContribSlide;// can't slide below the user's current real-world contribution
+  // ── Joint / shared-card slider variants (Hybrid couples) ──────────────
+  // Three variants based on ownership + household:
+  //   • Joint card in Hybrid household → DUAL sliders (your portion + spouse portion)
+  //   • Partner-shared card I can edit (grants[me]) → SINGLE slider but edits
+  //     are staged as approval requests rather than direct saves
+  //   • Everything else → original single slider (unchanged)
+  var _hh=CPLAN._householdType||'individual';
+  var _isJointCard=(a.owner==='joint');
+  var _isPartnerOwnedShared=(a._sharedId && a._sharedOwnerClientId && a._sharedOwnerClientId!==APP.currentClientId);
+  var _renderDual=(_hh==='hybrid'&&_isJointCard);
+  var _renderRequest=(_hh==='hybrid'&&_isPartnerOwnedShared);
+  if(_renderDual){
+    // Dual slider: amountSelf and amountSpouse each have their own input.
+    // Combined amount = amountSelf + amountSpouse. Sliders default to half/half
+    // split of current amount when amountSelf/amountSpouse aren't set yet.
+    var _curSelfPart=parseFloat(a.amountSelf)||(parseFloat(a.amount)||0)/2;
+    var _curSpousePart=parseFloat(a.amountSpouse)||(parseFloat(a.amount)||0)/2;
+    var _spouseName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
+    var _jointMax=_sliderTotalMax;// Use overall slider max as ceiling for combined
+    h+='<div style="display:grid;grid-template-columns:1fr;gap:6px;margin:4px 0;padding:8px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:3px">';
+    h+='<div style="font-size:10px;color:rgba(34,197,94,.85);font-family:var(--fh);font-weight:700;letter-spacing:.1em;text-transform:uppercase">JOINT CARD — split contribution</div>';
+    // Your portion
+    h+='<div style="display:flex;align-items:center;gap:8px">';
+    h+='<div style="width:80px;font-size:11px;color:#5B9BFF;font-weight:700">You</div>';
+    h+='<input type="range" data-cpjointidx="'+idx+'" data-cpjointside="self" min="0" max="'+_jointMax+'" step="5" value="'+Math.round(_curSelfPart)+'" oninput="_cpSlideJoint('+idx+',\'self\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:#5B9BFF;height:6px">';
+    h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpJointSelf'+idx+'" value="'+Math.round(_curSelfPart)+'" min="0" max="'+_jointMax+'" step="5" oninput="_cpSlideJoint('+idx+',\'self\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+    h+='</div>';
+    // Spouse portion
+    h+='<div style="display:flex;align-items:center;gap:8px">';
+    h+='<div style="width:80px;font-size:11px;color:#A855F7;font-weight:700">'+esc(_spouseName)+'</div>';
+    h+='<input type="range" data-cpjointidx="'+idx+'" data-cpjointside="spouse" min="0" max="'+_jointMax+'" step="5" value="'+Math.round(_curSpousePart)+'" oninput="_cpSlideJoint('+idx+',\'spouse\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:#A855F7;height:6px">';
+    h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpJointSpouse'+idx+'" value="'+Math.round(_curSpousePart)+'" min="0" max="'+_jointMax+'" step="5" oninput="_cpSlideJoint('+idx+',\'spouse\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+    h+='</div>';
+    h+='<div style="font-size:11px;color:var(--mu);text-align:right">Combined: <strong style="color:var(--gr)" id="cpJointTotal'+idx+'">$'+fmt(Math.round(_curSelfPart+_curSpousePart))+'</strong>/mo</div>';
+    h+='</div>';
+  } else if(_renderRequest){
+    // Shared non-owned card: slider stages a request rather than applying directly
+    h+='<div style="display:flex;align-items:center;gap:8px;margin:4px 0">';
+    h+='<input type="range" data-cprequestidx="'+idx+'" min="0" max="'+_sliderTotalMax+'" step="5" value="'+Math.min(_sliderTotal,_sliderTotalMax)+'" oninput="_cpStageRequest('+idx+',this.value)" style="flex:1;accent-color:'+color+';height:6px;opacity:.85">';
+    h+='<div class="inp-prefix" style="width:100px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpRequest'+idx+'" value="'+Math.round(_sliderTotal)+'" min="0" max="'+_sliderTotalMax+'" step="5" oninput="_cpStageRequest('+idx+',this.value)" style="padding-left:22px;min-height:32px;font-size:13px;width:100%"></div>';
+    h+='</div>';
+    h+='<div id="cpRequestBtn'+idx+'" style="display:none;margin-top:6px"><button onclick="_cpSendChangeRequest('+idx+')" style="padding:7px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);color:var(--yl);cursor:pointer;border-radius:3px;min-height:34px">📨 Send change request to spouse</button></div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;font-style:italic">This card is owned by your spouse. Adjusting the slider stages a change request — it doesn\'t apply until they approve.</div>';
+  } else {
+  // ── Default single slider (existing behavior, unchanged) ──
   h+='<div style="display:flex;align-items:center;gap:8px;margin:4px 0">';
   h+='<input type="range" data-cpidx="'+idx+'" data-cpcurrent="'+_curContribSlide+'" min="'+_sliderTotalMin+'" max="'+_sliderTotalMax+'" step="5" value="'+Math.min(_sliderTotal,_sliderTotalMax)+'" oninput="_cpSlide('+idx+',this.value);var _mi=document.getElementById(\'cpManual'+idx+'\');if(_mi){var _rv=String(this.value).replace(/\\B(?=(\\d{3})+(?!\\d))/g,\',\');_mi.value=_rv}" onchange="_cpSlideEnd()" style="flex:1;accent-color:'+color+';height:6px"'+(_premiumLocked?' title="Premium locked at $'+a.amount+'/mo — see lock icon"':'')+'>';
   h+='<div class="inp-prefix" style="width:100px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" data-cpidx="'+idx+'" data-cpcurrent="'+_curContribSlide+'" id="cpManual'+idx+'" value="'+_sliderTotal+'" min="'+_sliderTotalMin+'" max="'+_sliderTotalMax+'" step="5" oninput="var _raw=this.value.replace(/[^0-9]/g,\'\');_cpSlide('+idx+',_raw);var _sl=this.parentElement.previousElementSibling;if(_sl)_sl.value=_raw" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:32px;font-size:13px;width:100%"></div>';
   h+='</div>';
+  }
   if(_premiumLocked){
     h+='<div style="display:flex;align-items:center;gap:6px;margin-top:2px;padding:6px 8px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.18);border-radius:3px">';
     h+='<span style="font-size:13px">🔒</span>';
     h+='<span style="font-size:11px;color:rgba(226,232,240,.85);line-height:1.4">Premium locked at $'+fmt(a.amount)+'/mo. Insurance must be max-funded from day one to minimize fees and stay within MEC limits. To add more, open a <strong>new policy</strong>. To reduce, lower the slider — that represents surrendering or partial reduction.</span>';
     h+='</div>';
   }
+  }
+  // Share-with-spouse button: visible on self-owned cards in Hybrid households,
+  // not already shared. Initiates the sharing flow (sets sharedId, mirrors card
+  // into shared_plan_cards, grants partner access).
+  if(_hh==='hybrid'&&a.owner==='self'&&!a._sharedId&&!_renderDual&&!_renderRequest){
+    h+='<div style="margin-top:6px"><button onclick="_cpShareCardWithPartner('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:transparent;border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Share with spouse</button></div>';
+  } else if(_hh==='hybrid'&&a.owner==='self'&&a._sharedId&&!_renderDual&&!_renderRequest){
+    h+='<div style="margin-top:6px;font-size:11px;color:rgba(168,85,247,.7)">💑 Shared with your spouse</div>';
   }
   // IRS note — skip for insurance products (no IRS contribution limit)
   var _isInsType=a.type==='iul'||a.type==='wl'||a.type==='ibc';
@@ -28627,7 +29512,6 @@ function _cpCheckIn(type,status){
   }catch(e){}
   renderClientTracking();
 }
-// _cpShowDoNothing() removed 2026-05-19 — the 'Do Nothing vs Your Plan' overlay was decommissioned per spec; the projection chart below the plan covers the same ground.
 function _cpShowPlanComparison(){
   if(!CPLAN._originalAIPlan)return;
   var orig=CPLAN._originalAIPlan;var curr=CPLAN.allocations;
@@ -28946,7 +29830,67 @@ function _cpToast(msg,ms){
   }catch(e){}
 }
 
+// Owner-picker modal for Hybrid couples. Shows three buttons (Me/Spouse/Joint)
+// and routes back through _cpAddToPhase with the choice flagged so the picker
+// itself doesn't re-fire. Cancellation clears the in-flight flag without
+// adding anything.
+function _cpShowAddOwnerPicker(type,phase){
+  CPLAN._addOwnerInFlight=true;
+  var spouseName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
+  var typeName=(CP_NM&&CP_NM[type])||type;
+  var m='<div id="ownerPickerOverlay" style="position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:99999;display:flex;align-items:center;justify-content:center;padding:20px" onclick="if(event.target===this){this.remove();CPLAN._addOwnerInFlight=false;CPLAN._addOwnerChoice=null;}">';
+  m+='<div style="background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:24px;max-width:420px;width:100%;box-shadow:0 12px 40px rgba(0,0,0,.35)">';
+  m+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);margin-bottom:6px">Who is this '+esc(typeName)+' card for?</div>';
+  m+='<div style="font-size:13px;color:var(--mu);margin-bottom:16px">Choose ownership so it shows up in the right bucket on the projection charts and the partner can see (or not see) the card as appropriate.</div>';
+  // Me
+  m+='<button onclick="_cpFinishAddOwner(\''+esc(type)+'\','+phase+',\'self\')" style="display:block;width:100%;padding:12px 14px;margin-bottom:8px;text-align:left;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:4px;font-family:var(--fh);font-weight:700;font-size:13px;min-height:48px">';
+  m+='<div>👤 Me</div><div style="font-size:11px;color:var(--mu);font-weight:400;margin-top:2px">Your card · only you see it · counts in your bucket</div></button>';
+  // Spouse
+  m+='<button onclick="_cpFinishAddOwner(\''+esc(type)+'\','+phase+',\'spouse\')" style="display:block;width:100%;padding:12px 14px;margin-bottom:8px;text-align:left;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:4px;font-family:var(--fh);font-weight:700;font-size:13px;min-height:48px">';
+  m+='<div>👫 '+esc(spouseName)+'</div><div style="font-size:11px;color:var(--mu);font-weight:400;margin-top:2px">Tag as your spouse\'s · counts in their bucket on your charts</div></button>';
+  // Joint
+  m+='<button onclick="_cpFinishAddOwner(\''+esc(type)+'\','+phase+',\'joint\')" style="display:block;width:100%;padding:12px 14px;margin-bottom:14px;text-align:left;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);color:var(--gr);cursor:pointer;border-radius:4px;font-family:var(--fh);font-weight:700;font-size:13px;min-height:48px">';
+  m+='<div>💑 Joint</div><div style="font-size:11px;color:var(--mu);font-weight:400;margin-top:2px">Shared with '+esc(spouseName)+' · both contribute · auto-syncs to their plan</div></button>';
+  // Cancel
+  m+='<div style="text-align:right"><button onclick="document.getElementById(\'ownerPickerOverlay\').remove();CPLAN._addOwnerInFlight=false;CPLAN._addOwnerChoice=null" style="padding:8px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:3px;min-height:32px">Cancel</button></div>';
+  m+='</div></div>';
+  var prior=document.getElementById('ownerPickerOverlay');if(prior)prior.remove();
+  document.body.insertAdjacentHTML('beforeend',m);
+}
+
+// Picker button click handler: close the overlay, set the choice, re-call
+// _cpAddToPhase which now picks up the choice flag and routes to the internal
+// add path. We do this round-trip instead of calling _cpAddToPhaseInternal
+// directly so the cascade-resolution and post-add UI flow (which are inside
+// the original _cpAddToPhase logic) still fire.
+function _cpFinishAddOwner(type,phase,owner){
+  var overlay=document.getElementById('ownerPickerOverlay');if(overlay)overlay.remove();
+  CPLAN._addOwnerChoice=owner;
+  // _cpAddToPhase will see _addOwnerInFlight=true, skip showing the picker again
+  _cpAddToPhase(type,phase);
+}
+
 function _cpAddToPhase(type,phase){
+  // Hybrid couples: ask the user who this card belongs to (themselves, their
+  // spouse, or joint) before adding. The picker calls _cpAddToPhaseWithOwner
+  // with the chosen owner; non-Hybrid households go straight to the default
+  // 'self' owner.
+  if(CPLAN._householdType==='hybrid'&&!CPLAN._addOwnerInFlight){
+    _cpShowAddOwnerPicker(type,phase);
+    return;
+  }
+  // Clear the in-flight flag if it was set by the picker
+  CPLAN._addOwnerInFlight=false;
+  var _ownerForAdd=CPLAN._addOwnerChoice||'self';
+  CPLAN._addOwnerChoice=null;
+  _cpAddToPhaseInternal(type,phase,_ownerForAdd);
+}
+
+// Internal add-to-phase that takes an explicit owner. Called by:
+//   • _cpAddToPhase directly for non-Hybrid households (owner='self')
+//   • _cpShowAddOwnerPicker after the user picks for Hybrid households
+function _cpAddToPhaseInternal(type,phase,owner){
+  owner=owner||'self';
   var t=0;if(type==='ef')t=Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal));
   // Pre-fill amount for retirement types based on the user's existing
   // contribution detected from their financial data. Without this, picking
@@ -28964,7 +29908,7 @@ function _cpAddToPhase(type,phase){
       }
     }catch(_eM){console.warn('Existing contrib detect:',_eM);}
   }
-  CPLAN.allocations.push({type:type,amount:startAmount,target:t,phase:phase,cascade:'',customName:type==='custom'?'My goal':''});
+  CPLAN.allocations.push({type:type,amount:startAmount,target:t,phase:phase,cascade:'',customName:type==='custom'?'My goal':'',owner:owner});
   var newIdx=CPLAN.allocations.length-1;
   // ── Cascade prompt resolution path ──
   // If the user just picked "Add a new allocation" in the cascade prompt, the original
@@ -29511,6 +30455,10 @@ function _cpAvailableBudget(excludeIdx){
   var _premTypes={protection:1,umbrella:1,estate:1,annuity_research:1,iul:1,wl:1,ibc:1};
   CPLAN.allocations.forEach(function(a,i){
     if(i===excludeIdx)return;
+    // Partner-shared cards (owned by the other spouse, just displayed in this
+    // user's plan for visibility) do NOT consume THIS user's surplus. Skip them
+    // so the user's own budget reflects only their own commitments.
+    if(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId)return;
     // Cascade-engine-spawned absorber allocations are virtual destinations
     // for freed cascade cash whose amount IS the freed money (already counted
     // upstream via the source allocation that freed it). Counting again here
@@ -30485,6 +31433,18 @@ function _cpRetIncomeTarget(owner){
     if(t>0)return t;
     return Math.round((CPLAN.expenses||0)/2);
   }
+  if(owner==='joint'){
+    // Joint bucket target: combined household need at the joint retirement age.
+    // If both spouses set explicit retirement income targets, sum them; otherwise
+    // fall back to current household expenses (which is the closest concrete
+    // household-level number the system has).
+    var tSelf=parseFloat(CPLAN.retIncome)||0;
+    var tSpouse=parseFloat(CPLAN.spRetIncome)||0;
+    if(tSelf>0&&tSpouse>0)return tSelf+tSpouse;
+    if(tSelf>0)return tSelf;
+    if(tSpouse>0)return tSpouse;
+    return CPLAN.expenses||0;
+  }
   var st=parseFloat(CPLAN.retIncome)||0;
   if(st>0)return st;
   return CPLAN.expenses||0;
@@ -30501,15 +31461,63 @@ function _cpSustainableMonthly(balance,yearsInRet,realAnnualReturn){
 function _cpRenderIncomeReplacement(){
   var el=document.getElementById('cplanIncomeReplace');if(!el)return;
   if(CPLAN.income<=0){el.innerHTML='';return;}
+  var sim=CPLAN._sim;
+  var isHybrid=(CPLAN._householdType==='hybrid')&&!!CPLAN._partner;
+
+  // ── Inner helper: renders one labeled income-vs-target bar ──
+  // Used for both single-bucket and per-bucket displays. Caller computes
+  // retIncome and target; we draw the bar, label, gap/surplus line, etc.
+  function _renderBar(label,retIncome,target,smallTitle,extraNote){
+    if(target<=0&&retIncome<=0)return '';
+    var replacePct=target>0?Math.round(retIncome/target*100):0;
+    var displayPct=Math.min(100,replacePct);
+    var col=replacePct>=80?'var(--gr)':replacePct>=50?'var(--yl)':replacePct>=25?'var(--or)':'var(--rd)';
+    var statusLbl=replacePct>=100?'On track':replacePct>=80?'Close':replacePct>=50?'Behind':replacePct>=25?'Significant gap':'Critical gap';
+    var titleSize=smallTitle?'11px':'12px';
+    var out='<div style="margin-bottom:'+(smallTitle?'8px':'0')+'">';
+    out+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
+    out+='<div style="font-family:var(--fh);font-size:'+titleSize+';font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">'+label+'</div>';
+    out+='<div style="font-family:var(--fd);font-size:'+(smallTitle?'16px':'20px')+';color:'+col+'">'+displayPct+'%</div></div>';
+    out+='<div style="height:8px;background:rgba(0,68,191,.06);border-radius:4px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+displayPct+'%;background:'+col+';border-radius:4px;transition:width .3s"></div></div>';
+    out+='<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--mu)">';
+    out+='<span>'+statusLbl+' &mdash; '+fmt(retIncome)+'/mo projected</span>';
+    out+='<span>of '+fmt(target)+'/mo target</span></div>';
+    if(replacePct<100&&target>0)out+='<div style="font-size:12px;color:var(--yl);margin-top:4px">Gap: '+fmt(Math.max(0,target-retIncome))+'/mo</div>';
+    else if(replacePct>100)out+='<div style="font-size:12px;color:var(--gr);margin-top:4px">Surplus: '+fmt(retIncome-target)+'/mo above target</div>';
+    if(extraNote)out+='<div style="font-size:11px;color:var(--mu);margin-top:4px;font-style:italic">'+extraNote+'</div>';
+    out+='</div>';
+    return out;
+  }
+
+  if(isHybrid && sim && (sim.projRetIncome_self!=null || sim.projRetIncome_spouse!=null || sim.projRetIncome_joint!=null)){
+    // ── Hybrid three-bucket display ──
+    // Each bucket reads its own projection from the simulator (computed at the
+    // owner's retirement age, using per-bucket years-in-retirement).
+    var h='<div style="padding:12px 16px">';
+    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:10px">Retirement Income vs Target — by bucket</div>';
+    var spouseName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
+    var tSelf=Math.round(_cpRetIncomeTarget('self'));
+    var tSpouse=Math.round(_cpRetIncomeTarget('spouse'));
+    var tJoint=Math.round(_cpRetIncomeTarget('joint'));
+    h+=_renderBar('You',sim.projRetIncome_self||0,tSelf,true,'');
+    h+=_renderBar(spouseName,sim.projRetIncome_spouse||0,tSpouse,true,'');
+    h+=_renderBar('Joint',sim.projRetIncome_joint||0,tJoint,true,'');
+    if(!CPLAN.retIncome&&!CPLAN.spRetIncome)h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;font-style:italic">No retirement income targets set in profile &mdash; using current monthly expenses as fallback. Set Desired Monthly Income for each partner for accurate planning.</div>';
+    h+='</div>';
+    el.innerHTML=h;
+    return;
+  }
+
+  // ── Single-bucket display (default for Individual / Joint / Separate) ──
   // Retirement assets include taxable brokerage — see comment in _cpRunSimulation
   // (search "Track retirement-only assets") for the rationale.
   var _retVehicles=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'];
   // Phase 2: target is the user's stated retirement income (today's $/mo), not 4% rule.
   // Use simulation's retirement-only data if available
   var retIncome=0;
-  if(CPLAN._sim&&CPLAN._sim.retirement&&CPLAN._sim.retirement.length>0){
+  if(sim&&sim.retirement&&sim.retirement.length>0){
     var _retYrsToAge65=Math.max(1,Math.min(30,(CPLAN.retirementAge||65)-(CPLAN.age||35)));
-    var retAtRetire=CPLAN._sim.retirement[_retYrsToAge65]||CPLAN._sim.retirement[CPLAN._sim.retirement.length-1]||0;
+    var retAtRetire=sim.retirement[_retYrsToAge65]||sim.retirement[sim.retirement.length-1]||0;
     retIncome=Math.round(_cpSustainableMonthly(retAtRetire,_cpYearsInRetirement(),0.01));
   } else {
     var yrs=Math.max(1,(CPLAN.retirementAge||65)-CPLAN.age);
@@ -30523,23 +31531,12 @@ function _cpRenderIncomeReplacement(){
     retIncome=Math.round(_cpSustainableMonthly(_projBal,_cpYearsInRetirement(),0.01));
   }
   var target=Math.round(_cpRetIncomeTarget('self'));
-  var replacePct=target>0?Math.round(retIncome/target*100):0;
-  var displayPct=Math.min(100,replacePct);
-  var col=replacePct>=80?'var(--gr)':replacePct>=50?'var(--yl)':replacePct>=25?'var(--or)':'var(--rd)';
-  var label=replacePct>=100?'On track':replacePct>=80?'Close':replacePct>=50?'Behind':replacePct>=25?'Significant gap':'Critical gap';
-  var h='<div style="padding:12px 16px">';
-  h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
-  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Retirement Income vs Target</div>';
-  h+='<div style="font-family:var(--fd);font-size:20px;color:'+col+'">'+displayPct+'%</div></div>';
-  h+='<div style="height:8px;background:rgba(0,68,191,.06);border-radius:4px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+displayPct+'%;background:'+col+';border-radius:4px;transition:width .3s"></div></div>';
-  h+='<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--mu)">';
-  h+='<span>'+label+' &mdash; '+fmt(retIncome)+'/mo projected</span>';
-  h+='<span>of '+fmt(target)+'/mo target</span></div>';
-  if(replacePct<100&&target>0)h+='<div style="font-size:12px;color:var(--yl);margin-top:4px">Gap: '+fmt(Math.max(0,target-retIncome))+'/mo to reach stated target</div>';
-  else if(replacePct>100)h+='<div style="font-size:12px;color:var(--gr);margin-top:4px">Surplus: '+fmt(retIncome-target)+'/mo above target</div>';
-  if(!CPLAN.retIncome)h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;font-style:italic">No target set &mdash; using current monthly expenses ('+fmt(CPLAN.expenses)+'/mo) as fallback. Set "Desired Monthly Income" in profile for accurate planning.</div>';
-  h+='</div>';
-  el.innerHTML=h;
+  var fallbackNote=!CPLAN.retIncome?'No target set &mdash; using current monthly expenses ('+fmt(CPLAN.expenses)+'/mo) as fallback. Set "Desired Monthly Income" in profile for accurate planning.':'';
+  var h2='<div style="padding:12px 16px">';
+  h2+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">Retirement Income vs Target</div>';
+  h2+=_renderBar('',retIncome,target,false,fallbackNote);
+  h2+='</div>';
+  el.innerHTML=h2;
 }
 
 // ── STRESS TESTS (Pro+ only) ──
@@ -32123,7 +33120,24 @@ function initClientPlan(){
   // 3 is the minimum baseline; 4-6+ is appropriate for single-income, sole
   // provider, irregular income, high job-risk industries, etc.
   CPLAN._efMonthsTarget=parseInt((fd._efMonthsTarget!=null?fd._efMonthsTarget:CPLAN._efMonthsTarget))||3;
-  CPLAN.efTarget=Math.max(CPLAN.expenses*CPLAN._efMonthsTarget,1);CPLAN.employer=(rawS.profile&&rawS.profile.employer)||'';
+  CPLAN.efTarget=Math.max(CPLAN.expenses*CPLAN._efMonthsTarget,1);
+  // Three-tier employer detection so the 401k DIY menu populates correctly when
+  // users entered their info through detailed paycheck mode (which stores employer
+  // on incomeSources[*].employer instead of profile.employer):
+  //   1. profile.employer (explicit field)
+  //   2. first incomeSource with an employer name
+  //   3. employmentType=w2 (employer exists even if name not recorded — still gates 401k correctly)
+  var _empProfile=(rawS.profile&&rawS.profile.employer)||'';
+  var _empIncSrc='';
+  if(!_empProfile&&Array.isArray(rawS.incomeSources)){
+    for(var _esi=0;_esi<rawS.incomeSources.length;_esi++){
+      var _es=rawS.incomeSources[_esi]||{};
+      if(_es.employer&&String(_es.employer).trim()){_empIncSrc=String(_es.employer).trim();break;}
+    }
+  }
+  var _empType=(rawS.profile&&rawS.profile.employmentType)||(fd&&fd.employment_type)||'';
+  var _empFromType=(_empType==='w2')?'(W-2 employer)':'';
+  CPLAN.employer=_empProfile||_empIncSrc||_empFromType||'';
   CPLAN.children=rawS.children||[];CPLAN.policies=rawS.policies||[];
   CPLAN.marital=(rawS.profile&&rawS.profile.marital)||'single';
   var rp=rawS.riskProfile||{};CPLAN.riskDone=!!rp&&!!rp.label;CPLAN.riskProfile=CPLAN.riskDone?(typeof rp==='object'?rp.label:rp).toLowerCase():'';
@@ -32603,11 +33617,13 @@ function _pvRenderSpendingSharing(){
   }
 
   // ── Tier cards ──
+  // Order: recommended option first (Full visibility) so it's the natural choice,
+  // then partial-share tiers in decreasing detail, then opt-out last.
   var tiers=[
-    {n:0,name:'Not shared',desc:'Your advisor can\'t see any spending data.',icon:'🔒'},
-    {n:1,name:'Status only',desc:'Severity, projected overspend, and the impact on your plan. No categories or transactions.',icon:'📊'},
+    {n:3,name:'Full visibility',desc:'Adds your recent logged expenses and their descriptions.',icon:'🔍',recommended:true},
     {n:2,name:'Status + categories',desc:'Adds a breakdown across categories like food, transport, and subscriptions.',icon:'📁'},
-    {n:3,name:'Full visibility',desc:'Adds your recent logged expenses and their descriptions.',icon:'🔍'}
+    {n:1,name:'Status only',desc:'Severity, projected overspend, and the impact on your plan. No categories or transactions.',icon:'📊'},
+    {n:0,name:'Not shared',desc:'Your advisor can\'t see any spending data.',icon:'🔒'}
   ];
   if(isAdvisory){
     h+='<div style="display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:12px">';
@@ -32618,7 +33634,7 @@ function _pvRenderSpendingSharing(){
       var fgCol=sel?(t.n===0?'var(--mu)':'var(--gr)'):'var(--wh)';
       h+='<div onclick="_pvSelectTier('+t.n+')" role="button" tabindex="0" onkeypress="if(event.key===\'Enter\')_pvSelectTier('+t.n+')" style="display:flex;align-items:flex-start;gap:10px;padding:10px 12px;background:'+bgCol+';border:1px solid '+bdCol+';border-radius:4px;cursor:pointer;transition:.15s" onmouseover="this.style.background=\''+(sel?bgCol:'rgba(91,155,255,.04)')+'\'" onmouseout="this.style.background=\''+bgCol+'\'">';
       h+='<div style="font-size:18px;line-height:1.2;flex-shrink:0">'+t.icon+'</div>';
-      h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+fgCol+'">'+t.name+(sel?' <span style="font-size:11px;color:var(--gr);margin-left:4px">✓ ACTIVE</span>':'')+'</div>';
+      h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:'+fgCol+'">'+t.name+(t.recommended?' <span style="font-size:10px;letter-spacing:.08em;color:var(--gr);background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.3);padding:1px 6px;border-radius:2px;margin-left:6px;font-weight:700;vertical-align:middle">RECOMMENDED</span>':'')+(sel?' <span style="font-size:11px;color:var(--gr);margin-left:4px">✓ ACTIVE</span>':'')+'</div>';
       h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:2px">'+esc(t.desc)+'</div></div>';
       h+='</div>';
     });
@@ -32785,14 +33801,10 @@ function _pvShowAutoPrompt(){
   h+='</div>';
   h+='<div style="font-size:13px;color:var(--mu);margin-bottom:10px;font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase">Choose a level</div>';
 
-  // Order: most-sharing first since this is an advisor product — the client opted into
-  // an advisor relationship, so the recommendation reflects what gets them the most value.
-  // n: values map to stored visibility levels (3=full, 2=cat, 1=status, 0=none) and must
-  // not be renumbered — only the visual order of the array changes.
   var tiers=[
-    {n:3,name:'Full visibility',desc:'Adds your recent logged expenses and descriptions.',icon:'🔍',rec:true},
+    {n:1,name:'Status only',desc:'They see how you\'re tracking and the projected impact on your plan. No categories, no transactions.',icon:'📊',rec:true},
     {n:2,name:'Status + categories',desc:'Adds a breakdown across categories like food, transport, and subscriptions.',icon:'📁'},
-    {n:1,name:'Status only',desc:'They see how you\'re tracking and the projected impact on your plan. No categories, no transactions.',icon:'📊'},
+    {n:3,name:'Full visibility',desc:'Adds your recent logged expenses and descriptions.',icon:'🔍'},
     {n:0,name:'Not now',desc:'Keep your spending private. You can change this anytime in Privacy & Sharing.',icon:'🔒'}
   ];
   h+='<div style="display:grid;grid-template-columns:1fr;gap:6px;margin-bottom:14px">';
@@ -33285,7 +34297,7 @@ function _cpSubmitCheckIns(){
   try{if(typeof _cpRunSimulation==='function')_cpRunSimulation();}catch(e){}
   // Refresh UI components that depend on the simulation
   try{
-    if(typeof _cpRenderChart==='function')_cpRenderChart();
+    if(typeof _cpRenderCharts==='function')_cpRenderCharts(); else if(typeof _cpRenderChart==='function')_cpRenderChart();
     if(typeof _cpRenderHealthScore==='function')_cpRenderHealthScore();
     if(typeof _cpRenderEFRunway==='function')_cpRenderEFRunway();
     if(typeof _cpRenderIncomeReplacement==='function')_cpRenderIncomeReplacement();
@@ -34295,6 +35307,15 @@ function _cpRunSimulation(){
   var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt'||a._ibcDebtStrategy)allocSeries[a.type+'_'+i]=[];});
   var _retOnlyByYear={};
   var retirementData=[];
+  // Per-bucket trackers for hybrid couples (and applies harmlessly to other household
+  // types — single-owner households fill only the _self bucket). Each is a year-by-year
+  // array parallel to retirementData / netWorthData but partitioned by allocation owner.
+  // Joint bucket aggregates allocations tagged owner==='joint'. Self/spouse buckets
+  // aggregate their respective owner-tagged allocations.
+  var _retSelfByYear={},_retSpouseByYear={},_retJointByYear={};
+  var _nwSelfByYear={},_nwSpouseByYear={},_nwJointByYear={};
+  var retirementSelfData=[],retirementSpouseData=[],retirementJointData=[];
+  var netWorthSelfData=[],netWorthSpouseData=[],netWorthJointData=[];
   // Home equity tracking — get home value from profile if homeowner
   var _rawS2=(APP._portalFd&&APP._portalFd.S)||{};
   var _homeValue=parseFloat((_rawS2.assets&&_rawS2.assets.re)||0);
@@ -34531,12 +35552,21 @@ function _cpRunSimulation(){
       unBalAccum+=leftover;
     }
     // Snapshot per-allocation balances for chart series + retirement subtotal
+    // Per-owner asset sums (initialized fresh each year) so net worth and retirement
+    // can be split by owner downstream.
+    var _selfAssetsThisYr=0,_spouseAssetsThisYr=0,_jointAssetsThisYr=0;
+    var _retSelfThisYr=0,_retSpouseThisYr=0,_retJointThisYr=0;
     growthIdxList.forEach(function(idx){
       var a=CPLAN.allocations[idx];
       var bal=balByIdx[idx];
       var key=a.type+'_'+idx;
       if(allocSeries[key])allocSeries[key].push(Math.round(bal));
       totalAssets+=bal;
+      // Per-owner asset routing: every growth balance contributes to exactly one bucket.
+      var _aOwn=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
+      if(_aOwn==='self')_selfAssetsThisYr+=bal;
+      else if(_aOwn==='spouse')_spouseAssetsThisYr+=bal;
+      else _jointAssetsThisYr+=bal;
       // Track retirement-only assets separately. Taxable brokerage ('invest')
       // IS counted as a retirement asset because in real-world planning that
       // account is sold at LTCG rates, harvested for dividends, or used as
@@ -34552,8 +35582,18 @@ function _cpRunSimulation(){
       if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'].indexOf(a.type)>=0 || a._ibcDebtStrategy){
         if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
         _retOnlyByYear[yr]+=bal;
+        if(_aOwn==='self')_retSelfThisYr+=bal;
+        else if(_aOwn==='spouse')_retSpouseThisYr+=bal;
+        else _retJointThisYr+=bal;
       }
     });
+    // Persist per-owner year-end snapshots for downstream consumers
+    _retSelfByYear[yr]=_retSelfThisYr;
+    _retSpouseByYear[yr]=_retSpouseThisYr;
+    _retJointByYear[yr]=_retJointThisYr;
+    _nwSelfByYear[yr]=_selfAssetsThisYr;
+    _nwSpouseByYear[yr]=_spouseAssetsThisYr;
+    _nwJointByYear[yr]=_jointAssetsThisYr;
     // Remaining high-rate debt (accelerated payments)
     var remHi=hiRateTotal;
     for(var dm=0;dm<yr*12;dm++){remHi=Math.max(0,remHi*(1+avgHiRate)-hiRatePmt);if(remHi<1)remHi=0;}
@@ -34578,6 +35618,20 @@ function _cpRunSimulation(){
     // Excludes EF (cash buffer), custom goals (specific-purpose), 529 (education),
     // and home equity (illiquid until sold).
     retirementData.push(Math.round(_retOnlyByYear[yr]||0));
+    // Per-bucket year-end snapshots (parallel arrays).
+    // Net worth split: assets-only per owner; shared items (unallocated cash,
+    // debts, home equity) attribute to 'self' bucket as the primary balance sheet.
+    // This is a display-level attribution, not an ownership claim — the joint /
+    // spouse buckets show only the growth contribution of their owner-tagged
+    // allocations, while the self bucket additionally absorbs household-level
+    // shared liabilities and equity. Couples can compare the three deltas to
+    // see who's accumulating what.
+    retirementSelfData.push(Math.round(_retSelfThisYr));
+    retirementSpouseData.push(Math.round(_retSpouseThisYr));
+    retirementJointData.push(Math.round(_retJointThisYr));
+    netWorthSelfData.push(Math.round(_selfAssetsThisYr+unBal-remHi-remLo+_homeEq));
+    netWorthSpouseData.push(Math.round(_spouseAssetsThisYr));
+    netWorthJointData.push(Math.round(_jointAssetsThisYr));
   }
 
   // ── 4. Calculate trajectory metrics for health score ──
@@ -34599,6 +35653,41 @@ function _cpRunSimulation(){
   // Frame against user's stated retirement income target (CPLAN.retIncome) — not 4% rule.
   var projRetIncome=Math.round(_cpSustainableMonthly(projRetValue,_cpYearsInRetirement(),0.01));
 
+  // ── Per-bucket projection metrics (hybrid couples + general use) ──
+  // Each bucket projects to its own retirement age (self → primary's retAge,
+  // spouse → partner's retAge, joint → later of the two). Sustainable monthly
+  // income uses years-in-retirement specific to that bucket:
+  //   • self: lifeExp - primary's retAge
+  //   • spouse: lifeExp - partner's retAge
+  //   • joint: lifeExp - later-of-two retAges (the joint bucket isn't drawn down
+  //     until both are retired, so the relevant window starts at the later age
+  //     and ends at the longer-lived spouse's life expectancy; using primary's
+  //     lifeExp as proxy keeps the formula simple — joint planning assumes both
+  //     live to the lifeExp setting)
+  var _hasPartner=!!CPLAN._partner;
+  var _selfRetAge=CPLAN.retirementAge||65;
+  var _spouseRetAge=_hasPartner?(CPLAN._partner.retirementAge||65):_selfRetAge;
+  var _jointRetAge=Math.max(_selfRetAge,_spouseRetAge);
+  var _selfCurAge=CPLAN.age||35;
+  var _spouseCurAge=_hasPartner?(CPLAN._partner.age||35):_selfCurAge;
+  var _yrsToSelfRet=Math.max(1,Math.min(years,_selfRetAge-_selfCurAge));
+  var _yrsToSpouseRet=Math.max(1,Math.min(years,_spouseRetAge-_spouseCurAge));
+  // Joint bucket horizon: years until the LATER of the two partners retires
+  var _yrsToJointRet=Math.max(_yrsToSelfRet,_yrsToSpouseRet);
+  var _lifeExp=(function(){
+    var rawS3=(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)||{};
+    return parseInt((rawS3.calcs&&rawS3.calcs.retLifeExp))||90;
+  })();
+  var _projRetValue_self=retirementSelfData[_yrsToSelfRet]||retirementSelfData[years]||0;
+  var _projRetValue_spouse=retirementSpouseData[_yrsToSpouseRet]||retirementSpouseData[years]||0;
+  var _projRetValue_joint=retirementJointData[_yrsToJointRet]||retirementJointData[years]||0;
+  var _yrsInRet_self=Math.max(1,_lifeExp-_selfRetAge);
+  var _yrsInRet_spouse=Math.max(1,_lifeExp-_spouseRetAge);
+  var _yrsInRet_joint=Math.max(1,_lifeExp-_jointRetAge);
+  var _projRetIncome_self=Math.round(_cpSustainableMonthly(_projRetValue_self,_yrsInRet_self,0.01));
+  var _projRetIncome_spouse=Math.round(_cpSustainableMonthly(_projRetValue_spouse,_yrsInRet_spouse,0.01));
+  var _projRetIncome_joint=Math.round(_cpSustainableMonthly(_projRetValue_joint,_yrsInRet_joint,0.01));
+
   // Store result
   CPLAN._sim={
     netWorth:netWorthData,
@@ -34612,6 +35701,23 @@ function _cpRunSimulation(){
     fullFundingMonth:fullFundingMonth,
     projRetValue:projRetValue,
     projRetIncome:projRetIncome,
+    // Per-bucket trajectories and projections — consumed by three-charts UI in
+    // Hybrid households and by per-bucket income replacement / outcomes displays.
+    netWorth_self:netWorthSelfData,
+    netWorth_spouse:netWorthSpouseData,
+    netWorth_joint:netWorthJointData,
+    retirement_self:retirementSelfData,
+    retirement_spouse:retirementSpouseData,
+    retirement_joint:retirementJointData,
+    projRetValue_self:_projRetValue_self,
+    projRetValue_spouse:_projRetValue_spouse,
+    projRetValue_joint:_projRetValue_joint,
+    projRetIncome_self:_projRetIncome_self,
+    projRetIncome_spouse:_projRetIncome_spouse,
+    projRetIncome_joint:_projRetIncome_joint,
+    yrsToSelfRet:_yrsToSelfRet,
+    yrsToSpouseRet:_yrsToSpouseRet,
+    yrsToJointRet:_yrsToJointRet,
     // Phase A: time-anchored fields. Consumers (timeline, you-are-here marker,
     // accountability messaging) read these to align display with real elapsed time.
     monthsElapsed:_monthsElapsed,
@@ -34620,10 +35726,15 @@ function _cpRunSimulation(){
   return CPLAN._sim;
 }
 
-function _cpRenderChart(targetId){
+function _cpRenderChart(targetId,bucket){
   var el=document.getElementById(targetId||'cplanChart');if(!el)return;
   if(!CPLAN._chartView)CPLAN._chartView='nw';
   var _isRetView=CPLAN._chartView==='retirement';
+  // bucket: 'all' (default — full household totals), 'self', 'spouse', 'joint'.
+  // When per-bucket, pull from sim.netWorth_<bucket> / sim.retirement_<bucket> arrays
+  // and filter the per-allocation overlay to only that owner's cards. The bucket
+  // value is preserved through toggle clicks so re-renders stay scoped.
+  bucket=bucket||'all';
   var _retTypes=['roth','401k','roth401k','iul','wl','trad_ira','solo401k','sep_ira','hsa','ibc','invest'];
   var _chartGrowthTypes=_isRetView?_retTypes:['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','ef','house','rental'];
   var active=CPLAN.allocations.filter(function(a){
@@ -34642,26 +35753,54 @@ function _cpRenderChart(targetId){
     if(a.type==='custom'&&a.amount===0)return false;
     if(_isRetView&&_retTypes.indexOf(a.type)<0&&!a._ibcDebtStrategy)return false;// Retirement view: only retirement vehicles
     if(_chartGrowthTypes.indexOf(a.type)<0&&a.type!=='custom'&&!a._ibcDebtStrategy)return false;
+    // Per-bucket filter: when rendering a specific bucket, exclude allocations
+    // whose owner doesn't match. 'all' bucket includes everything (current behavior).
+    if(bucket!=='all'){
+      var _aOwn=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
+      if(_aOwn!==bucket)return false;
+    }
     if(a.amount>0)return true;
     if(CPLAN._sim&&CPLAN._sim.allocFuture){var idx=CPLAN.allocations.indexOf(a);return CPLAN._sim.allocFuture[idx]&&CPLAN._sim.allocFuture[idx].futureAmount>0;}
     return false;
   });
   if(!active.length&&!CPLAN._sim){el.innerHTML='';return;}
   // ── Chart toggle: Net Worth vs Retirement ──
-  var _toggleH='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
-  _toggleH+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">'+(_isRetView?'RETIREMENT PROJECTION':'NET WORTH PROJECTION')+'</div>';
-  _toggleH+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
-  var _chartTarget=targetId?("'"+targetId+"'"):'';
-  _toggleH+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
-  _toggleH+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
-  _toggleH+='</div></div>';
+  // Per-bucket charts share a single household-level toggle (managed by the
+  // wrapper _cpRenderCharts in Hybrid view), so we only emit the inline toggle
+  // when this is a standalone single-chart render (bucket==='all').
+  var _toggleH='';
+  if(bucket==='all'){
+    _toggleH='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+    _toggleH+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">'+(_isRetView?'RETIREMENT PROJECTION':'NET WORTH PROJECTION')+'</div>';
+    _toggleH+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
+    var _chartTarget=targetId?("'"+targetId+"'"):'';
+    _toggleH+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
+    _toggleH+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
+    _toggleH+='</div></div>';
+  } else {
+    // Per-bucket chart: small header identifies the bucket
+    var _bucketLabel=bucket==='self'?'You':bucket==='spouse'?(CPLAN._partner&&CPLAN._partner.firstName||'Spouse'):'Joint';
+    var _bucketColor=bucket==='self'?'#5B9BFF':bucket==='spouse'?'#A855F7':'#22C55E';
+    _toggleH='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:'+_bucketColor+';margin-bottom:6px">'+_bucketLabel+'</div>';
+  }
   var W=600,H=260,padL=50,padR=55,padT=24,padB=28;var years=30;
 
   // ── Use simulation data if available, else fall back to static ──
   var sim=CPLAN._sim;
   var baselineData,totalData,rawSeries;
   if(sim&&sim.netWorth&&sim.netWorth.length>0){
-    totalData=_isRetView?(sim.retirement||sim.netWorth):sim.netWorth;
+    // Bucket-aware trajectory selection. When bucket==='all', use the existing
+    // total arrays (sim.netWorth, sim.retirement). Otherwise pull from the per-
+    // bucket arrays computed at the end of _cpRunSimulation. Falls back to total
+    // if a per-bucket array is somehow missing.
+    if(bucket==='all'){
+      totalData=_isRetView?(sim.retirement||sim.netWorth):sim.netWorth;
+    } else {
+      var _bSuffix='_'+bucket;
+      var _bNwArr=sim['netWorth'+_bSuffix];
+      var _bRetArr=sim['retirement'+_bSuffix];
+      totalData=_isRetView?(_bRetArr||sim.retirement||sim.netWorth):(_bNwArr||sim.netWorth);
+    }
     if(_isRetView){
       // Retirement-view baseline = "do nothing on retirement contributions":
       // existing retirement-account balances AND existing taxable brokerage
@@ -34996,6 +36135,57 @@ function _cpRenderChart(targetId){
   el.innerHTML=_toggleH+svg;
 }
 
+// ── _cpRenderCharts: wrapper that decides single vs three-chart layout ─────
+// Called by _cpRenderPlanV2 instead of _cpRenderChart directly. For Hybrid
+// households with a loaded partner, renders three side-by-side charts (Self /
+// Spouse / Joint) with a single shared NW/Retirement toggle at the top.
+// All other household types (Individual, Joint, Separate) render exactly one
+// chart with no behavioral change from before.
+//
+// DOM contract: the parent calls this after laying out <div id="cplanChart">.
+// We replace the contents of that container with either:
+//   - One chart (current behavior, bucket='all'), or
+//   - A toggle row + three child charts (#cplanChart_self, _spouse, _joint).
+// The shared toggle invokes _cpRenderCharts to re-render all three at once.
+function _cpRenderCharts(){
+  var el=document.getElementById('cplanChart');if(!el)return;
+  var isHybrid=(CPLAN._householdType==='hybrid')&&!!CPLAN._partner;
+  if(!isHybrid){
+    // Single chart — call the existing renderer in its original mode. The chart
+    // function expects to write into 'cplanChart' which already exists.
+    _cpRenderChart('cplanChart');
+    return;
+  }
+  if(!CPLAN._chartView)CPLAN._chartView='nw';
+  var _isRetView=CPLAN._chartView==='retirement';
+  // Shared toggle row at the top — drives all three child charts in lockstep.
+  // We re-call _cpRenderCharts on toggle so the bucket parameter is preserved
+  // for each child chart.
+  var h='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">'+(_isRetView?'RETIREMENT PROJECTION':'NET WORTH PROJECTION')+'</div>';
+  h+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
+  h+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderCharts()" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
+  h+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderCharts()" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
+  h+='</div></div>';
+  // Three side-by-side chart containers. On narrow viewports they stack via
+  // CSS media query (handled elsewhere) — the inline grid keeps desktop layout.
+  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">';
+  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_self"></div></div>';
+  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_spouse"></div></div>';
+  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_joint"></div></div>';
+  h+='</div>';
+  el.innerHTML=h;
+  // Defer child-chart rendering one tick so the DOM exists before _cpRenderChart
+  // queries for the target ids. _cpRenderChart preserves the bucket parameter
+  // through its own toggle clicks (its own toggle is suppressed for non-'all'
+  // bucket renders — handled inside _cpRenderChart).
+  setTimeout(function(){
+    try{_cpRenderChart('cplanChart_self','self');}catch(e){}
+    try{_cpRenderChart('cplanChart_spouse','spouse');}catch(e){}
+    try{_cpRenderChart('cplanChart_joint','joint');}catch(e){}
+  },10);
+}
+
 function _cpRenderOutcomes(){
   var el=document.getElementById('cplanOutcomes');if(!el)return;
   var active=CPLAN.allocations.filter(function(a){return a.amount>0;});
@@ -35052,12 +36242,46 @@ function _cpRenderOutcomes(){
   var _retTarget=Math.round(_cpRetIncomeTarget('self'));
   var _retPct=_retTarget>0?Math.min(100,Math.round(_retSustained/_retTarget*100)):0;
   var _retCol=_retPct>=100?'var(--gr)':_retPct>=80?'var(--gr)':_retPct>=50?'var(--yl)':_retPct>=25?'var(--or)':'var(--rd)';
-  h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">';
-  [{y:'YR 5',v:nw5},{y:'YR 10',v:nw10},{y:'YR 20',v:nw20},{y:'YR 30',v:nw30}].forEach(function(p){h+='<div class="info-card" style="text-align:center;padding:10px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700">'+p.y+'</div><div style="font-family:var(--fd);font-size:16px;color:var(--gr)">'+fmtK(Math.round(p.v))+'</div></div>';});
-  h+='</div>';
-  h+='<div class="info-card" style="text-align:center;padding:10px;margin-bottom:10px"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700">SUSTAINABLE MONTHLY INCOME &middot; YR 30</div><div style="font-family:var(--fd);font-size:20px;color:'+_retCol+'">'+fmt(_retSustained)+'/mo</div>';
-  if(_retTarget>0)h+='<div style="font-size:11px;color:var(--mu);margin-top:2px">'+_retPct+'% of '+fmt(_retTarget)+'/mo target</div>';
-  h+='</div>';
+  // ── Hybrid per-bucket outcomes ──
+  // For Hybrid couples, surface per-bucket YR-30 retirement and sustainable monthly
+  // income alongside the household total. Uses CPLAN._sim per-bucket fields populated
+  // by the simulator. Falls back to the single-row display for other household types.
+  var _isHybridOutcomes=(CPLAN._householdType==='hybrid')&&CPLAN._sim&&CPLAN._sim.projRetValue_self!=null;
+  if(_isHybridOutcomes){
+    var _sim=CPLAN._sim;
+    var _spName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
+    h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">';
+    [{y:'YR 5',v:nw5},{y:'YR 10',v:nw10},{y:'YR 20',v:nw20},{y:'YR 30',v:nw30}].forEach(function(p){h+='<div class="info-card" style="text-align:center;padding:10px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700">'+p.y+'</div><div style="font-family:var(--fd);font-size:16px;color:var(--gr)">'+fmtK(Math.round(p.v))+'</div></div>';});
+    h+='</div>';
+    // Three per-bucket sustainable monthly income tiles
+    var _selfSMI=parseInt(_sim.projRetIncome_self)||0;
+    var _spouseSMI=parseInt(_sim.projRetIncome_spouse)||0;
+    var _jointSMI=parseInt(_sim.projRetIncome_joint)||0;
+    var _selfTgt=Math.round(_cpRetIncomeTarget('self'));
+    var _spouseTgt=Math.round(_cpRetIncomeTarget('spouse'));
+    var _jointTgt=Math.round(_cpRetIncomeTarget('joint'));
+    function _smiTile(label,smi,tgt,col){
+      var pct=tgt>0?Math.min(100,Math.round(smi/tgt*100)):0;
+      var smiCol=pct>=100?'var(--gr)':pct>=80?'var(--gr)':pct>=50?'var(--yl)':pct>=25?'var(--or)':'var(--rd)';
+      var tile='<div class="info-card" style="text-align:center;padding:10px"><div style="font-size:10px;color:'+col+';font-family:var(--fh);font-weight:700;letter-spacing:.06em">'+label+'</div>';
+      tile+='<div style="font-family:var(--fd);font-size:16px;color:'+smiCol+'">'+fmt(smi)+'/mo</div>';
+      if(tgt>0)tile+='<div style="font-size:10px;color:var(--mu);margin-top:2px">'+pct+'% of '+fmt(tgt)+'/mo</div>';
+      tile+='</div>';
+      return tile;
+    }
+    h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:10px">';
+    h+=_smiTile('YOU · YR30 SMI',_selfSMI,_selfTgt,'#5B9BFF');
+    h+=_smiTile((_spName||'SPOUSE').toUpperCase()+' · YR30 SMI',_spouseSMI,_spouseTgt,'#A855F7');
+    h+=_smiTile('JOINT · YR30 SMI',_jointSMI,_jointTgt,'var(--gr)');
+    h+='</div>';
+  } else {
+    h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:10px">';
+    [{y:'YR 5',v:nw5},{y:'YR 10',v:nw10},{y:'YR 20',v:nw20},{y:'YR 30',v:nw30}].forEach(function(p){h+='<div class="info-card" style="text-align:center;padding:10px"><div style="font-size:10px;color:var(--mu);font-family:var(--fh);font-weight:700">'+p.y+'</div><div style="font-family:var(--fd);font-size:16px;color:var(--gr)">'+fmtK(Math.round(p.v))+'</div></div>';});
+    h+='</div>';
+    h+='<div class="info-card" style="text-align:center;padding:10px;margin-bottom:10px"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700">SUSTAINABLE MONTHLY INCOME &middot; YR 30</div><div style="font-family:var(--fd);font-size:20px;color:'+_retCol+'">'+fmt(_retSustained)+'/mo</div>';
+    if(_retTarget>0)h+='<div style="font-size:11px;color:var(--mu);margin-top:2px">'+_retPct+'% of '+fmt(_retTarget)+'/mo target</div>';
+    h+='</div>';
+  }
 
   // ── 3. Per-Allocation Year-by-Year Table ──
   h+='<div class="info-card" style="padding:14px;margin-bottom:10px">';
@@ -35334,6 +36558,182 @@ function _cpUpdateDebtStrategyNumbers(idx){
   }
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// JOINT DUAL-SLIDER + APPROVAL REQUEST HANDLERS
+// ════════════════════════════════════════════════════════════════════════════
+
+// Dual slider for joint cards: each spouse adjusts their portion independently.
+// side: 'self' (your portion) or 'spouse' (partner's portion).
+// Combined = a.amountSelf + a.amountSpouse, written to a.amount as the total
+// so the simulator and budget math don't need to know about the split.
+//
+// Budget + IRS enforcement:
+//   1. The dragged side is clamped at the IRS limit (combined cannot exceed
+//      _cpIRSMax for the card type).
+//   2. The dragged side is also clamped at the contributing spouse's available
+//      budget. "Your" portion can't exceed your share of household surplus
+//      (split by income contribution); same for spouse portion.
+//   3. After clamping, combined = amountSelf + amountSpouse, then _cpEnforce
+//      reconciles any final household-level limits.
+function _cpSlideJoint(i,side,v){
+  var a=CPLAN.allocations[i];if(!a)return;
+  var newVal=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
+  if(newVal<0)newVal=0;
+  // Per-spouse budget caps. Each spouse's share of household surplus is
+  // proportional to their income contribution. Fall back to 50/50 split when
+  // partner income isn't loaded yet.
+  var totalSurplus=CPLAN.surplus||0;
+  var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+  var budgetTotal=Math.round(totalSurplus*(1-brPct));
+  var selfInc=CPLAN.income||0;
+  var spouseInc=(CPLAN._partner&&CPLAN._partner.income)||0;
+  var combInc=selfInc+spouseInc;
+  var selfShare=combInc>0?(selfInc/combInc):0.5;
+  var selfBudget=Math.round(budgetTotal*selfShare);
+  var spouseBudget=Math.round(budgetTotal*(1-selfShare));
+  // Subtract this spouse's other joint-card portions from their per-spouse budget
+  var selfOtherJoint=0,spouseOtherJoint=0;
+  (CPLAN.allocations||[]).forEach(function(other,j){
+    if(j===i)return;
+    if(other.owner!=='joint')return;
+    selfOtherJoint+=parseFloat(other.amountSelf)||0;
+    spouseOtherJoint+=parseFloat(other.amountSpouse)||0;
+  });
+  // Subtract this user's regular self-owned allocations from THEIR budget too
+  // (those count against self's share of surplus, not against joint card's
+  // contribution from self).
+  var selfOtherRegular=0;
+  (CPLAN.allocations||[]).forEach(function(other,j){
+    if(j===i)return;
+    if(other.owner!=='self')return;
+    selfOtherRegular+=parseFloat(other.amount)||0;
+  });
+  var selfAvail=Math.max(0,selfBudget-selfOtherJoint-selfOtherRegular);
+  var spouseAvail=Math.max(0,spouseBudget-spouseOtherJoint);
+  // Apply the per-spouse budget cap to the dragged side
+  if(side==='self'&&newVal>selfAvail)newVal=selfAvail;
+  if(side==='spouse'&&newVal>spouseAvail)newVal=spouseAvail;
+  // Apply IRS cap to the COMBINED amount. Compute the cap, then if combined
+  // would exceed it, clamp the dragged side.
+  if(side==='self'){
+    a.amountSelf=newVal;
+  } else {
+    a.amountSpouse=newVal;
+  }
+  var combined=(parseFloat(a.amountSelf)||0)+(parseFloat(a.amountSpouse)||0);
+  if(typeof _cpIRSMax==='function'){
+    var _irsTypes={roth:1,'401k':1,roth401k:1,trad_ira:1,solo401k:1,sep_ira:1,hsa:1};
+    if(_irsTypes[a.type]){
+      var irsCap=_cpIRSMax(a.type,a);
+      if(combined>irsCap){
+        // Reduce the dragged side enough to fit
+        var overshoot=combined-irsCap;
+        if(side==='self'){a.amountSelf=Math.max(0,(a.amountSelf||0)-overshoot);newVal=a.amountSelf;}
+        else{a.amountSpouse=Math.max(0,(a.amountSpouse||0)-overshoot);newVal=a.amountSpouse;}
+        combined=(parseFloat(a.amountSelf)||0)+(parseFloat(a.amountSpouse)||0);
+      }
+    }
+  }
+  a.amount=combined;
+  // Sync the matching number input + slider to the clamped value
+  var inpId=side==='self'?('cpJointSelf'+i):('cpJointSpouse'+i);
+  var inp=document.getElementById(inpId);if(inp)inp.value=newVal;
+  var sliderEl=document.querySelector('input[type="range"][data-cpjointidx="'+i+'"][data-cpjointside="'+side+'"]');
+  if(sliderEl)sliderEl.value=newVal;
+  // Update combined display
+  var totEl=document.getElementById('cpJointTotal'+i);if(totEl)totEl.textContent='$'+fmt(a.amount);
+  _cpMarkModified();
+  // Debounce heavy renders
+  clearTimeout(CPLAN._slideTimer);CPLAN._slideTimer=setTimeout(function(){
+    try{_cpRunSimulation();_cpRenderCharts();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();}catch(e){}
+  },200);
+}
+
+// Stage a change request for a partner-owned shared card. Doesn't apply
+// immediately — sets a pending value and reveals the "Send request" button.
+function _cpStageRequest(i,v){
+  var a=CPLAN.allocations[i];if(!a)return;
+  var newVal=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
+  if(newVal<0)newVal=0;
+  if(!CPLAN._pendingRequestChanges)CPLAN._pendingRequestChanges={};
+  CPLAN._pendingRequestChanges[i]={oldAmount:parseFloat(a.amount)||0,newAmount:newVal};
+  // Reveal the send button only when the staged value differs from the current
+  var btnWrap=document.getElementById('cpRequestBtn'+i);
+  if(btnWrap){
+    var origAmt=parseFloat(a.amount)||0;
+    btnWrap.style.display=(newVal!==origAmt)?'':'none';
+  }
+  // Keep the manual number input in sync
+  var inp=document.getElementById('cpRequest'+i);if(inp&&inp.value!=String(newVal))inp.value=newVal;
+}
+
+// Send the staged change request to the partner via couple_links.pending_change_requests
+async function _cpSendChangeRequest(i){
+  var a=CPLAN.allocations[i];if(!a||!_cpSharedCardsApi)return;
+  var staged=(CPLAN._pendingRequestChanges||{})[i];
+  if(!staged)return;
+  if(!a._sharedId){_cpToast('Card has no shared id — refresh and try again');return;}
+  var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
+  try{
+    var ok=await _cpSharedCardsApi.submitChangeRequest(a._sharedId,cardName,a.type,staged.oldAmount,staged.newAmount);
+    if(ok){
+      _cpToast('Request sent to spouse');
+      // Track that we have an outstanding request on this card so realtime can
+      // notify us when the partner approves or declines it. Stores the staged
+      // new amount and old amount so we can give specific feedback.
+      if(!CPLAN._myOutstandingRequests)CPLAN._myOutstandingRequests={};
+      CPLAN._myOutstandingRequests[a._sharedId]={cardName:cardName,oldAmount:staged.oldAmount,newAmount:staged.newAmount,sentAt:Date.now()};
+      var btnWrap=document.getElementById('cpRequestBtn'+i);if(btnWrap)btnWrap.style.display='none';
+      delete CPLAN._pendingRequestChanges[i];
+    } else {
+      _cpToast('Failed to send request');
+    }
+  }catch(e){console.warn('send request:',e);_cpToast('Failed to send request');}
+}
+
+// Small toast notification helper — auto-dismiss after 2.5s
+function _cpToast(msg){
+  if(!msg)return;
+  var t=document.createElement('div');
+  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 18px;background:rgba(0,0,0,.85);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none;transition:opacity .3s';
+  t.textContent=msg;
+  document.body.appendChild(t);
+  setTimeout(function(){t.style.opacity='0';},2200);
+  setTimeout(function(){t.remove();},2500);
+}
+
+// Open a small picker so the user can choose which partner to share a card with
+// and whether the partner can edit (request changes) or only view. For now,
+// hybrid couples have a single partner, so we show a simple confirm flow.
+async function _cpShareCardWithPartner(i){
+  var a=CPLAN.allocations[i];if(!a||!_cpSharedCardsApi)return;
+  var couple=_cpSharedCardsApi._ensureCouple();
+  if(!couple){_cpToast('No partner linked');return;}
+  var partnerId=getPartnerClientId(couple,APP.currentClientId);
+  if(!partnerId){_cpToast('No partner found');return;}
+  var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
+  var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
+  var mode=confirm('Share "'+cardName+'" with '+partnerName+'?\n\nOK = let them request changes (edit mode)\nCancel = view-only')?'edit':'view';
+  // Make sure card has a sharedId
+  _cpSharedCardsApi.ensureSharedId(a,'self');
+  // Mirror into shared_plan_cards so the partner can see it
+  var row=await _cpSharedCardsApi.fetchCoupleRow();
+  if(row){
+    var arr=Array.isArray(row.shared_plan_cards)?row.shared_plan_cards:[];
+    var existing=arr.find(function(c){return c&&c.sharedId===a._sharedId;});
+    var serialized=_cpSharedCardsApi.serializeCard(a,APP.currentClientId);
+    if(existing){
+      Object.assign(existing,serialized);
+    } else {
+      arr.push(serialized);
+    }
+    await _cpSharedCardsApi.updateCouple({shared_plan_cards:arr});
+  }
+  // Grant the partner access
+  var ok=await _cpSharedCardsApi.grantShare(a._sharedId,partnerId,mode);
+  if(ok){_cpToast('Shared with '+partnerName);}else{_cpToast('Share failed');}
+}
+
 function _cpSlide(i,v){
   // Snapshot debt amounts BEFORE this slide so _cpSlideEnd can detect a
   // zero-crossing on any debt allocation (positive → 0 OR 0 → positive).
@@ -35443,7 +36843,7 @@ function _cpSlide(i,v){
   if(a&&a.type==='debt')_cpUpdateDebtStrategyNumbers(i);
   // 5. Debounce heavy renders (chart, timeline, completion estimates)
   clearTimeout(CPLAN._slideTimer);CPLAN._slideTimer=setTimeout(function(){
-    try{_cpRunSimulation();_cpRenderChart();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();}catch(e){}
+    try{_cpRunSimulation();_cpRenderCharts();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();}catch(e){}
     if(CPLAN.mode==='detailed'){try{_cpRenderOutcomes();}catch(e2){}}
   },200);
 }
@@ -35474,7 +36874,7 @@ function _cpSlideEnd(){
   }
   try{
     if(typeof _cpRunSimulation==='function')_cpRunSimulation();
-    if(typeof _cpRenderChart==='function')_cpRenderChart();
+    if(typeof _cpRenderCharts==='function')_cpRenderCharts(); else if(typeof _cpRenderChart==='function')_cpRenderChart();
     if(typeof _cpRenderHealthScore==='function')_cpRenderHealthScore();
     if(typeof _cpRenderEFRunway==='function')_cpRenderEFRunway();
     if(typeof _cpRenderIncomeReplacement==='function')_cpRenderIncomeReplacement();
@@ -35572,11 +36972,19 @@ function _cpAdd(type){
   _cpMaybeShowCascadePrompt(newIdx);
 }
 function _cpRemove(i){
+  var a=CPLAN.allocations[i];
+  // Partner-owned shared cards (joint or self) can't be removed by this user
+  // — they belong to the partner. Removal silently bounces back on next load
+  // anyway because the hydration re-inserts them. Block here with a clearer
+  // signal so the user understands.
+  if(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId){
+    try{_cpToast('Your spouse owns this card — ask them to remove it');}catch(e){}
+    return;
+  }
   // If this card came from a red flag, mark that flag as dismissed so the auto-sync
   // in _cpSyncFlagsToUnassigned doesn't re-stage it on the next render. The user
   // can clear CPLAN._dismissedFlags later if they want all flags to repopulate.
   try{
-    var a=CPLAN.allocations[i];
     if(a&&a.flagAction){
       if(!CPLAN._dismissedFlags)CPLAN._dismissedFlags={};
       CPLAN._dismissedFlags[a.flagAction]=true;
@@ -36591,7 +37999,14 @@ function cplanSave(){
   // Wave 4: preserve state machine fields. Also fix latent Wave 1 bug —
   // _ibcUnderlyingType was missing from this map and was being lost on reload,
   // which made IUL allocations fall back to the WL 4% rate after any save/reload.
-  var cleanAllocs=CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,
+  // Filter out partner-shared cards before serializing — they belong to the
+  // partner's allocation_plan, not ours. We loaded them into CPLAN.allocations
+  // only for display + request-change workflow on this user's side. Joint
+  // cards stay (they're co-owned and we DO save them); only cards owned by
+  // the partner via shared_card_grants are filtered.
+  var cleanAllocs=CPLAN.allocations.filter(function(a){
+    return !(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint');
+  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,
   // Loan tracking fields — persisted so the IBC continuation card state
   // survives logout/login. loanBalance is the canonical outstanding balance;
   // monthlyLoanRepay is the user's repayment slider value; loans[] is the
@@ -36657,6 +38072,12 @@ function cplanSave(){
           b2.textContent='✓ Saved';b2.style.color='var(--gr)';CPLAN.modified=false;
           // Auto-save plan version history
           db.from('plan_versions').insert({client_id:_svId,plan_data:plan,source:CPLAN.planMode==='ai'?'ai_generated':CPLAN.hasAdvisor?'advisor':'manual',summary:cleanAllocs.length+' allocations, '+fmt(CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0))+'/mo deployed, health score: '+(_cpCalcHealthScore()||0)}).then(function(){}).catch(function(){});
+          // Hybrid couples: sync joint cards to the shared couple_links row so
+          // the partner sees the updates. Fire-and-forget; partner will receive
+          // a realtime UPDATE event and refresh their view.
+          if(CPLAN._householdType==='hybrid'&&typeof _cpSharedCardsApi!=='undefined'&&_cpSharedCardsApi){
+            try{_cpSharedCardsApi.syncJointCards().catch(function(_e){console.warn('[shared] joint sync after save:',_e);});}catch(_e){console.warn('[shared] joint sync:',_e);}
+          }
         }
         setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},2000);
       }
