@@ -2460,6 +2460,8 @@ async function initAuth(){
     if(event === 'SIGNED_IN' && session){ APP.user = session.user; await determineRoleAndRoute(); }
     else if(event === 'SIGNED_OUT'){
       APP.user = null; APP.role = 'agent';
+      // Phase 5 — drop the joint-financials realtime subscription on logout.
+      try{ if(typeof _cpUnsubscribeFromJointFinancials === 'function') _cpUnsubscribeFromJointFinancials(); }catch(e){}
       // Clear ALL cached financial data so a different user doesn't see previous user's data
       try{
         ['pfos_profile_client_id','pfos_pending_user','pfos_client_tags_v1',
@@ -4491,6 +4493,11 @@ async function loadClientDataIntoPFOS(clientId){
   var frame=getPFOSFrame();if(frame&&frame.contentWindow)try{frame.contentWindow.postMessage({type:'PFOS_FLUSH'},'https://pfos.esjfinancial.com');}catch(e){}
   // Small delay to let flush complete
   await new Promise(function(r){setTimeout(r,50);});
+  // Phase 5 — drop any prior joint-data realtime subscription. Without this,
+  // an advisor switching between Hybrid couples would keep receiving updates
+  // (and toasts) for the previous client because RLS allows advisors to read
+  // both their clients' couple_links rows.
+  try{ if(typeof _cpUnsubscribeFromJointFinancials === 'function') _cpUnsubscribeFromJointFinancials(); }catch(e){}
   // Detect couple link for this client. The in-memory APP_COUPLES list is only
   // populated for advisors via loadCouples() (which uses APP.myClients — empty
   // for logged-in clients). For client mode, do a direct DB lookup so the
@@ -4541,6 +4548,40 @@ async function loadClientDataIntoPFOS(clientId){
       recommendations = recs || [];
     } catch(e){}
 
+    // Load partner's profileCompleted flag for Hybrid households so the
+    // Mark Profile Complete UI on pfos-main can show partner's status. Only
+    // queried for Hybrid (other types don't gate on partner completion).
+    // Single row, only the field we need. Failure is silent — pfos-main
+    // falls back to "loading…" status.
+    var partnerProfileCompleted = false;
+    var partnerProfileCompletedAt = null;
+    var partnerEmail = '';
+    var partnerFirstName = '';
+    if(couple.household_type === 'hybrid' && partnerId){
+      try{
+        const { data: pPart } = await db.from('client_profiles')
+          .select('financial_data,client_id')
+          .eq('client_id', partnerId)
+          .order('updated_at',{ascending:false})
+          .limit(1).maybeSingle();
+        if(pPart && pPart.financial_data && pPart.financial_data.S){
+          partnerProfileCompleted = pPart.financial_data.S.profileCompleted === true;
+          partnerProfileCompletedAt = pPart.financial_data.S.profileCompletedAt || null;
+          if(pPart.financial_data.S.profile){
+            partnerFirstName = pPart.financial_data.S.profile.firstName || '';
+          }
+        }
+        // Also pull partner email from clients table (separate row)
+        const { data: pClient } = await db.from('clients').select('email,name').eq('id', partnerId).maybeSingle();
+        if(pClient){
+          partnerEmail = pClient.email || '';
+          if(!partnerFirstName && pClient.name){
+            partnerFirstName = (pClient.name.split(' ')[0]) || '';
+          }
+        }
+      }catch(e){console.warn('[coupleData] partner profileCompleted fetch failed:', e);}
+    }
+
     coupleData = {
       coupleLinkId:    couple.id,
       householdType:   couple.household_type,
@@ -4550,7 +4591,12 @@ async function loadClientDataIntoPFOS(clientId){
       isPrimary:       clientId === couple.client_a_id,
       sharedGoals:     sharedGoals,
       jointFinancialData: couple.joint_financial_data || {},
-      recommendations: recommendations
+      recommendations: recommendations,
+      // Phase 2 — partner profile completion status (Hybrid only)
+      partnerProfileCompleted: partnerProfileCompleted,
+      partnerProfileCompletedAt: partnerProfileCompletedAt,
+      partnerEmail: partnerEmail,
+      partnerFirstName: partnerFirstName
     };
 
     clientId = loadFrom; // for joint, load primary's profile
@@ -4599,11 +4645,20 @@ async function loadClientDataIntoPFOS(clientId){
   _lastPfosState = { state: stateData || {}, calcs: seedCalcs };
 
   var _ci=APP.currentClient?{name:APP.currentClient.name||'',email:APP.currentClient.email||'',phone:APP.currentClient.phone||'',marital:APP.currentClient.marital_status||'',spouse:APP.currentClient.spouse_name||''}:null;
+  // Phase 2 — stash coupleData on _portalFd so the profile-completion gate
+  // (_cpCheckProfileCompletionGate) can read partner's profileCompleted flag
+  // without an extra DB query. Also attach to APP for redundancy.
+  if(APP._portalFd){APP._portalFd._coupleData=coupleData;}
+  APP._clientCoupleData=coupleData;
   pfosPost({ type:'PFOS_LOAD', state: stateData, clientInfo: _ci, clientId: APP.currentClientId, mode: mode, tier: pfosTier,
     trialStart: APP.currentClient ? (APP.currentClient.trial_start_date||null) : null,
     clientType: APP.currentClient ? (APP.currentClient.client_type||'product') : 'product',
     assignedAdvisorId: (APP.currentClient && APP.currentClient.client_type !== 'product') ? (APP.currentClient.user_id || null) : null,
     coupleData: coupleData });
+  // Phase 5 — subscribe to realtime updates on couple_links.joint_financial_data
+  // for Hybrid households. Helper no-ops for non-Hybrid. Wrapped in try/catch
+  // so a subscription failure doesn't block the load.
+  try{ if(typeof _cpSubscribeToJointFinancials === 'function') _cpSubscribeToJointFinancials(); }catch(e){ console.warn('[joint-rt] subscribe at load failed:', e); }
   // Allow saves now that real data has been sent to iframe
   _pfosDataLoaded=true;
   // Sync plan data to pfos-main iframe after plan initializes
@@ -7823,6 +7878,335 @@ window.addEventListener('message',async function(e){
     showClientPage(page);
     if(page==='tracking')renderClientTracking();
     if(page==='projections')renderClientProjections();
+    return;
+  }
+  // Phase 2: pfos-main sends this when the user marks their profile complete.
+  // We fire an email notification to the partner via send-notification edge
+  // function. Best-effort — failures are logged but don't surface to the user
+  // (the profile is already marked complete locally; the email is just a nudge).
+  if(msg.type==='PFOS_NOTIFY_PARTNER_COMPLETED'){
+    try{
+      var p=msg.payload||{};
+      if(!p.partnerEmail){console.warn('[notify-partner] no partner email available');return;}
+      db.functions.invoke('send-notification',{
+        body:{
+          type:'partner_profile_completed',
+          clientEmail: p.partnerEmail,
+          clientName: p.partnerName||'',
+          agentName: p.selfFirstName||'Your spouse',
+          clientId: p.partnerClientId||null
+        }
+      }).catch(function(err){console.warn('[notify-partner] send failed:', err);});
+    }catch(e){console.warn('[notify-partner] handler error:', e);}
+    return;
+  }
+  // Phase 2: pfos-main sends this when the user clicks "Send Reminder" on the
+  // gate-blocked AI screen. Different copy than the auto-fire above.
+  if(msg.type==='PFOS_REMIND_PARTNER_COMPLETION'){
+    try{
+      var rp=msg.payload||{};
+      if(!rp.partnerEmail){console.warn('[remind-partner] no partner email');return;}
+      db.functions.invoke('send-notification',{
+        body:{
+          type:'partner_profile_reminder',
+          clientEmail: rp.partnerEmail,
+          clientName: rp.partnerName||'',
+          agentName: rp.selfFirstName||'Your spouse',
+          clientId: rp.partnerClientId||null
+        }
+      }).catch(function(err){console.warn('[remind-partner] send failed:', err);});
+    }catch(e){console.warn('[remind-partner] handler error:', e);}
+    return;
+  }
+  // Phase 3 — Hybrid joint-data migration. Fired by pfos-main when a Hybrid
+  // user's V2 migration sweep extracts owner='joint' items from their
+  // financial_data.S. We merge those items into couple_links.joint_financial_data
+  // so both spouses can see/edit them in V2.
+  //
+  // Concurrency: if BOTH spouses' first-load triggers this (race), the second
+  // write merges into the already-populated joint_financial_data without
+  // duplicating. We dedupe by exact-match on (name + amount) since old data
+  // had no shared IDs. Acceptable for first-load migration; subsequent edits
+  // use the proper V2 joint-toggle UI which assigns proper IDs.
+  if(msg.type==='PFOS_MIGRATE_HYBRID_JOINT_DATA'){
+    try{
+      var mp=msg.payload||msg;
+      var coupleLinkId=mp.coupleLinkId;
+      var jp=mp.jointPayload||{};
+      var origId=mp.originatorClientId||null;
+      if(!coupleLinkId){console.warn('[migration-hybrid] missing coupleLinkId');return;}
+      (async function(){
+        try{
+          const { data: cl } = await db.from('couple_links').select('joint_financial_data').eq('id', coupleLinkId).maybeSingle();
+          var existing = (cl && cl.joint_financial_data) || {};
+          // Initialize merged shape — preserves anything already there
+          var merged = {
+            incomeSources: Array.isArray(existing.incomeSources) ? existing.incomeSources.slice() : [],
+            expData:       (existing.expData && typeof existing.expData === 'object') ? existing.expData : {},
+            retAccounts:   Array.isArray(existing.retAccounts) ? existing.retAccounts.slice() : [],
+            investments:   Array.isArray(existing.investments) ? existing.investments.slice() : [],
+            debts:         Array.isArray(existing.debts) ? existing.debts.slice() : [],
+            _lastChange:   existing._lastChange || null
+          };
+          // Dedup helper: looks for an item with the same name (or label/source/type)
+          // and approximately the same amount/balance. If found, skip the incoming
+          // item (the partner already migrated the shared item from their side).
+          function _dupMatch(list, incoming){
+            return list.some(function(x){
+              var nameEq = ((x.name||x.label||x.source||'') === (incoming.name||incoming.label||incoming.source||''));
+              var amtEq = (parseFloat(x.amount||x.balance||0) === parseFloat(incoming.amount||incoming.balance||0));
+              return nameEq && amtEq;
+            });
+          }
+          var addedCount = 0;
+          (jp.incomeSources||[]).forEach(function(s){ if(!_dupMatch(merged.incomeSources, s)){ merged.incomeSources.push(s); addedCount++; } });
+          (jp.retAccounts||[]).forEach(function(r){ if(!_dupMatch(merged.retAccounts, r)){ merged.retAccounts.push(r); addedCount++; } });
+          (jp.investments||[]).forEach(function(i){ if(!_dupMatch(merged.investments, i)){ merged.investments.push(i); addedCount++; } });
+          (jp.debts||[]).forEach(function(d){ if(!_dupMatch(merged.debts, d)){ merged.debts.push(d); addedCount++; } });
+          // Write back
+          await db.from('couple_links').update({ joint_financial_data: merged }).eq('id', coupleLinkId);
+          console.log('[migration-hybrid] joint items merged to couple_links — added:', addedCount, 'originator:', origId);
+        }catch(err){
+          console.error('[migration-hybrid] write failed:', err);
+        }
+      })();
+    }catch(e){console.warn('[migration-hybrid] handler error:', e);}
+    return;
+  }
+  // Phase 4 — write joint items (incomeSources/retAccounts/investments/debts)
+  // back to couple_links.joint_financial_data. Fired by pfos-main whenever a
+  // Hybrid user toggles Joint on/off, adds a joint item, or edits share_pct.
+  //
+  // The payload carries the FULL local view of joint items (not a delta) so
+  // the write is idempotent. We preserve any non-managed fields on the
+  // joint_financial_data column (employmentType, retAge, dob, etc) by reading
+  // the current row, merging, and writing back.
+  //
+  // Concurrency: this is last-write-wins. Phase 5 adds realtime subscriptions
+  // so the OTHER spouse sees updates without reload. Until then, race window
+  // is brief (button-press to DB write ~200ms) and the dedup logic prevents
+  // duplicate inserts in any realistic scenario.
+  if(msg.type==='PFOS_WRITE_JOINT_ITEMS'){
+    try{
+      var wp=msg.payload||{};
+      var coupleLinkId=wp.coupleLinkId;
+      var jointItems=wp.jointItems||{};
+      var origId=wp.originatorClientId||null;
+      if(!coupleLinkId){console.warn('[joint-write] missing coupleLinkId');return;}
+      // Phase 5 — stamp self-write timestamp BEFORE the DB call so the
+      // realtime subscriber can suppress our own echo. Using a generous
+      // 1.5s window like the shared-cards pattern.
+      try{ if(typeof CPLAN!=='undefined') CPLAN._lastJointFinancialsSelfWriteAt = Date.now(); }catch(e){}
+      (async function(){
+        try{
+          const { data: cl } = await db.from('couple_links').select('joint_financial_data').eq('id', coupleLinkId).maybeSingle();
+          var existing = (cl && cl.joint_financial_data) || {};
+          // Preserve everything except the four managed arrays — those get fully replaced
+          var merged = Object.assign({}, existing, {
+            incomeSources: Array.isArray(jointItems.incomeSources) ? jointItems.incomeSources : (existing.incomeSources||[]),
+            retAccounts:   Array.isArray(jointItems.retAccounts)   ? jointItems.retAccounts   : (existing.retAccounts||[]),
+            investments:   Array.isArray(jointItems.investments)   ? jointItems.investments   : (existing.investments||[]),
+            debts:         Array.isArray(jointItems.debts)         ? jointItems.debts         : (existing.debts||[]),
+            _lastChange: {
+              ts: new Date().toISOString(),
+              by: origId
+            }
+          });
+          await db.from('couple_links').update({ joint_financial_data: merged }).eq('id', coupleLinkId);
+          console.log('[joint-write] couple_links updated — income:', merged.incomeSources.length, 'ret:', merged.retAccounts.length, 'inv:', merged.investments.length, 'debt:', merged.debts.length, 'by:', origId);
+        }catch(err){
+          console.error('[joint-write] failed:', err);
+        }
+      })();
+    }catch(e){console.warn('[joint-write] handler error:', e);}
+    return;
+  }
+  // Phase 6 — write a single scalar field on couple_links.joint_financial_data
+  // (filingStatus, etc). Distinct from PFOS_WRITE_JOINT_ITEMS which writes the
+  // four arrays wholesale. Re-uses the same self-write timestamp for realtime
+  // echo suppression.
+  if(msg.type==='PFOS_WRITE_JOINT_FIELD'){
+    try{
+      var fp = msg.payload || {};
+      var fpCoupleLinkId = fp.coupleLinkId;
+      var fpField = fp.field;
+      var fpValue = fp.value;
+      var fpOrigId = fp.originatorClientId || null;
+      if(!fpCoupleLinkId || !fpField){ console.warn('[joint-field-write] missing required fields'); return; }
+      // Whitelist of allowed scalar fields — defense against unintended writes
+      var ALLOWED = ['filingStatus'];
+      if(ALLOWED.indexOf(fpField) === -1){ console.warn('[joint-field-write] field not allowed:', fpField); return; }
+      try{ if(typeof CPLAN!=='undefined') CPLAN._lastJointFinancialsSelfWriteAt = Date.now(); }catch(e){}
+      (async function(){
+        try{
+          const { data: clf } = await db.from('couple_links').select('joint_financial_data').eq('id', fpCoupleLinkId).maybeSingle();
+          var existing = (clf && clf.joint_financial_data) || {};
+          var merged = Object.assign({}, existing);
+          merged[fpField] = fpValue;
+          merged._lastChange = { ts: new Date().toISOString(), by: fpOrigId };
+          await db.from('couple_links').update({ joint_financial_data: merged }).eq('id', fpCoupleLinkId);
+          console.log('[joint-field-write] couple_links updated —', fpField, '=', fpValue, 'by:', fpOrigId);
+        }catch(err){ console.error('[joint-field-write] failed:', err); }
+      })();
+    }catch(e){ console.warn('[joint-field-write] handler error:', e); }
+    return;
+  }
+  // ── Phase 8 — household conversion handlers ────────────────────────────
+  // PFOS_CREATE_COUPLE_LINK: Individual user is adding a spouse. We create
+  // the partner clients row, the couple_links row, and dispatch the portal
+  // invite, then reply with PFOS_COUPLE_LINK_CREATED.
+  if(msg.type==='PFOS_CREATE_COUPLE_LINK'){
+    (async function(){
+      var cp = msg.payload || {};
+      var hh = cp.householdType;
+      var spouseFirst = (cp.spouseFirstName||'').trim();
+      var spouseLast  = (cp.spouseLastName||'').trim();
+      var spouseEmail = (cp.spouseEmail||'').trim().toLowerCase();
+      var origId = cp.originatorClientId || APP.currentClientId;
+      function reply(payload){
+        try{
+          var frame = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+          if(frame && frame.contentWindow){
+            frame.contentWindow.postMessage({ type:'PFOS_COUPLE_LINK_CREATED', payload:payload }, 'https://pfos.esjfinancial.com');
+          }
+        }catch(e){}
+      }
+      if(!origId){ reply({success:false, error:'Not signed in.'}); return; }
+      if(!hh || ['joint','separate','hybrid'].indexOf(hh) === -1){ reply({success:false, error:'Invalid household type.'}); return; }
+      if(!spouseFirst || !spouseEmail){ reply({success:false, error:'Missing spouse details.'}); return; }
+      try{
+        // 1. Check if a couple link already exists for this client — refuse
+        //    to create a second one
+        const { data: existingCl } = await db.from('couple_links').select('id')
+          .or('client_a_id.eq.'+origId+',client_b_id.eq.'+origId)
+          .limit(1).maybeSingle();
+        if(existingCl && existingCl.id){
+          reply({success:false, error:'You already have a couple link. Remove the existing one before adding a new spouse.'});
+          return;
+        }
+        // 2. Check if a client already exists for the spouse email
+        var partnerClientId = null;
+        const { data: existingClient } = await db.from('clients').select('id,name,email')
+          .ilike('email', spouseEmail).limit(1).maybeSingle();
+        if(existingClient && existingClient.id){
+          partnerClientId = existingClient.id;
+        } else {
+          // 3. Create partner clients row. Match the originating client's
+          //    advisor (user_id) and tier so the partner inherits the same
+          //    access level.
+          var fullName = spouseLast ? (spouseFirst + ' ' + spouseLast) : spouseFirst;
+          var _self = APP.currentClient || {};
+          const { data: newClient, error: insErr } = await db.from('clients').insert({
+            name: fullName,
+            email: spouseEmail,
+            user_id: _self.user_id || null,
+            client_type: _self.client_type || 'product',
+            pfos_tier: _self.pfos_tier || 'trial',
+            marital_status: 'married',
+            status: 'new',
+            created_at: new Date().toISOString()
+          }).select('id').maybeSingle();
+          if(insErr || !newClient){
+            console.error('[phase8] partner client insert failed:', insErr);
+            reply({success:false, error:'Failed to create partner record: '+((insErr&&insErr.message)||'unknown')});
+            return;
+          }
+          partnerClientId = newClient.id;
+        }
+        // 4. Create couple_links row. Originator is client_a (primary) by
+        //    convention so they own the shared profile for Joint households.
+        const { data: newCouple, error: clErr } = await db.from('couple_links').insert({
+          client_a_id: origId,
+          client_b_id: partnerClientId,
+          household_type: hh,
+          created_by: origId,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }).select('id').maybeSingle();
+        if(clErr || !newCouple){
+          console.error('[phase8] couple_links insert failed:', clErr);
+          reply({success:false, error:'Failed to link couple: '+((clErr&&clErr.message)||'unknown')});
+          return;
+        }
+        // 5. Also update the originator's clients row with the new
+        //    household_type and marital_status — keeps things consistent
+        try{
+          await db.from('clients').update({
+            marital_status: 'married',
+            household_type: hh,
+            spouse_name: spouseLast ? (spouseFirst+' '+spouseLast) : spouseFirst
+          }).eq('id', origId);
+        }catch(e){ console.warn('[phase8] self update failed (non-fatal):', e); }
+        // 6. Dispatch portal invite (best-effort, non-blocking on response).
+        //    Column is invite_token (not token); no source column.
+        try{
+          var token = (typeof crypto!=='undefined'&&crypto.randomUUID)?crypto.randomUUID():(Date.now()+'-'+Math.random().toString(36).slice(2,12));
+          var expiresAt = new Date(Date.now() + 30*24*60*60*1000).toISOString();// 30 days
+          await db.from('portal_invites').upsert({
+            client_id: partnerClientId,
+            email: spouseEmail,
+            invite_token: token,
+            status: 'pending',
+            created_at: new Date().toISOString(),
+            expires_at: expiresAt
+          }, {onConflict:'client_id'});
+          var inviterName = (APP.currentClient && APP.currentClient.name) || 'Your partner';
+          db.functions.invoke('send-portal-invite', { body:{ email:spouseEmail, token:token, clientName:(spouseLast?(spouseFirst+' '+spouseLast):spouseFirst), inviterName:inviterName, source:'couple_registration' } }).catch(function(e){ console.warn('[phase8] invite send failed (non-fatal):', e); });
+        }catch(e){ console.warn('[phase8] portal_invite upsert failed:', e); }
+        // 7. Refresh local couples cache so subsequent reads see the new link
+        try{ if(typeof loadCouples === 'function') await loadCouples(); }catch(e){}
+        reply({success:true, coupleLinkId:newCouple.id, partnerClientId:partnerClientId});
+        console.log('[phase8] couple link created:', newCouple.id, 'partner:', partnerClientId);
+      }catch(e){
+        console.error('[phase8] create-couple-link error:', e);
+        reply({success:false, error:e.message||'Unexpected error'});
+      }
+    })();
+    return;
+  }
+  // PFOS_SUBMIT_UNLINK_REQUEST: Coupled user wants to unlink (or change
+  // couple type). Inserts an unlink_requests row for admin review.
+  if(msg.type==='PFOS_SUBMIT_UNLINK_REQUEST'){
+    (async function(){
+      var up = msg.payload || {};
+      var coupleLinkId = up.coupleLinkId;
+      var reason = (up.reason||'').trim();
+      var desiredType = up.desiredHouseholdType || 'individual';
+      var origId = up.originatorClientId || APP.currentClientId;
+      function reply(payload){
+        try{
+          var frame = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+          if(frame && frame.contentWindow){
+            payload.desiredHouseholdType = desiredType;// echo back so pfos-main knows which modal to close
+            frame.contentWindow.postMessage({ type:'PFOS_UNLINK_REQUEST_SUBMITTED', payload:payload }, 'https://pfos.esjfinancial.com');
+          }
+        }catch(e){}
+      }
+      if(!coupleLinkId){ reply({success:false, error:'Missing couple link id.'}); return; }
+      if(!origId){ reply({success:false, error:'Not signed in.'}); return; }
+      // Encode desired type in admin_message so admin can route the request.
+      // Format: "[DESIRED: hybrid] User-provided reason here..."
+      var adminMsg = '[DESIRED: '+desiredType+']' + (reason ? ' ' + reason : '');
+      try{
+        const { error } = await db.from('unlink_requests').insert({
+          couple_link_id: coupleLinkId,
+          requesting_client_id: origId,
+          status: 'pending',
+          admin_message: adminMsg,
+          created_at: new Date().toISOString()
+        });
+        if(error){
+          console.error('[phase8] unlink_requests insert failed:', error);
+          reply({success:false, error:'Failed to submit: '+error.message});
+          return;
+        }
+        reply({success:true});
+        console.log('[phase8] unlink request submitted — desired:', desiredType);
+      }catch(e){
+        console.error('[phase8] submit-unlink-request error:', e);
+        reply({success:false, error:e.message||'Unexpected error'});
+      }
+    })();
     return;
   }
   if(msg.type==='PFOS_TRACK_ACTION'){
@@ -23361,7 +23745,140 @@ async function _cpSendPlanInquiry(){
 }
 
 // ── SELF-BUILD: Show unassigned flags + empty phases ──
+// ── PROFILE COMPLETION GATE (Phase 2 — Hybrid only) ────────────────────
+// Hybrid households can't run AI or build a DIY plan until BOTH spouses
+// have set S.profileCompleted = true. Other household types (Individual,
+// Joint, Separate) have no gate — they return {gated:false} immediately.
+//
+// State sources:
+//   - Self profileCompleted: APP._portalFd.S.profileCompleted (loaded fresh
+//     each time the user enters the plan view; set by pfos-main)
+//   - Partner profileCompleted: APP._portalFd._coupleData.partnerProfileCompleted
+//     (cached from the load-time coupleData query in loadClientDataIntoPFOS)
+//
+// Returns {gated:bool, reason:string, partnerName:string, partnerEmail:string,
+// partnerClientId:string, selfFirstName:string}.
+function _cpCheckProfileCompletionGate(){
+  var hh=(CPLAN&&CPLAN._householdType)||(APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.householdType)||'individual';
+  if(hh!=='hybrid')return{gated:false};
+  var stateS=(APP._portalFd&&APP._portalFd.S)||{};
+  var coupleData=(APP._portalFd&&APP._portalFd._coupleData)||(APP._clientCoupleData)||null;
+  var selfComplete=stateS.profileCompleted===true;
+  var partnerComplete=coupleData?(coupleData.partnerProfileCompleted===true):false;
+  var partnerName=(coupleData&&coupleData.partnerFirstName)||((coupleData&&coupleData.partnerName&&coupleData.partnerName.split(' ')[0]))||'your spouse';
+  var partnerEmail=(coupleData&&coupleData.partnerEmail)||'';
+  var partnerClientId=(coupleData&&coupleData.partnerClientId)||'';
+  var selfFirstName=(stateS.profile&&stateS.profile.firstName)||'';
+  if(!selfComplete&&!partnerComplete){
+    return{gated:true,reason:'neither',partnerName:partnerName,partnerEmail:partnerEmail,partnerClientId:partnerClientId,selfFirstName:selfFirstName};
+  }
+  if(!selfComplete){
+    return{gated:true,reason:'self',partnerName:partnerName,partnerEmail:partnerEmail,partnerClientId:partnerClientId,selfFirstName:selfFirstName};
+  }
+  if(!partnerComplete){
+    return{gated:true,reason:'partner',partnerName:partnerName,partnerEmail:partnerEmail,partnerClientId:partnerClientId,selfFirstName:selfFirstName};
+  }
+  return{gated:false};
+}
+
+// Render the gate-blocked screen. Content depends on which side is incomplete.
+//   reason='self'    — current user hasn't marked complete → "Mark yours first"
+//   reason='partner' — partner hasn't marked complete → "Waiting on [name], send a reminder?"
+//   reason='neither' — neither side complete → covers both messages
+// The "Send Reminder" button posts a message to pfos-main which fires the
+// email via the existing send-notification edge function.
+function _cpRenderCompletionGate(check){
+  var root=document.getElementById('cplanRoot');if(!root)return;
+  var partnerName=check.partnerName||'your spouse';
+  var h='<div style="display:flex;align-items:center;justify-content:center;min-height:400px;padding:20px">';
+  h+='<div style="width:100%;max-width:520px;background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(168,85,247,.25);border-radius:8px;padding:36px 30px;box-shadow:0 12px 40px rgba(0,0,0,.3)">';
+  h+='<div style="width:64px;height:64px;border-radius:16px;background:rgba(168,85,247,.15);display:flex;align-items:center;justify-content:center;font-size:30px;margin:0 auto 16px">⏳</div>';
+
+  if(check.reason==='self'){
+    h+='<div style="font-family:var(--fh);font-size:20px;font-weight:800;color:var(--wh);margin-bottom:8px;text-align:center">Mark your profile complete first</div>';
+    h+='<div style="font-size:14px;color:var(--mu);line-height:1.7;margin-bottom:20px;text-align:center">Hybrid households require both spouses to mark their profile complete before generating or building a plan. Go to <strong style="color:var(--wh)">My Finances</strong> and click <strong style="color:var(--wh)">Mark Profile Complete</strong> when you\'ve filled in everything you can.</div>';
+    h+='<div style="padding:14px 16px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.18);border-radius:6px;margin-bottom:20px;text-align:center;font-size:13px;color:var(--gr)">✓ '+escH(partnerName)+' has marked their profile complete and is waiting on you.</div>';
+    h+='<div style="display:flex;flex-direction:column;gap:10px">';
+    h+='<button onclick="showClientPage(\'pfos\')" class="btn" style="width:100%;padding:14px 24px;background:linear-gradient(135deg,rgba(168,85,247,.25),rgba(168,85,247,.15));border:1px solid rgba(168,85,247,.5);color:var(--pu);font-size:14px;font-weight:700;min-height:48px;border-radius:4px;letter-spacing:.03em">Go to My Finances</button>';
+    h+='<button onclick="_cpRenderFork()" class="btn" style="width:100%;padding:12px 24px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-size:13px;min-height:42px;border-radius:4px">← Back</button>';
+    h+='</div>';
+  } else if(check.reason==='partner'){
+    h+='<div style="font-family:var(--fh);font-size:20px;font-weight:800;color:var(--wh);margin-bottom:8px;text-align:center">Waiting for '+escH(partnerName)+'</div>';
+    h+='<div style="font-size:14px;color:var(--mu);line-height:1.7;margin-bottom:20px;text-align:center">You\'ve marked your profile complete. Once <strong style="color:var(--wh)">'+escH(partnerName)+'</strong> marks their profile complete too, you\'ll both be able to generate or build a plan.</div>';
+    h+='<div style="padding:14px 16px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.18);border-radius:6px;margin-bottom:20px;text-align:center;font-size:13px;color:var(--mu)">Hybrid households require both spouses to be ready before the AI can generate a coordinated household plan.</div>';
+    h+='<div style="display:flex;flex-direction:column;gap:10px">';
+    if(check.partnerEmail){
+      h+='<button onclick="_cpSendPartnerReminder()" id="cpRemindBtn" class="btn" style="width:100%;padding:14px 24px;background:linear-gradient(135deg,rgba(249,115,22,.2),rgba(249,115,22,.1));border:1px solid rgba(249,115,22,.45);color:#F97316;font-size:14px;font-weight:700;min-height:48px;border-radius:4px;letter-spacing:.03em">📧 Send Reminder to '+escH(partnerName)+'</button>';
+    } else {
+      h+='<div style="padding:10px;font-size:12px;color:var(--mu);text-align:center;background:rgba(100,116,139,.04);border:1px dashed var(--bd);border-radius:4px">Partner email not on file. Please ask them directly to log in and mark their profile complete.</div>';
+    }
+    h+='<button onclick="_cpRenderFork()" class="btn" style="width:100%;padding:12px 24px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-size:13px;min-height:42px;border-radius:4px">← Back</button>';
+    h+='</div>';
+  } else {
+    // neither
+    h+='<div style="font-family:var(--fh);font-size:20px;font-weight:800;color:var(--wh);margin-bottom:8px;text-align:center">Both profiles need to be complete</div>';
+    h+='<div style="font-size:14px;color:var(--mu);line-height:1.7;margin-bottom:20px;text-align:center">Hybrid households require both you and <strong style="color:var(--wh)">'+escH(partnerName)+'</strong> to mark your profiles complete before generating or building a plan. Start with yours — go to <strong style="color:var(--wh)">My Finances</strong>, fill in everything you can, then click <strong style="color:var(--wh)">Mark Profile Complete</strong>.</div>';
+    h+='<div style="display:flex;flex-direction:column;gap:10px">';
+    h+='<button onclick="showClientPage(\'pfos\')" class="btn" style="width:100%;padding:14px 24px;background:linear-gradient(135deg,rgba(168,85,247,.25),rgba(168,85,247,.15));border:1px solid rgba(168,85,247,.5);color:var(--pu);font-size:14px;font-weight:700;min-height:48px;border-radius:4px;letter-spacing:.03em">Go to My Finances</button>';
+    if(check.partnerEmail){
+      h+='<button onclick="_cpSendPartnerReminder()" id="cpRemindBtn" class="btn" style="width:100%;padding:12px 24px;background:rgba(249,115,22,.06);border:1px solid rgba(249,115,22,.2);color:#F97316;font-size:13px;font-weight:700;min-height:42px;border-radius:4px">📧 Also send '+escH(partnerName)+' a reminder</button>';
+    }
+    h+='<button onclick="_cpRenderFork()" class="btn" style="width:100%;padding:12px 24px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-size:13px;min-height:42px;border-radius:4px">← Back</button>';
+    h+='</div>';
+  }
+  h+='</div></div>';
+  root.innerHTML=h;
+  // Stash check data so _cpSendPartnerReminder can use it without re-querying
+  CPLAN._gateCheck=check;
+}
+
+// Fire the partner-reminder email via the pfos-main → pfos-client postMessage
+// channel (same channel used for the auto-fire on Mark Complete). Disables the
+// button briefly to prevent double-clicks. Best-effort: shows a toast either way.
+function _cpSendPartnerReminder(){
+  var check=CPLAN._gateCheck||_cpCheckProfileCompletionGate();
+  if(!check||!check.partnerEmail){
+    if(typeof _cpToast==='function')_cpToast('No partner email on file');
+    return;
+  }
+  var btn=document.getElementById('cpRemindBtn');
+  if(btn){btn.disabled=true;btn.style.opacity='0.6';btn.textContent='Sending…';}
+  var payload={
+    partnerEmail:check.partnerEmail,
+    partnerName:check.partnerName,
+    partnerClientId:check.partnerClientId,
+    selfFirstName:check.selfFirstName||(APP.currentClient&&APP.currentClient.name)||'Your spouse'
+  };
+  // Best-effort invoke. We don't await since the message handler does the
+  // fire-and-forget pattern; the button feedback is purely visual.
+  try{
+    db.functions.invoke('send-notification',{
+      body:{
+        type:'partner_profile_reminder',
+        clientEmail:payload.partnerEmail,
+        clientName:payload.partnerName,
+        agentName:payload.selfFirstName,
+        clientId:payload.partnerClientId
+      }
+    }).then(function(){
+      if(typeof _cpToast==='function')_cpToast('Reminder sent to '+payload.partnerName);
+      if(btn){btn.textContent='✓ Reminder Sent';btn.style.background='rgba(34,197,94,.1)';btn.style.borderColor='rgba(34,197,94,.45)';btn.style.color='var(--gr)';}
+    }).catch(function(err){
+      console.warn('[remind-partner] send failed:',err);
+      if(typeof _cpToast==='function')_cpToast('Reminder failed to send — they can still log in directly');
+      if(btn){btn.disabled=false;btn.style.opacity='1';btn.textContent='📧 Send Reminder to '+payload.partnerName;}
+    });
+  }catch(e){
+    console.warn('[remind-partner] invoke threw:',e);
+    if(typeof _cpToast==='function')_cpToast('Reminder failed to send — they can still log in directly');
+    if(btn){btn.disabled=false;btn.style.opacity='1';}
+  }
+}
+
 function _cpStartSelfBuild(){
+  // Phase 2 — Hybrid gate: both spouses must mark profile complete before DIY
+  var _gate=_cpCheckProfileCompletionGate();
+  if(_gate.gated){_cpRenderCompletionGate(_gate);return;}
   CPLAN.planMode='self';
   CPLAN._selectedApproach=null;
   CPLAN._viewingApproach=null;
@@ -24014,20 +24531,10 @@ async function _cpSubmitAgentRequest(){
 
 // ── AI RECOMMENDATION: Generate phased plan ──
 function _cpStartAIRec(){
+  // Phase 2 — Hybrid gate: both spouses must mark profile complete before AI
+  var _gate=_cpCheckProfileCompletionGate();
+  if(_gate.gated){_cpRenderCompletionGate(_gate);return;}
   CPLAN.planMode='ai';
-  // Reset the Hybrid spouse-ready one-shot flag whenever this function is
-  // entered fresh (from the Generate button, regenerate, or fork screen).
-  // The exception is re-entry from _cpHybridSpouseReady, which sets a
-  // transient flag so this reset is skipped — letting that one path skip
-  // past the spouse-ready dialog and proceed to the existing confirmation
-  // card. Without this reset, a user who cancelled the dialog wouldn't see
-  // it again on their next attempt.
-  if(CPLAN._hybridReentry){
-    CPLAN._hybridReentry=false;
-  } else {
-    CPLAN._hybridSpouseReadyAsked=false;
-    CPLAN._hybridSpouseReady=null;
-  }
   // Check generation limits
   var plan=APP._portalFd&&APP._portalFd.allocation_plan;
   var gens=(plan&&plan.ai_generations)||[];
@@ -24059,44 +24566,6 @@ function _cpStartAIRec(){
     var nextDate=new Date(lastGen+cooldownMs).toLocaleDateString();
     var root2=document.getElementById('cplanRoot');
     if(root2)root2.innerHTML='<div style="text-align:center;padding:40px 20px"><div style="font-size:32px;margin-bottom:12px">⏳</div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:8px">Cooldown active</div><div style="font-size:13px;color:var(--mu);line-height:1.6;margin-bottom:6px">Next AI generation available: <strong style="color:#5B9BFF">'+nextDate+'</strong></div><div style="font-size:13px;color:var(--mu);margin-bottom:16px">'+(maxGens-gens.length)+' of '+maxGens+' remaining this year</div><button onclick="_cpStartSelfBuild()" class="btn" style="padding:10px 24px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;min-height:44px">Build your own plan instead</button></div>';
-    return;
-  }
-  // ── Hybrid pre-AI dialog ───────────────────────────────────────────────
-  // For Hybrid couples, before we hit the existing confirmation card with
-  // disclaimers, ask the household-context question: is the partner's
-  // profile complete? This is the consent moment that determines whether
-  // the eventual AI generation runs as solo-with-locked-result (State A)
-  // or as dual-plan-with-coordination (State C).
-  //
-  // For NOW, both proceed-paths route into the existing confirmation card
-  // and from there into the existing AI generation flow. The actual State
-  // C dual-plan generation isn't wired yet — that's a later change. We
-  // record the user's choice on CPLAN._hybridSpouseReady so subsequent
-  // changes can read it when building the request body / routing.
-  //
-  // Non-Hybrid households (solo, joint, separate) skip this dialog entirely
-  // and see the existing confirmation card unchanged.
-  var _hh=(typeof CPLAN!=='undefined'&&CPLAN._householdType)||(APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.householdType)||'individual';
-  var _isHybridCouple=_hh==='hybrid';
-  if(_isHybridCouple&&!CPLAN._hybridSpouseReadyAsked){
-    var _spName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
-    var rootHy=document.getElementById('cplanRoot');if(!rootHy)return;
-    var hh='<div style="display:flex;align-items:center;justify-content:center;min-height:400px;padding:20px">';
-    hh+='<div style="width:100%;max-width:520px;background:linear-gradient(145deg,#111142,#0C0C34);border:1px solid rgba(168,85,247,.25);border-radius:8px;padding:36px 30px;box-shadow:0 12px 40px rgba(0,0,0,.3)">';
-    hh+='<div style="width:64px;height:64px;border-radius:16px;background:rgba(168,85,247,.15);display:flex;align-items:center;justify-content:center;font-size:30px;margin:0 auto 16px">💑</div>';
-    hh+='<div style="font-family:var(--fh);font-size:20px;font-weight:800;color:var(--wh);margin-bottom:8px;text-align:center">Before generating your plan</div>';
-    hh+='<div style="font-size:14px;color:var(--mu);line-height:1.7;margin-bottom:20px;text-align:center">This AI generation is one-time. After it runs, your plan is locked and cannot be regenerated. You\'ll use <strong style="color:var(--wh)">Audit Plan</strong> to refine it later.</div>';
-    hh+='<div style="padding:16px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.18);border-radius:6px;margin-bottom:20px">';
-    hh+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--pu);margin-bottom:8px;text-align:center">Has '+escH(_spName)+' completed their profile?</div>';
-    hh+='<div style="font-size:12px;color:var(--mu);line-height:1.6;text-align:center">If yes, AI will plan for both of you at once and coordinate joint goals. If not, AI will plan for you only — '+escH(_spName)+' can still get their own plan later when they\'re ready.</div>';
-    hh+='</div>';
-    hh+='<div style="display:flex;flex-direction:column;gap:10px">';
-    hh+='<button onclick="_cpHybridSpouseReady(true)" class="btn" style="width:100%;padding:14px 24px;background:linear-gradient(135deg,rgba(34,197,94,.2),rgba(34,197,94,.1));border:1px solid rgba(34,197,94,.45);color:var(--gr);font-size:13px;font-weight:700;min-height:48px;border-radius:4px;letter-spacing:.02em;text-align:left;line-height:1.4">'+escH(_spName)+'\'s profile is complete<br><span style="font-size:11px;font-weight:400;color:rgba(34,197,94,.7)">Plan for both of us</span></button>';
-    hh+='<button onclick="_cpHybridSpouseReady(false)" class="btn" style="width:100%;padding:14px 24px;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-size:13px;font-weight:700;min-height:48px;border-radius:4px;letter-spacing:.02em;text-align:left;line-height:1.4">'+escH(_spName)+'\'s profile isn\'t ready yet<br><span style="font-size:11px;font-weight:400;color:rgba(91,155,255,.7)">Plan for me only</span></button>';
-    hh+='<button onclick="_cpRenderFork()" class="btn" style="width:100%;padding:12px 24px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.15);color:var(--yl);font-size:13px;min-height:42px;border-radius:4px;margin-top:6px">Cancel</button>';
-    hh+='</div>';
-    hh+='</div></div>';
-    rootHy.innerHTML=hh;
     return;
   }
   // Show confirmation prompt before generating
@@ -24139,26 +24608,6 @@ function _cpStartAIRec(){
   h+='<div style="margin-top:14px"><button onclick="_cpRenderFork()" style="background:none;border:none;color:var(--mu);font-size:13px;cursor:pointer;padding:8px">← Back</button></div>';
   h+='</div></div>';
   root3.innerHTML=h;
-}
-
-// Callback for the Hybrid pre-AI dialog. The user answered the
-// "Has [spouse] completed their profile?" question — record their choice
-// on CPLAN so subsequent code (request body builder, dual-plan routing)
-// can read it, set the one-shot flag so the dialog doesn't re-appear when
-// we re-enter _cpStartAIRec, then fall through to the existing
-// confirmation card with disclaimers.
-//
-// For now, both true and false answers route to the same downstream
-// existing AI flow — the actual State C dual-plan generation isn't wired
-// yet. This change just captures the consent moment.
-function _cpHybridSpouseReady(ready){
-  CPLAN._hybridSpouseReady=!!ready;
-  CPLAN._hybridSpouseReadyAsked=true;
-  // Mark the upcoming _cpStartAIRec call as a re-entry so it doesn't
-  // reset the spouse-ready state we just recorded above. This signal
-  // is consumed (and cleared) on the very next call to _cpStartAIRec.
-  CPLAN._hybridReentry=true;
-  _cpStartAIRec();
 }
 
 function _cpConfirmedAIGen(){
@@ -25125,40 +25574,30 @@ function _cpConvertAIRecs(aiData){
 function _cpSelectApproach(key){
   if(!CPLAN._approaches||!CPLAN._approaches[key])return;
   var aiData=CPLAN._approaches[key];
-  // ── State C detection: dual-plan generation ──
-  // If the response carries hybridState:'C' and the State C arrays exist,
-  // route to the dual-write path. That path handles both spouses' plans
-  // atomically via the state_c_dual_plan_write RPC.
-  if(aiData&&aiData.hybridState==='C'&&Array.isArray(aiData.partnerRecommendations)&&Array.isArray(aiData.jointAllocations)){
-    _cpSelectApproachStateC(key,aiData);
+  // ── Hybrid detection: dual-plan generation ──
+  // For Hybrid households the AI response always carries partnerRecommendations
+  // and jointAllocations arrays (enforced server-side by the dual-plan output
+  // schema). Route to the dual-write path for Hybrid; everyone else takes the
+  // single-plan path.
+  var _isHybrid=(aiData&&aiData.householdType==='hybrid')||(CPLAN._householdType==='hybrid');
+  if(_isHybrid&&aiData&&Array.isArray(aiData.partnerRecommendations)&&Array.isArray(aiData.jointAllocations)){
+    _cpSelectApproachHybrid(key,aiData);
     return;
   }
-  _cpSelectApproachSolo(key,aiData);
+  _cpSelectApproachSingle(key,aiData);
 }
 
-// Solo / State A / State B selection — original behavior, factored out so
-// State C can stay as a clean sibling path without nested branching.
-function _cpSelectApproachSolo(key,aiData){
+// Single-plan selection — used by Individual, Joint, and Separate households.
+// One plan, one DB write, no partner coordination. Hybrid uses
+// _cpSelectApproachHybrid instead which does dual-write via the
+// state_c_dual_plan_write RPC.
+function _cpSelectApproachSingle(key,aiData){
   // Load logic: prefer the user's edited version if it exists, otherwise load
   // the AI original. Without this preference, clicking a card with prior edits
   // would silently revert those edits — defeating the per-card auto-save.
   var edited=(CPLAN._editedApproaches||{})[key];
   CPLAN._selectedApproach=key;
   CPLAN._viewingApproach=null;
-  // Capture jointSuggestions from the AI response (Hybrid State B only — the
-  // edge function strips this field outside State B). The frontend surfaces
-  // these as Make Joint nudges on the plan view. Stored alongside the
-  // dismissed-suggestion set so users can hide individual items without them
-  // reappearing on every render.
-  if(aiData&&Array.isArray(aiData.jointSuggestions)&&aiData.jointSuggestions.length){
-    CPLAN._jointSuggestions=aiData.jointSuggestions.slice();
-    if(!CPLAN._jointSuggestionsDismissed)CPLAN._jointSuggestionsDismissed={};
-  } else {
-    // No suggestions on this approach — clear any prior suggestions from a
-    // different approach the user previously selected. Each approach choice
-    // gets a clean suggestion set tied to its own AI response.
-    CPLAN._jointSuggestions=[];
-  }
   if(edited && edited.allocations && edited.allocations.length){
     // Restore the user's edited copy — sliders return to their last positions
     CPLAN.allocations=JSON.parse(JSON.stringify(edited.allocations));
@@ -25181,8 +25620,8 @@ function _cpSelectApproachSolo(key,aiData){
   cplanSave();
 }
 
-// ── State C dual-plan selection ────────────────────────────────────────────
-// User picked an approach in State C (both profiles complete). This must:
+// ── Hybrid dual-plan selection ─────────────────────────────────────────────
+// User picked an approach in Hybrid. This must:
 //   1. Build joint card objects with matching _sharedId pairs (one copy for
 //      each spouse, both pointing to the same shared id)
 //   2. Build the requesting user's allocations from response.recommendations
@@ -25194,7 +25633,7 @@ function _cpSelectApproachSolo(key,aiData){
 //      allocation_plan rows and couple_links.shared_plan_cards
 //   5. On success, render the requesting user's plan locally
 //   6. On failure, surface the error and keep the user on the approach fork
-async function _cpSelectApproachStateC(key,aiData){
+async function _cpSelectApproachHybrid(key,aiData){
   var couple=CPLAN._coupleLink||(APP._clientCoupleLink)||null;
   if(!couple||!couple.id){
     _cpToast&&_cpToast('Cannot generate dual plan — couple link not found');
@@ -25311,7 +25750,6 @@ async function _cpSelectApproachStateC(key,aiData){
   // CPLAN.allocations contains both self recs and joint cards.
   CPLAN._selectedApproach=key;
   CPLAN._viewingApproach=null;
-  CPLAN._jointSuggestions=[];// State C doesn't use jointSuggestions
   _cpConvertAIRecs(aiData);
   jointCardsForBothSpouses.forEach(function(jc){
     CPLAN.allocations.push(JSON.parse(JSON.stringify(jc)));
@@ -25345,9 +25783,7 @@ async function _cpSelectApproachStateC(key,aiData){
     planStartDate:nowIso,
     originalProjection:null,
     catchUpBoosts:[],
-    jointSuggestions:[],
-    jointSuggestionsDismissed:{},
-    // State C banner flag — partner sees a one-time notice on next plan view
+    // Hybrid dual-plan banner flag — partner sees a one-time notice on next plan view
     // explaining where their plan came from
     _stateCGeneratedByPartner:true,
     _stateCGeneratedByPartnerAt:nowIso,
@@ -25381,8 +25817,6 @@ async function _cpSelectApproachStateC(key,aiData){
     planStartDate:CPLAN._planStartDate||nowIso,
     originalProjection:CPLAN._originalProjection||null,
     catchUpBoosts:CPLAN._catchUpBoosts||[],
-    jointSuggestions:[],
-    jointSuggestionsDismissed:{},
     _extrasSemantics:true
   };
 
@@ -25390,7 +25824,7 @@ async function _cpSelectApproachStateC(key,aiData){
   // Shape MUST match _cpSharedCardsApi.serializeCard (line ~26155): the
   // existing code reads/writes shared_plan_cards entries with sharedId
   // (camelCase, not 'id'), owner='joint', and amountSelf/amountSpouse split
-  // fields. Our State C cards have to match that shape exactly or
+  // fields. Our Hybrid joint cards have to match that shape exactly or
   // loadForCurrentUser will filter them out (it requires owner==='joint')
   // and the byId map in syncJointCards keys on c.sharedId, not c.id.
   var sharedCardsForCouple=jointCardsForBothSpouses.map(function(jc){
@@ -25456,7 +25890,7 @@ async function _cpSelectApproachStateC(key,aiData){
   }
 
   // ── Step F: render the requesting user's plan locally ──
-  if(typeof _cpCaptureSnapshot==='function')_cpCaptureSnapshot('approach_selected','user','Loaded plan: '+key+' approach (State C dual)');
+  if(typeof _cpCaptureSnapshot==='function')_cpCaptureSnapshot('approach_selected','user','Loaded plan: '+key+' approach (Hybrid dual)');
   _cpRenderPlanV2();
   // Don't call cplanSave here — the RPC already wrote the canonical record.
   // cplanSave would re-write with potentially-stale local state and could
@@ -26095,11 +26529,6 @@ function _cpRetryApproach(key){
     if(CPLAN._householdType==='hybrid'){
       var pSharedList=[].concat(CPLAN._jointSharedCards||[]).concat(CPLAN.partnerSharedCards||[]);
       if(pSharedList.length)baseBody.partnerSharedCards=pSharedList.map(function(c){return{type:c.type,owner:c.owner,amount:c.amount,customName:c.customName||''};});
-      // Same spouseReady signal as in _cpDoAIGenerate. A retry on a failed
-      // approach reuses the same household-context answer the user gave
-      // when they originally started the AI session — they don't need to
-      // re-answer the dialog for a single-approach retry.
-      baseBody.spouseReady=(CPLAN._hybridSpouseReady===true)?true:(CPLAN._hybridSpouseReady===false)?false:null;
     }
     if(!CPLAN._approachErrors)CPLAN._approachErrors={};
     delete CPLAN._approaches[key];// Set back to loading
@@ -26606,6 +27035,132 @@ function _cpSubscribeToShared(){
   if(ch)CPLAN._sharedRealtimeChannel=ch;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// PHASE 5 — REALTIME SYNC: couple_links.joint_financial_data
+// ════════════════════════════════════════════════════════════════════════════
+// When one Hybrid spouse edits a joint item (income/investment/debt) we write
+// to couple_links.joint_financial_data via the PFOS_WRITE_JOINT_ITEMS handler.
+// This subscription listens for those updates on the partner's side so they
+// see changes without reload.
+//
+// Self-echo suppression: every write stamps CPLAN._lastJointFinancialsSelfWriteAt.
+// When realtime delivers a row update within 1.5s of that timestamp it's
+// almost certainly our own echo — skip it. The partner's window is at most
+// ~50ms (realtime round-trip), well under the suppression threshold.
+//
+// pfos-main owns the rendering, so we just forward the new joint_financial_data
+// to it via postMessage. pfos-main's handler updates S._jointItems and
+// re-renders affected panels.
+//
+// Lifecycle:
+//   - Subscribe: when PFOS_LOAD completes for a Hybrid household
+//   - Unsubscribe: on logout, client switch, or household type change away
+//     from Hybrid (handled by the existing _cpUnsubscribeFromShared pattern
+//     plus our own cleanup helper)
+
+function _cpSubscribeToJointFinancials(){
+  if(CPLAN._jointFinancialsChannel)return;// already subscribed
+  if(!APP.currentClientId)return;
+  var couple = (typeof getCoupleForClient === 'function') ? getCoupleForClient(APP.currentClientId) : null;
+  if(!couple) return;
+  // Phase 5: Hybrid uses joint arrays + filing status.
+  // Phase 6: Separate uses filing status only — still needs the subscription.
+  // Phase 9: Joint subscribes too, to receive household_type change events
+  //          when admins reshape the household (e.g., Joint→Hybrid). For
+  //          Joint users, joint_financial_data updates are unlikely (single
+  //          shared profile), but the subscription is harmless if no jfd
+  //          updates come through.
+  // Individual has no couple_links so still excluded.
+  if(couple.household_type !== 'hybrid' && couple.household_type !== 'separate' && couple.household_type !== 'joint') return;
+  if(!db || !db.channel) return;
+  try{
+    // Phase 9 — cache the current household_type at subscribe time so we
+    // can detect type changes when admins modify couple_links.
+    CPLAN._lastKnownHouseholdType = couple.household_type;
+    var channel = db.channel('joint_fin_data:'+couple.id)
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'couple_links',
+        filter: 'id=eq.'+couple.id
+      }, function(payload){
+        // Self-echo suppression
+        var lastSelf = CPLAN._lastJointFinancialsSelfWriteAt || 0;
+        var isSelfWrite = (Date.now() - lastSelf < 1500);
+        var row = payload && payload.new;
+        if(!row) return;
+        // Phase 9 — detect household_type change. Type changes are admin-
+        // initiated and never come from our own write (the user-facing
+        // setHH for couple-type changes routes through unlink_request, not
+        // a direct couple_links update). So we react even on "self" writes
+        // — different change, separate dispatch.
+        var newHht = row.household_type;
+        if(newHht && newHht !== CPLAN._lastKnownHouseholdType){
+          var oldHht = CPLAN._lastKnownHouseholdType;
+          CPLAN._lastKnownHouseholdType = newHht;
+          console.log('[joint-rt] household_type changed:', oldHht, '→', newHht);
+          try{
+            var iframeHt = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+            if(iframeHt && iframeHt.contentWindow){
+              iframeHt.contentWindow.postMessage({
+                type: 'PFOS_HOUSEHOLD_TYPE_CHANGED',
+                payload: {
+                  oldHouseholdType: oldHht,
+                  newHouseholdType: newHht,
+                  coupleLinkId: couple.id
+                }
+              }, 'https://pfos.esjfinancial.com');
+            }
+          }catch(e){ console.warn('[joint-rt] household_type forward failed:', e); }
+          // Also refresh local couples cache so subsequent calls see the new type
+          try{ if(typeof loadCouples === 'function') loadCouples(); }catch(e){}
+        }
+        if(isSelfWrite){
+          // Our own write — skip jfd forwarding
+          return;
+        }
+        // Forward to pfos-main. The iframe will re-hydrate S._jointItems and
+        // re-render affected panels. We pass only the joint_financial_data
+        // field (not other couple_links fields like shared_plan_cards which
+        // are managed by the separate _cpSharedCardsApi subscription).
+        var jfd = row.joint_financial_data || {};
+        var lastChange = jfd._lastChange || {};
+        // Don't fire if the change was authored by us (defense in depth —
+        // covers the case where the timestamp suppression missed because the
+        // round-trip took >1.5s)
+        if(lastChange.by && lastChange.by === APP.currentClientId) return;
+        try{
+          var iframe = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+          if(iframe && iframe.contentWindow){
+            iframe.contentWindow.postMessage({
+              type: 'PFOS_JOINT_DATA_REMOTE_UPDATE',
+              payload: {
+                jointFinancialData: jfd,
+                changedBy: lastChange.by || null,
+                changedAt: lastChange.ts || null
+              }
+            }, 'https://pfos.esjfinancial.com');
+          }
+        }catch(e){ console.warn('[joint-rt] forward to pfos-main failed:', e); }
+      })
+      .subscribe();
+    CPLAN._jointFinancialsChannel = channel;
+    console.log('[joint-rt] subscribed to couple_links:'+couple.id);
+  }catch(e){ console.warn('[joint-rt] subscribe failed:', e); }
+}
+
+function _cpUnsubscribeFromJointFinancials(){
+  if(!CPLAN._jointFinancialsChannel) return;
+  try{
+    if(typeof db !== 'undefined' && db.removeChannel){
+      db.removeChannel(CPLAN._jointFinancialsChannel);
+    } else if(CPLAN._jointFinancialsChannel.unsubscribe){
+      CPLAN._jointFinancialsChannel.unsubscribe();
+    }
+  }catch(e){ console.warn('[joint-rt] unsubscribe failed:', e); }
+  CPLAN._jointFinancialsChannel = null;
+}
+
 // ── Phase D: lazy-load partner data once for AI calls. Returns a promise. ──
 async function _cpLoadPartnerForAI(){
   if(CPLAN._partnerForAILoaded)return CPLAN._partnerForAICache||null;
@@ -26771,14 +27326,6 @@ function _cpDoAIGenerate(){
     if(CPLAN._householdType==='hybrid'){
       var pSharedList=[].concat(CPLAN._jointSharedCards||[]).concat(CPLAN.partnerSharedCards||[]);
       if(pSharedList.length)baseBody.partnerSharedCards=pSharedList.map(function(c){return{type:c.type,owner:c.owner,amount:c.amount,customName:c.customName||''};});
-      // Hybrid spouse-ready signal. The user answered the pre-AI dialog
-      // (_cpHybridSpouseReady) — that answer is the consent moment that
-      // determines whether the edge function should generate dual plans
-      // (true → both spouses, joint coordination) or solo-plus-context
-      // (false → user only, partner data is read-only context). null/undefined
-      // means we never asked, treat as conservative solo. Only sent for
-      // Hybrid since the dialog only fires for Hybrid.
-      baseBody.spouseReady=(CPLAN._hybridSpouseReady===true)?true:(CPLAN._hybridSpouseReady===false)?false:null;
     }
     // Initialize approaches as undefined (=loading). Do NOT call
     // _cpShowApproachFork() yet — that would overwrite the checkmark
@@ -27457,8 +28004,8 @@ function _cpRenderPlanV2(){
     h+='</div>';
   }
 
-  // ── State C Banner — partner-generated plan notice ──
-  // When State C dual-plan generation runs, the partner's plan gets written
+  // ── Hybrid Banner — partner-generated plan notice ──
+  // When Hybrid dual-plan generation runs, the partner's plan gets written
   // without them clicking anything. On their next login they see a one-time
   // notice explaining where it came from and giving them the chance to
   // review. The flag is persisted on their allocation_plan and cleared on
@@ -27482,67 +28029,6 @@ function _cpRenderPlanV2(){
     h+='<div style="display:flex;align-items:center;gap:10px"><span style="font-size:18px">🔄</span><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#A855F7">Plan updated by '+esc(_spName)+'</div><div style="font-size:13px;color:var(--mu)">A joint card was just edited. Your view has been refreshed automatically.</div></div></div>';
     h+='<button onclick="CPLAN._partnerUpdatedBanner=null;_cpRenderPlanV2()" style="padding:6px 12px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:30px">Dismiss</button>';
     h+='</div>';
-  }
-
-  // ── Joint-suggestions Panel (Hybrid State B — AI suggested Make Joint candidates) ──
-  // Surfaces the jointSuggestions array the edge function returned when the
-  // user's AI run happened with the partner having an already-finalized plan.
-  // Each suggestion identifies a card type where converting both spouses'
-  // matching cards into a single joint card would be household-optimal. The
-  // user can initiate the conversion (which fires the existing _cpConvertToJoint
-  // flow + Make Joint approval workflow) or dismiss the suggestion (hides it
-  // without firing anything; dismissals persist via _jointSuggestionsDismissed).
-  //
-  // We compute the "live" suggestion list at render time: drop dismissed items
-  // and drop items whose matching userCardType no longer exists in the user's
-  // allocations (e.g., they removed the card after the AI ran). This keeps
-  // stale suggestions from cluttering the panel.
-  if(Array.isArray(CPLAN._jointSuggestions)&&CPLAN._jointSuggestions.length){
-    var _spNameJS=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
-    var _dismissed=CPLAN._jointSuggestionsDismissed||{};
-    // Filter: not dismissed AND user has a matching card in their current allocations
-    var _liveSugs=CPLAN._jointSuggestions.filter(function(s,i){
-      if(_dismissed[i])return false;
-      // Match by type (the most stable identifier). The AI uses strategy keys
-      // like emergency_fund / invest / debt_payoff — allocations store these
-      // on `.type` (which mirrors the strategy key). We accept exact type match
-      // OR ef ↔ emergency_fund equivalence (both keys exist in the codebase).
-      var uType=(s.userCardType||'').toLowerCase();
-      return CPLAN.allocations.some(function(a){
-        var aType=(a.type||'').toLowerCase();
-        if(aType===uType)return true;
-        if((aType==='ef'&&uType==='emergency_fund')||(aType==='emergency_fund'&&uType==='ef'))return true;
-        if((aType==='debt'&&uType==='debt_payoff')||(aType==='debt_payoff'&&uType==='debt'))return true;
-        if((aType==='invest'&&(uType==='taxable_brokerage'||uType==='invest'))||(aType==='taxable_brokerage'&&uType==='invest'))return true;
-        if((aType==='custom'&&uType==='custom_goal')||(aType==='custom_goal'&&uType==='custom'))return true;
-        if((aType==='edu'&&(uType==='529'||uType==='coverdell'||uType==='edu'))||((aType==='529'||aType==='coverdell')&&uType==='edu'))return true;
-        return false;
-      });
-    });
-    if(_liveSugs.length){
-      h+='<div style="padding:16px;margin-bottom:14px;background:linear-gradient(135deg,rgba(34,197,94,.06),rgba(91,155,255,.04));border:1px solid rgba(34,197,94,.25);border-left:4px solid var(--gr);border-radius:4px">';
-      h+='<div style="display:flex;align-items:flex-start;gap:10px;margin-bottom:10px"><span style="font-size:20px">💑</span><div style="flex:1"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--gr);letter-spacing:.04em">AI suggests joint coordination</div><div style="font-size:12px;color:var(--mu);line-height:1.5;margin-top:2px">Your plan and '+esc(_spNameJS)+'\'s plan have overlapping items that could be combined into joint cards. Each conversion still needs '+esc(_spNameJS)+'\'s approval.</div></div></div>';
-      _liveSugs.forEach(function(s){
-        // Recover the original index in CPLAN._jointSuggestions so the
-        // dismiss/initiate handlers can reference the same item across renders.
-        var _origIdx=CPLAN._jointSuggestions.indexOf(s);
-        var _amtTxt=s.suggestedJointAmount>0?'$'+s.suggestedJointAmount.toLocaleString()+'/mo combined':'';
-        h+='<div style="padding:12px 14px;margin-top:8px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">';
-        h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">';
-        h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--wh);text-transform:uppercase;letter-spacing:.06em">'+esc(s.userCardType||'')+'</span>';
-        h+='<span style="font-size:11px;color:var(--mu)">↔</span>';
-        h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:#A855F7;text-transform:uppercase;letter-spacing:.06em">'+esc(_spNameJS)+': '+esc(s.partnerCardType||'')+'</span>';
-        if(_amtTxt)h+='<span style="margin-left:auto;font-family:var(--fd);font-size:13px;color:var(--gr)">'+_amtTxt+'</span>';
-        h+='</div>';
-        h+='<div style="font-size:12px;color:var(--mu);line-height:1.5;margin-bottom:10px">'+esc(s.rationale||'')+'</div>';
-        h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
-        h+='<button onclick="_cpInitiateJointSuggestion('+_origIdx+')" style="padding:8px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.35);color:var(--gr);cursor:pointer;border-radius:3px;min-height:34px">💑 Initiate Make Joint</button>';
-        h+='<button onclick="_cpDismissJointSuggestion('+_origIdx+')" style="padding:8px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:3px;min-height:34px">Dismiss</button>';
-        h+='</div>';
-        h+='</div>';
-      });
-      h+='</div>';
-    }
   }
 
   // Couple combined view
@@ -28202,6 +28688,69 @@ function _cpRenderPlanV2(){
 
 // ── BUILD CARD ──
 function _cpHex2Rgba(hex,alpha){var r=parseInt(hex.slice(1,3),16),g=parseInt(hex.slice(3,5),16),b=parseInt(hex.slice(5,7),16);return'rgba('+r+','+g+','+b+','+alpha+')';}
+
+// ── PHASE 7 — OWNER BADGE ────────────────────────────────────────────────
+// Small inline badge on plan cards identifying which spouse an allocation
+// belongs to. Disambiguates whose retirement, whose debt-payoff, etc. in
+// household plans. Returns empty string for individual households or where
+// the owner is unknown.
+//
+// Color scheme:
+//   self  → blue (#5B9BFF) — matches "Your" sections elsewhere
+//   spouse → orange (#F97316) — matches "Spouse" sections elsewhere
+//   joint → green (#22C55E) — matches the joint card border treatment
+function _cpOwnerFirstName(which){
+  // Resolve first name for 'self' (current user) or 'spouse' (partner).
+  // Falls back to a sensible default per side.
+  if(which==='self'){
+    var fd=APP._portalFd||{};
+    var profile=(fd.S&&fd.S.profile)||{};
+    if(profile.firstName) return profile.firstName;
+    if(APP.currentClient && APP.currentClient.name){
+      return (APP.currentClient.name.split(' ')[0]||'You');
+    }
+    return 'You';
+  } else if(which==='spouse'){
+    if(CPLAN._partner && CPLAN._partner.firstName) return CPLAN._partner.firstName;
+    if(APP._clientCoupleData && APP._clientCoupleData.partnerFirstName) return APP._clientCoupleData.partnerFirstName;
+    return 'Spouse';
+  }
+  return '';
+}
+
+function _cpOwnerBadge(a){
+  if(!a) return '';
+  var hh = CPLAN._householdType || 'individual';
+  // Individual: no need to disambiguate
+  if(hh === 'individual') return '';
+  // Separate: each spouse has their own plan, no cross-owner cards expected
+  if(hh === 'separate') return '';
+  // Joint and Hybrid: show badge based on owner field
+  var owner = a.owner || 'self';
+  var label, color, bg, brd;
+  if(owner === 'joint'){
+    label = 'Shared';
+    color = '#22C55E';
+    bg = 'rgba(34,197,94,.12)';
+    brd = 'rgba(34,197,94,.3)';
+  } else if(owner === 'spouse'){
+    label = _cpOwnerFirstName('spouse');
+    color = '#F97316';
+    bg = 'rgba(249,115,22,.12)';
+    brd = 'rgba(249,115,22,.3)';
+  } else {
+    // self / personal / missing → "Mine"
+    label = _cpOwnerFirstName('self');
+    color = '#5B9BFF';
+    bg = 'rgba(91,155,255,.12)';
+    brd = 'rgba(91,155,255,.3)';
+  }
+  var title = owner === 'joint' ? 'Joint allocation (both spouses contribute)' : (owner === 'spouse' ? 'Your spouse\'s allocation' : 'Your allocation');
+  var safeLabel = (typeof esc === 'function') ? esc(label) : String(label).replace(/[<>&"]/g, '');
+  var safeTitle = (typeof esc === 'function') ? esc(title) : title;
+  return '<span title="'+safeTitle+'" style="margin-left:8px;padding:2px 7px;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.06em;color:'+color+';background:'+bg+';border:1px solid '+brd+';border-radius:2px;text-transform:uppercase;white-space:nowrap">'+safeLabel+'</span>';
+}
+
 function _cpBuildCard(a,idx,isUnassigned){
   // ── Chooser-placeholder card (multi-select trigger for retirement/edu/rollover) ──
   // When a chooser-type flag is detected, _cpSyncFlagsToUnassigned drops a placeholder
@@ -28269,7 +28818,11 @@ function _cpBuildCard(a,idx,isUnassigned){
   // Header
   h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">';
   h+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0"><div style="width:40px;height:40px;border-radius:10px;background:'+_cpHex2Rgba(color,0.15)+';display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+icon+'</div><div style="flex:1;min-width:0">';
-  if(a.type==='custom')h+='<input type="text" value="'+esc(name)+'" onchange="_cpSetName('+idx+',this.value)" style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);background:transparent;border:none;border-bottom:1px dashed var(--bd);width:100%;padding:2px 0;min-height:28px">';
+  if(a.type==='custom'){
+    // Phase 7 — owner badge sits beside the editable name input
+    var _customOwnerBadge=(typeof _cpOwnerBadge==='function')?_cpOwnerBadge(a):'';
+    h+='<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><input type="text" value="'+esc(name)+'" onchange="_cpSetName('+idx+',this.value)" style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);background:transparent;border:none;border-bottom:1px dashed var(--bd);flex:1;min-width:140px;padding:2px 0;min-height:28px">'+_customOwnerBadge+'</div>';
+  }
   else {
     var _cardSlug=(typeof _cpLearnSlugFor==='function')?_cpLearnSlugFor(a.type,a.eduVehicle):'';
     var _cardInfo=(_cardSlug&&typeof _cpInfoBtn==='function')?_cpInfoBtn(_cardSlug,name):'';
@@ -28278,7 +28831,9 @@ function _cpBuildCard(a,idx,isUnassigned){
     // that to the user with a small "NEW" badge next to the title so they
     // understand the card was added beyond the conventional Phase 1 plan.
     var _newBadge=a._overflowAbsorber===true?'<span style="margin-left:8px;padding:2px 6px;font-size:9px;font-weight:700;letter-spacing:.06em;color:var(--yl);background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);border-radius:2px;text-transform:uppercase">NEW</span>':'';
-    h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);display:flex;align-items:center">'+name+_cardInfo+_newBadge+'</div>';
+    // Phase 7 — owner badge (Joint/Hybrid only; empty for Individual/Separate)
+    var _ownerBadge=(typeof _cpOwnerBadge==='function')?_cpOwnerBadge(a):'';
+    h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);display:flex;align-items:center;flex-wrap:wrap">'+name+_cardInfo+_newBadge+_ownerBadge+'</div>';
   }
   // "Why this" in guided or AI reasoning. Interpolate {{AMOUNT}} placeholders
   // with the live a.amount so the prose always matches the slider — see
@@ -34014,10 +34569,7 @@ function initClientPlan(){
     if(loadedPlan.originalProjection)CPLAN._originalProjection=loadedPlan.originalProjection;
     // Phase B: restore catch-up boosts so they keep applying after reload
     if(loadedPlan.catchUpBoosts)CPLAN._catchUpBoosts=loadedPlan.catchUpBoosts;
-    // Hybrid State B joint-suggestion restoration
-    if(Array.isArray(loadedPlan.jointSuggestions))CPLAN._jointSuggestions=loadedPlan.jointSuggestions;
-    if(loadedPlan.jointSuggestionsDismissed&&typeof loadedPlan.jointSuggestionsDismissed==='object')CPLAN._jointSuggestionsDismissed=loadedPlan.jointSuggestionsDismissed;
-    // Hybrid State C banner — restore so the partner-generated notice persists
+    // Hybrid dual-plan banner — restore so the partner-generated notice persists
     // across logout/login until the user dismisses it
     if(loadedPlan._stateCGeneratedByPartner===true)CPLAN._stateCGeneratedByPartner=true;
     if(loadedPlan._stateCGeneratedByPartnerAt)CPLAN._stateCGeneratedByPartnerAt=loadedPlan._stateCGeneratedByPartnerAt;
@@ -37896,55 +38448,12 @@ async function _cpShareCardWithPartner(i){
 // Drops the existing _sharedId (if any) so syncJointCards regenerates it with
 // the 'joint:' prefix. Removes any prior self-share grants/mirror entries
 // since the joint flow handles visibility through shared_plan_cards directly.
-// ── Joint-suggestions handlers ──────────────────────────────────────────────
-// _cpInitiateJointSuggestion: clicked from the suggestions panel on the plan
-// view. Resolves the suggestion's userCardType into an actual allocation index
-// in CPLAN.allocations, then delegates to _cpConvertToJoint(i) which fires the
-// existing Make Joint workflow (50/50 split, approval flow to partner, etc).
-// We don't auto-dismiss on success — the suggestion is filtered out at render
-// time because the user's card is no longer self-owned (it became joint).
-function _cpInitiateJointSuggestion(idx){
-  if(!CPLAN._jointSuggestions||!CPLAN._jointSuggestions[idx]){_cpToast&&_cpToast('Suggestion no longer available');return;}
-  var s=CPLAN._jointSuggestions[idx];
-  var uType=(s.userCardType||'').toLowerCase();
-  // Same matching logic as the render-time filter so initiate hits the same card
-  var allocIdx=-1;
-  for(var i=0;i<CPLAN.allocations.length;i++){
-    var a=CPLAN.allocations[i];
-    var aType=(a.type||'').toLowerCase();
-    if(aType===uType
-       ||(aType==='ef'&&uType==='emergency_fund')||(aType==='emergency_fund'&&uType==='ef')
-       ||(aType==='debt'&&uType==='debt_payoff')||(aType==='debt_payoff'&&uType==='debt')
-       ||(aType==='invest'&&(uType==='taxable_brokerage'||uType==='invest'))||(aType==='taxable_brokerage'&&uType==='invest')
-       ||(aType==='custom'&&uType==='custom_goal')||(aType==='custom_goal'&&uType==='custom')
-       ||(aType==='edu'&&(uType==='529'||uType==='coverdell'||uType==='edu'))||((aType==='529'||aType==='coverdell')&&uType==='edu')){
-      // Prefer a self-owned card (Make Joint only operates on owner:self)
-      if((a.owner||'self')==='self'){allocIdx=i;break;}
-      // Fallback: remember first matching index in case no self-owned exists
-      if(allocIdx<0)allocIdx=i;
-    }
-  }
-  if(allocIdx<0){_cpToast&&_cpToast('No matching card found in your plan');return;}
-  // Delegate to the existing Make Joint flow — it handles confirmation,
-  // 50/50 split, sharedId regeneration, partner notification, etc.
-  if(typeof _cpConvertToJoint==='function')_cpConvertToJoint(allocIdx);
-}
 
-// _cpDismissJointSuggestion: marks a suggestion as dismissed in the persistent
-// dismissed-set so it doesn't reappear on re-render or reload. The suggestion
-// stays in CPLAN._jointSuggestions for audit-trail purposes; we just hide it.
-function _cpDismissJointSuggestion(idx){
-  if(!CPLAN._jointSuggestionsDismissed)CPLAN._jointSuggestionsDismissed={};
-  CPLAN._jointSuggestionsDismissed[idx]=true;
-  if(typeof cplanSave==='function')cplanSave();
-  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
-}
-
-// ── State C banner dismiss ─────────────────────────────────────────────────
+// ── Hybrid banner dismiss ─────────────────────────────────────────────────
 // Clears the "your plan was generated by your partner" notice once the user
 // acknowledges it. Persisted via cplanSave so the banner doesn't re-appear
 // after reload. The original timestamp is kept in case future audit/history
-// features want to surface when State C ran.
+// features want to surface when the partner-generated plan was created.
 function _cpDismissStateCBanner(){
   CPLAN._stateCGeneratedByPartner=false;
   if(typeof cplanSave==='function')cplanSave();
@@ -39473,13 +39982,7 @@ function cplanSave(){
     originalProjection:CPLAN._originalProjection||null,
     // Phase B: persist user-committed catch-up boosts (one-time top-ups for missed months)
     catchUpBoosts:CPLAN._catchUpBoosts||[],
-    // Hybrid State B joint-suggestion persistence. The AI returns these on the
-    // initial AI response (when partner has a locked plan); we surface them as
-    // Make Joint nudges on the plan view. Persisted so they survive reload and
-    // so the dismissed-set tracks which ones the user explicitly hid.
-    jointSuggestions:CPLAN._jointSuggestions||[],
-    jointSuggestionsDismissed:CPLAN._jointSuggestionsDismissed||{},
-    // Hybrid State C banner — partner-generated plan notice. Survives reload
+    // Hybrid banner — partner-generated plan notice. Survives reload
     // until the user dismisses it (flag cleared in _cpDismissStateCBanner).
     _stateCGeneratedByPartner:CPLAN._stateCGeneratedByPartner===true,
     _stateCGeneratedByPartnerAt:CPLAN._stateCGeneratedByPartnerAt||null,
