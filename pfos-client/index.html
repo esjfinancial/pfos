@@ -24850,6 +24850,13 @@ function _cpConvertAIRecs(aiData){
     else if(!_stratExplicit&&(_tl.indexOf('estate')>=0||_tl.indexOf('will')>=0||_tl.indexOf('trust')>=0||_tl.indexOf('beneficiary')>=0))map.type='custom';
     var phase=r.phase||map.phase;
     var amt=r.monthly_cost||0;
+    // BRACKET-AWARE: contribution_amount (added by edge function) is the
+    // actual dollar amount that gets contributed to the account. For pre-tax
+    // vehicles it's larger than monthly_cost (grossed up by 1/(1-marginal)).
+    // For all other vehicles it equals monthly_cost. Fallback to monthly_cost
+    // for older AI responses that lack the field.
+    var _contribRaw=parseFloat(r.contribution_amount);
+    if(!isFinite(_contribRaw)||_contribRaw<=0)_contribRaw=amt;
     // Respect AI's $0 intent. A $0 rec is an informational placeholder, an action item,
     // or a deferred strategy — the AI did not forget to populate it. Pool gaps (when the
     // AI under-deploys) are handled by server-side under-deployment correction in the
@@ -24859,9 +24866,13 @@ function _cpConvertAIRecs(aiData){
     // not intend to fund) and forced the over-deployment correction to scale OTHER recs
     // down proportionally — a cascading mismatch the user could see as fund amounts
     // drifting from what the plan card text described.
+    var _amtOrig=amt;
     amt=Math.min(amt,Math.max(0,pool-usedPool));
+    // Scale contribAmt proportionally when amt was capped (preserves the
+    // gross-up multiplier: contrib/amt stays constant when both shrink).
+    var _contribAmt=_amtOrig>0?Math.round(_contribRaw*(amt/_amtOrig)):0;
     // Force protection/insurance items to $0 — premiums require real quotes, never estimate
-    if(map.type==='protection')amt=0;
+    if(map.type==='protection'){amt=0;_contribAmt=0;}
     var reason=r.recommendation||'';
     if(r.outcome)reason+='\n📊 '+r.outcome;
     if(r.risk_alignment)reason+='\n🎯 '+r.risk_alignment;
@@ -24951,7 +24962,7 @@ function _cpConvertAIRecs(aiData){
     // distinguish Policy #1 vs Policy #2 vs Policy #N within the same purpose lane.
     var _isInsurance=(map.type==='iul'||map.type==='wl'||map.type==='ibc'||(map.type==='edu'&&(r._eduVeh==='wl'||r._eduVeh==='iul'))||_isIBCDebtStrat);
     var _policyId=_isInsurance?('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)):null;
-    CPLAN.allocations.push({type:map.type,amount:amt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying||(_isIBCDebtStrat&&_strat==='ibc_iul'?'iul':_isIBCDebtStrat?'wl':null),_ibcDebtStrategy:_isIBCDebtStrat,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,_overflowAbsorber:r._overflowAbsorber===true});
+    CPLAN.allocations.push({type:map.type,amount:amt,contribAmount:_contribAmt,target:(parseFloat(r.target_amount)||parseFloat(r.target)||0),phase:phase,cascade:r.cascade_to||'',customName:r.title||'',reason:reason,flagTitle:'',flagType:r.priority==='high'?'crit':r.priority==='medium'?'warn':'opp',flagIcon:'',eduVehicle:r._eduVeh||(r.strategy==='529'?'529':r.strategy==='coverdell'?'coverdell':r.strategy==='utma'?'utma':r.strategy==='whole_life'?'wl':r.strategy==='iul'?'iul':''),owner:_ownerTag,_ibcUnderlyingType:_underlying||(_isIBCDebtStrat&&_strat==='ibc_iul'?'iul':_isIBCDebtStrat?'wl':null),_ibcDebtStrategy:_isIBCDebtStrat,_state:'proposed',_policyId:_policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,_overflowAbsorber:r._overflowAbsorber===true});
     usedPool+=amt;
   });
 
@@ -25681,6 +25692,11 @@ async function _cpSelectApproachHybrid(key,aiData){
   }
   var jointCardsForBothSpouses=(aiData.jointAllocations||[]).map(function(r,idx){
     var _amt=Math.max(0,parseFloat(r.monthly_cost)||0);
+    // Carry the AI's contribution_amount when present; fall back to _amt
+    // (= monthly_cost) for backward compat with older AI responses.
+    var _contribRaw=parseFloat(r.contribution_amount);
+    if(!isFinite(_contribRaw)||_contribRaw<=0)_contribRaw=_amt;
+    var _contribAmt=Math.round(_contribRaw);
     return {
       _sharedId:_newSharedId(),
       _sharedOwnerClientId:null,// joint cards have no single owner; both clients see them as theirs
@@ -25689,6 +25705,7 @@ async function _cpSelectApproachHybrid(key,aiData){
       type:_mapRecToType(r),
       customName:r.title||'',
       amount:_amt,
+      contribAmount:_contribAmt,
       // Joint cards need per-spouse contribution split for the dual-slider UI.
       // Default 50/50; users adjust via the dual-slider after generation. Both
       // spouses see the same numbers initially since the split is symmetric.
@@ -25716,12 +25733,16 @@ async function _cpSelectApproachHybrid(key,aiData){
   // generated by the partner's own solo flow.
   function _buildPartnerAllocations(partnerRecs){
     var allocs=(partnerRecs||[]).map(function(r,idx){
+      var _pAmt=Math.max(0,parseFloat(r.monthly_cost)||0);
+      var _pContribRaw=parseFloat(r.contribution_amount);
+      if(!isFinite(_pContribRaw)||_pContribRaw<=0)_pContribRaw=_pAmt;
       return {
         _createdAt:nowIso,
         _state:'selected',
         type:_mapRecToType(r),
         customName:r.title||'',
-        amount:Math.max(0,parseFloat(r.monthly_cost)||0),
+        amount:_pAmt,
+        contribAmount:Math.round(_pContribRaw),
         owner:'self',
         section:(r.section||'general').toLowerCase(),
         phase:_mapRecToPhase(r),
@@ -28938,6 +28959,25 @@ function _cpBuildCard(a,idx,isUnassigned){
       if(_cMo>0)_endLabel=new Date(Date.now()+_cMo*30*86400000).toLocaleDateString('en-US',{month:'short',year:'numeric'})+' ('+_cMo+' mo)';
     }
     h+='<div style="font-size:11px;color:var(--mu);margin-top:4px">'+_startMo+' → '+_endLabel+'</div>';
+  }
+  // ── Tax-savings chip (pre-tax retirement vehicles only) ─────────────
+  // When the AI's contribution_amount is meaningfully larger than the user's
+  // take-home cost (amount), this is a pre-tax allocation where the IRS
+  // effectively co-funds the contribution via deferred tax. Show the user
+  // both numbers so they understand: "$X take-home buys $Y of retirement
+  // savings — the difference ($Z) is your tax savings from deferring."
+  // For old saved plans without contribAmount, _ca falls back to a.amount
+  // and the chip stays hidden (parity diff < 5).
+  if(!_isActionOnly && a.amount > 0){
+    var _ca = parseFloat(a.contribAmount);
+    if(isFinite(_ca) && _ca > a.amount + 5){
+      var _taxSavings = _ca - a.amount;
+      h += '<div style="display:flex;align-items:center;gap:8px;padding:6px 10px;margin-top:6px;background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.16);border-radius:3px">'
+        +'<span style="font-size:13px">💰</span>'
+        +'<div style="font-size:12px;color:var(--gr);line-height:1.5">'
+        +'<strong style="color:var(--wh)">'+fmt(a.amount)+'/mo</strong> from your take-home funds <strong style="color:var(--wh)">'+fmt(_ca)+'/mo</strong> in actual contribution — the extra <strong>'+fmt(_taxSavings)+'/mo</strong> is your pre-tax savings (IRS effectively co-funds via the deferred tax deduction).'
+        +'</div></div>';
+    }
   }
   // Slider + manual input — hide for action-only items
   if(!_isActionOnly){
