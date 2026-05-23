@@ -1396,6 +1396,9 @@ html[data-theme="light"] .pwa-bar{background:linear-gradient(0deg,#FFFFFF,#F8FAF
     <div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF">Retirement Accounts</div>
     <div id="retTotalDisplay" style="font-size:11px;color:var(--mu)"></div>
   </div>
+  <!-- 401(k) Tax-Impact Preview — live updates as user edits payroll-deducted
+       contribution fields. Empty/hidden when no qualifying accounts exist. -->
+  <div id="retTaxImpact" style="margin-bottom:12px"></div>
   <!-- Individual mode: single list -->
   <div id="retIndividual">
     <div id="retAccountsList"></div>
@@ -2519,6 +2522,161 @@ function _estimateGrossFromNet(annualNet,annualPreTaxDeductions,filingStatus,sta
 }
 function _totalMonthlyGross(){
   return (S.incomeSources||[]).reduce(function(t,s){return t+_incSrcMonthlyGross(s);},0);
+}
+
+// ── 401(k) TAX-IMPACT SIMULATOR ────────────────────────────────────────────
+// Models the cash-flow effect of pre-tax 401(k) contributions: how much tax
+// is saved, how much take-home actually drops, whether the user has crossed
+// a bracket, and how close they are to the IRS annual limit. Uses the existing
+// _estimateFederalAndFICA + _estimateStateTax engines to get bracket-accurate
+// numbers (including bracket-crossing math, which falls out of the diff of two
+// progressive-tax calls).
+
+// 2026 employee deferral limit per IRS Notice 2025-67 + SECURE 2.0 super
+// catch-up rules. Update annually when IRS publishes new limits.
+function _401kAnnualLimit(currentAge){
+  var age = parseInt(currentAge) || 0;
+  if(age >= 60 && age <= 63) return 34750;  // SECURE 2.0 "super catch-up"
+  if(age >= 50)                return 31000;  // Standard catch-up
+  return 23500;                                // Under 50
+}
+
+// Effective marginal rate (combined federal + state) at the next dollar of
+// additional pre-tax deduction. Computed as the derivative via a small probe.
+function _currentMarginalRate(annualGross, annualPreTaxAlready, filingStatus, state){
+  if(!annualGross || annualGross <= 0) return 0;
+  var probe = 100;
+  var baseWage  = Math.max(0, annualGross - annualPreTaxAlready);
+  var probeWage = Math.max(0, annualGross - annualPreTaxAlready - probe);
+  var baseTax  = _estimateFederalAndFICA(baseWage,  filingStatus) + _estimateStateTax(baseWage,  filingStatus, state);
+  var probeTax = _estimateFederalAndFICA(probeWage, filingStatus) + _estimateStateTax(probeWage, filingStatus, state);
+  return Math.max(0, (baseTax - probeTax) / probe);
+}
+
+// Returns total payroll-deducted (pre-tax) annual context for the user:
+// {gross, currentPreTaxAll, current401kAll, filingStatus, state}.
+// Uses Income card detailed-mode data when available; falls back to retirement
+// account contribs as a proxy when Income card isn't in detailed mode.
+function _401kSimContext(){
+  var prof = S.profile || {};
+  var c    = S.calcs   || {};
+  var filingStatus = prof.taxFilingStatus || prof.filingStatus || 'single';
+  var state = prof.state || '';
+  // Annual gross — prefer the calc-engine gross (which uses detailed mode
+  // bisection from _incSrcMonthlyGross); fallback to net × 12.
+  var annualGross = (c.incGross || c.inc || 0) * 12;
+  // Pre-tax deductions already coming from detailed paycheck mode
+  var currentAnnualPreTax = 0;
+  var currentAnnual401kFromIncome = 0;
+  (S.incomeSources || []).forEach(function(src){
+    if(_incSrcMode(src) !== 'detailed') return;
+    var checks = _checksPerMonth(src.pay_frequency);
+    var d401  = (parseFloat(src.deduction_401k)   || 0) * checks * 12;
+    var dHlth = (parseFloat(src.deduction_health) || 0) * checks * 12;
+    var dHsa  = (parseFloat(src.deduction_hsa)    || 0) * checks * 12;
+    var dOth  = (parseFloat(src.deduction_other)  || 0) * checks * 12;
+    currentAnnual401kFromIncome += d401;
+    currentAnnualPreTax += d401 + dHlth + dHsa + dOth;
+  });
+  // Retirement-card view of the same number (often differs — sync gap)
+  var currentAnnual401kFromRet = 0;
+  (S.retAccounts || []).forEach(function(a){
+    if(_isPayrollDeducted(a.type)) currentAnnual401kFromRet += (parseFloat(a.contrib) || 0) * 12;
+  });
+  return {
+    filingStatus: filingStatus,
+    state: state,
+    annualGross: annualGross,
+    currentAnnualPreTaxAll: currentAnnualPreTax,
+    currentAnnual401kFromIncome: currentAnnual401kFromIncome,
+    currentAnnual401kFromRet: currentAnnual401kFromRet,
+    // For tax math, use the higher of the two as "what's actually deducted"
+    // — if Retirement card has been updated but Income card hasn't, the
+    // tax savings ARE locked-in only if payroll actually withholds the
+    // higher amount. The Retirement number is the user's stated intent.
+    baselineAnnual401k: Math.max(currentAnnual401kFromIncome, currentAnnual401kFromRet)
+  };
+}
+
+// Compute impact of a target TOTAL monthly 401(k) contribution (not delta).
+// Returns the full breakdown so the UI can render any subset of fields.
+function _simulate401kImpact(targetMonthly401k){
+  var ctx = _401kSimContext();
+  var prof = S.profile || {};
+  var age = parseInt(prof.currentAge) || S.currentAge || 0;
+  var limit = _401kAnnualLimit(age);
+  var targetAnnual = (parseFloat(targetMonthly401k) || 0) * 12;
+  // Cap at IRS limit
+  var cappedAnnual = Math.min(targetAnnual, limit);
+  var atLimit = targetAnnual >= limit;
+  // Pre-tax deductions OTHER than 401k stay the same; only the 401k part swings.
+  var nonRetPreTax = ctx.currentAnnualPreTaxAll - ctx.currentAnnual401kFromIncome;
+  if(nonRetPreTax < 0) nonRetPreTax = 0;
+  var newAnnualPreTax = nonRetPreTax + cappedAnnual;
+  // Baseline = ZERO 401k (so the user sees what the contribution as a whole costs)
+  var wageNoContrib = Math.max(0, ctx.annualGross - nonRetPreTax);
+  var wageWithContrib = Math.max(0, ctx.annualGross - newAnnualPreTax);
+  var taxNoContrib = _estimateFederalAndFICA(wageNoContrib, ctx.filingStatus) + _estimateStateTax(wageNoContrib, ctx.filingStatus, ctx.state);
+  var taxWithContrib = _estimateFederalAndFICA(wageWithContrib, ctx.filingStatus) + _estimateStateTax(wageWithContrib, ctx.filingStatus, ctx.state);
+  var annualTaxSaved = Math.max(0, taxNoContrib - taxWithContrib);
+  var monthlyTaxSaved = annualTaxSaved / 12;
+  var monthlyContrib = cappedAnnual / 12;
+  var takeHomeImpact = monthlyContrib - monthlyTaxSaved;
+  // Marginal rates at boundaries — detect bracket crossing within the
+  // contribution range (e.g., user moves from 24% bracket to 22% bracket
+  // as their contribution reduces taxable income across the threshold).
+  var marginalBefore = _currentMarginalRate(ctx.annualGross, nonRetPreTax, ctx.filingStatus, ctx.state);
+  var marginalAfter  = _currentMarginalRate(ctx.annualGross, newAnnualPreTax, ctx.filingStatus, ctx.state);
+  var bracketCrossed = Math.abs(marginalBefore - marginalAfter) > 0.005;
+  var effectiveRate = cappedAnnual > 0 ? annualTaxSaved / cappedAnnual : 0;
+  return {
+    monthlyContrib: monthlyContrib,
+    annualContrib: cappedAnnual,
+    irsLimit: limit,
+    atLimit: atLimit,
+    annualOverLimit: Math.max(0, targetAnnual - limit),
+    capacityRemaining: Math.max(0, limit - cappedAnnual),
+    monthlyTaxSaved: monthlyTaxSaved,
+    annualTaxSaved: annualTaxSaved,
+    takeHomeImpact: takeHomeImpact,
+    marginalBefore: marginalBefore,
+    marginalAfter: marginalAfter,
+    bracketCrossed: bracketCrossed,
+    effectiveRate: effectiveRate,
+    annualGross: ctx.annualGross,
+    baselineAnnual401k: ctx.baselineAnnual401k,
+    // Sync gap diagnostic: are the two sources of 401k truth in agreement?
+    syncMismatch: Math.abs(ctx.currentAnnual401kFromIncome - ctx.currentAnnual401kFromRet) > 12,
+    syncFromIncome: ctx.currentAnnual401kFromIncome,
+    syncFromRet: ctx.currentAnnual401kFromRet
+  };
+}
+
+// Reverse-solve: find the monthly 401(k) contribution that produces a target
+// take-home drop. Iterates with Newton-style adjustment (3-5 iters typical).
+// Caps at IRS limit. Useful for "I can afford to lose $X/mo of take-home —
+// how much can I actually contribute?".
+function _optimalContribForTakeHomeBudget(takeHomeDropBudget){
+  var budget = parseFloat(takeHomeDropBudget) || 0;
+  if(budget <= 0) return _simulate401kImpact(0);
+  var ctx = _401kSimContext();
+  if(ctx.annualGross <= 0) return _simulate401kImpact(0);
+  // First-pass estimate: budget grossed up by ~current marginal
+  var nonRetPreTax = ctx.currentAnnualPreTaxAll - ctx.currentAnnual401kFromIncome;
+  if(nonRetPreTax < 0) nonRetPreTax = 0;
+  var rate0 = _currentMarginalRate(ctx.annualGross, nonRetPreTax, ctx.filingStatus, ctx.state);
+  var contrib = budget / Math.max(0.05, 1 - rate0);
+  // Newton-style refine
+  for(var i = 0; i < 8; i++){
+    var sim = _simulate401kImpact(contrib);
+    var diff = budget - sim.takeHomeImpact;
+    if(Math.abs(diff) < 1) break;
+    var adj = diff / Math.max(0.05, 1 - sim.effectiveRate);
+    contrib += adj;
+    if(contrib < 0) contrib = 0;
+    if(contrib * 12 > sim.irsLimit) contrib = sim.irsLimit / 12;
+  }
+  return _simulate401kImpact(contrib);
 }
 
 // ── Auto-comma formatting for dollar inputs ──
@@ -7083,6 +7241,113 @@ function updateRetTotals(){
   },0);
   var matchHtml=totMatch>0?' + <span style="color:var(--yl)">'+fmt(Math.round(totMatch))+'/mo</span> match':'';
   el.innerHTML='<span style="color:var(--wh);font-family:var(--fh);font-weight:700">'+(totBal>=1000?'$'+Math.round(totBal).toLocaleString():fmtK(totBal))+'</span> total · <span style="color:var(--gr)">'+fmt(totContrib)+'/mo</span> contributions'+matchHtml+' · <span style="color:var(--mu)">'+S.retAccounts.length+' account'+(S.retAccounts.length!==1?'s':'')+'</span>';
+  // Keep the 401(k) tax-impact preview in sync with current contribution state
+  if(typeof _renderRetTaxImpact === 'function') _renderRetTaxImpact();
+}
+
+// Live 401(k) tax-impact preview. Sums the user's payroll-deducted retirement
+// contributions, runs the simulator, and renders a compact card showing tax
+// saved, real take-home cost, IRS capacity, and any sync mismatch with the
+// Income card. Auto-hides if no payroll-deducted accounts exist.
+function _renderRetTaxImpact(){
+  var el = document.getElementById('retTaxImpact');
+  if(!el) return;
+  // Sum payroll-deducted contributions split by tax treatment.
+  // - pretax (Traditional 401k, 403b, TSP, etc) → reduces taxable wages → tax savings
+  // - roth (Roth 401k family) → uses post-tax dollars → no current-year tax saving
+  //   but shares the same IRS annual deferral limit.
+  var pretaxMonthly = 0;
+  var rothMonthly = 0;
+  var hasAccount = false;
+  (S.retAccounts || []).forEach(function(a){
+    if(!a || !_isPayrollDeducted(a.type)) return;
+    // For Joint household, exclude spouse-owned for this user's tax view
+    if(S.householdType === 'joint' && a.owner === 'spouse') return;
+    hasAccount = true;
+    var c = parseFloat(a.contrib) || 0;
+    if(_isRoth401kFamily(a.type)) rothMonthly += c;
+    else                          pretaxMonthly += c;
+  });
+  if(!hasAccount){ el.innerHTML = ''; return; }
+  // Simulator only sees pretax — that's what drives tax math.
+  var sim = _simulate401kImpact(pretaxMonthly);
+  // Combined total for IRS limit display (both buckets share the same cap).
+  var combinedMonthly = pretaxMonthly + rothMonthly;
+  var combinedAnnual = combinedMonthly * 12;
+  var combinedAtLimit = combinedAnnual >= sim.irsLimit;
+  var combinedCapacityRemaining = Math.max(0, sim.irsLimit - combinedAnnual);
+  if(!sim.annualGross || sim.annualGross <= 0){ el.innerHTML = ''; return; }
+  var fmt$ = function(n){ return '$'+Math.round(n).toLocaleString(); };
+  var pct  = function(r){ return (r*100).toFixed(0)+'%'; };
+  // Sync mismatch warning — Income card detailed mode disagrees with Retirement
+  // (only meaningful for pretax — Roth wouldn't appear in pretax_401k deductions)
+  var mismatchHtml = '';
+  if(sim.syncMismatch && sim.syncFromIncome > 0 && sim.syncFromRet > 0){
+    mismatchHtml = '<div style="margin-top:8px;padding:8px 10px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.22);border-radius:3px;font-size:11px;color:var(--yl);line-height:1.5">'
+      +'⚠ <strong>Sync mismatch:</strong> Your Income card shows '+fmt$(sim.syncFromIncome/12)+'/mo in pre-tax 401(k) deductions, but Retirement shows '+fmt$(sim.syncFromRet/12)+'/mo. Tax math assumes the higher of the two — for accurate take-home, update your Income card paycheck details to match.'
+      +'</div>';
+  }
+  // Limit warning — uses COMBINED total (pretax + roth) since they share the IRS cap
+  var limitHtml = '';
+  if(combinedAtLimit){
+    limitHtml = '<div style="margin-top:8px;padding:8px 10px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.22);border-radius:3px;font-size:11px;color:var(--rd);line-height:1.5">'
+      +'🚫 <strong>IRS limit reached:</strong> Combined Traditional + Roth deferrals are at the '+fmt$(sim.irsLimit)+'/yr cap. Excess contributions face a 6% excise tax until withdrawn.'
+      +'</div>';
+  } else if(combinedCapacityRemaining > 0 && combinedCapacityRemaining < 5000){
+    limitHtml = '<div style="margin-top:8px;padding:8px 10px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:3px;font-size:11px;color:#5B9BFF;line-height:1.5">'
+      +'ℹ <strong>'+fmt$(combinedCapacityRemaining)+' remaining</strong> before hitting this year\'s IRS limit ('+fmt$(sim.irsLimit)+'). Combined cap covers Traditional and Roth together.'
+      +'</div>';
+  }
+  var bracketHtml = '';
+  if(sim.bracketCrossed && pretaxMonthly > 0){
+    bracketHtml = '<div style="margin-top:8px;padding:8px 10px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.22);border-radius:3px;font-size:11px;color:var(--gr);line-height:1.5">'
+      +'📉 <strong>Bracket crossed:</strong> Your pre-tax contribution drops you from the '+pct(sim.marginalBefore)+' marginal bracket to '+pct(sim.marginalAfter)+'. The effective rate ('+pct(sim.effectiveRate)+') reflects this — first dollars saved more than last dollars.'
+      +'</div>';
+  }
+  // Roth-only banner: explain why no tax savings show
+  var rothNoteHtml = '';
+  if(rothMonthly > 0 && pretaxMonthly === 0){
+    rothNoteHtml = '<div style="margin-top:8px;padding:8px 10px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.22);border-radius:3px;font-size:11px;color:rgba(168,85,247,.95);line-height:1.5">'
+      +'💜 <strong>Roth contributions:</strong> Roth dollars are taxed up front — no current-year tax saving — but withdrawals (including growth) are tax-free in retirement. Real take-home cost = the full contribution.'
+      +'</div>';
+  } else if(rothMonthly > 0 && pretaxMonthly > 0){
+    rothNoteHtml = '<div style="margin-top:8px;padding:8px 10px;background:rgba(168,85,247,.06);border:1px solid rgba(168,85,247,.22);border-radius:3px;font-size:11px;color:rgba(168,85,247,.95);line-height:1.5">'
+      +'💜 <strong>Mixed contributions:</strong> Tax-savings shown reflect '+fmt$(pretaxMonthly)+'/mo pre-tax only. Your '+fmt$(rothMonthly)+'/mo Roth portion has no current-year tax saving (already post-tax) — full amount comes out of take-home.'
+      +'</div>';
+  }
+  // Adjust take-home cost display when Roth is mixed in
+  var displayMonthlyContrib = combinedMonthly;
+  var displayMonthlyTaxSaved = sim.monthlyTaxSaved;
+  var displayTakeHomeImpact = combinedMonthly - sim.monthlyTaxSaved;// Roth portion fully drops take-home; pretax portion partially
+  var displayEffectiveRate = combinedMonthly > 0 ? sim.monthlyTaxSaved / combinedMonthly : 0;
+  el.innerHTML =
+    '<div style="padding:14px 16px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-left:3px solid var(--gr);border-radius:4px">'
+    +'<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--gr);margin-bottom:10px">401(k) Tax Impact</div>'
+    +'<div style="display:flex;gap:16px;flex-wrap:wrap">'
+    +  '<div style="flex:1;min-width:130px">'
+    +    '<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Payroll contribution</div>'
+    +    '<div style="font-family:var(--fd);font-size:18px;font-weight:700;color:var(--wh)">'+fmt$(displayMonthlyContrib)+'<span style="font-size:11px;color:var(--mu);font-weight:400">/mo</span></div>'
+    +    '<div style="font-size:10px;color:rgba(148,163,184,.5);margin-top:2px">'
+    +      (rothMonthly > 0 && pretaxMonthly > 0 ? fmt$(pretaxMonthly)+' pretax + '+fmt$(rothMonthly)+' Roth · ' : '')
+    +      fmt$(combinedAnnual)+'/yr · limit '+fmt$(sim.irsLimit)
+    +    '</div>'
+    +  '</div>'
+    +  '<div style="flex:1;min-width:130px">'
+    +    '<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Tax saved (current year)</div>'
+    +    '<div style="font-family:var(--fd);font-size:18px;font-weight:700;color:'+(displayMonthlyTaxSaved > 0 ? 'var(--gr)' : 'var(--mu)')+'">'+fmt$(displayMonthlyTaxSaved)+'<span style="font-size:11px;color:var(--mu);font-weight:400">/mo</span></div>'
+    +    '<div style="font-size:10px;color:rgba(148,163,184,.5);margin-top:2px">'+(pretaxMonthly > 0 ? pct(sim.effectiveRate)+' effective on pretax portion · fed+state' : 'Roth — no current-year saving')+'</div>'
+    +  '</div>'
+    +  '<div style="flex:1;min-width:130px;padding-left:16px;border-left:1px dashed rgba(34,197,94,.25)">'
+    +    '<div style="font-size:11px;color:var(--mu);margin-bottom:2px">Real take-home cost</div>'
+    +    '<div style="font-family:var(--fd);font-size:20px;font-weight:800;color:#5B9BFF">'+fmt$(displayTakeHomeImpact)+'<span style="font-size:11px;color:var(--mu);font-weight:400">/mo</span></div>'
+    +    '<div style="font-size:10px;color:rgba(148,163,184,.5);margin-top:2px">What you actually feel in your paycheck</div>'
+    +  '</div>'
+    +'</div>'
+    +mismatchHtml
+    +limitHtml
+    +bracketHtml
+    +rothNoteHtml
+    +'</div>';
 }
 function renderRetAccounts(){
   if(!S.retAccounts)S.retAccounts=[];
@@ -8033,8 +8298,44 @@ function getMonthlyExp(key){
   if(d.subs) Object.values(d.subs).forEach(function(s){ var sv=pf(s.amount); subTotal+=s.period==='annual'?sv/12:sv; });
   return subTotal>0?subTotal:v;
 }
-// Auto-pull debt minimums into expenses (exclude Mortgage — already in Housing, exclude Auto Loan — already in Transportation as Car Payment)
+// Auto-pull investment contributions (exclude payroll-deducted plans)
 var PAYROLL_DEDUCTED_TYPES=['401k_current','roth401k_current','403b_current','tsp_current','pension'];
+// Reusable predicate. Handles canonical RET_TYPES values AND legacy short-form
+// types (e.g., '401k' from an earlier version of the taxonomy that some users
+// still have in stored data). Any account whose type starts with the family
+// prefix is treated as payroll-deducted — captures both current and legacy
+// rollover variants ('401k_current', '401k_old', '401k', etc).
+function _isPayrollDeducted(type){
+  var t = String(type||'').toLowerCase();
+  if(!t) return false;
+  if(t === 'pension') return true;
+  // Family prefixes — include legacy short forms (no _current/_old suffix)
+  if(t.indexOf('401k') === 0) return true;       // 401k, 401k_current, 401k_old
+  if(t.indexOf('roth401k') === 0) return true;   // roth401k, roth401k_current, roth401k_old
+  if(t === 'roth_401k') return true;              // legacy underscore variant
+  if(t.indexOf('403b') === 0) return true;       // 403b, 403b_current, 403b_old
+  if(t.indexOf('tsp') === 0) return true;        // tsp, tsp_current, tsp_old
+  return false;
+}
+// Of the payroll-deducted types, which are Roth (post-tax) vs traditional
+// (pre-tax). Roth contributions don't reduce taxable wages — so tax-savings
+// math should exclude them — but they share the same IRS employee-deferral
+// limit ($23,500 in 2026) with their traditional counterparts.
+function _isRoth401kFamily(type){
+  var t = String(type||'').toLowerCase();
+  if(!t) return false;
+  if(t.indexOf('roth401k') === 0) return true;
+  if(t === 'roth_401k') return true;
+  if(t === 'roth_solo_401k') return true;
+  // Note: Roth IRAs aren't payroll-deducted, so they fall through _isPayrollDeducted=false
+  return false;
+}
+function getInvestContribAuto(){
+  return (S.retAccounts||[]).reduce(function(t,a){
+    if(_isPayrollDeducted(a.type)) return t;
+    return t+(parseFloat(a.contrib)||0);
+  },0);
+}
 function getDebtPaymentsAuto(){
   var personal = (S.debts||[]).reduce(function(t,d){ return t+((d.type!=='Mortgage'&&d.type!=='Auto Loan')?(parseFloat(d.min)||0):0); },0);
   // Phase 4d — Hybrid: also count user's share of joint debt minimums.
@@ -8048,13 +8349,6 @@ function getDebtPaymentsAuto(){
     }, 0);
   }
   return personal;
-}
-// Auto-pull investment contributions (exclude payroll-deducted plans)
-function getInvestContribAuto(){
-  return (S.retAccounts||[]).reduce(function(t,a){
-    if(PAYROLL_DEDUCTED_TYPES.indexOf(a.type)!==-1) return t;
-    return t+(parseFloat(a.contrib)||0);
-  },0);
 }
 // Auto-pull education contributions
 function getEduContribAuto(){
@@ -12148,11 +12442,39 @@ function deCalcAllocation(c){
   DE.allocation.push({label:'Buffer ('+DE.bufferPct+'%)',amt:DE.bufferAmt,color:'var(--mu)',icon:'🛡️'});
   if(pool<=0)return;
 
+  // Helper: estimate marginal rate at current pretax level (called multiple
+  // times below — caches via _401kSimContext, which is cheap).
+  function _marginalNow(){
+    if(typeof _currentMarginalRate !== 'function' || typeof _401kSimContext !== 'function') return 0;
+    var ctx = _401kSimContext();
+    if(!ctx.annualGross || ctx.annualGross <= 0) return 0;
+    var m = _currentMarginalRate(ctx.annualGross, ctx.currentAnnualPreTaxAll, ctx.filingStatus, ctx.state);
+    return Math.min(0.5, Math.max(0, m));
+  }
+  // Helper: capacity remaining under the IRS 401(k) employee-deferral cap
+  // (combined Traditional + Roth, this user only).
+  function _401kCapacityMonthly(){
+    if(typeof _401kAnnualLimit !== 'function') return Infinity;
+    var prof = S.profile || {};
+    var age = parseInt(prof.currentAge) || S.currentAge || 0;
+    var limit = _401kAnnualLimit(age);
+    var ht = S.householdType || 'individual';
+    var alreadyAnnual = 0;
+    (S.retAccounts || []).forEach(function(a){
+      if(!a || typeof _isPayrollDeducted !== 'function' || !_isPayrollDeducted(a.type)) return;
+      if(ht === 'joint' && a.owner === 'spouse') return;
+      alreadyAnnual += (parseFloat(a.contrib) || 0) * 12;
+    });
+    return Math.max(0, (limit - alreadyAnnual) / 12);
+  }
+
   // PARALLEL ALLOCATION — never sequential
   // Rule 1: Employer match ALWAYS first (free money, 100% return)
+  // matchAmt is already in pre-tax dollars (it's a % of gross). Its take-home
+  // cost is matchAmt × (1 − marginal_rate), so the pool gets debited by less
+  // than matchAmt, leaving more budget for other goals.
   var matchFlag=DE.systemFlags.find(function(f){return f.id==='employer_match';});
   if(matchFlag){
-    // Calculate exact match shortfall
     var matchAmt=0;
     if(S.retAccounts){S.retAccounts.forEach(function(a){
       var rt=RET_TYPES.find(function(t){return t.val===a.type;})||{};
@@ -12162,8 +12484,23 @@ function deCalcAllocation(c){
         matchAmt+=gap;
       }
     });}
-    matchAmt=Math.min(pool,Math.round(matchAmt));
-    if(matchAmt>0){DE.allocation.push({label:'Employer Match',amt:matchAmt,color:'var(--gr)',icon:'🆓',flagId:'employer_match'});pool-=matchAmt;}
+    // Cap by IRS limit
+    var matchCap = _401kCapacityMonthly();
+    matchAmt = Math.min(matchAmt, matchCap);
+    // Take-home cost of capturing this match
+    var matchRate = _marginalNow();
+    var matchTakeHomeCost = matchAmt * (1 - matchRate);
+    // Constrain by pool's take-home budget
+    if(matchTakeHomeCost > pool){
+      // Pool can't fully fund the match — give what we can
+      matchAmt = Math.min(matchAmt, pool / Math.max(0.5, 1 - matchRate));
+      matchTakeHomeCost = matchAmt * (1 - matchRate);
+    }
+    matchAmt = Math.round(matchAmt);
+    if(matchAmt > 0){
+      DE.allocation.push({label:'Employer Match',amt:matchAmt,color:'var(--gr)',icon:'🆓',flagId:'employer_match'});
+      pool -= matchTakeHomeCost;
+    }
   }
 
   // Rule 2: Distribute remainder across all flags in parallel
@@ -12174,6 +12511,10 @@ function deCalcAllocation(c){
   // Rule 3: Never allocate 100% to investing if EF < 1 month
   var efFlag=remaining.find(function(f){return f.id==='ef_none'||f.id==='ef_low';});
 
+  // Flag IDs that drive pre-tax 401(k) recommendations — these get grossed
+  // up so the contribution consumes exactly the user's take-home budget.
+  var pretaxRetFlagIds = {retirement_gap:1, no_retirement:1};
+
   var totalWeight=0;
   remaining.forEach(function(f){totalWeight+=(f.level===1?50:f.level===2?25:f.level===3?15:10);});
   remaining.forEach(function(f){
@@ -12182,9 +12523,28 @@ function deCalcAllocation(c){
     var slice=Math.round(pool*(weight/Math.max(1,totalWeight)));
     // Rule 3: If EF < 1 month, cap investment allocation at 20% of pool
     if((f.id==='idle_cash'||f.id==='high_cash')&&c.efMonths<1) slice=Math.min(slice,Math.round(pool*0.2));
-    if(slice>0){
-      DE.allocation.push({label:f.title.split(':')[0],amt:slice,color:f.level===1?'var(--rd)':f.level===2?'var(--or)':f.level===3?'var(--yl)':'var(--gr)',icon:f.icon,flagId:f.id});
+    if(slice<=0) return;
+    // Rule 4 (NEW) — gross-up for pre-tax retirement flags. Take-home `slice`
+    // is converted to a CONTRIBUTION amount using the simulator's reverse-
+    // solve. The slice still represents take-home cost (correctly debits
+    // pool), but the allocAmt stored is the gross-up'd contribution so the
+    // apply handler writes the right number into retAccounts.contrib.
+    var allocAmt = slice;
+    if(pretaxRetFlagIds[f.id]){
+      if(typeof _optimalContribForTakeHomeBudget === 'function'){
+        var sim = _optimalContribForTakeHomeBudget(slice);
+        if(sim && sim.monthlyContrib > 0){
+          allocAmt = Math.round(sim.monthlyContrib);
+        }
+      }
     }
+    DE.allocation.push({
+      label: f.title.split(':')[0],
+      amt: allocAmt,
+      color: f.level===1?'var(--rd)':f.level===2?'var(--or)':f.level===3?'var(--yl)':'var(--gr)',
+      icon: f.icon,
+      flagId: f.id
+    });
   });
   // Any unallocated remainder
   var allocated=DE.allocation.reduce(function(s,a){return s+a.amt;},0)-DE.bufferAmt;
@@ -12358,6 +12718,62 @@ function deGenMinimumViablePlan(){var c=S.calcs;if(!c||!c.inc)return null;var su
 var DE_NEXT_ACTIONS={detected:'Review details and discuss with client.',drafted:'Present at next meeting.',proposed:'Confirm client agreement and set timeline.',agreed:'Submit application or initiate service.',submitted:'Follow up on application status.',implemented:'Update client profile. Schedule 90-day check-in.',active:'Review progress at next meeting.'};
 function deGetNextAction(recStatus,service){if(recStatus==='agreed'&&service)return'Submit application / initiate '+service+'.';if(recStatus==='implemented')return'Add premiums to expenses, update contributions, schedule check-in.';return DE_NEXT_ACTIONS[recStatus]||'Continue to next step.';}
 function deLogAudit(recIdx,field,oldVal,newVal){if(!DE.advisorPlan[recIdx])return;if(!DE.advisorPlan[recIdx].auditLog)DE.advisorPlan[recIdx].auditLog=[];DE.advisorPlan[recIdx].auditLog.push({field:field,before:oldVal,after:newVal,changedBy:'advisor',timestamp:new Date().toISOString()});}
+// ── LINKED INCOME UPDATE FOR PRE-TAX 401(k) APPLY ─────────────────────────
+// When a 401(k) increase recommendation is applied, the contribution gets
+// written to S.retAccounts. For the cash-flow math to stay coherent, the
+// matching Income source's pre-tax 401(k) deduction must ALSO increase and
+// take-home per check must drop by the after-tax delta. Otherwise the
+// dashboard reports the old take-home (now wrong) and the AI rec appears
+// to cost nothing to the user.
+//
+// Returns {linked:bool, marginalRate:Number, takeHomeReductionPerCheck:Number,
+//          srcIdx:Number} describing what happened.
+function _applyLinkedIncomePretaxUpdate(retIdx, deltaMonthly){
+  if(!S.retAccounts || !S.retAccounts[retIdx]) return {linked:false};
+  if(!S.incomeSources || !S.incomeSources.length) return {linked:false};
+  if(!deltaMonthly || deltaMonthly <= 0) return {linked:false};
+  var retAcct = S.retAccounts[retIdx];
+  var owner = retAcct.owner || 'personal';
+  // Find a matching income source — prefer same owner + detailed mode + same employer
+  var bestIdx = -1, fallbackIdx = -1;
+  for(var si = 0; si < S.incomeSources.length; si++){
+    var src = S.incomeSources[si];
+    if(!src) continue;
+    var srcOwner = src.owner || 'personal';
+    if(srcOwner !== owner) continue;
+    if(_incSrcMode(src) !== 'detailed') continue;
+    if(retAcct.employer && src.employer && retAcct.employer === src.employer){
+      bestIdx = si; break;
+    }
+    if(fallbackIdx < 0) fallbackIdx = si;
+  }
+  var matchIdx = bestIdx >= 0 ? bestIdx : fallbackIdx;
+  if(matchIdx < 0) return {linked:false};// no detailed-mode income source — can't link
+  var src = S.incomeSources[matchIdx];
+  var checks = _checksPerMonth(src.pay_frequency);
+  if(checks <= 0) return {linked:false};
+  var deltaPerCheck = deltaMonthly / checks;
+  // Marginal rate at the user's CURRENT pretax level — used to size the
+  // take-home reduction. This is the "first dollar" effect; for very large
+  // deltas the bracket-aware average will differ slightly, which is fine for
+  // the apply-time estimate (the simulator handles the exact display).
+  var ctx = _401kSimContext();
+  var marginal = _currentMarginalRate(ctx.annualGross, ctx.currentAnnualPreTaxAll, ctx.filingStatus, ctx.state);
+  var takeHomeReductionPerCheck = deltaPerCheck * (1 - marginal);
+  // Apply the field updates. Store as strings to match existing field format.
+  var newDed = (parseFloat(src.deduction_401k) || 0) + deltaPerCheck;
+  var newTakeHome = Math.max(0, (parseFloat(src.take_home_per_check) || 0) - takeHomeReductionPerCheck);
+  src.deduction_401k = String(Math.round(newDed * 100) / 100);
+  src.take_home_per_check = String(Math.round(newTakeHome * 100) / 100);
+  return {
+    linked: true,
+    marginalRate: marginal,
+    takeHomeReductionPerCheck: takeHomeReductionPerCheck,
+    srcIdx: matchIdx,
+    deltaPerCheck: deltaPerCheck
+  };
+}
+
 function deApplyImplementationEffect(recIdx){
   var r=DE.advisorPlan[recIdx];if(!r||!r.allocAmt)return;
   var amt=r.allocAmt;
@@ -12375,18 +12791,87 @@ function deApplyImplementationEffect(recIdx){
     }
   }
   if(r.section==='retirement'){
-    var applied=false;
-    if(S.retAccounts&&S.retAccounts.length){
-      var rt=RET_TYPES;
-      for(var ri=0;ri<S.retAccounts.length;ri++){
-        var rtDef=rt.find(function(t){return t.val===S.retAccounts[ri].type;})||{};
-        if(rtDef.allowContrib!==false&&S.retAccounts[ri].type!=='pension'){
-          S.retAccounts[ri].contrib=(S.retAccounts[ri].contrib||0)+amt;
-          applied=true;break;
+    // Strategy classification — drives which account to pick AND whether the
+    // matching Income source's pretax 401k deduction should be updated.
+    var preTaxStrats = ['increase_401k','tax_advantaged'];
+    var rothStrats   = ['roth_ira_max','roth_conversion','roth_solo_401k'];
+    var isPretaxRec  = preTaxStrats.indexOf(r.strategy) !== -1;
+    var isRothRec    = rothStrats.indexOf(r.strategy) !== -1;
+    var applied = false;
+    var targetIdx = -1;
+    if(S.retAccounts && S.retAccounts.length){
+      // Pass 1 — match the strategy's intent
+      for(var ri = 0; ri < S.retAccounts.length; ri++){
+        var a = S.retAccounts[ri];
+        if(!a) continue;
+        var rtDef = RET_TYPES.find(function(t){return t.val === a.type;}) || {};
+        if(rtDef.allowContrib === false) continue;
+        if(a.type === 'pension') continue;
+        if(isPretaxRec && _isPayrollDeducted(a.type) && !_isRoth401kFamily(a.type)){
+          targetIdx = ri; break;
+        }
+        if(isRothRec && (_isRoth401kFamily(a.type) || a.type === 'roth_ira')){
+          targetIdx = ri; break;
+        }
+      }
+      // Pass 2 — fallback to first contributable non-pension account
+      if(targetIdx < 0){
+        for(var ri2 = 0; ri2 < S.retAccounts.length; ri2++){
+          var a2 = S.retAccounts[ri2];
+          if(!a2) continue;
+          var rtDef2 = RET_TYPES.find(function(t){return t.val === a2.type;}) || {};
+          if(rtDef2.allowContrib !== false && a2.type !== 'pension'){
+            targetIdx = ri2; break;
+          }
+        }
+      }
+      if(targetIdx >= 0){
+        var targetAcct = S.retAccounts[targetIdx];
+        var requestedNewContrib = (parseFloat(targetAcct.contrib) || 0) + amt;
+        var capDelta = amt;// what we'll actually apply (may be reduced by IRS cap)
+        // IRS limit check for payroll-deducted accounts (shared cap across Trad+Roth payroll family)
+        if(_isPayrollDeducted(targetAcct.type)){
+          var prof = S.profile || {};
+          var age = parseInt(prof.currentAge) || S.currentAge || 0;
+          var irsLimit = _401kAnnualLimit(age);
+          var otherPayrollAnnual = 0;
+          for(var rk = 0; rk < S.retAccounts.length; rk++){
+            if(rk === targetIdx) continue;
+            var ao = S.retAccounts[rk];
+            if(ao && _isPayrollDeducted(ao.type)){
+              // Only count this user's accounts in Joint mode
+              if(S.householdType === 'joint' && ao.owner === 'spouse') continue;
+              otherPayrollAnnual += (parseFloat(ao.contrib) || 0) * 12;
+            }
+          }
+          var thisAcctMaxAnnual = Math.max(0, irsLimit - otherPayrollAnnual);
+          var thisAcctMaxMonthly = thisAcctMaxAnnual / 12;
+          if(requestedNewContrib > thisAcctMaxMonthly){
+            requestedNewContrib = thisAcctMaxMonthly;
+            capDelta = Math.max(0, requestedNewContrib - (parseFloat(targetAcct.contrib) || 0));
+            console.warn('[apply-rec] 401k IRS limit hit — capped delta from $'+amt+'/mo to $'+capDelta.toFixed(2)+'/mo');
+          }
+        }
+        targetAcct.contrib = requestedNewContrib;
+        applied = true;
+        // Linked income update for pre-tax payroll-deducted contributions only.
+        // Roth payroll (post-tax) and IRA accounts don't reduce taxable wages
+        // and aren't withheld from payroll in the same way, so no income-card
+        // change for those.
+        if(_isPayrollDeducted(targetAcct.type) && !_isRoth401kFamily(targetAcct.type) && capDelta > 0){
+          var linkResult = _applyLinkedIncomePretaxUpdate(targetIdx, capDelta);
+          if(linkResult.linked){
+            console.log('[apply-rec] Linked income update: src['+linkResult.srcIdx+'] +$'+linkResult.deltaPerCheck.toFixed(2)+' per check pretax 401k, -$'+linkResult.takeHomeReductionPerCheck.toFixed(2)+' per check take-home (marginal rate '+(linkResult.marginalRate*100).toFixed(1)+'%)');
+          } else {
+            console.log('[apply-rec] No detailed-mode income source to link — Retirement updated, Income card unchanged. User should update paycheck details manually.');
+          }
         }
       }
     }
     if(!applied){var el=document.getElementById('retContrib');if(el)el.value=String(pf(el.value)+amt);}
+    // Re-render the panels we just modified so the DOM reflects new state.
+    if(typeof renderRetAccounts === 'function') renderRetAccounts();
+    if(typeof renderIncomeRow === 'function') renderIncomeRow();
   }
   if(r.section==='expenses'||r.flagId==='cashflow_neg'||r.flagId==='cashflow_thin'||r.flagId==='leaks'){
     // Reduce discretionary spending
