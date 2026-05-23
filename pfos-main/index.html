@@ -3403,6 +3403,28 @@ function _dropSpouseOwnedItems(){
   return counts;
 }
 
+function _defensiveSpouseCleanup(){
+  // Runs on every load for non-Joint household types — owner='spouse' items
+  // should never exist on Individual/Hybrid/Separate profiles (they belong
+  // on the partner's profile, or in couple_links for joint items). The
+  // V2 migration sweep handles initial cleanup but is gated on a one-shot
+  // flag; if stale items survive that or get re-introduced (legacy data,
+  // sync race, manual fix), they leak into every household-level calc
+  // (c.incSpouse, c.totalDebt via S.debts, retBal via S.retAccounts,
+  // invBal via S.investments) and the right-sidebar metrics, pillar
+  // scores, FI target, and projections all silently drift.
+  //
+  // Cheap to run — filter scans 4 small arrays. Self-healing.
+  var ht = S.householdType || 'individual';
+  if(ht === 'joint') return;// Joint shares ONE profile; owner='spouse' is valid
+  var drops = _dropSpouseOwnedItems();
+  var total = drops.incomeDropped + drops.retDropped + drops.invDropped + drops.debtDropped;
+  if(total > 0){
+    console.log('[defensive-cleanup] dropped '+total+' stale owner=spouse items for '+ht+' household:', drops);
+    if(typeof _doSync === 'function')_doSync();
+  }
+}
+
 function _collectJointItemsForMigration(){
   // Hybrid only: collect owner='joint' items into a payload structure ready
   // for posting to couple_links.joint_financial_data. Does NOT mutate S —
@@ -4483,7 +4505,22 @@ function renderFinCards(){
       statusHtml='<div class="fin-card-status" style="color:var(--yl);background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.15)">Setup</div>';
     }
     // Summary stats per card
-    if(cd.title==='Income'&&c.inc>0) summaryHtml='<div class="fin-card-sum">'+(S.incomeSources||[]).length+' source'+(((S.incomeSources||[]).length!==1)?'s':'')+' · '+fmt(Math.round(c.inc))+'/mo</div>';
+    if(cd.title==='Income'&&c.inc>0){
+      // For Hybrid/Separate, S.incomeSources includes the cross-synced
+      // spouse income (owner='spouse') used by household-level calcs, but
+      // the Income page filters those out. Mirror that filter here so the
+      // dashboard card and the page agree on source count and total.
+      var _isHybSep = (S.householdType==='hybrid' || S.householdType==='separate');
+      var _visSrc, _visTotal;
+      if(_isHybSep){
+        _visSrc = (S.incomeSources||[]).filter(function(s){return (s.owner||'').toLowerCase()!=='spouse';});
+        _visTotal = (c.incPersonal||0) + (c.incJoint||0);
+      } else {
+        _visSrc = (S.incomeSources||[]);
+        _visTotal = c.inc;
+      }
+      if(_visTotal>0) summaryHtml='<div class="fin-card-sum">'+_visSrc.length+' source'+(_visSrc.length!==1?'s':'')+' · '+fmt(Math.round(_visTotal))+'/mo</div>';
+    }
     else if(cd.title==='Expenses'&&c.baseExp>0) summaryHtml='<div class="fin-card-sum">'+fmt(Math.round(c.baseExp))+'/mo</div>';
     else if(cd.title==='Assets & Debts'){
       var parts=[];
@@ -4495,9 +4532,23 @@ function renderFinCards(){
       var retBal=S.retAccounts.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
       summaryHtml='<div class="fin-card-sum">'+S.retAccounts.length+' acct'+(S.retAccounts.length!==1?'s':'')+' · '+fmtK(retBal)+'</div>';
     }
-    else if(cd.title==='Investments'&&S.investments&&S.investments.length>0){
-      var invBal=S.investments.reduce(function(t,iv){return t+(parseFloat(iv.balance)||0);},0);
-      summaryHtml='<div class="fin-card-sum">'+S.investments.length+' acct'+(S.investments.length!==1?'s':'')+' · '+fmtK(invBal)+'</div>';
+    else if(cd.title==='Investments'){
+      // Mirror the page layout: personal investments + (for Hybrid) joint
+      // investments from S._jointItems.investments. Excludes crypto from
+      // the balance rollup (same rule as c.netWorth — no defensible
+      // long-term return assumption).
+      var _allInv = (S.investments||[]).slice();
+      if(S.householdType === 'hybrid' && S._jointItems && Array.isArray(S._jointItems.investments)){
+        _allInv = _allInv.concat(S._jointItems.investments);
+      }
+      if(_allInv.length>0){
+        var invBal=_allInv.reduce(function(t,iv){
+          if(!iv)return t;
+          if((iv.type||'').toLowerCase()==='crypto')return t;
+          return t+(parseFloat(iv.balance)||0);
+        },0);
+        summaryHtml='<div class="fin-card-sum">'+_allInv.length+' acct'+(_allInv.length!==1?'s':'')+' · '+fmtK(invBal)+'</div>';
+      }
     }
     else if(cd.title==='Protection'&&S.policies&&S.policies.length>0){
       var polCov=S.policies.reduce(function(t,p){return t+(parseFloat(p.coverage)||0);},0);
@@ -13499,6 +13550,14 @@ function submitAdvisorRequestFromModal(){
       }
       // ── Restore household UI ──
       if(S.householdType)setHH(S.householdType);
+      // ── Defensive cleanup — drop stale owner='spouse' items for non-Joint
+      //    household types. Stale items leak into c.incSpouse / totalDebt /
+      //    retBal / invBal and silently inflate every household-level metric
+      //    (sidebar Total Income, DTI, Net Worth, Net Cash Flow, pillar
+      //    scores, FI target, projections, life-insurance need). The V2
+      //    migration sweep handles this initially but is gated; this runs
+      //    unconditionally so legacy data self-heals on next load. ──
+      if(typeof _defensiveSpouseCleanup === 'function') _defensiveSpouseCleanup();
       // ── Bump all ID counters past restored values ──
       if(S.retAccounts&&S.retAccounts.length){var mx=S.retAccounts.reduce(function(m,a){return Math.max(m,a.id||0);},0);if(mx>retAcctIdCtr)retAcctIdCtr=mx;}
       if(S.incomeSources&&S.incomeSources.length){var mx2=S.incomeSources.reduce(function(m,a){return Math.max(m,a.id||0);},0);if(mx2>incomeIdCtr)incomeIdCtr=mx2;}
