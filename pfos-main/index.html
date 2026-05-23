@@ -2846,7 +2846,22 @@ function _setHHRaw(type){
     var btn=document.getElementById('hh-'+t); if(btn) btn.classList.toggle('active',t===type);
   });
   var desc=document.getElementById('hhDesc'); if(desc) desc.innerHTML=HH_DESCS[type]||'';
-  var sp=document.getElementById('spouseSection'); if(sp) sp.style.display=type!=='individual'?'block':'none';
+  // SPOUSE / PARTNER section: only Joint households use it. Joint shares
+  // ONE profile so the spouse fields live there. Individual has no spouse.
+  // Hybrid and Separate spouses each have their own profile and enter their
+  // own data — showing this section on their profile would be misleading
+  // and the data would get written back into THEIR client_profiles row.
+  var sp=document.getElementById('spouseSection');
+  var spouseVisible = (type === 'joint');
+  if(sp) sp.style.display = spouseVisible ? 'block' : 'none';
+  // When hiding, clear the DOM inputs so a subsequent _doSync doesn't
+  // re-write stale values back into S.profile.
+  if(!spouseVisible){
+    ['spFirstName','spLastName','spEmail','spOccupation','spDOB','spCurrentAge','spRetAge','spSsBenefit','spRetIncome'].forEach(function(id){
+      var el = document.getElementById(id);
+      if(el && el.value){ el.value = ''; }
+    });
+  }
   // Update income panel layout for couple vs individual
   renderIncomeRow();
   // Update retirement & investment panel layouts for couple vs individual
@@ -3237,6 +3252,8 @@ var SPOUSE_FIELDS = ['spFirstName','spLastName','spEmail','spDOB','spOccupation'
 function _wipeSpouseFields(){
   // Remove spouse-info fields from S.profile and clear S.spouseInfo.
   // Safe to call repeatedly. Returns count of fields wiped (for logging).
+  // Also clears the DOM inputs so a subsequent _doSync doesn't read stale
+  // values back into S.profile.
   var count = 0;
   if(S.profile){
     SPOUSE_FIELDS.forEach(function(k){
@@ -3244,6 +3261,13 @@ function _wipeSpouseFields(){
     });
   }
   if(S.spouseInfo && Object.keys(S.spouseInfo).length){ S.spouseInfo = {}; count++; }
+  // Clear DOM input values for the visible spouse fields. The IDs aren't a
+  // perfect superset of SPOUSE_FIELDS (some fields are state-only with no
+  // DOM counterpart), so we just clear the ones we know exist as inputs.
+  ['spFirstName','spLastName','spEmail','spOccupation','spDOB','spCurrentAge','spRetAge','spSsBenefit','spRetIncome'].forEach(function(id){
+    var el = document.getElementById(id);
+    if(el && el.value){ el.value = ''; count++; }
+  });
   return count;
 }
 
@@ -8232,6 +8256,13 @@ function _doSync(){
       return;
     }
   }
+  // Spouse fields only belong on the profile for Joint households (where
+  // both spouses share ONE client_profiles row). For Individual, no spouse.
+  // For Hybrid and Separate, each spouse has their own client_profiles row
+  // and entering spouse data on the other's profile would create stale
+  // duplicates that get overwritten by the partner's actual edits.
+  var _ht_sync = S.householdType || 'individual';
+  var _includeSpouse = (_ht_sync === 'joint');
   S.profile={
     firstName:gv('cpFirstName'),lastName:gv('cpLastName'),email:gv('cpEmail'),phone:gv('cpPhone'),dob:gv('cpDOB'),
     marital:gv('cpMarital'),spouse:gv('cpSpouse'),children:S.children?S.children.length:0,occupation:gv('cpOccupation'),
@@ -8240,8 +8271,15 @@ function _doSync(){
     state:gv('cpState'),healthStatus:gv('cpHealthStatus'),selectedGoals:S.selectedGoals||[],
     currentAge:gv('currentAge'),hhSize:gv('hhSize'),creditScore:gv('creditScore'),
     taxFilingStatus:gv('taxFilingStatus'),
-    spFirstName:gv('spFirstName'),spLastName:gv('spLastName'),spEmail:gv('spEmail'),spOccupation:gv('spOccupation'),
-    spDOB:gv('spDOB'),spCurrentAge:gv('spCurrentAge'),spRetAge:gv('spRetAge'),spSsBenefit:gv('spSsBenefit'),spRetIncome:gv('spRetIncome'),
+    spFirstName: _includeSpouse ? gv('spFirstName') : '',
+    spLastName:  _includeSpouse ? gv('spLastName')  : '',
+    spEmail:     _includeSpouse ? gv('spEmail')     : '',
+    spOccupation:_includeSpouse ? gv('spOccupation'): '',
+    spDOB:       _includeSpouse ? gv('spDOB')       : '',
+    spCurrentAge:_includeSpouse ? gv('spCurrentAge'): '',
+    spRetAge:    _includeSpouse ? gv('spRetAge')    : '',
+    spSsBenefit: _includeSpouse ? gv('spSsBenefit') : '',
+    spRetIncome: _includeSpouse ? gv('spRetIncome') : '',
     retAge:gv('retAge'),retIncome:gv('retIncome'),retLifeExp:gv('retLifeExp'),ssBenefit:gv('ssBenefit'),retInflation:gv('retInflation'),
     retTaxBracket:gv('retTaxBracket'),retCapGainsBracket:gv('retCapGainsBracket'),
     liAnnualIncome:gv('liAnnualIncome'),liYearsReplace:gv('liYearsReplace'),liSpouseYears:gv('liSpouseYears'),
@@ -12783,7 +12821,15 @@ function submitAdvisorRequestFromModal(){
           var btn=document.getElementById('hh-'+t); if(btn) btn.classList.toggle('active', t === newHt);
         });
         var desc=document.getElementById('hhDesc'); if(desc) desc.innerHTML=HH_DESCS[newHt]||'';
-        var sp=document.getElementById('spouseSection'); if(sp) sp.style.display=newHt!=='individual'?'block':'none';
+        var sp=document.getElementById('spouseSection');
+        var spouseVisible = (newHt === 'joint');
+        if(sp) sp.style.display = spouseVisible ? 'block' : 'none';
+        if(!spouseVisible){
+          ['spFirstName','spLastName','spEmail','spOccupation','spDOB','spCurrentAge','spRetAge','spSsBenefit','spRetIncome'].forEach(function(id){
+            var el = document.getElementById(id);
+            if(el && el.value){ el.value = ''; }
+          });
+        }
         // Run migration — it will detect that _migratedHouseholdType !== newHt
         // and reshape data appropriately. Wrap in setTimeout to let the UI
         // settle first.
@@ -13409,6 +13455,26 @@ function submitAdvisorRequestFromModal(){
       // settle so any DOM updates from the sweep don't fight in-progress
       // renders.
       try{setTimeout(function(){ if(typeof _pfosRunMigration === 'function')_pfosRunMigration(); }, 250);}catch(e){}
+      // Post-load cleanup: for already-migrated Hybrid/Separate users whose
+      // S.profile still has leftover spouse data from before the fix that
+      // hid the spouseSection. Migration won't re-run on its own (gate
+      // checks _migratedHouseholdType), so we detect leftover spouse keys
+      // and wipe them once. No-op for clean profiles.
+      try{setTimeout(function(){
+        try{
+          var ht = S.householdType || 'individual';
+          if((ht === 'hybrid' || ht === 'separate') && S.profile){
+            var hasLeftover = ['spFirstName','spLastName','spEmail','spOccupation','spDOB','spCurrentAge','spRetAge','spSsBenefit','spRetIncome'].some(function(k){
+              return S.profile[k] !== undefined && S.profile[k] !== null && S.profile[k] !== '';
+            });
+            if(hasLeftover){
+              console.log('[cleanup] removing leftover spouse fields from', ht, 'profile');
+              _wipeSpouseFields();
+              if(typeof _doSync === 'function') _doSync();
+            }
+          }
+        }catch(e){ console.warn('[cleanup] spouse-field pass failed:', e); }
+      }, 400);}catch(e){}
       // Phase 6 — initial filing-status warning check after load completes.
       try{setTimeout(function(){ if(typeof _updateFilingStatusWarning === 'function') _updateFilingStatusWarning(); }, 300);}catch(e){}
     }catch(err){console.warn('PFOS load error:',err);}
