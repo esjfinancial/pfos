@@ -2500,6 +2500,30 @@ function _estimateFederalAndFICA(annualGross,filingStatus){
   if(annualGross>addMedThreshold)medTax+=(annualGross-addMedThreshold)*0.009;
   return fedTax+ssTax+medTax;
 }
+// FICA-only (Social Security + Medicare + Additional Medicare).
+// Pre-tax 401(k) contributions do NOT reduce FICA wages — only federal income
+// tax and most state income taxes. Carved out so the 401(k) simulator can
+// subtract FICA from total tax when computing tax-savings-from-contribution
+// (where FICA delta is zero), while _estimateGrossFromNet (which converts
+// actual take-home to actual gross) can keep using the full federal+FICA total.
+function _ficaOnly(annualGross,filingStatus){
+  var isMFJ=filingStatus==='married_joint';
+  var isMFS=filingStatus==='married_separate';
+  var ssTax=Math.min(annualGross,184500)*0.062;
+  var addMedThreshold=isMFJ?250000:(isMFS?125000:200000);
+  var medTax=annualGross*0.0145;
+  if(annualGross>addMedThreshold)medTax+=(annualGross-addMedThreshold)*0.009;
+  return ssTax+medTax;
+}
+// Federal income tax only (no FICA). The portion that DOES change when
+// pre-tax 401(k) contributions change. Use this in _currentMarginalRate and
+// _simulate401kImpact — using the FICA-inclusive version would overstate the
+// tax savings by ~7.65 percentage points and inflate the displayed effective
+// rate (turning a true 12% federal saving into a fake ~20% "federal+FICA"
+// saving — the user's take-home doesn't actually drop by that much).
+function _estimateFederalIncomeOnly(annualGross,filingStatus){
+  return _estimateFederalAndFICA(annualGross,filingStatus) - _ficaOnly(annualGross,filingStatus);
+}
 // Reverse-engineers gross from take-home using bisection. Bounds: gross can't
 // be less than net (no negative tax) and won't exceed ~3x net even at the
 // highest brackets. Pre-tax 401k/health/HSA reduce federal taxable wages (W-2
@@ -2548,8 +2572,10 @@ function _currentMarginalRate(annualGross, annualPreTaxAlready, filingStatus, st
   var probe = 100;
   var baseWage  = Math.max(0, annualGross - annualPreTaxAlready);
   var probeWage = Math.max(0, annualGross - annualPreTaxAlready - probe);
-  var baseTax  = _estimateFederalAndFICA(baseWage,  filingStatus) + _estimateStateTax(baseWage,  filingStatus, state);
-  var probeTax = _estimateFederalAndFICA(probeWage, filingStatus) + _estimateStateTax(probeWage, filingStatus, state);
+  // Use federal-income-only (not FICA) — pre-tax 401(k) doesn't reduce FICA wages.
+  // Including FICA would inflate the marginal rate by ~7.65% and overstate tax savings.
+  var baseTax  = _estimateFederalIncomeOnly(baseWage,  filingStatus) + _estimateStateTax(baseWage,  filingStatus, state);
+  var probeTax = _estimateFederalIncomeOnly(probeWage, filingStatus) + _estimateStateTax(probeWage, filingStatus, state);
   return Math.max(0, (baseTax - probeTax) / probe);
 }
 
@@ -2616,8 +2642,8 @@ function _simulate401kImpact(targetMonthly401k){
   // Baseline = ZERO 401k (so the user sees what the contribution as a whole costs)
   var wageNoContrib = Math.max(0, ctx.annualGross - nonRetPreTax);
   var wageWithContrib = Math.max(0, ctx.annualGross - newAnnualPreTax);
-  var taxNoContrib = _estimateFederalAndFICA(wageNoContrib, ctx.filingStatus) + _estimateStateTax(wageNoContrib, ctx.filingStatus, ctx.state);
-  var taxWithContrib = _estimateFederalAndFICA(wageWithContrib, ctx.filingStatus) + _estimateStateTax(wageWithContrib, ctx.filingStatus, ctx.state);
+  var taxNoContrib = _estimateFederalIncomeOnly(wageNoContrib, ctx.filingStatus) + _estimateStateTax(wageNoContrib, ctx.filingStatus, ctx.state);
+  var taxWithContrib = _estimateFederalIncomeOnly(wageWithContrib, ctx.filingStatus) + _estimateStateTax(wageWithContrib, ctx.filingStatus, ctx.state);
   var annualTaxSaved = Math.max(0, taxNoContrib - taxWithContrib);
   var monthlyTaxSaved = annualTaxSaved / 12;
   var monthlyContrib = cappedAnnual / 12;
