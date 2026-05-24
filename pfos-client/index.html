@@ -4596,7 +4596,14 @@ async function loadClientDataIntoPFOS(clientId){
       partnerProfileCompleted: partnerProfileCompleted,
       partnerProfileCompletedAt: partnerProfileCompletedAt,
       partnerEmail: partnerEmail,
-      partnerFirstName: partnerFirstName
+      partnerFirstName: partnerFirstName,
+      // Spouse tax aggregates for MFJ marginal-rate computation (Hybrid/Separate only).
+      // Each spouse writes their own slot; we read the OTHER slot here. Null until
+      // the spouse's session completes a calc() — the iframe shows a pending banner
+      // until realtime delivers the first value.
+      spouseAnnualGross:   (clientId === couple.client_a_id) ? (couple.spouse_b_annual_gross   != null ? Number(couple.spouse_b_annual_gross)   : null) : (couple.spouse_a_annual_gross   != null ? Number(couple.spouse_a_annual_gross)   : null),
+      spouseAnnualPretax:  (clientId === couple.client_a_id) ? (couple.spouse_b_annual_pretax  != null ? Number(couple.spouse_b_annual_pretax)  : null) : (couple.spouse_a_annual_pretax  != null ? Number(couple.spouse_a_annual_pretax)  : null),
+      spouseTaxUpdatedAt:  (clientId === couple.client_a_id) ? (couple.spouse_b_updated_at || null) : (couple.spouse_a_updated_at || null)
     };
 
     clientId = loadFrom; // for joint, load primary's profile
@@ -8050,6 +8057,77 @@ window.addEventListener('message',async function(e){
         }catch(err){ console.error('[joint-field-write] failed:', err); }
       })();
     }catch(e){ console.warn('[joint-field-write] handler error:', e); }
+    return;
+  }
+  // ── PFOS_WRITE_SPOUSE_TAX_DATA — cross-spouse MFJ marginal-rate aggregates ──
+  // The iframe's _401kSimContext needs the SPOUSE's annual gross + pretax to
+  // compute MFJ marginal rate correctly for Hybrid/Separate households (where
+  // each spouse has a separate client_profile so the calc engine only sees
+  // their own income by default). After every calc() that produces stable
+  // totals, the iframe debounce-posts this message with MY annual gross + my
+  // annual pretax. We write to MY slot on couple_links (spouse_a_* if I'm
+  // client_a, spouse_b_* if client_b). Partner's realtime subscriber picks
+  // this up and forwards PFOS_SPOUSE_TAX_DATA_UPDATE into their iframe, which
+  // updates the Tax Impact box live.
+  //
+  // Privacy: only two scalar totals are written. No paycheck breakdown, no
+  // employer info, no source list crosses the spouse boundary.
+  if(msg.type==='PFOS_WRITE_SPOUSE_TAX_DATA'){
+    try{
+      var stp = msg.payload || {};
+      var stCoupleLinkId = stp.coupleLinkId;
+      var stMyClientId = stp.myClientId;
+      var stGross = (stp.annualGross != null) ? Number(stp.annualGross) : null;
+      var stPretax = (stp.annualPretax != null) ? Number(stp.annualPretax) : null;
+      if(!stCoupleLinkId || !stMyClientId){
+        console.warn('[spouse-tax-write] missing coupleLinkId or myClientId');
+        return;
+      }
+      // Resolve which slot is mine using the cached couple link if available,
+      // else look it up. APP._clientCoupleLink is the canonical reference for
+      // the logged-in client; APP_COUPLES holds the advisor-side list.
+      var coupleRow = null;
+      if(APP._clientCoupleLink && APP._clientCoupleLink.id === stCoupleLinkId){
+        coupleRow = APP._clientCoupleLink;
+      } else if(Array.isArray(APP_COUPLES)){
+        coupleRow = APP_COUPLES.find(function(c){ return c && c.id === stCoupleLinkId; }) || null;
+      }
+      // If we can't resolve which slot is mine, abort. Don't write to the wrong slot.
+      if(!coupleRow){
+        console.warn('[spouse-tax-write] couple link not in local cache:', stCoupleLinkId);
+        return;
+      }
+      var amIClientA = (coupleRow.client_a_id === stMyClientId);
+      var amIClientB = (coupleRow.client_b_id === stMyClientId);
+      if(!amIClientA && !amIClientB){
+        console.warn('[spouse-tax-write] myClientId matches neither client_a nor client_b on couple link');
+        return;
+      }
+      // Stamp the self-write timestamp BEFORE the DB call so the realtime
+      // subscriber skips the echo. Separate flag from joint-financials so
+      // my spouse-tax write doesn't suppress partner's jfd updates.
+      try{ if(typeof CPLAN!=='undefined') CPLAN._lastSpouseTaxSelfWriteAt = Date.now(); }catch(e){}
+      var updateObj = {};
+      if(amIClientA){
+        updateObj.spouse_a_annual_gross = stGross;
+        updateObj.spouse_a_annual_pretax = stPretax;
+        updateObj.spouse_a_updated_at = new Date().toISOString();
+      } else {
+        updateObj.spouse_b_annual_gross = stGross;
+        updateObj.spouse_b_annual_pretax = stPretax;
+        updateObj.spouse_b_updated_at = new Date().toISOString();
+      }
+      (async function(){
+        try{
+          await db.from('couple_links').update(updateObj).eq('id', stCoupleLinkId);
+          // Update local cache so subsequent reads see the new value
+          if(coupleRow){
+            Object.keys(updateObj).forEach(function(k){ coupleRow[k] = updateObj[k]; });
+          }
+          console.log('[spouse-tax-write] couple_links updated — slot:', amIClientA?'A':'B', 'gross:', stGross, 'pretax:', stPretax);
+        }catch(err){ console.error('[spouse-tax-write] failed:', err); }
+      })();
+    }catch(e){ console.warn('[spouse-tax-write] handler error:', e); }
     return;
   }
   // ── Phase 8 — household conversion handlers ────────────────────────────
@@ -27137,33 +27215,74 @@ function _cpSubscribeToJointFinancials(){
           // Also refresh local couples cache so subsequent calls see the new type
           try{ if(typeof loadCouples === 'function') loadCouples(); }catch(e){}
         }
-        if(isSelfWrite){
-          // Our own write — skip jfd forwarding
-          return;
-        }
-        // Forward to pfos-main. The iframe will re-hydrate S._jointItems and
-        // re-render affected panels. We pass only the joint_financial_data
-        // field (not other couple_links fields like shared_plan_cards which
-        // are managed by the separate _cpSharedCardsApi subscription).
-        var jfd = row.joint_financial_data || {};
-        var lastChange = jfd._lastChange || {};
-        // Don't fire if the change was authored by us (defense in depth —
-        // covers the case where the timestamp suppression missed because the
-        // round-trip took >1.5s)
-        if(lastChange.by && lastChange.by === APP.currentClientId) return;
-        try{
-          var iframe = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
-          if(iframe && iframe.contentWindow){
-            iframe.contentWindow.postMessage({
-              type: 'PFOS_JOINT_DATA_REMOTE_UPDATE',
-              payload: {
-                jointFinancialData: jfd,
-                changedBy: lastChange.by || null,
-                changedAt: lastChange.ts || null
+        // ── jfd forwarding (suppressed on own jfd writes) ──────────────
+        // The two write streams (joint_financial_data and spouse_*_annual_*)
+        // are independent. We check each suppression flag separately rather
+        // than early-returning, so a recent jfd self-write doesn't block
+        // an incoming spouse-tax update from partner (and vice versa).
+        if(!isSelfWrite){
+          // Forward to pfos-main. The iframe will re-hydrate S._jointItems and
+          // re-render affected panels. We pass only the joint_financial_data
+          // field (not other couple_links fields like shared_plan_cards which
+          // are managed by the separate _cpSharedCardsApi subscription).
+          var jfd = row.joint_financial_data || {};
+          var lastChange = jfd._lastChange || {};
+          // Don't fire if the change was authored by us (defense in depth —
+          // covers the case where the timestamp suppression missed because the
+          // round-trip took >1.5s)
+          if(!(lastChange.by && lastChange.by === APP.currentClientId)){
+            try{
+              var iframe = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+              if(iframe && iframe.contentWindow){
+                iframe.contentWindow.postMessage({
+                  type: 'PFOS_JOINT_DATA_REMOTE_UPDATE',
+                  payload: {
+                    jointFinancialData: jfd,
+                    changedBy: lastChange.by || null,
+                    changedAt: lastChange.ts || null
+                  }
+                }, 'https://pfos.esjfinancial.com');
               }
-            }, 'https://pfos.esjfinancial.com');
+            }catch(e){ console.warn('[joint-rt] forward to pfos-main failed:', e); }
           }
-        }catch(e){ console.warn('[joint-rt] forward to pfos-main failed:', e); }
+        }
+        // ── SPOUSE TAX AGGREGATES — separate dispatch ───────────────────
+        // Cross-spouse tax data (spouse_*_annual_gross, spouse_*_annual_pretax)
+        // for MFJ marginal-rate math. Each spouse writes their OWN slot; we
+        // watch for changes in the OPPOSITE slot. Suppress self-echoes using
+        // a SEPARATE flag from jfd writes — these two streams are independent
+        // (partner's jfd updates shouldn't be suppressed by my spouse-tax
+        // writes, and vice versa).
+        var lastSelfSpouseTax = CPLAN._lastSpouseTaxSelfWriteAt || 0;
+        var isSpouseTaxSelfWrite = (Date.now() - lastSelfSpouseTax < 1500);
+        if(!isSpouseTaxSelfWrite){
+          var amIPrimary = APP.currentClientId === couple.client_a_id;
+          var spouseGrossField   = amIPrimary ? 'spouse_b_annual_gross'  : 'spouse_a_annual_gross';
+          var spousePretaxField  = amIPrimary ? 'spouse_b_annual_pretax' : 'spouse_a_annual_pretax';
+          var spouseUpdatedField = amIPrimary ? 'spouse_b_updated_at'    : 'spouse_a_updated_at';
+          var newGross  = row[spouseGrossField];
+          var newPretax = row[spousePretaxField];
+          // Only forward if the spouse field actually has a value (avoid
+          // forwarding nulls from initial seed; the pending banner stays).
+          // Even null→null is skipped because the iframe already shows the
+          // pending state by default for hybrid/separate MFJ.
+          var hasSpouseData = (newGross != null) || (newPretax != null);
+          if(hasSpouseData){
+            try{
+              var iframe2 = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+              if(iframe2 && iframe2.contentWindow){
+                iframe2.contentWindow.postMessage({
+                  type: 'PFOS_SPOUSE_TAX_DATA_UPDATE',
+                  payload: {
+                    spouseAnnualGross: newGross != null ? Number(newGross) : null,
+                    spouseAnnualPretax: newPretax != null ? Number(newPretax) : null,
+                    spouseTaxUpdatedAt: row[spouseUpdatedField] || null
+                  }
+                }, 'https://pfos.esjfinancial.com');
+              }
+            }catch(e){ console.warn('[spouse-tax-rt] forward failed:', e); }
+          }
+        }
       })
       .subscribe();
     CPLAN._jointFinancialsChannel = channel;
@@ -40484,4 +40603,4 @@ function cas_toggleBiometricEnrollment(checkbox){
 })();
 </script>
 </body>
-</html>v
+</html>
