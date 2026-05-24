@@ -2588,6 +2588,7 @@ function _401kSimContext(){
   var c    = S.calcs   || {};
   var filingStatus = prof.taxFilingStatus || prof.filingStatus || 'single';
   var state = prof.state || '';
+  var householdType = S.householdType || 'individual';
   // Annual gross — prefer the calc-engine gross (which uses detailed mode
   // bisection from _incSrcMonthlyGross); fallback to net × 12.
   var annualGross = (c.incGross || c.inc || 0) * 12;
@@ -2609,13 +2610,51 @@ function _401kSimContext(){
   (S.retAccounts || []).forEach(function(a){
     if(_isPayrollDeducted(a.type)) currentAnnual401kFromRet += (parseFloat(a.contrib) || 0) * 12;
   });
+  // ── HOUSEHOLD-COMBINED MFJ MARGINAL RATE (Hybrid / Separate only) ──
+  // For MFJ filing status, the IRS computes tax on combined household
+  // taxable income. The single-spouse view (just my client_profile) misses
+  // half the household basis, which can place the marginal rate in the
+  // wrong bracket. We sum the spouse's published aggregates (from couple_
+  // links.spouse_*_annual_gross / _pretax, surfaced via S._spouseAnnualGross
+  // / _spouseAnnualPretax) when:
+  //   - filing status = married_joint
+  //   - household type ∈ {hybrid, separate}  (Joint already has one profile;
+  //     Individual has no spouse to add)
+  // If spouse data hasn't arrived yet (S._spouseAnnualGross is null or
+  // undefined), we flag pendingSpouseData so the renderer shows a friendly
+  // waiting banner instead of returning stale single-filer math. The wait
+  // resolves automatically when partner's session writes their aggregates
+  // and our realtime subscriber fires PFOS_SPOUSE_TAX_DATA_UPDATE.
+  //
+  // MFS (married_filing_separately) brackets are half of MFJ and per-person
+  // — single-filer-equivalent math is actually correct for MFS, so we skip
+  // the household combine.
+  var needsSpouseData = (filingStatus === 'married_joint') &&
+                        (householdType === 'hybrid' || householdType === 'separate');
+  var pendingSpouseData = false;
+  if(needsSpouseData){
+    var spouseGross  = (typeof S._spouseAnnualGross  === 'number') ? S._spouseAnnualGross  : null;
+    var spousePretax = (typeof S._spouseAnnualPretax === 'number') ? S._spouseAnnualPretax : null;
+    // We require spouse gross at minimum. Pretax can default to 0 (a spouse
+    // with no payroll-deducted retirement is a valid steady state — they
+    // just have no pretax).
+    if(spouseGross == null){
+      pendingSpouseData = true;
+    } else {
+      annualGross += spouseGross;
+      if(spousePretax != null) currentAnnualPreTax += spousePretax;
+    }
+  }
   return {
     filingStatus: filingStatus,
     state: state,
+    householdType: householdType,
     annualGross: annualGross,
     currentAnnualPreTaxAll: currentAnnualPreTax,
     currentAnnual401kFromIncome: currentAnnual401kFromIncome,
     currentAnnual401kFromRet: currentAnnual401kFromRet,
+    needsSpouseData: needsSpouseData,
+    pendingSpouseData: pendingSpouseData,
     // For tax math, use the higher of the two as "what's actually deducted"
     // — if Retirement card has been updated but Income card hasn't, the
     // tax savings ARE locked-in only if payroll actually withholds the
@@ -2674,7 +2713,12 @@ function _simulate401kImpact(targetMonthly401k){
     // Sync gap diagnostic: are the two sources of 401k truth in agreement?
     syncMismatch: Math.abs(ctx.currentAnnual401kFromIncome - ctx.currentAnnual401kFromRet) > 12,
     syncFromIncome: ctx.currentAnnual401kFromIncome,
-    syncFromRet: ctx.currentAnnual401kFromRet
+    syncFromRet: ctx.currentAnnual401kFromRet,
+    // Spouse-data status — propagated from ctx so the renderer can show a
+    // pending banner when MFJ Hybrid/Separate user is waiting on their
+    // spouse to fill in income for the first time.
+    needsSpouseData: ctx.needsSpouseData,
+    pendingSpouseData: ctx.pendingSpouseData
   };
 }
 
@@ -7317,6 +7361,27 @@ function _renderRetTaxImpact(){
   if(!hasAccount){ el.innerHTML = ''; return; }
   // Simulator only sees pretax — that's what drives tax math.
   var sim = _simulate401kImpact(pretaxMonthly);
+  // ── Pending-spouse-data state (MFJ Hybrid/Separate only) ──
+  // We can't compute the correct household marginal rate until the spouse's
+  // session has written their annual gross. Show a friendly banner that
+  // will live-replace itself when realtime delivers their data.
+  if(sim.pendingSpouseData){
+    el.innerHTML =
+      '<div style="padding:14px 16px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-left:3px solid #5B9BFF;border-radius:4px">'
+      +'<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">401(k) Tax Impact</div>'
+      +'<div style="display:flex;align-items:center;gap:12px">'
+      +  '<span style="font-size:20px">🤝</span>'
+      +  '<div style="flex:1;font-size:13px;color:var(--wh);line-height:1.55">'
+      +    '<strong style="color:#5B9BFF">Waiting on your spouse\'s profile.</strong> '
+      +    'For married-filing-jointly tax math, we combine both incomes. '
+      +    'Your joint marginal rate and tax savings will appear here automatically '
+      +    'as soon as your spouse fills in their income — even if they do it on another device right now. '
+      +    'No refresh needed.'
+      +  '</div>'
+      +'</div>'
+      +'</div>';
+    return;
+  }
   // Combined total for IRS limit display (both buckets share the same cap).
   var combinedMonthly = pretaxMonthly + rothMonthly;
   var combinedAnnual = combinedMonthly * 12;
@@ -9244,6 +9309,55 @@ function calc(){
   // Sync to platform
   clearTimeout(S._syncTimer);
   S._syncTimer=setTimeout(_doSync,300);
+
+  // ── Spouse tax aggregate write (Hybrid / Separate MFJ only) ──
+  // Publish my annual gross + pretax to couple_links so my spouse's session
+  // can compute the joint marginal rate accurately. Each spouse writes only
+  // their own slot. Aggregates only (no source-level data) — privacy-preserving.
+  //
+  // Debounced 500ms separately from _doSync (which writes the profile JSONB
+  // to client_profiles — a different table). The two writes are independent;
+  // separate debounce keeps each cleanly scoped.
+  //
+  // No-op for: Individual filers (no spouse), Joint households (one shared
+  // profile already), MFS filers (per-person brackets work without combine),
+  // sessions without a coupleLinkId (decoupled or pre-link state).
+  try{
+    var _hhTax = S.householdType || 'individual';
+    var _fsTax = (S.profile && (S.profile.taxFilingStatus || S.profile.filingStatus)) ||
+                 gv('taxFilingStatus') || 'single';
+    if(_fsTax === 'married_joint' && (_hhTax === 'hybrid' || _hhTax === 'separate') && S.coupleLinkId){
+      clearTimeout(S._spouseTaxWriteTimer);
+      S._spouseTaxWriteTimer = setTimeout(function(){
+        try{
+          var _annualGross = (incGross || inc || 0) * 12;
+          // Sum my pretax deductions — same logic as _401kSimContext
+          var _annualPretax = 0;
+          (S.incomeSources || []).forEach(function(src){
+            if(_incSrcMode(src) !== 'detailed') return;
+            var checks = _checksPerMonth(src.pay_frequency);
+            var d401  = (parseFloat(src.deduction_401k)   || 0) * checks * 12;
+            var dHlth = (parseFloat(src.deduction_health) || 0) * checks * 12;
+            var dHsa  = (parseFloat(src.deduction_hsa)    || 0) * checks * 12;
+            var dOth  = (parseFloat(src.deduction_other)  || 0) * checks * 12;
+            _annualPretax += d401 + dHlth + dHsa + dOth;
+          });
+          // Don't write zeros until the user has actually entered income —
+          // would briefly clear partner's view of our data and look weird.
+          if(_annualGross <= 0) return;
+          window.parent.postMessage({
+            type: 'PFOS_WRITE_SPOUSE_TAX_DATA',
+            payload: {
+              coupleLinkId: S.coupleLinkId,
+              myClientId: window._pfosLoadedClientId || null,
+              annualGross: _annualGross,
+              annualPretax: _annualPretax
+            }
+          }, '*');
+        }catch(e){ console.warn('[spouse-tax-write] post failed:', e); }
+      }, 500);
+    }
+  }catch(e){ /* defensive — never let this break calc() */ }
   }finally{ _calcRunning=false; }
 }
 function _doSync(){
@@ -14095,6 +14209,40 @@ function submitAdvisorRequestFromModal(){
       }catch(e){ console.warn('[joint-rt] update handler failed:', e); }
       return;
     }
+    // ── Spouse tax-aggregate update (cross-spouse, MFJ Hybrid/Separate) ──
+    // Partner's session just wrote their annual gross + pretax to couple_links.
+    // Update S and snap-re-render the Tax Impact box so the user sees the
+    // joint marginal rate immediately. No full panel rerender — that would
+    // destroy any input focus the user has elsewhere on the page.
+    //
+    // Fires whenever partner's calc() produces fresh aggregates (debounced
+    // 500ms on their side), so this can arrive multiple times in a typing
+    // session. Each arrival is idempotent — re-rendering with the same
+    // numbers is a no-op visually.
+    if(msg.type==='PFOS_SPOUSE_TAX_DATA_UPDATE'){
+      try{
+        var stp = msg.payload || {};
+        // Update S aggregates. We accept null to roll back to pending state
+        // (e.g., if spouse unlinks and their data clears) — though in practice
+        // we only get null from the initial PFOS_LOAD coupleData seed, not
+        // from realtime updates which require hasSpouseData=true to fire.
+        if(stp.spouseAnnualGross !== undefined){
+          S._spouseAnnualGross = (stp.spouseAnnualGross != null) ? Number(stp.spouseAnnualGross) : null;
+        }
+        if(stp.spouseAnnualPretax !== undefined){
+          S._spouseAnnualPretax = (stp.spouseAnnualPretax != null) ? Number(stp.spouseAnnualPretax) : null;
+        }
+        if(stp.spouseTaxUpdatedAt !== undefined){
+          S._spouseTaxUpdatedAt = stp.spouseTaxUpdatedAt;
+        }
+        // Snap-render the Tax Impact box. This is the ONLY visible surface
+        // that depends on spouse data right now. If we add more (e.g., the
+        // dashboard joint-income readout), they can be re-rendered here too.
+        if(typeof _renderRetTaxImpact === 'function') _renderRetTaxImpact();
+        console.log('[spouse-tax-rt] updated S._spouseAnnualGross =', S._spouseAnnualGross, 'pretax =', S._spouseAnnualPretax);
+      }catch(e){ console.warn('[spouse-tax-rt] handler failed:', e); }
+      return;
+    }
     if(msg.type==='PFOS_PLAN_DEPLOY'){S._planDeployed=msg.deployed||0;S._planAllocCount=msg.allocCount||0;S._planAllocations=msg.allocations||[];if(_currentSection==='home')renderHome();return;}
     if(msg.type==='PFOS_PLAN_SYNC'){
       S._plan=msg.plan||{};
@@ -14392,6 +14540,7 @@ function submitAdvisorRequestFromModal(){
       S.advisorRequests=[];S.advisorRecs=[];S.calcs={};S.analysisRun=false;
       S.householdType='individual';S.spouseInfo={};
       S.coupleLinkId=null;S.partnerName=null;S.sharedGoals=[];S.coupleData=null;
+      S._spouseAnnualGross=null;S._spouseAnnualPretax=null;S._spouseTaxUpdatedAt=null;
       S._jointItems={incomeSources:[],retAccounts:[],investments:[],debts:[]};// Phase 4 — reset on client switch
       S.profile=null;S.snapshot=null;S.visitedPanels=[];
       // ── Clear all DOM inputs ──
@@ -14453,6 +14602,21 @@ function submitAdvisorRequestFromModal(){
         if(msg.coupleData.householdType)S.householdType=msg.coupleData.householdType;
         if(msg.coupleData.coupleLinkId)S.coupleLinkId=msg.coupleData.coupleLinkId;
         if(msg.coupleData.partnerName)S.partnerName=msg.coupleData.partnerName;
+        // Spouse tax aggregates (Hybrid / Separate MFJ only).
+        // Each spouse writes their own annual gross + pretax to couple_links;
+        // we pick up the OPPOSITE slot here. Null when partner hasn't yet
+        // completed enough data for their session to write — the simulator
+        // shows a pending banner in that case. Updated live via realtime
+        // (see PFOS_SPOUSE_TAX_DATA_UPDATE handler).
+        if(msg.coupleData.spouseAnnualGross !== undefined){
+          S._spouseAnnualGross = msg.coupleData.spouseAnnualGross;
+        }
+        if(msg.coupleData.spouseAnnualPretax !== undefined){
+          S._spouseAnnualPretax = msg.coupleData.spouseAnnualPretax;
+        }
+        if(msg.coupleData.spouseTaxUpdatedAt !== undefined){
+          S._spouseTaxUpdatedAt = msg.coupleData.spouseTaxUpdatedAt;
+        }
         // Phase 2 — partner profile completion cache (Hybrid only). pfos-main
         // can't query DB directly from inside the iframe, so the parent
         // (pfos-client.html) queries partner's client_profiles row and passes
