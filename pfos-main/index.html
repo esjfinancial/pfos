@@ -9586,18 +9586,72 @@ function _bkId(){return 'bk_'+(++_sgIdCtr)+'_'+Date.now().toString(36);}
 
 // ── Migration: convert old goals+buckets to new format ──
 function _migrateSavingsGoals(){
-  // Owner backfill — MUST run BEFORE the S._goalsMigrated function-level
-  // early-return below. Legacy goals were stamped _goalsMigrated=true under
-  // an older version of this function that didn't default the owner field,
-  // and the function-level guard short-circuits before we can reach the
-  // per-goal migration loop. Without this preflight, hybrid-mode
-  // renderSavingsGoals silently drops goals whose owner is neither
-  // 'personal' nor 'joint' — they show in the sidebar (which iterates all of
-  // S.goals unfiltered) but not in the main panel. Defaults to 'personal'
-  // to match saveSavingsGoal at line ~9722 and the bucket-conversion default
-  // at line ~9630. Idempotent — no-op when owner is already set.
+  // Owner + ID + Priority backfill — MUST run BEFORE the S._goalsMigrated
+  // function-level early-return below. Legacy goals were stamped
+  // _goalsMigrated=true under an older version of this function that didn't
+  // default these fields, and the function-level guard short-circuits before
+  // we can reach the per-goal migration loop. Without this preflight:
+  //   • Missing owner: hybrid-mode renderSavingsGoals silently drops the goal
+  //     (filter by owner=='personal'|'joint' matches neither), so it shows in
+  //     the sidebar (unfiltered) but not the main panel.
+  //   • Missing id: every per-goal button (delete/edit/contribute) generates
+  //     onclick="deleteSavingsGoal('undefined')" etc., so clicks are no-ops.
+  //   • String priority: seed data may have 'high'/'medium'/'low' instead of
+  //     integers; renderer does 'P'+g.priority which produces 'Phigh' visually.
+  //
+  // Owner default: for Hybrid households, missing owner → 'joint' (so both
+  // spouses see legacy goals via the couple_links sync path). For all other
+  // household types, missing owner → 'personal'. Joint households share a
+  // single profile (owner field is moot); Separate/Individual have no
+  // sharing concept.
+  //
+  // Idempotent — no-op when fields are already set. When IDs or owner='joint'
+  // are newly assigned, schedules a _doSync to persist (else they'd
+  // regenerate every load) and a _syncJointGoalsToCoupleLinks to push newly-
+  // joint goals to couple_links so the partner can see them.
   if(Array.isArray(S.goals) && S.goals.length){
-    S.goals.forEach(function(g){ if(g && !g.owner) g.owner='personal'; });
+    var _backfillChanges = false;
+    var _backfillJointAssigned = false;
+    var _isHybrid = (S.householdType === 'hybrid');
+    S.goals.forEach(function(g){
+      if(!g) return;
+      if(!g.owner){
+        g.owner = _isHybrid ? 'joint' : 'personal';
+        _backfillChanges = true;
+        if(_isHybrid) _backfillJointAssigned = true;
+      }
+      if(!g.id){
+        g.id = (typeof _sgId === 'function') ? _sgId() : ('sg_legacy_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,6));
+        _backfillChanges = true;
+      }
+      // Normalize string priorities to integers
+      if(typeof g.priority === 'string'){
+        var _p = g.priority.toLowerCase();
+        if(_p === 'high') g.priority = 3;
+        else if(_p === 'medium') g.priority = 2;
+        else if(_p === 'low') g.priority = 1;
+        else {
+          var _n = parseInt(g.priority, 10);
+          g.priority = isNaN(_n) ? 1 : _n;
+        }
+        _backfillChanges = true;
+      }
+    });
+    if(_backfillChanges){
+      if(!S._touched) S._touched = {};
+      S._touched.goals = true;
+      // Schedule a sync so the backfilled values persist to client_profiles.
+      // Direct _doSync call (not calc) — calc would call renderSavingsGoals
+      // which calls back into this function. Deferred so PFOS_LOAD's other
+      // state is in place first.
+      setTimeout(function(){ if(typeof _doSync === 'function'){ try{ _doSync(); }catch(e){} } }, 500);
+    }
+    if(_backfillJointAssigned){
+      // Newly-jointed goals need to reach couple_links so the partner sees
+      // them. Slightly later than _doSync so client_profiles gets the
+      // backfill first; couple_links picks up the joint set after.
+      setTimeout(function(){ if(typeof _syncJointGoalsToCoupleLinks === 'function'){ try{ _syncJointGoalsToCoupleLinks(); }catch(e){} } }, 800);
+    }
   }
   if(S._goalsMigrated)return;
   if(!S.goals)S.goals=[];
@@ -14780,12 +14834,24 @@ function submitAdvisorRequestFromModal(){
           // the source of truth for joint goals (consistent with how joint income,
           // debts, expenses round-trip). Merge them into S.goals by id so the
           // existing renderSavingsGoals (which filters S.goals by g.owner) keeps
-          // working unchanged. Per-user save strips owner==='joint' from
-          // client_profiles (see _doSync) so duplication doesn't accumulate.
+          // working unchanged.
+          //
+          // Pre-drop capture: snapshot local-only owner='joint' goals (those NOT
+          // in jfd.goals by id) BEFORE the drop+push. The drop step would
+          // otherwise discard them — which is fatal during initial migration if
+          // the partner synced first (their goals end up in jfd, this user's
+          // local-only goals get dropped, and the next _doSync writes the
+          // shrunken S.goals to client_profiles, permanently losing them).
+          // We restore the captured locals after the push, then schedule a
+          // _syncJointGoalsToCoupleLinks to upload them so the partner sees
+          // them on next load/realtime.
+          var __preDropLocalJoint = [];
+          if(Array.isArray(S.goals)){
+            var __jfdGoalIds = (Array.isArray(jfd.goals)?jfd.goals:[]).map(function(g){return g && g.id;}).filter(Boolean);
+            __preDropLocalJoint = S.goals.filter(function(g){return g && g.owner==='joint' && g.id && __jfdGoalIds.indexOf(g.id) === -1;});
+          }
           if(Array.isArray(jfd.goals) && jfd.goals.length){
             if(!Array.isArray(S.goals)) S.goals=[];
-            // Drop any locally-cached joint goals first (they may be stale copies
-            // from the per-user blob written before the strip was in place).
             S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
             jfd.goals.forEach(function(jg){
               if(!jg) return;
@@ -14793,6 +14859,19 @@ function submitAdvisorRequestFromModal(){
               copy.owner = 'joint';
               S.goals.push(copy);
             });
+          }
+          // Restore the captured local-only joint goals
+          if(__preDropLocalJoint.length){
+            if(!Array.isArray(S.goals)) S.goals=[];
+            __preDropLocalJoint.forEach(function(g){
+              if(!S.goals.some(function(x){return x && x.id === g.id;})){
+                S.goals.push(g);
+              }
+            });
+            // Schedule sync so couple_links picks up the captured locals
+            setTimeout(function(){
+              try{ if(typeof _syncJointGoalsToCoupleLinks === 'function') _syncJointGoalsToCoupleLinks(); }catch(e){}
+            }, 800);
           }
           if(jfd.employmentType){
             if(!S.profile)S.profile={};
