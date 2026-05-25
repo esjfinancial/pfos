@@ -9451,14 +9451,13 @@ function _doSync(){
     // mutated there during toggle operations; persisting it into
     // client_profiles.S would duplicate the data.
     if(pl._jointItems) delete pl._jointItems;
-    // Phase: Hybrid joint goals — source of truth is couple_links.joint_financial_data.goals
-    // (written via _syncJointGoalsToCoupleLinks → PFOS_WRITE_JOINT_ITEMS). Strip
-    // owner==='joint' goals from the per-user client_profiles save so they live
-    // in exactly one place. The strip is only for Hybrid: Joint households share
-    // one profile, and Individual/Separate have no concept of joint goals.
-    if(S.householdType === 'hybrid' && Array.isArray(pl.goals)){
-      pl.goals = pl.goals.filter(function(g){return g && g.owner !== 'joint';});
-    }
+    // (Earlier revision stripped owner==='joint' goals from per-user save here.
+    // Removed because _doSync fires on a 300ms debounce and would strip joint
+    // goals from client_profiles BEFORE _syncJointGoalsToCoupleLinks had a
+    // chance to push them to couple_links, causing permanent data loss for
+    // pre-existing local joint goals. Joint goals now persist in both
+    // client_profiles (defensive copy) and couple_links (canonical cross-spouse
+    // store). The realtime handler reconciles when partner writes.)
     console.log('[PFOS _doSync] SAVING →',
       'income:',((S.incomeSources||[]).length),'('+((S.incomeSources||[]).reduce(function(t,s){return t+(s.amount||0);},0))+'/mo)',
       'expData:',Object.keys(S.expData||{}).length,
@@ -14247,15 +14246,25 @@ function submitAdvisorRequestFromModal(){
           // Phase: Hybrid joint goals — re-merge from couple_links into S.goals.
           // Drop existing joint goals first, then push the fresh copies. Matches
           // the PFOS_LOAD pattern so the realtime path produces the same end
-          // state as a cold load.
+          // state as a cold load. Guarded by jfd.goals.length>0 so an empty
+          // write from the partner (e.g. they edited income, and their
+          // _postJointItemsWrite included goals=[] because they have no local
+          // joint goals) doesn't wipe THIS user's local joint goals during
+          // the migration window. Trade-off: a partner deleting their last
+          // joint goal won't propagate via realtime — the other user will
+          // see it on next refresh (PFOS_LOAD has the same guard, so actually
+          // they keep their local copy; an explicit refresh after both spouses
+          // have synced is the cleanest way to reconcile delete-to-zero).
           if(!Array.isArray(S.goals)) S.goals=[];
-          S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
-          (Array.isArray(jfd.goals) ? jfd.goals : []).forEach(function(jg){
-            if(!jg) return;
-            var copy = Object.assign({}, jg);
-            copy.owner = 'joint';
-            S.goals.push(copy);
-          });
+          if(Array.isArray(jfd.goals) && jfd.goals.length){
+            S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
+            jfd.goals.forEach(function(jg){
+              if(!jg) return;
+              var copy = Object.assign({}, jg);
+              copy.owner = 'joint';
+              S.goals.push(copy);
+            });
+          }
           // Re-render all panels that read from _jointItems
           try{ if(typeof renderIncomeRow === 'function') renderIncomeRow(); }catch(e){}
           try{ if(typeof renderRetAccounts === 'function') renderRetAccounts(); }catch(e){}
