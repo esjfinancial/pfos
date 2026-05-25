@@ -3980,6 +3980,16 @@ function _postJointItemsWrite(){
   // No-op if not Hybrid or no couple link.
   if(S.householdType !== 'hybrid' || !S.coupleLinkId) return;
   if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  // Always refresh _jointItems.goals from current S.goals BEFORE posting.
+  // _jointItems.goals starts as a snapshot from PFOS_LOAD hydration but goal
+  // mutations update S.goals (the renderer's source), not _jointItems. Without
+  // this refresh, any joint-items write fired from a non-goal mutation path
+  // (joint income toggle, joint debt edit, joint expense add, etc.) sends a
+  // stale — often empty — goals array, which the parent uses to replace
+  // couple_links.joint_financial_data.goals, wiping the partner's joint goals.
+  // (Goal-mutation paths also call _syncJointGoalsToCoupleLinks which performs
+  // the same refresh; this guard catches every OTHER path.)
+  S._jointItems.goals = (S.goals||[]).filter(function(g){return g && g.owner==='joint';});
   try{
     window.parent.postMessage({
       type:'PFOS_WRITE_JOINT_ITEMS',
@@ -9620,8 +9630,17 @@ function _migrateSavingsGoals(){
         _backfillChanges = true;
         if(_isHybrid) _backfillJointAssigned = true;
       }
-      if(!g.id){
-        g.id = (typeof _sgId === 'function') ? _sgId() : ('sg_legacy_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,6));
+      // ID backfill: missing OR not a string (seed data may use integers
+      // like {id:1,id:2}). The delete/edit button HTML generates
+      // onclick="deleteSavingsGoal('1')" (string-wrapped), so when the
+      // handler does g.id !== id, integer 1 !== string '1' is true and
+      // the filter never matches — delete silently fails. Coerce non-
+      // string ids to strings preserving the original value when possible
+      // so cross-references (transactions, buckets, etc.) still resolve.
+      if(!g.id || typeof g.id !== 'string'){
+        var _origId = g.id;
+        g.id = (typeof _origId === 'number') ? ('sg_legacy_' + _origId)
+             : ((typeof _sgId === 'function') ? _sgId() : ('sg_legacy_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,6)));
         _backfillChanges = true;
       }
       // Normalize string priorities to integers
