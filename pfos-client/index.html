@@ -21555,7 +21555,12 @@ function _cpEnsurePlanLoaded(){
                   _ibcUnderlyingType:c._ibcUnderlyingType||null,
                   _state:c._state||'proposed',
                   _policyNumber:c._policyNumber||null,
-                  _lockedPremium:c._lockedPremium||null
+                  _lockedPremium:c._lockedPremium||null,
+                  // Carry account linkage from the owner's serialized card so
+                  // the approval flow can fire update_retirement/update_investment
+                  // when a change request on this card is approved.
+                  _retAccountId:c._retAccountId||null,
+                  _investmentId:c._investmentId||null
                 });
                 existingIds[c.sharedId]=true;
               });
@@ -21641,7 +21646,12 @@ function _cpEnsurePlanLoaded(){
                 _ibcUnderlyingType:c._ibcUnderlyingType||null,
                 _state:c._state||'proposed',
                 _policyNumber:c._policyNumber||null,
-                _lockedPremium:c._lockedPremium||null
+                _lockedPremium:c._lockedPremium||null,
+                // Carry account linkage from the owner's serialized card so
+                // the approval flow can fire update_retirement/update_investment
+                // when a change request on this card is approved.
+                _retAccountId:c._retAccountId||null,
+                _investmentId:c._investmentId||null
               });
             });
             try{_cpCheckPendingApprovals(sharedData.pendingRequests||{});}catch(e){}
@@ -24373,6 +24383,9 @@ function _cpSendPartnerReminder(){
 // _retTypeMap/_retPhaseMap from _cpStartSelfBuild; they're small and stable.
 function _cpBuildRetAllocFromAccount(r){
   if(!r)return null;
+  // Strict literal map for canonical types (fast path), extended below with a
+  // normalized fallback to handle legacy/imported data shapes (e.g. '403b'
+  // without _current suffix, 'Solo 401k' as a label).
   var _retTypeMap={
     'roth_ira':'roth',
     '401k_current':'401k','403b_current':'401k','tsp_current':'401k',
@@ -24381,8 +24394,22 @@ function _cpBuildRetAllocFromAccount(r){
     'solo_401k':'solo401k','roth_solo_401k':'solo401k',
     'sep_ira':'sep_ira'
   };
+  function _normRetTypeP21(t){
+    if(!t) return '';
+    return String(t).toLowerCase().replace(/[()—–\-_]/g,'').replace(/\s+/g,'');
+  }
+  var _retTypeMapNorm={
+    'rothira':'roth','roth':'roth',
+    '401kcurrent':'401k','401k':'401k',
+    '403bcurrent':'401k','403b':'401k',
+    'tspcurrent':'401k','tsp':'401k',
+    'roth401kcurrent':'roth401k','roth401k':'roth401k',
+    'tradira':'trad_ira','ira':'trad_ira','traditionalira':'trad_ira',
+    'solo401k':'solo401k','rothsolo401k':'solo401k',
+    'sepira':'sep_ira','sep':'sep_ira'
+  };
   var _retPhaseMap={'roth':1,'401k':1,'roth401k':1,'trad_ira':1,'solo401k':1,'sep_ira':1};
-  var allocType=_retTypeMap[r.type];
+  var allocType=_retTypeMap[r.type] || _retTypeMapNorm[_normRetTypeP21(r.type)];
   if(!allocType)return null;
   var info=(typeof _cpResolveMatchInfo==='function')?_cpResolveMatchInfo(r):null;
   var contrib=(info&&info.currentContrib)||0;
@@ -24595,6 +24622,33 @@ function _cpStartSelfBuild(){
   var savedDiy=CPLAN._diyPlan;
   if(savedDiy && savedDiy.allocations && savedDiy.allocations.length){
     CPLAN.allocations=JSON.parse(JSON.stringify(savedDiy.allocations));
+    // Merge in any current own accounts that weren't seeded the first time
+    // around. Idempotent: the build helpers dedup by _retAccountId /
+    // _investmentId so re-running this never produces duplicates. Catches:
+    //   - accounts added in pfos-main AFTER the first DIY entry
+    //   - accounts that existed at first DIY entry but the saved state lost
+    //     the card (e.g., legacy bug where the spouse-account seeder wiped
+    //     the self seeder's output via incomplete handling)
+    try{
+      var _rsRawS=(APP._portalFd&&APP._portalFd.S)||{};
+      (_rsRawS.retAccounts||[]).forEach(function(r){
+        if(!r||!r.id)return;
+        // Skip if a card already references this retAccount
+        var dup=CPLAN.allocations.some(function(a){return a&&a._retAccountId===r.id;});
+        if(dup)return;
+        if(typeof _cpBuildRetAllocFromAccount!=='function')return;
+        var newAlloc=_cpBuildRetAllocFromAccount(r);
+        if(newAlloc)CPLAN.allocations.push(newAlloc);
+      });
+      (_rsRawS.investments||[]).forEach(function(iv){
+        if(!iv||!iv.id)return;
+        var dup=CPLAN.allocations.some(function(a){return a&&a._investmentId===iv.id;});
+        if(dup)return;
+        if(typeof _cpBuildInvestAllocFromAccount!=='function')return;
+        var newAlloc=_cpBuildInvestAllocFromAccount(iv);
+        if(newAlloc)CPLAN.allocations.push(newAlloc);
+      });
+    }catch(_re){console.warn('Restore-time account merge failed:',_re);}
     _cpRenderPlanV2();
     return;
   }
@@ -24610,6 +24664,9 @@ function _cpStartSelfBuild(){
   // the existing ones.
   var rawS_seed=(APP._portalFd&&APP._portalFd.S)||{};
   var existingRet=rawS_seed.retAccounts||[];
+  // Strict literal map for canonical types (fast path). Extended below with a
+  // normalized fallback to handle legacy/imported data shapes (e.g. '403b'
+  // without _current suffix, 'Solo 401k' as a label, 'Roth IRA' with spaces).
   var _retTypeMap={
     'roth_ira':'roth',
     '401k_current':'401k','403b_current':'401k','tsp_current':'401k',
@@ -24618,6 +24675,26 @@ function _cpStartSelfBuild(){
     'solo_401k':'solo401k','roth_solo_401k':'solo401k',
     'sep_ira':'sep_ira'
   };
+  // Normalizer mirrors _cpMatchExisting's _normRetType (line ~21854): strip
+  // parens, em/en dashes, hyphens, underscores; lowercase; remove whitespace.
+  // After normalization, 'Roth IRA' / 'roth_ira' / 'Roth-IRA' all become
+  // 'rothira'. The variant table maps each normalized form to its alloc type.
+  // _old variants are intentionally excluded — those flow through the
+  // rollover-decision render (Phase 2.2), not the regular seeder.
+  function _normSeedRetType(t){
+    if(!t) return '';
+    return String(t).toLowerCase().replace(/[()—–\-_]/g,'').replace(/\s+/g,'');
+  }
+  var _retTypeMapNorm={
+    'rothira':'roth','roth':'roth',
+    '401kcurrent':'401k','401k':'401k',
+    '403bcurrent':'401k','403b':'401k',
+    'tspcurrent':'401k','tsp':'401k',
+    'roth401kcurrent':'roth401k','roth401k':'roth401k',
+    'tradira':'trad_ira','ira':'trad_ira','traditionalira':'trad_ira',
+    'solo401k':'solo401k','rothsolo401k':'solo401k',
+    'sepira':'sep_ira','sep':'sep_ira'
+  };
   // Existing retirement accounts → phase 1 (user already has them open).
   // Phase 2+ is reserved for cascade destinations that activate after a
   // phase 1 item completes.
@@ -24625,7 +24702,9 @@ function _cpStartSelfBuild(){
     'roth':1,'401k':1,'roth401k':1,'trad_ira':1,'solo401k':1,'sep_ira':1
   };
   existingRet.forEach(function(r){
-    var allocType=_retTypeMap[r.type];
+    // Try strict literal lookup first (fast path for canonical data), then
+    // fall back to normalized form (legacy/imported data).
+    var allocType=_retTypeMap[r.type] || _retTypeMapNorm[_normSeedRetType(r.type)];
     if(!allocType)return;
     // Resolve match context — drives whether the card gets dual-slider treatment.
     var info = _cpResolveMatchInfo(r);
@@ -24740,88 +24819,6 @@ function _cpStartSelfBuild(){
       reason: 'Existing brokerage account detected. Slider shows your current monthly contribution; drag to plan changes.'
     });
   });
-  // ── Phase 3.2: spouse-account seeder (Hybrid couples only) ────────────────
-  // Walks the partner's retAccounts + investments and creates read-only spouse
-  // cards in this user's plan. Each card carries _sharedOwnerClientId pointing
-  // at the partner — that flag triggers the existing _renderRequest branch
-  // (line ~29816) which renders the slider as a staged change with a "Send
-  // change request" button instead of an Apply button. Also stamps the
-  // partner's actual retAccount.id / investment.id so the approval flow
-  // (Edit 5 / _cpHandleApproval) can fire update_retirement/update_investment
-  // when the partner approves the request — the partner IS the owner of those
-  // accounts in their own pfos-main, so they have write access.
-  //
-  // Only fires in Hybrid mode. In Joint households both spouses share one
-  // S.retAccounts row so spouse accounts are already in the self seeder. In
-  // Separate households each spouse has full independence — no shared
-  // visibility. Hybrid is the only one with per-spouse plans + cross-visibility.
-  if(CPLAN._householdType==='hybrid'&&CPLAN._partner&&CPLAN._coupleLink){
-    var _partnerId=null;
-    try{
-      var _coup=CPLAN._coupleLink;
-      _partnerId=(_coup.client_a_id===APP.currentClientId)?_coup.client_b_id:_coup.client_a_id;
-    }catch(e){}
-    if(_partnerId){
-      var _partnerRet=(CPLAN._partner.retAccounts)||[];
-      var _partnerInv=(CPLAN._partner.investments)||[];
-      // Spouse retirement accounts
-      _partnerRet.forEach(function(pr){
-        if(!pr||!pr.id)return;
-        var pAllocType=_retTypeMap[pr.type];
-        if(!pAllocType)return;// unsupported type / _old skipped
-        var pContrib=parseFloat(pr.contrib)||0;
-        if(pContrib<=0)return;// don't seed accounts spouse isn't actively funding
-        // Dedup: don't double-seed the same spouse account
-        var pDup=CPLAN.allocations.some(function(a){return a&&a._retAccountId===pr.id;});
-        if(pDup)return;
-        var pProvLabel=(pr.provider||pr.label||'')?
-          ((pr.provider||pr.label)+' ('+(CP_NM[pAllocType]||pAllocType)+') [spouse]'):
-          ((CP_NM[pAllocType]||pAllocType)+' [spouse]');
-        // Generate a stable shared id so realtime/approval flows can address this card.
-        var pSid=(typeof _cpSharedCardsApi!=='undefined'&&_cpSharedCardsApi&&typeof _cpSharedCardsApi.ensureSharedId==='function')
-          ?_cpSharedCardsApi.ensureSharedId({},'spouse'):('spouse:'+pr.id+'-'+Date.now());
-        CPLAN.allocations.push({
-          type:pAllocType,
-          _retAccountId:pr.id,
-          _sharedOwnerClientId:_partnerId,
-          _sharedId:pSid,
-          amount:0,// extras semantics — staged change starts at 0
-          target:0,
-          phase:_retPhaseMap[pAllocType]||1,
-          cascade:'',
-          customName:pProvLabel,
-          owner:'spouse',
-          reason:'Spouse account — read-only view. Drag slider to propose a change; your spouse will receive an approval request.'
-        });
-      });
-      // Spouse brokerage investments
-      _partnerInv.forEach(function(piv){
-        if(!piv||!piv.id)return;
-        var pivContrib=parseFloat(piv.monthlyContrib)||0;
-        if(pivContrib<=0)return;
-        var pivType=String(piv.type||'').toLowerCase();
-        if(pivType.indexOf('crypto')>=0)return;// crypto excluded
-        var pivDup=CPLAN.allocations.some(function(a){return a&&a._investmentId===piv.id;});
-        if(pivDup)return;
-        var pivDisplay=(piv.provider||piv.label||'Taxable Brokerage')+' [spouse]';
-        var pivSid=(typeof _cpSharedCardsApi!=='undefined'&&_cpSharedCardsApi&&typeof _cpSharedCardsApi.ensureSharedId==='function')
-          ?_cpSharedCardsApi.ensureSharedId({},'spouse'):('spouse:inv-'+piv.id+'-'+Date.now());
-        CPLAN.allocations.push({
-          type:'invest',
-          _investmentId:piv.id,
-          _sharedOwnerClientId:_partnerId,
-          _sharedId:pivSid,
-          amount:0,
-          target:0,
-          phase:1,
-          cascade:'',
-          customName:pivDisplay,
-          owner:'spouse',
-          reason:'Spouse brokerage account — read-only view. Drag slider to propose a change; your spouse will receive an approval request.'
-        });
-      });
-    }
-  }
   // Create allocations from red flags, all unassigned (phase 0 = unassigned).
   // Multi-option categories (retirement, education) are intentionally OMITTED here —
   // those flags appear in the red-flag panel with a "Choose…" button so the user can
@@ -27596,6 +27593,13 @@ var _cpSharedCardsApi={
       _state:a._state||'proposed',
       _policyNumber:a._policyNumber||null,
       _lockedPremium:a._lockedPremium||null,
+      // Account linkage — when the owner shared a card backed by a real
+      // retAccount or investment in their pfos-main, carry the id forward so
+      // the recipient's local allocation can stamp it. This enables the
+      // approval flow to fire update_retirement/update_investment on the
+      // owner's pfos-main when the recipient's change request is approved.
+      _retAccountId:a._retAccountId||null,
+      _investmentId:a._investmentId||null,
       // For joint cards: each spouse's portion of the combined contribution.
       // If absent (legacy data), treat the full amount as primary's portion.
       amountSelf:parseFloat(a.amountSelf)||(a.owner==='joint'?(parseFloat(a.amount)||0)/2:0),
@@ -28030,7 +28034,14 @@ function _cpSubscribeToShared(){
           _ibcUnderlyingType:c._ibcUnderlyingType||null,
           _state:c._state||'proposed',
           _policyNumber:c._policyNumber||null,
-          _lockedPremium:c._lockedPremium||null
+          _lockedPremium:c._lockedPremium||null,
+          // Carry account linkage forward when the partner shared a card
+          // backed by a real retAccount/investment in their pfos-main. The
+          // request/approval flow uses these to fire update_retirement /
+          // update_investment on the OWNER's pfos-main when this user's
+          // change request is approved.
+          _retAccountId:c._retAccountId||null,
+          _investmentId:c._investmentId||null
         });
         inserted=true;
       }
