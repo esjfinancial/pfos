@@ -8105,6 +8105,23 @@ window.addEventListener('message',async function(e){
         console.warn('[spouse-tax-write] myClientId matches neither client_a nor client_b on couple link');
         return;
       }
+      // Skip if values are unchanged from last write. The local cache (coupleRow)
+      // holds the most recent values either from initial load or our own last
+      // write. If our new values match, writing again would bump updated_at on
+      // couple_links for no semantic reason — and that bump fires the realtime
+      // channel on both spouses, who then both run calc() (suppressed _doSync,
+      // good), but calc() schedules another spouse-tax-write 500ms later, which
+      // produces an unbounded feedback loop. This dedup breaks it.
+      var mySlotGrossField  = amIClientA ? 'spouse_a_annual_gross'  : 'spouse_b_annual_gross';
+      var mySlotPretaxField = amIClientA ? 'spouse_a_annual_pretax' : 'spouse_b_annual_pretax';
+      var prevGross  = coupleRow[mySlotGrossField];
+      var prevPretax = coupleRow[mySlotPretaxField];
+      var prevGrossN  = (prevGross  != null) ? Number(prevGross)  : null;
+      var prevPretaxN = (prevPretax != null) ? Number(prevPretax) : null;
+      if(prevGrossN === stGross && prevPretaxN === stPretax){
+        console.log('[spouse-tax-write] skipped — values unchanged (slot:', amIClientA?'A':'B', 'gross:', stGross, 'pretax:', stPretax, ')');
+        return;
+      }
       // Stamp the self-write timestamp BEFORE the DB call so the realtime
       // subscriber skips the echo. Separate flag from joint-financials so
       // my spouse-tax write doesn't suppress partner's jfd updates.
@@ -27235,20 +27252,34 @@ function _cpSubscribeToJointFinancials(){
           // covers the case where the timestamp suppression missed because the
           // round-trip took >1.5s)
           if(!(lastChange.by && lastChange.by === APP.currentClientId)){
-            console.log('[diag] jfd forwarding to iframe, lastChange.by:', lastChange.by, 'goals in payload:', (jfd.goals||[]).length);
-            try{
-              var iframe = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
-              if(iframe && iframe.contentWindow){
-                iframe.contentWindow.postMessage({
-                  type: 'PFOS_JOINT_DATA_REMOTE_UPDATE',
-                  payload: {
-                    jointFinancialData: jfd,
-                    changedBy: lastChange.by || null,
-                    changedAt: lastChange.ts || null
-                  }
-                }, 'https://pfos.esjfinancial.com');
-              }
-            }catch(e){ console.warn('[joint-rt] forward to pfos-main failed:', e); }
+            // Skip forward if jfd hasn't actually changed since last forward.
+            // The couple_links row's updated_at bumps for ANY column change
+            // (e.g. spouse_*_annual_* writes), but jfd may be unchanged. The
+            // ts identifier on _lastChange is set only by PFOS_WRITE_JOINT_ITEMS,
+            // so an unchanged ts means jfd hasn't been touched even though
+            // realtime fired. Without this guard, every spouse-tax-write
+            // round-trips through the partner's calc() → spouse-tax-write
+            // chain, producing an unbounded feedback loop.
+            var thisChangeTs = (lastChange && lastChange.ts) || null;
+            if(thisChangeTs && CPLAN._lastForwardedJfdTs === thisChangeTs){
+              console.log('[diag] jfd forward skipped — ts unchanged ('+thisChangeTs+'), no actual jfd change');
+            } else {
+              if(thisChangeTs) CPLAN._lastForwardedJfdTs = thisChangeTs;
+              console.log('[diag] jfd forwarding to iframe, lastChange.by:', lastChange.by, 'goals in payload:', (jfd.goals||[]).length);
+              try{
+                var iframe = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+                if(iframe && iframe.contentWindow){
+                  iframe.contentWindow.postMessage({
+                    type: 'PFOS_JOINT_DATA_REMOTE_UPDATE',
+                    payload: {
+                      jointFinancialData: jfd,
+                      changedBy: lastChange.by || null,
+                      changedAt: lastChange.ts || null
+                    }
+                  }, 'https://pfos.esjfinancial.com');
+                }
+              }catch(e){ console.warn('[joint-rt] forward to pfos-main failed:', e); }
+            }
           } else {
             console.log('[diag] jfd forwarding SUPPRESSED — lastChange.by matches my id:', lastChange.by);
           }
