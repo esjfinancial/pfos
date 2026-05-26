@@ -8074,6 +8074,91 @@ window.addEventListener('message',async function(e){
     }catch(e){ console.warn('[joint-field-write] handler error:', e); }
     return;
   }
+  // Profile completion ping — writes a small marker into couple_links.joint_financial_data
+  // (_lastCompletionChange: {by, ts}) so the existing realtime channel forwards
+  // the change to the partner. Partner's iframe sees the marker and requests a
+  // fresh partner completion fetch (PFOS_FETCH_PARTNER_COMPLETION) which we
+  // also handle here.
+  if(msg.type==='PFOS_WRITE_COMPLETION_PING'){
+    try{
+      var cpp = msg.payload || {};
+      var cppCoupleLinkId = cpp.coupleLinkId;
+      var cppBy = cpp.completedBy || null;
+      var cppTs = cpp.ts || new Date().toISOString();
+      if(!cppCoupleLinkId){ console.warn('[completion-ping] missing coupleLinkId'); return; }
+      try{ if(typeof CPLAN!=='undefined') CPLAN._lastJointFinancialsSelfWriteAt = Date.now(); }catch(e){}
+      (async function(){
+        try{
+          const { data: clp } = await db.from('couple_links').select('joint_financial_data').eq('id', cppCoupleLinkId).maybeSingle();
+          var existingP = (clp && clp.joint_financial_data) || {};
+          var mergedP = Object.assign({}, existingP);
+          mergedP._lastCompletionChange = { by: cppBy, ts: cppTs, completed: !!cpp.completed };
+          // Bump _lastChange too so the partner's jfd-forward dedup doesn't
+          // skip this update (the dedup keys on _lastChange.ts).
+          mergedP._lastChange = { ts: cppTs, by: cppBy };
+          await db.from('couple_links').update({ joint_financial_data: mergedP }).eq('id', cppCoupleLinkId);
+          console.log('[completion-ping] couple_links updated — completed:', !!cpp.completed, 'by:', cppBy);
+        }catch(err){ console.error('[completion-ping] failed:', err); }
+      })();
+    }catch(e){ console.warn('[completion-ping] handler error:', e); }
+    return;
+  }
+  // Partner completion fetch — iframe saw a _lastCompletionChange marker in
+  // a realtime arrival and wants the actual current partner completion value.
+  // Query partner's client_profiles for S.profileCompleted and push back to
+  // iframe via PFOS_PARTNER_COMPLETION_REFRESH.
+  if(msg.type==='PFOS_FETCH_PARTNER_COMPLETION'){
+    try{
+      var fpcp = msg.payload || {};
+      var fpcpLinkId = fpcp.coupleLinkId;
+      if(!fpcpLinkId){ console.warn('[completion-fetch] missing coupleLinkId'); return; }
+      (async function(){
+        try{
+          // Resolve partner client id from the couple link
+          var coupleRow2 = null;
+          if(APP._clientCoupleLink && APP._clientCoupleLink.id === fpcpLinkId){
+            coupleRow2 = APP._clientCoupleLink;
+          } else if(Array.isArray(APP_COUPLES)){
+            coupleRow2 = APP_COUPLES.find(function(c){return c && c.id === fpcpLinkId;}) || null;
+          }
+          if(!coupleRow2){ console.warn('[completion-fetch] couple link not in cache'); return; }
+          var partnerId2 = (coupleRow2.client_a_id === APP.currentClientId) ? coupleRow2.client_b_id : coupleRow2.client_a_id;
+          if(!partnerId2){ console.warn('[completion-fetch] no partner id'); return; }
+          // Read partner's profile completion. Only the fields we need.
+          const { data: pp2 } = await db.from('client_profiles')
+            .select('financial_data')
+            .eq('client_id', partnerId2)
+            .order('updated_at',{ascending:false})
+            .limit(1).maybeSingle();
+          var pCompleted = false;
+          var pCompletedAt = null;
+          var pFirstName = '';
+          if(pp2 && pp2.financial_data && pp2.financial_data.S){
+            pCompleted = pp2.financial_data.S.profileCompleted === true;
+            pCompletedAt = pp2.financial_data.S.profileCompletedAt || null;
+            if(pp2.financial_data.S.profile){
+              pFirstName = pp2.financial_data.S.profile.firstName || '';
+            }
+          }
+          // Push to iframe
+          try{
+            var iframeC = (typeof getPFOSFrame === 'function') ? getPFOSFrame() : null;
+            if(iframeC && iframeC.contentWindow){
+              iframeC.contentWindow.postMessage({
+                type: 'PFOS_PARTNER_COMPLETION_REFRESH',
+                payload: {
+                  profileCompleted: pCompleted,
+                  profileCompletedAt: pCompletedAt,
+                  firstName: pFirstName
+                }
+              }, 'https://pfos.esjfinancial.com');
+            }
+          }catch(e){ console.warn('[completion-fetch] forward to iframe failed:', e); }
+        }catch(err){ console.error('[completion-fetch] failed:', err); }
+      })();
+    }catch(e){ console.warn('[completion-fetch] handler error:', e); }
+    return;
+  }
   // ── PFOS_WRITE_SPOUSE_TAX_DATA — cross-spouse MFJ marginal-rate aggregates ──
   // The iframe's _401kSimContext needs the SPOUSE's annual gross + pretax to
   // compute MFJ marginal rate correctly for Hybrid/Separate households (where
