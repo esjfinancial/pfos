@@ -21225,8 +21225,23 @@ async function checkPartnerStatus(){
   card.style.display='';
   var partnerId=couple.client_a_id===APP.currentClientId?couple.client_b_id:couple.client_a_id;
   var partnerName='Partner';
-  // Get partner name from clients list
-  if(APP.allClients){var pc=APP.allClients.find(function(c){return c.id===partnerId;});if(pc)partnerName=pc.name||pc.email||'Partner';}
+  var partnerClient=null;
+  // Try the admin-only cache first (APP.allClients is populated by
+  // loadAllClients which only admins run). Fall back to a direct DB lookup
+  // for non-admin (client portal) sessions — without this fallback, the
+  // partner panel always shows "hasn't set up their account" even when the
+  // partner has been logged in for months, because the cache simply doesn't
+  // exist outside admin context.
+  if(APP.allClients){
+    partnerClient = APP.allClients.find(function(c){return c.id===partnerId;}) || null;
+  }
+  if(!partnerClient){
+    try{
+      var direct = await db.from('clients').select('id,name,email,pfos_tier').eq('id', partnerId).maybeSingle();
+      if(direct && direct.data) partnerClient = direct.data;
+    }catch(e){/* fall through — partnerClient stays null, UI shows generic state */}
+  }
+  if(partnerClient) partnerName = partnerClient.name || partnerClient.email || 'Partner';
   // Check invite status
   try{
     var inv=await db.from('portal_invites').select('status,created_at,email').eq('client_id',partnerId).order('created_at',{ascending:false}).limit(1).maybeSingle();
@@ -21234,8 +21249,11 @@ async function checkPartnerStatus(){
       var sentDate=inv.data.created_at?new Date(inv.data.created_at).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'';
       el.innerHTML='<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--yl)">⏳ '+esc(partnerName)+' — Invite Pending</div><div style="font-size:12px;color:var(--mu)">Sent '+sentDate+'</div></div><div style="display:flex;gap:6px"><button onclick="resendPartnerInvite(\''+partnerId+'\',\''+esc(inv.data.email||'')+'\')" style="padding:6px 14px;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer;border-radius:2px">📧 Resend</button></div></div>';
     } else {
-      // Check if partner has logged in (pfos_tier !== none means active)
-      var partnerClient=APP.allClients?APP.allClients.find(function(c){return c.id===partnerId;}):null;
+      // Check if partner has logged in (pfos_tier !== none means active).
+      // partnerClient is now populated either from APP.allClients (admin) or
+      // a direct lookup above (client portal). The original code used the
+      // admin-only cache and silently fell through to "hasn't set up" when
+      // it was undefined.
       if(partnerClient&&partnerClient.pfos_tier&&partnerClient.pfos_tier!=='none'){
         el.innerHTML='<div style="display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:var(--gr)"></div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--gr)">'+esc(partnerName)+' — Account Active</div></div>';
       } else {
@@ -21245,7 +21263,16 @@ async function checkPartnerStatus(){
   }catch(e){card.style.display='none';}
 }
 async function sendPartnerInvite(partnerId){
+  // Resolve partner email — try admin cache first, fall back to direct lookup
+  // (same reason as checkPartnerStatus: client portal sessions don't have
+  // APP.allClients populated).
   var partner=APP.allClients?APP.allClients.find(function(c){return c.id===partnerId;}):null;
+  if(!partner){
+    try{
+      var direct = await db.from('clients').select('id,name,email').eq('id', partnerId).maybeSingle();
+      if(direct && direct.data) partner = direct.data;
+    }catch(e){}
+  }
   if(!partner||!partner.email){alert('Partner email not found.');return;}
   try{
     var token=crypto.randomUUID();
