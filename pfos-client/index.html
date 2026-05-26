@@ -2410,9 +2410,13 @@ async function routeToClientPortal(){
     var sb=document.querySelector('.plat-sidebar');
     if(sb) sb.style.display='';
     startSessionTimeout();
-    await loadClientPortalData();
-    // Preload pfos-main iframe in background so it's ready when user navigates to My Financial Data
-    setTimeout(function(){
+    // Kick off iframe preload IMMEDIATELY in parallel with dashboard data load.
+    // Iframe load runs on a separate browser thread + network channel, so it
+    // doesn't block the dashboard. Previously this was setTimeout(...,2000)
+    // AFTER loadClientPortalData — meaning if a user clicked "My Financial
+    // Data" within ~3 seconds of page load (dashboard load + 2s delay), the
+    // iframe hadn't even started yet, costing the full iframe init wait.
+    (function preloadPfosIframe(){
       var container=document.getElementById('clientPfosContainer');
       if(container&&!container.dataset.loaded&&APP.currentClientId){
         container.dataset.loaded='1';
@@ -2420,7 +2424,8 @@ async function routeToClientPortal(){
         var frame2=document.getElementById('clientPfosFrame');
         if(frame2)frame2.addEventListener('load',function(){var loader=document.getElementById('pfosLoadingIndicator');if(loader)loader.style.display='none';frame2.style.display='block';try{frame2.contentWindow.postMessage({type:'PFOS_AUTH'},'https://pfos.esjfinancial.com');}catch(e){}},{once:true});
       }
-    },2000);// Wait 2s after portal load to not compete with initial render
+    })();
+    await loadClientPortalData();
   }catch(e){ console.error('Client portal init:',e); }
 }
 
@@ -2627,6 +2632,8 @@ function showClientPage(id){
 }
 // ── CORE MOBILE TOOLS ───────────────────────────────────
 function updateMobileTools(){
+  var __tMT = performance.now();
+  console.log('[perf] updateMobileTools START');
   var fd=_lastPfosState||{};var c=fd.calcs||{};
   // Net Worth Ticker
   renderClientTracking();
@@ -4770,13 +4777,17 @@ async function submitUnlinkRequest(){
 }
 async function loadClientPortalData(){
   if(!APP.currentClientId) return;
+  var __t0 = performance.now();
+  console.log('[perf] loadClientPortalData START');
   try{
   // For joint couples, financial data is stored under the primary (client_a)
   await loadCouples();
+  console.log('[perf] loadCouples done:', Math.round(performance.now()-__t0), 'ms');
   var _couple=getCoupleForClient(APP.currentClientId);
   var _profileQueryId=(_couple&&_couple.household_type==='joint')?_couple.client_a_id:APP.currentClientId;
   var pData = await db.from('client_profiles').select('*').eq('client_id',_profileQueryId)
     .order('updated_at',{ascending:false}).limit(1).maybeSingle();
+  console.log('[perf] client_profiles done:', Math.round(performance.now()-__t0), 'ms');
   var profile = pData.data;
   // Check if localStorage has a newer backup (handles debounce race on refresh)
   try{
@@ -4863,6 +4874,7 @@ async function loadClientPortalData(){
     set('clientPriorityData','');
   }
   var rData = await db.from('reports').select('*').eq('client_id',APP.currentClientId).order('created_at',{ascending:false});
+  console.log('[perf] reports done:', Math.round(performance.now()-__t0), 'ms');
   var reports = rData.data || [];
   var rEl = document.getElementById('clientReportsList');
   if(!rEl) return;
@@ -4883,6 +4895,7 @@ async function loadClientPortalData(){
     item.addEventListener('click',function(){viewClientReport(this.dataset.reportId);});
   });
   }catch(e){ console.error('loadClientPortalData error:',e); }
+  console.log('[perf] loadClientPortalData END:', Math.round(performance.now()-__t0), 'ms');
   // Show satisfaction pulse after 30 seconds on the page
   setTimeout(function(){showSatisfactionPulse();},30000);
   // Check if client is part of a couple
@@ -21216,6 +21229,8 @@ function _clientSubmitGoal(){
 
 // ── Partner Status Card (couples) ──
 async function checkPartnerStatus(){
+  var __tCP = performance.now();
+  console.log('[perf] checkPartnerStatus START');
   var card=document.getElementById('partnerStatusCard');
   var el=document.getElementById('partnerStatusContent');
   if(!card||!el)return;
@@ -21235,25 +21250,25 @@ async function checkPartnerStatus(){
   if(APP.allClients){
     partnerClient = APP.allClients.find(function(c){return c.id===partnerId;}) || null;
   }
-  if(!partnerClient){
-    try{
-      var direct = await db.from('clients').select('id,name,email,pfos_tier').eq('id', partnerId).maybeSingle();
-      if(direct && direct.data) partnerClient = direct.data;
-    }catch(e){/* fall through — partnerClient stays null, UI shows generic state */}
-  }
-  if(partnerClient) partnerName = partnerClient.name || partnerClient.email || 'Partner';
-  // Check invite status
+  // Fire both partner queries in parallel — they're independent and both keyed
+  // by partnerId. Previously was sequential await: clients first, then
+  // portal_invites — costing two full round-trips. Promise.all halves the
+  // wait. Only the clients query is skipped if partnerClient is already in
+  // APP.allClients (admin cache).
   try{
-    var inv=await db.from('portal_invites').select('status,created_at,email').eq('client_id',partnerId).order('created_at',{ascending:false}).limit(1).maybeSingle();
+    var clientsPromise = partnerClient
+      ? Promise.resolve({data: partnerClient})
+      : db.from('clients').select('id,name,email,pfos_tier').eq('id', partnerId).maybeSingle();
+    var invitesPromise = db.from('portal_invites').select('status,created_at,email').eq('client_id',partnerId).order('created_at',{ascending:false}).limit(1).maybeSingle();
+    var [clientsRes, inv] = await Promise.all([clientsPromise, invitesPromise]);
+    console.log('[perf] checkPartnerStatus queries done:', Math.round(performance.now()-__tCP), 'ms');
+    if(!partnerClient && clientsRes && clientsRes.data) partnerClient = clientsRes.data;
+    if(partnerClient) partnerName = partnerClient.name || partnerClient.email || 'Partner';
     if(inv&&inv.data&&inv.data.status==='pending'){
       var sentDate=inv.data.created_at?new Date(inv.data.created_at).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'}):'';
       el.innerHTML='<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px"><div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--yl)">⏳ '+esc(partnerName)+' — Invite Pending</div><div style="font-size:12px;color:var(--mu)">Sent '+sentDate+'</div></div><div style="display:flex;gap:6px"><button onclick="resendPartnerInvite(\''+partnerId+'\',\''+esc(inv.data.email||'')+'\')" style="padding:6px 14px;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;cursor:pointer;border-radius:2px">📧 Resend</button></div></div>';
     } else {
       // Check if partner has logged in (pfos_tier !== none means active).
-      // partnerClient is now populated either from APP.allClients (admin) or
-      // a direct lookup above (client portal). The original code used the
-      // admin-only cache and silently fell through to "hasn't set up" when
-      // it was undefined.
       if(partnerClient&&partnerClient.pfos_tier&&partnerClient.pfos_tier!=='none'){
         el.innerHTML='<div style="display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:var(--gr)"></div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--gr)">'+esc(partnerName)+' — Account Active</div></div>';
       } else {
