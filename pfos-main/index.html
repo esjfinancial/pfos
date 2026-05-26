@@ -3532,6 +3532,10 @@ function markProfileComplete(){
   S.profileCompletedAt=new Date().toISOString();
   if(typeof _doSync==='function')_doSync();
   renderProfileCompletionBox();
+  // Broadcast completion change to partner via couple_links ping (Hybrid only).
+  // The partner's iframe sees this marker arrive via the existing realtime
+  // channel and re-fetches partner completion status to update their box.
+  try{_broadcastCompletionChange();}catch(e){console.warn('[completion] broadcast failed:',e);}
   // Fire email notification to partner. The edge function handles failure
   // gracefully — if the notification type isn't deployed yet or partner
   // email is missing, we just skip the notification silently.
@@ -3544,6 +3548,29 @@ function unmarkProfileComplete(){
   S.profileCompletedAt=null;
   if(typeof _doSync==='function')_doSync();
   renderProfileCompletionBox();
+  // Broadcast completion change to partner via couple_links ping (Hybrid only).
+  try{_broadcastCompletionChange();}catch(e){console.warn('[completion] broadcast failed:',e);}
+}
+
+// Post a small "completion ping" to parent. Parent writes a marker
+// (couple_links.joint_financial_data._lastCompletionChange = {by, ts}) which
+// the existing realtime channel broadcasts to both spouses. The receiving
+// spouse's iframe re-fetches partner completion status when the marker
+// arrives. No-op for non-Hybrid (Individual = no partner, Joint = shared
+// profile so no coordination needed, Separate = each spouse plans solo).
+function _broadcastCompletionChange(){
+  if(S.householdType !== 'hybrid' || !S.coupleLinkId) return;
+  try{
+    window.parent.postMessage({
+      type:'PFOS_WRITE_COMPLETION_PING',
+      payload:{
+        coupleLinkId: S.coupleLinkId,
+        completedBy: window._pfosLoadedClientId || null,
+        completed: !!S.profileCompleted,
+        ts: new Date().toISOString()
+      }
+    }, 'https://pfos.esjfinancial.com');
+  }catch(e){ console.warn('[completion] postMessage failed:', e); }
 }
 
 function notifyPartnerOfCompletion(){
@@ -14372,6 +14399,20 @@ function submitAdvisorRequestFromModal(){
             if(typeof _updateFilingStatusWarning === 'function') _updateFilingStatusWarning();
           }
         }
+        // Detect completion ping from partner: if jfd._lastCompletionChange
+        // is present and not authored by us, request a partner completion
+        // refresh from parent. Parent queries partner's client_profiles for
+        // the completion flag and sends PFOS_PARTNER_COMPLETION_REFRESH back.
+        try{
+          var lcc = jfd && jfd._lastCompletionChange;
+          if(lcc && lcc.by && lcc.by !== (window._pfosLoadedClientId || '') && lcc.ts !== S._lastSeenCompletionTs){
+            S._lastSeenCompletionTs = lcc.ts;
+            window.parent.postMessage({
+              type:'PFOS_FETCH_PARTNER_COMPLETION',
+              payload:{ coupleLinkId: S.coupleLinkId || null }
+            }, 'https://pfos.esjfinancial.com');
+          }
+        }catch(e){ console.warn('[completion] ping detect failed:', e); }
         // Suppress the _doSync that calc() will schedule. Realtime arrivals
         // are PARTNER state being applied locally — they don't represent any
         // local mutation that needs to be saved back to OUR client_profiles row.
@@ -14421,6 +14462,32 @@ function submitAdvisorRequestFromModal(){
         if(typeof _renderRetTaxImpact === 'function') _renderRetTaxImpact();
         console.log('[spouse-tax-rt] updated S._spouseAnnualGross =', S._spouseAnnualGross, 'pretax =', S._spouseAnnualPretax);
       }catch(e){ console.warn('[spouse-tax-rt] handler failed:', e); }
+      return;
+    }
+    // Partner completion status refresh — parent has re-fetched partner's
+    // S.profileCompleted from their client_profiles row and pushed the new
+    // value here. Update window._pfosPartnerFromParent (the cache that
+    // renderProfileCompletionBox reads) and re-render. Safe — no editable
+    // inputs in the completion box, so no focus loss.
+    if(msg.type==='PFOS_PARTNER_COMPLETION_REFRESH'){
+      try{
+        var pcr = msg.payload || {};
+        if(!window._pfosPartnerFromParent) window._pfosPartnerFromParent = {};
+        if(pcr.profileCompleted !== undefined){
+          window._pfosPartnerFromParent.profileCompleted = !!pcr.profileCompleted;
+        }
+        if(pcr.profileCompletedAt !== undefined){
+          window._pfosPartnerFromParent.profileCompletedAt = pcr.profileCompletedAt;
+        }
+        if(pcr.firstName){
+          window._pfosPartnerFromParent.firstName = pcr.firstName;
+        }
+        // Invalidate the in-iframe cache so renderProfileCompletionBox
+        // rebuilds it from the freshened parent cache.
+        window._pfosPartnerCompletionCache = null;
+        if(typeof renderProfileCompletionBox === 'function') renderProfileCompletionBox();
+        console.log('[completion-rt] partner completion refreshed:', pcr.profileCompleted);
+      }catch(e){ console.warn('[completion-rt] handler failed:', e); }
       return;
     }
     if(msg.type==='PFOS_PLAN_DEPLOY'){S._planDeployed=msg.deployed||0;S._planAllocCount=msg.allocCount||0;S._planAllocations=msg.allocations||[];if(_currentSection==='home')renderHome();return;}
