@@ -24139,8 +24139,11 @@ function _cpStartSelfBuild(){
     'solo_401k':'solo401k','roth_solo_401k':'solo401k',
     'sep_ira':'sep_ira'
   };
+  // Existing retirement accounts → phase 1 (user already has them open).
+  // Phase 2+ is reserved for cascade destinations that activate after a
+  // phase 1 item completes.
   var _retPhaseMap={
-    'roth':2,'401k':2,'roth401k':2,'trad_ira':2,'solo401k':2,'sep_ira':2
+    'roth':1,'401k':1,'roth401k':1,'trad_ira':1,'solo401k':1,'sep_ira':1
   };
   existingRet.forEach(function(r){
     var allocType=_retTypeMap[r.type];
@@ -24191,7 +24194,9 @@ function _cpStartSelfBuild(){
       type:allocType,
       amount:Math.round(premium),
       target:0,
-      phase:3,
+      // Existing policies → phase 1 (user already owns them). Phase 2+ is
+      // reserved for cascade destinations after phase 1 items complete.
+      phase:1,
       cascade:'',
       customName:displayName,
       owner:p.owner||'self',
@@ -24391,6 +24396,93 @@ function _cpSyncFlagsToUnassigned(){
 }
 // Tiny extend helper (avoids depending on Object.assign for older browsers used by clients).
 function _extend(base,more){var o={};for(var k in base)o[k]=base[k];for(var k2 in more)o[k2]=more[k2];return o;}
+
+// ── _cpReAddDismissedFlag ──────────────────────────────────────────────────
+// Re-stage a previously-dismissed flag-sourced card at the user-chosen phase.
+// Called when the user picks a dismissed item from the +Add menu's
+// "Previously Dismissed" section. Mirrors the push logic in
+// _cpSyncFlagsToUnassigned so the re-added card has the same flag context
+// (flagTitle, flagType, flagIcon, custom name for protection sub-flags) as
+// the original auto-staged card — not a generic placeholder.
+//
+// Also clears CPLAN._dismissedFlags[flagAction] so the auto-stager can
+// surface the SAME flag again later if the user removes it again — without
+// this clear, the auto-stager would suppress it but the +Add menu would
+// keep showing it, creating a confusing "click does nothing" state.
+function _cpReAddDismissedFlag(flagAction, phase){
+  if(!flagAction) return;
+  if(typeof _cpExtractRedFlags !== 'function') return;
+  // Find the matching flag in the current red-flag snapshot. If the flag
+  // is no longer active (e.g. user already addressed the underlying issue),
+  // there's nothing meaningful to re-add — just clear the dismissal and
+  // bail. The +Add menu's regular allocation-type options remain available.
+  var flags = _cpExtractRedFlags() || [];
+  var matching = flags.filter(function(f){return f && f.action === flagAction;});
+  if(!matching.length){
+    if(CPLAN._dismissedFlags) delete CPLAN._dismissedFlags[flagAction];
+    _cpRenderPlanV2();
+    return;
+  }
+  // Clear the dismissal first so subsequent renders don't suppress re-staging.
+  if(CPLAN._dismissedFlags) delete CPLAN._dismissedFlags[flagAction];
+  // Reuse the same maps as _cpSyncFlagsToUnassigned (kept in sync with that
+  // function — if the categorization changes there, update here too).
+  var directMap = {
+    ef:'ef', debt:'debt',
+    savings:'invest',
+    hsa:'hsa', ibc:'ibc',
+    existing_policy:'wl'
+  };
+  var actionOnlyMap = {
+    protection:'protection',
+    protection_ext:'umbrella',
+    estate:'estate',
+    ibc_audit:'ibc_audit',
+    annuity_research:'annuity_research',
+    diversify:'diversify',
+    expenses:null
+  };
+  var chooserActions = {retirement:1, edu:1, rollover:1, growth:1};
+  var _protectionTitleMap = {
+    'No life insurance detected':'Term Life Insurance Review',
+    'Life coverage may be too low':'Life Coverage Review',
+    'No disability coverage detected':'Disability Insurance Review',
+    'Disability coverage gap':'Disability Coverage Gap Review',
+    'No long-term care planning':'Long-Term Care Review'
+  };
+  // Push one card per matching flag. For 'protection' there can be multiple
+  // (life + disability + LTC); we re-add all of them since dismissal is
+  // by action, not by flag title.
+  matching.forEach(function(f){
+    var act = f.action;
+    var nowFlag = {flagTitle:f.title, flagType:f.type, flagIcon:f.icon, flagAction:act, owner:'self', reason:f.desc||''};
+    if(act === 'protection'){
+      var _customNm = _protectionTitleMap[f.title];
+      if(!_customNm){
+        for(var _k in _protectionTitleMap){
+          if(f.title.indexOf(_k) === 0){ _customNm = _protectionTitleMap[_k]; break; }
+        }
+      }
+      if(_customNm) nowFlag.customName = _customNm;
+    }
+    if(chooserActions[act]){
+      var titleByAct = {retirement:'Choose a retirement vehicle', edu:'Choose an education vehicle', rollover:'Choose a rollover destination', growth:'Choose a growth vehicle'};
+      CPLAN.allocations.push(_extend(nowFlag, {type:'custom', amount:0, target:0, phase:phase, cascade:'', customName:titleByAct[act]||'Choose a vehicle', _chooserAction:act, _isPlaceholder:true}));
+    } else if(actionOnlyMap.hasOwnProperty(act)){
+      var t2 = actionOnlyMap[act];
+      if(t2 == null) return;
+      CPLAN.allocations.push(_extend(nowFlag, {type:t2, amount:0, target:0, phase:phase, cascade:''}));
+    } else if(directMap[act]){
+      var t3 = directMap[act];
+      var tgt = (t3 === 'ef') ? Math.round(Math.max(0, (CPLAN.efTarget||0) - (CPLAN.efBal||0))) : 0;
+      CPLAN.allocations.push(_extend(nowFlag, {type:t3, amount:0, target:tgt, phase:phase, cascade:''}));
+    } else if(act === '401k'){
+      CPLAN.allocations.push(_extend(nowFlag, {type:'401k', amount:0, target:0, phase:phase, cascade:''}));
+    }
+  });
+  _cpMarkModified();
+  _cpRenderPlanV2();
+}
 
 // Note: dismissal tracking on remove is wired directly inside _cpRemove (see that function).
 
@@ -31199,6 +31291,65 @@ function _cpShowAddMenu(phase){
   menu+='<div onclick="event.stopPropagation()" style="background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:20px 16px;max-width:420px;width:100%;max-height:75vh;overflow-y:auto;box-shadow:0 16px 48px rgba(0,0,0,.3)">';
   menu+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);margin-bottom:4px">Add to Phase '+phase+'</div>';
   menu+='<div style="font-size:13px;color:var(--mu);margin-bottom:14px">'+(CPLAN['_phase'+phase+'Name']||CP_PHASE[phase].name)+' — choose an allocation type</div>';
+  // ── Previously Dismissed section ──
+  // Lists action items the user previously removed (which set
+  // _dismissedFlags[flagAction]=true in _cpRemove) AND that are still
+  // active in the current red-flag snapshot. Clicking re-adds the card
+  // with the original flag context — not a generic placeholder.
+  // Only renders if at least one dismissed-and-still-applicable flag exists.
+  try{
+    if(CPLAN._dismissedFlags && typeof _cpExtractRedFlags === 'function'){
+      var _curFlags = _cpExtractRedFlags() || [];
+      // Build a unique list of dismissed actions that still match a current flag.
+      // Group by action (some actions like 'protection' can have multiple sub-flags;
+      // they collapse into one menu row that re-adds all matching sub-flags).
+      var _dismissedActionsSeen = {};
+      var _dismissedItems = [];
+      _curFlags.forEach(function(f){
+        if(!f || !f.action) return;
+        if(!CPLAN._dismissedFlags[f.action]) return;
+        if(_dismissedActionsSeen[f.action]) return;
+        _dismissedActionsSeen[f.action] = true;
+        // Pick a readable label for the action. For 'protection', list the
+        // specific sub-flag titles to make it explicit what's being restored.
+        var label;
+        var subdesc;
+        if(f.action === 'protection'){
+          var _protTitles = _curFlags.filter(function(g){return g && g.action === 'protection';}).map(function(g){return g.title;});
+          label = (_protTitles.length === 1) ? _protTitles[0] : ('Protection Reviews ('+_protTitles.length+')');
+          subdesc = (_protTitles.length > 1) ? _protTitles.join(' · ') : (f.desc || '');
+        } else {
+          var _actionLabels = {
+            ef:'Emergency Fund Gap', debt:'High-Interest Debt',
+            '401k':'Employer Match Gap',
+            retirement:'Retirement Vehicle', edu:'Education Savings',
+            rollover:'Rollover Review', savings:'Growth / Savings',
+            hsa:'HSA Opportunity', ibc:'IBC Strategy',
+            protection_ext:'Umbrella Coverage', estate:'Estate Planning',
+            ibc_audit:'IBC Policy Audit', annuity_research:'Annuity Research',
+            diversify:'Portfolio Diversification', expenses:'Expense Review',
+            existing_policy:'Existing Policy Review', growth:'Growth Vehicle'
+          };
+          label = _actionLabels[f.action] || f.title || f.action;
+          subdesc = f.desc || '';
+        }
+        _dismissedItems.push({action:f.action, icon:f.icon||'⚠️', label:label, desc:subdesc});
+      });
+      if(_dismissedItems.length){
+        var _dismColor = '#94A3B8';// slate — neutral, distinct from category colors
+        menu+='<div style="margin-bottom:16px;padding-bottom:12px;border-bottom:1px solid var(--bd)">';
+        menu+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+_dismColor+';margin-bottom:6px;padding-left:4px">Previously Dismissed</div>';
+        _dismissedItems.forEach(function(di){
+          menu+='<div style="display:flex;align-items:center;gap:10px;padding:10px 8px;border-radius:4px;transition:all .15s;min-height:44px;margin-bottom:2px;cursor:pointer" onmouseover="this.style.background=\''+_dismColor+'18\';this.style.transform=\'translateX(4px)\'" onmouseout="this.style.background=\'transparent\';this.style.transform=\'none\'" onclick="document.getElementById(\'addMenuOverlay\').remove();_cpReAddDismissedFlag(\''+di.action.replace(/'/g,"\\'")+'\','+phase+')">';
+          menu+='<div style="width:32px;height:32px;border-radius:8px;background:'+_dismColor+'18;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0">'+di.icon+'</div>';
+          menu+='<div style="min-width:0;flex:1"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+di.label+'</div>';
+          if(di.desc) menu+='<div style="font-size:12px;color:var(--mu);line-height:1.4">'+di.desc+'</div>';
+          menu+='</div></div>';
+        });
+        menu+='</div>';
+      }
+    }
+  }catch(e){ /* defensive — never let dismissed-section rendering break the +Add menu */ }
   categories.forEach(function(cat){
     menu+='<div style="margin-bottom:12px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+cat.color+';margin-bottom:6px;padding-left:4px">'+cat.name+'</div>';
     cat.items.forEach(function(it){
