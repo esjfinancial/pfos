@@ -7735,6 +7735,7 @@ function updInvAccount(i,field,val){
   if(!S.investments||!S.investments[i])return;
   S._touched.investments=true;
   S.investments[i][field]=['balance','monthlyContrib'].indexOf(field)!==-1?stripComma(val):val;
+  updateInvTotals();
   calc();
 }
 function delInvAccount(i){
@@ -8492,10 +8493,36 @@ function _isRoth401kFamily(type){
   return false;
 }
 function getInvestContribAuto(){
-  return (S.retAccounts||[]).reduce(function(t,a){
+  // Pull both: (1) retirement contributions that aren't payroll-deducted (the
+  // user funds them from take-home), and (2) taxable brokerage / investment
+  // accounts (always funded from take-home). Both reduce real cash flow and
+  // belong in the Investment Contributions expense category.
+  var ret = (S.retAccounts||[]).reduce(function(t,a){
     if(_isPayrollDeducted(a.type)) return t;
     return t+(parseFloat(a.contrib)||0);
   },0);
+  var brok = (S.investments||[]).reduce(function(t,a){
+    return t+(parseFloat(a.monthlyContrib)||0);
+  },0);
+  // Phase 4 — Hybrid: include user's share of joint investments + joint retirement.
+  // Same shape used by getDebtPaymentsAuto for joint debts.
+  if(S.householdType === 'hybrid' && S._jointItems){
+    var myField = (typeof _hybridShareField === 'function') ? _hybridShareField() : 'share_pct_a';
+    if(Array.isArray(S._jointItems.investments)){
+      brok += S._jointItems.investments.reduce(function(t,a){
+        var pct = (a && a[myField] !== undefined) ? (parseFloat(a[myField]) || 0) : 50;
+        return t + ((parseFloat(a.monthlyContrib)||0) * pct / 100);
+      }, 0);
+    }
+    if(Array.isArray(S._jointItems.retAccounts)){
+      ret += S._jointItems.retAccounts.reduce(function(t,a){
+        if(!a || _isPayrollDeducted(a.type)) return t;
+        var pct = (a[myField] !== undefined) ? (parseFloat(a[myField]) || 0) : 50;
+        return t + ((parseFloat(a.contrib)||0) * pct / 100);
+      }, 0);
+    }
+  }
+  return ret + brok;
 }
 function getDebtPaymentsAuto(){
   var personal = (S.debts||[]).reduce(function(t,d){ return t+((d.type!=='Mortgage'&&d.type!=='Auto Loan')?(parseFloat(d.min)||0):0); },0);
@@ -8815,7 +8842,7 @@ function renderExpenses(){
       +'<div class="exp-cat-amt">'+(debtAuto>0?fmt(isAnn?debtAuto*12:debtAuto):'—')+'</div>'
     +'</div></div>';
   }
-  if(investAuto>0||S.retAccounts&&S.retAccounts.length){
+  if(investAuto>0 || (S.retAccounts&&S.retAccounts.length) || (S.investments&&S.investments.length)){
     autoHtml+='<div class="exp-cat" style="opacity:0.85"><div class="exp-cat-hdr" style="cursor:default">'
       +'<div class="exp-cat-icon">📊</div>'
       +'<div class="exp-cat-info"><div class="exp-cat-name">Investment Contributions</div><div class="exp-cat-sub">Auto-pulled from Retirement (excl. payroll-deducted)</div></div>'
