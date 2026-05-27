@@ -22392,11 +22392,21 @@ function _cpApplyRetAccountContrib(idx){
   // round-trip via _portalFd.S.retAccounts[i].contrib).
   linkedCards.forEach(function(c){
     c.amount = 0;
-    // Dual-slider cards (#7) also have matchAmount + extraAmount fields that
-    // need zeroing so the slider thumbs reset to the new baseline.
+    // Dual-slider cards: matchAmount + extraAmount now hold ACTUAL contribution
+    // dollars (not deltas). After Apply the new contrib is newContrib, so the
+    // sliders should sit at min(newContrib, ceiling) and max(0, newContrib−ceiling)
+    // respectively. Resolve ceiling fresh in case salary/matchPct changed.
     if(c._hasMatch){
-      c.matchAmount = 0;
-      c.extraAmount = 0;
+      try{
+        var _ar = (typeof _cpFindRetAccountById==='function') ? _cpFindRetAccountById(c._retAccountId) : null;
+        var _ai = _ar ? _cpResolveMatchInfo(_ar) : null;
+        var _ceilApply = (_ai && _ai.matchCeiling) || 0;
+        c.matchAmount = Math.min(newContrib, _ceilApply);
+        c.extraAmount = Math.max(0, newContrib - _ceilApply);
+      }catch(_eApply){
+        c.matchAmount = 0;
+        c.extraAmount = 0;
+      }
     }
   });
   // Update local _portalFd cache immediately so the next render of
@@ -24435,8 +24445,9 @@ function _cpBuildRetAllocFromAccount(r){
   };
   if(hasMatch){
     alloc._hasMatch=true;
-    alloc.matchAmount=0;
-    alloc.extraAmount=0;
+    var _ceilB=info.matchCeiling||0;
+    alloc.matchAmount=Math.min(contrib,_ceilB);
+    alloc.extraAmount=Math.max(0,contrib-_ceilB);
     alloc.reason='{{MATCH_PCT}} employer match on {{MONTHLY_WAGE}}/mo wages = {{MATCH_CEILING}}/mo ceiling. Use the top slider to capture the match, the bottom slider for additional contributions.';
   }
   return alloc;
@@ -24552,19 +24563,17 @@ function _cpLinkAIAllocationsToAccounts(){
       var infoR=(typeof _cpResolveMatchInfo==='function')?_cpResolveMatchInfo(match):null;
       var curContribR=(infoR&&infoR.currentContrib)||(parseFloat(match.contrib)||0);
       var neededExtrasR=Math.max(0,aAmt-curContribR);
-      // Match-eligible: enable dual-slider, split extras across match + beyond-match.
+      // Match-eligible: dual-slider semantics — matchAmount and extraAmount
+      // hold the ACTUAL contribution split, not extras above current. AI target
+      // is split into match-portion (up to ceiling) and beyond-match-portion.
+      // a.amount stays as the delta vs currentContrib (sign-agnostic, used by
+      // deployment bar and simulator).
       if(matchEligibleTypes[aType]&&infoR&&infoR.hasMatchData){
         var matchCeiling=infoR.matchCeiling||0;
-        var curMatchCap=Math.min(curContribR,matchCeiling);
-        var matchHeadroom=Math.max(0,matchCeiling-curMatchCap);
-        var matchExtra=Math.min(neededExtrasR,matchHeadroom);
-        var beyondExtra=Math.max(0,neededExtrasR-matchExtra);
         a._hasMatch=true;
-        a.matchAmount=Math.round(matchExtra);
-        a.extraAmount=Math.round(beyondExtra);
-        // a.amount mirrors the extras sum (matches what _cpSlideMatchExtra
-        // writes back on first drag — keeps semantics consistent from t=0).
-        a.amount=Math.round(matchExtra+beyondExtra);
+        a.matchAmount=Math.round(Math.min(aAmt,matchCeiling));
+        a.extraAmount=Math.round(Math.max(0,aAmt-matchCeiling));
+        a.amount=Math.round(aAmt-curContribR);
         if(aAmt<curContribR){a._aiBelowCurrent=true;}
         // Live reason tokens (same as DIY dual-slider seeder)
         a.reason='{{MATCH_PCT}} employer match on {{MONTHLY_WAGE}}/mo wages = {{MATCH_CEILING}}/mo ceiling. Use the top slider to capture the match, the bottom slider for additional contributions.';
@@ -24742,13 +24751,16 @@ function _cpStartSelfBuild(){
       reason:'Existing account detected from your financial data. Slider shows your current contribution; drag to plan changes.'
     };
     if(hasMatch){
-      // Dual-slider mode (#7). matchAmount and extraAmount are the EXTRA the
-      // user plans to add on each slider — both default to 0. a.amount is the
-      // derived sum used everywhere else in the engine; kept in sync via the
-      // slider drag handlers and seed-time write.
+      // Dual-slider model: matchAmount and extraAmount hold the user's ACTUAL
+      // contribution split between match-capture and above-match. At seed time
+      // they reflect reality: match-portion = min(currentContrib, ceiling),
+      // extra-portion = max(0, currentContrib − ceiling). a.amount stays as the
+      // delta vs currentContrib (zero on first render — slider matches reality).
+      // Apply path writes (matchAmount + extraAmount) directly as new contrib.
       alloc._hasMatch = true;
-      alloc.matchAmount = 0;
-      alloc.extraAmount = 0;
+      var _ceilSeed = info.matchCeiling || 0;
+      alloc.matchAmount = Math.min(contrib, _ceilSeed);
+      alloc.extraAmount = Math.max(0, contrib - _ceilSeed);
       // Live-interpolated reason (tokens substituted at render time from
       // pfos-main data — so salary/matchPct changes propagate without re-seed).
       alloc.reason = '{{MATCH_PCT}} employer match on {{MONTHLY_WAGE}}/mo wages = {{MATCH_CEILING}}/mo ceiling. Use the top slider to capture the match, the bottom slider for additional contributions.';
@@ -30345,11 +30357,10 @@ function _cpBuildCard(a,idx,isUnassigned){
   // adjusted max by including the same boosts we added into _sliderEffective.
   var _cascadeBoostHere=Math.max(0,_sliderEffective-(parseInt(a.amount)||0));
   var _sliderTotalMax=_slMax+_curContribSlide+_cascadeBoostHere;
-  // Slider lower bound. For cards backed by an existing retirement or investment
-  // account, the slider can travel all the way down to $0 — the user may want
-  // to set their contribution lower than what they're doing today. For unlinked
-  // planning cards (a new Roth IRA they haven't opened, etc.), there's no current
-  // contribution to reduce, so the floor stays at currentContrib (which is 0).
+  // Slider lower bound: for cards backed by an existing account, allow the
+  // user to drag all the way down to $0 (planning a reduction). For unlinked
+  // planning cards, the floor stays at currentContrib (which is 0 for new
+  // cards anyway).
   var _sliderTotalMin=(a._retAccountId||a._investmentId)?0:_curContribSlide;
   // ── Joint / shared-card slider variants (Hybrid couples) ──────────────
   // Three variants based on ownership + household:
@@ -30366,19 +30377,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   // sliders (match-capture + additional contribution) on the same card.
   // Both write to the same retAccount on Apply. _hasMatch is set by the
   // seeder when matchPct > 0 and the account type supports match.
-  //
-  // Skip the dual-slider when there's nothing for it to control: the user is
-  // already at-or-above their match ceiling AND hasn't staged any extras on
-  // either side. In that state the dual-slider would show two disabled/inert
-  // controls, and the only meaningful action the user can take on this card
-  // is to adjust their contribution (up via IRS headroom, or down). Falling
-  // through to the single slider gives them that.
-  var _matchPctPre=parseFloat((_match&&_match.matchPct)||0);
-  var _monIncPre=parseFloat((_match&&_match.monthlyIncome)||0);
-  var _curContribPre=parseFloat((_match&&_match.currentContrib)||0);
-  var _ceilPre=Math.round(_monIncPre*(_matchPctPre/100));
-  var _alreadyCapturedNoExtras=(_ceilPre>0&&_curContribPre>=_ceilPre&&!parseFloat(a.matchAmount||0)&&!parseFloat(a.extraAmount||0));
-  var _renderMatchDual=(!_renderDual && !_renderRequest && a._hasMatch && a._retAccountId && !_alreadyCapturedNoExtras);
+  var _renderMatchDual=(!_renderDual && !_renderRequest && a._hasMatch && a._retAccountId);
   if(_renderMatchDual){
     // Read live match info from the linked retAccount so that salary or
     // matchPct changes in pfos-main propagate without needing a re-seed.
@@ -30386,69 +30385,66 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _infoMD = _rMD?_cpResolveMatchInfo(_rMD):{matchPct:0,monthlyWage:0,matchCeiling:0,currentContrib:0,hasMatchData:false};
     var _ceilMD = _infoMD.matchCeiling || 0;
     var _curMD = _infoMD.currentContrib || 0;
-    // Slider headrooms (extras semantics — these are what the user can ADD):
-    //   match slider: max = max(0, ceiling - currentContrib)
-    //   extra slider: max = max(0, IRSmax - max(currentContrib, ceiling))
-    //                 i.e. the IRS headroom above the higher of (ceiling, current)
+    // Dual-slider model — values are ACTUAL contribution dollars (not deltas):
+    //   match slider:  0 to ceiling                       (the match-capture portion)
+    //   extra slider:  0 to extraCap                      (the above-match portion)
+    // extraCap = min(IRS headroom above ceiling, surplus−breathing−others_total + currentContrib − ceiling)
+    // Extra slider is disabled until match is maxed at ceiling.
     var _irsMD = (typeof _cpSliderMax==='function')?_cpSliderMax(a.type,idx):24500;
-    // _cpSliderMax already subtracts currentContrib via extras-semantics, so
-    // it represents the headroom above currentContrib. The "extra" slider
-    // headroom is what's left after capturing the match: irs-headroom minus
-    // the match-add room (if user is currently below ceiling).
-    var _matchHeadMD = Math.max(0, _ceilMD - _curMD);
-    var _extraHeadMD = Math.max(0, _irsMD - _matchHeadMD);
-    var _matchValMD = parseFloat(a.matchAmount)||0;
-    var _extraValMD = parseFloat(a.extraAmount)||0;
-    // Captured-state badge: user is at-or-above ceiling already.
+    // _cpSliderMax returns headroom above currentContrib under extras semantics.
+    // For our actual-dollar model we want the total IRS cap = currentContrib + headroom.
+    var _irsMaxTotalMD = _curMD + _irsMD;
+    // Budget headroom: surplus − breathing room − sum(other allocations' a.amount).
+    // a.amount is the delta (matchAmount+extraAmount − currentContrib), so others'
+    // a.amount sum represents how much of the budget they're using. The amount
+    // this card can add to deployment is what's left: budget − others_delta.
+    // Card's deployment = (matchAmount + extraAmount) − currentContrib, capped
+    // at what's available. Resolving for total contribution:
+    //   total ≤ (budget − others_delta) + currentContrib
+    var _surplusMD = CPLAN.surplus||0;
+    var _brPctMD = (CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+    var _budgetMD = Math.round(_surplusMD*(1-_brPctMD));
+    var _othersDeltaMD = (CPLAN.allocations||[]).reduce(function(t,al,j){return j===idx?t:t+(parseFloat(al.amount)||0);},0);
+    var _budgetCapTotalMD = _budgetMD - _othersDeltaMD + _curMD;
+    // Total contribution cannot exceed the lesser of IRS cap and budget cap.
+    var _totalMaxMD = Math.max(_curMD, Math.min(_irsMaxTotalMD, _budgetCapTotalMD));
+    // Extra slider cap = total cap minus the match ceiling (extra rides above match).
+    var _extraCapMD = Math.max(0, _totalMaxMD - _ceilMD);
+    var _matchValMD = Math.min(parseFloat(a.matchAmount)||0, _ceilMD);
+    var _extraValMD = Math.min(parseFloat(a.extraAmount)||0, _extraCapMD);
+    // Extra slider can only be active when the match is fully captured.
+    var _extraEnabledMD = (_matchValMD >= _ceilMD && _ceilMD > 0);
     var _capturedMD = _curMD >= _ceilMD && _ceilMD > 0;
     h+='<div style="display:grid;grid-template-columns:1fr;gap:8px;margin:4px 0;padding:10px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:3px">';
-    // Match slider row
+    // Match slider row — actual match-capture contribution, 0 to ceiling
     h+='<div>';
     h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">';
     h+='<div style="font-size:11px;font-family:var(--fh);font-weight:700;color:var(--gr);letter-spacing:.06em">EMPLOYER MATCH';
-    if(_capturedMD)h+=' <span style="color:var(--gr);margin-left:6px">✓ Captured</span>';
+    if(_matchValMD>=_ceilMD && _ceilMD>0)h+=' <span style="color:var(--gr);margin-left:6px">✓ Captured</span>';
     h+='</div>';
     h+='<div style="font-size:11px;color:var(--mu)">'+_infoMD.matchPct+'% up to '+fmt(_ceilMD)+'/mo</div>';
     h+='</div>';
     h+='<div style="display:flex;align-items:center;gap:8px">';
-    if(_matchHeadMD===0 && _capturedMD){
-      // Fully captured: replace the otherwise-empty disabled slider with a
-      // filled green bar so the visual matches the "captured" status.
-      // Underlying data semantics unchanged (matchAmount = 0; nothing to add).
-      h+='<div style="flex:1;height:6px;background:rgba(34,197,94,.25);border-radius:3px;position:relative;overflow:hidden">';
-      h+='<div style="position:absolute;inset:0;background:var(--gr);border-radius:3px"></div>';
-      h+='</div>';
-      h+='<div class="inp-prefix" style="width:90px;flex-shrink:0;opacity:.7"><span class="pfx">$</span><input class="inp" type="number" id="cpMatchAmt'+idx+'" value="'+Math.round(_curMD)+'" disabled style="padding-left:22px;min-height:30px;font-size:13px;width:100%;cursor:not-allowed"></div>';
-    } else {
-      // Match slider: travels from -currentContrib (full stop on contributions)
-      // up to +matchHead (capture full match). Slider value is the planned delta,
-      // but the number input next to it displays the resulting TOTAL contribution
-      // so the user always sees the target dollar amount. Input oninput converts
-      // target back to delta via (target − currentContrib).
-      var _matchSliderMin = -_curMD;
-      h+='<input type="range" data-cpmatchidx="'+idx+'" data-cpmatchside="match" min="'+_matchSliderMin+'" max="'+_matchHeadMD+'" step="5" value="'+Math.max(_matchSliderMin,Math.min(_matchValMD,_matchHeadMD))+'" oninput="_cpSlideMatchExtra('+idx+',\'match\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:var(--gr);height:6px">';
-      h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpMatchAmt'+idx+'" value="'+Math.round(_curMD+_matchValMD)+'" min="0" max="'+(_curMD+_matchHeadMD)+'" step="5" oninput="_cpSlideMatchExtra('+idx+',\'match\',(parseInt(this.value)||0)-'+_curMD+')" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
-    }
+    h+='<input type="range" data-cpmatchidx="'+idx+'" data-cpmatchside="match" min="0" max="'+_ceilMD+'" step="5" value="'+Math.round(_matchValMD)+'" oninput="_cpSlideMatchExtra('+idx+',\'match\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:var(--gr);height:6px">';
+    h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpMatchAmt'+idx+'" value="'+Math.round(_matchValMD)+'" min="0" max="'+_ceilMD+'" step="5" oninput="_cpSlideMatchExtra('+idx+',\'match\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
     h+='</div>';
-    if(_matchHeadMD===0 && _capturedMD){
-      h+='<div style="font-size:11px;color:var(--gr);margin-top:3px;font-style:italic">Match fully captured by current contribution.</div>';
-    } else if(_matchHeadMD>0){
-      h+='<div style="font-size:11px;color:var(--mu);margin-top:3px">Add '+fmt(_matchHeadMD)+'/mo to capture the full match.</div>';
-    }
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:3px">Capturing '+fmt(_matchValMD)+'/mo of the '+fmt(_ceilMD)+'/mo match'+(_matchValMD<_ceilMD?'. Drag right to capture more.':'.')+'</div>';
     h+='</div>';
-    // Additional contribution slider row
-    h+='<div style="padding-top:8px;border-top:1px dashed rgba(91,155,255,.12)">';
+    // Extra slider row — actual above-match contribution, disabled until match maxed
+    h+='<div style="padding-top:8px;border-top:1px dashed rgba(91,155,255,.12)'+(!_extraEnabledMD?';opacity:0.45':'')+'">';
     h+='<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:4px">';
     h+='<div style="font-size:11px;font-family:var(--fh);font-weight:700;color:#5B9BFF;letter-spacing:.06em">ADDITIONAL CONTRIBUTION</div>';
-    h+='<div style="font-size:11px;color:var(--mu)">above match · tax-deferred only</div>';
+    h+='<div style="font-size:11px;color:var(--mu)">above match · tax-deferred</div>';
     h+='</div>';
     h+='<div style="display:flex;align-items:center;gap:8px">';
-    h+='<input type="range" data-cpmatchidx="'+idx+'" data-cpmatchside="extra" min="0" max="'+_extraHeadMD+'" step="5" value="'+Math.min(_extraValMD,_extraHeadMD)+'" oninput="_cpSlideMatchExtra('+idx+',\'extra\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:#5B9BFF;height:6px">';
-    h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpExtraAmt'+idx+'" value="'+Math.round(_extraValMD)+'" min="0" max="'+_extraHeadMD+'" step="5" oninput="_cpSlideMatchExtra('+idx+',\'extra\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+    h+='<input type="range" data-cpmatchidx="'+idx+'" data-cpmatchside="extra" min="0" max="'+_extraCapMD+'" step="5" value="'+Math.round(_extraValMD)+'" oninput="_cpSlideMatchExtra('+idx+',\'extra\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:#5B9BFF;height:6px"'+(!_extraEnabledMD?' disabled':'')+'>';
+    h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpExtraAmt'+idx+'" value="'+Math.round(_extraValMD)+'" min="0" max="'+_extraCapMD+'" step="5" oninput="_cpSlideMatchExtra('+idx+',\'extra\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"'+(!_extraEnabledMD?' disabled':'')+'></div>';
     h+='</div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:3px">'+(_extraEnabledMD?('Cap: '+fmt(_extraCapMD)+'/mo (IRS + budget).'):'Max the employer match first to unlock additional contributions.')+'</div>';
     h+='</div>';
-    // Combined total at bottom
-    h+='<div style="font-size:11px;color:var(--mu);text-align:right;padding-top:6px;border-top:1px dashed rgba(91,155,255,.12)">Combined extra: <strong style="color:var(--gr)" id="cpMatchTotalCombined'+idx+'">$'+fmt(Math.round(_matchValMD+_extraValMD))+'</strong>/mo · Total contribution after Apply: <strong style="color:var(--wh)" id="cpMatchTotalAfter'+idx+'">$'+fmt(Math.round(_curMD+_matchValMD+_extraValMD))+'</strong>/mo</div>';
+    // Combined total — direct actual contribution display (matchAmount + extraAmount)
+    var _totalMD = Math.round(_matchValMD + _extraValMD);
+    h+='<div style="font-size:11px;color:var(--mu);text-align:right;padding-top:6px;border-top:1px dashed rgba(91,155,255,.12)">Total contribution: <strong style="color:var(--wh)" id="cpMatchTotalAfter'+idx+'">$'+fmt(_totalMD)+'</strong>/mo'+(_curMD>0?(' · was $'+fmt(_curMD)+'/mo'):'')+'</div>';
     h+='</div>';
   } else if(_renderDual){
     // Dual slider: amountSelf and amountSpouse each have their own input.
@@ -31617,15 +31613,16 @@ function _cpBuildCard(a,idx,isUnassigned){
     // Done is replaced with "↗ Apply to my account" because Done's modal
     // is for NEW accounts and would create a duplicate.
     if(a._retAccountId || a._investmentId){
-      // Show Apply whenever the slider value differs from current contribution.
-      // a.amount holds the slider-vs-current delta; any non-zero delta means
-      // the user has a change to commit, whether they dragged up or down.
+      // a.amount is the delta vs currentContrib. Apply button appears whenever
+      // the slider value differs from current — in either direction. Both the
+      // button and the Synced badge are always rendered; the live-drag handler
+      // toggles display via these ids so we don't need a full re-render to
+      // flip Apply visibility.
       var _hasChange = Math.abs(parseFloat(a.amount) || 0) > 0.01;
-      if(_hasChange){
-        h+='<button onclick="_cpApplyAccountContrib('+idx+')" title="Update your real account contribution in your financial data" style="padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.45);color:#5B9BFF;cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(91,155,255,.28)\'" onmouseout="this.style.background=\'rgba(91,155,255,.18)\'">↗ Apply to my account</button>';
-      } else {
-        h+='<span style="padding:6px 12px;font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2);border-radius:3px" title="Slider matches your current contribution — no change to apply">✓ Synced with your account</span>';
-      }
+      var _applyDisp = _hasChange ? '' : 'none';
+      var _syncDisp  = _hasChange ? 'none' : '';
+      h+='<button id="cpApplyBtn'+idx+'" onclick="_cpApplyAccountContrib('+idx+')" title="Update your real account contribution in your financial data" style="display:'+_applyDisp+';padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.45);color:#5B9BFF;cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(91,155,255,.28)\'" onmouseout="this.style.background=\'rgba(91,155,255,.18)\'">↗ Apply to my account</button>';
+      h+='<span id="cpSyncedBadge'+idx+'" style="display:'+_syncDisp+';padding:6px 12px;font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2);border-radius:3px" title="Slider matches your current contribution — no change to apply">✓ Synced with your account</span>';
     } else {
       var _doneTooltip=(a.amount>0||_isActionOnly)
         ?'Click after you actually open this account / start contributing'
@@ -39859,69 +39856,82 @@ function _cpSlideMatchExtra(i, side, v){
   var a = CPLAN.allocations[i];
   if(!a || !a._hasMatch || !a._retAccountId)return;
   var newVal = parseInt(String(v).replace(/[^0-9.\-]/g,'')) || 0;
-  // Re-resolve match info live from pfos-main data so changes to salary or
-  // matchPct propagate without requiring a re-seed (#6 live reason text +
-  // #4 bi-directional sync foundation).
+  if(newVal < 0)newVal = 0;
+  // Re-resolve match info live so salary/matchPct changes in pfos-main
+  // propagate without requiring a re-seed.
   var r = (typeof _cpFindRetAccountById === 'function') ? _cpFindRetAccountById(a._retAccountId) : null;
   var info = r ? _cpResolveMatchInfo(r) : {matchPct:0, monthlyWage:0, matchCeiling:0, currentContrib:0, hasMatchData:false};
   var ceil = info.matchCeiling || 0;
   var cur = info.currentContrib || 0;
-  var irsMax = (typeof _cpSliderMax === 'function') ? _cpSliderMax(a.type, i) : 24500;
-  // Per-side headrooms (extras semantics).
-  var matchHead = Math.max(0, ceil - cur);
-  var extraHead = Math.max(0, irsMax - matchHead);
-  // Match side handles the user's adjustment to their actual contribution —
-  // travels from -cur (full stop on contributions) up to +matchHead (capture
-  // full match). Extra side is for additional contribution above match and
-  // stays >= 0; reductions belong on the match side.
-  if(side === 'match'){
-    if(newVal > matchHead)newVal = matchHead;
-    if(newVal < -cur)newVal = -cur;
-  }
-  if(side === 'extra'){
-    if(newVal < 0)newVal = 0;
-    if(newVal > extraHead)newVal = extraHead;
-  }
-  // Available-budget cap on COMBINED extras. Pull pool/breathing math from
-  // the same source _cpSlide uses so the two paths agree.
+  var irsHeadAboveCur = (typeof _cpSliderMax === 'function') ? _cpSliderMax(a.type, i) : 24500;
+  var irsMaxTotal = cur + irsHeadAboveCur;
+  // Budget cap: how much can this card's total contribution be without busting
+  // the deployment pool? Sum of other cards' a.amount (deltas) tells how much
+  // of the budget they consume; this card's deployment = total − cur. So:
+  //   total ≤ (budget − others_delta) + cur
   var _surplusS = CPLAN.surplus || 0;
   var _brPctS = (CPLAN._breathingPct != null ? CPLAN._breathingPct : 15) / 100;
   var _budgetS = Math.round(_surplusS * (1 - _brPctS));
-  var _othersTotalS = (CPLAN.allocations || []).reduce(function(t, al, j){
+  var _othersDelta = (CPLAN.allocations || []).reduce(function(t, al, j){
     return j === i ? t : t + (parseFloat(al.amount) || 0);
   }, 0);
-  var _availForThis = Math.max(0, _budgetS - _othersTotalS);
-  // Tentatively set the dragged side
-  if(side === 'match')a.matchAmount = newVal;
-  else if(side === 'extra')a.extraAmount = newVal;
-  // Sum and clamp to available budget — if exceeded, reduce the dragged side
-  var combined = (parseFloat(a.matchAmount) || 0) + (parseFloat(a.extraAmount) || 0);
-  if(combined > _availForThis){
-    var overshoot = combined - _availForThis;
-    if(side === 'match'){a.matchAmount = Math.max(0, (a.matchAmount || 0) - overshoot);newVal = a.matchAmount;}
-    else{a.extraAmount = Math.max(0, (a.extraAmount || 0) - overshoot);newVal = a.extraAmount;}
-    combined = (parseFloat(a.matchAmount) || 0) + (parseFloat(a.extraAmount) || 0);
+  var totalMax = Math.max(cur, Math.min(irsMaxTotal, _budgetS - _othersDelta + cur));
+  var extraCap = Math.max(0, totalMax - ceil);
+  if(side === 'match'){
+    // Match slider holds actual match-capture dollars, clamped to 0..ceiling.
+    if(newVal > ceil)newVal = ceil;
+    a.matchAmount = newVal;
+    // Unmaxing the match disables/zeros the extra slider — the extra is
+    // additional above the match and can't exist without the match maxed out.
+    if(newVal < ceil)a.extraAmount = 0;
+  } else if(side === 'extra'){
+    if(newVal > extraCap)newVal = extraCap;
+    a.extraAmount = newVal;
   }
-  a.amount = combined;// keep a.amount as the canonical sum for simulator/projections
-  // Sync DOM elements on the dragged side. Match-side number input shows the
-  // resulting TOTAL contribution (cur + matchAmount); extra-side input shows
-  // the raw additional contribution. Slider thumb tracks the delta directly.
-  var inpId = side === 'match' ? ('cpMatchAmt' + i) : ('cpExtraAmt' + i);
-  var inp = document.getElementById(inpId);
-  if(inp){
-    if(side === 'match')inp.value = Math.round(cur + (parseFloat(a.matchAmount) || 0));
-    else inp.value = newVal;
+  // a.amount = delta vs currentContrib (sign-agnostic). Drives the simulator,
+  // deployment bar, projection — never user-visible.
+  var matchAmt = parseFloat(a.matchAmount) || 0;
+  var extraAmt = parseFloat(a.extraAmount) || 0;
+  var totalContrib = matchAmt + extraAmt;
+  a.amount = totalContrib - cur;
+  // ── Live DOM updates (debounced sim re-render happens at the end) ──
+  // Match-side number input + slider thumb
+  var matchInp = document.getElementById('cpMatchAmt' + i);
+  if(matchInp)matchInp.value = Math.round(matchAmt);
+  var matchSliderEl = document.querySelector('input[type="range"][data-cpmatchidx="' + i + '"][data-cpmatchside="match"]');
+  if(matchSliderEl)matchSliderEl.value = Math.round(matchAmt);
+  // Extra-side number input + slider thumb; toggle disabled state based on
+  // whether match is maxed (extra is gated on full match capture).
+  var extraEnabled = (matchAmt >= ceil && ceil > 0);
+  var extraInp = document.getElementById('cpExtraAmt' + i);
+  if(extraInp){
+    extraInp.value = Math.round(extraAmt);
+    extraInp.disabled = !extraEnabled;
   }
-  var sliderEl = document.querySelector('input[type="range"][data-cpmatchidx="' + i + '"][data-cpmatchside="' + side + '"]');
-  if(sliderEl)sliderEl.value = newVal;
-  // Update combined + after-Apply totals
-  var combEl = document.getElementById('cpMatchTotalCombined' + i);if(combEl)combEl.textContent = '$' + fmt(combined);
-  var aftEl = document.getElementById('cpMatchTotalAfter' + i);if(aftEl)aftEl.textContent = '$' + fmt(cur + combined);
+  var extraSliderEl = document.querySelector('input[type="range"][data-cpmatchidx="' + i + '"][data-cpmatchside="extra"]');
+  if(extraSliderEl){
+    extraSliderEl.value = Math.round(extraAmt);
+    extraSliderEl.disabled = !extraEnabled;
+  }
+  // Combined total line (right-aligned under the dual-slider block)
+  var aftEl = document.getElementById('cpMatchTotalAfter' + i);
+  if(aftEl)aftEl.textContent = '$' + fmt(Math.round(totalContrib));
   // Big-number total at top-right of card
-  var amtEl = document.getElementById('cpAmt' + i);if(amtEl)amtEl.textContent = fmt(cur + combined);
+  var amtEl = document.getElementById('cpAmt' + i);
+  if(amtEl)amtEl.textContent = fmt(Math.round(totalContrib));
+  // Toggle Apply button / Synced badge visibility based on whether the slider
+  // value differs from current. No full re-render needed — both elements exist
+  // in the DOM and we just flip their display.
+  var _applyHasChange = Math.abs(a.amount) > 0.01;
+  var applyBtn = document.getElementById('cpApplyBtn' + i);
+  if(applyBtn)applyBtn.style.display = _applyHasChange ? '' : 'none';
+  var syncBadge = document.getElementById('cpSyncedBadge' + i);
+  if(syncBadge)syncBadge.style.display = _applyHasChange ? 'none' : '';
   _cpMarkModified();
   clearTimeout(CPLAN._slideTimer);CPLAN._slideTimer = setTimeout(function(){
-    try{_cpRunSimulation();_cpRenderCharts();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();}catch(e){}
+    try{
+      _cpRunSimulation();_cpRenderCharts();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();
+    }catch(e){}
     if(CPLAN.mode === 'detailed'){try{_cpRenderOutcomes();}catch(e2){}}
   }, 200);
 }
@@ -40190,10 +40200,8 @@ function _cpSlide(i,v){
   var _curContrib=_slidEl?(parseInt(_slidEl.getAttribute('data-cpcurrent'))||0):0;
   var _newTotal=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
   var _a=CPLAN.allocations[i];
-  // For cards linked to an existing account, the slider tracks the user's target
-  // contribution. Whatever they drag to becomes the target — no floor at current.
-  // For unlinked planning cards, the original floor stays (extras can't go below
-  // zero on a card with no current contribution).
+  // For cards linked to an existing account, a.amount can go negative (planned
+  // reduction). For unlinked planning cards, the floor stays at 0.
   var _newAmt=(_a&&(_a._retAccountId||_a._investmentId))?(_newTotal-_curContrib):Math.max(0,_newTotal-_curContrib);
   // P4: if this is a Done insurance allocation, cap the new amount at the current
   // amount (no increases). Decreases are allowed (user can effectively surrender).
@@ -40273,6 +40281,15 @@ function _cpSlide(i,v){
   //    focus loss). Cheap enough to run every tick. Only fires for debt
   //    allocations with amount > 0.
   if(a&&a.type==='debt')_cpUpdateDebtStrategyNumbers(i);
+  // 4b. Toggle Apply button / Synced badge for linked retirement/investment
+  //     cards so the visibility flips during the drag, not after a re-render.
+  if(a&&(a._retAccountId||a._investmentId)){
+    var _applyHas=Math.abs(parseFloat(a.amount)||0)>0.01;
+    var _slApply=document.getElementById('cpApplyBtn'+i);
+    if(_slApply)_slApply.style.display=_applyHas?'':'none';
+    var _slSync=document.getElementById('cpSyncedBadge'+i);
+    if(_slSync)_slSync.style.display=_applyHas?'none':'';
+  }
   // 5. Debounce heavy renders (chart, timeline, completion estimates)
   clearTimeout(CPLAN._slideTimer);CPLAN._slideTimer=setTimeout(function(){
     try{_cpRunSimulation();_cpRenderCharts();_cpRenderHealthScore();_cpRenderEFRunway();_cpRenderIncomeReplacement();}catch(e){}
