@@ -2197,9 +2197,47 @@ window.pfosBioSignIn=function(){
     }
     try{
       var keysToRemove = [];
+      // Device-level data that survives sign-out. These are NOT account-session
+      // tokens for the live web auth — they're either user preferences or the
+      // biometric authentication setup (which is itself a credential scheme).
+      // Wiping them on every sign-out breaks the user experience:
+      //   - pfos_bio_dismissed: user already said "don't ask me again"
+      //   - pfos_biometric_*: the entire biometric auth chain. The user opted
+      //     into using Face ID/fingerprint AS their auth method. Wiping
+      //     enrollment means re-enroll every session; wiping tokens means
+      //     biometric login succeeds at the device level but then can't
+      //     restore the Supabase session, defeating the whole feature.
+      //
+      // Cross-user protection is still enforced at the SIGNED_IN handler
+      // (line ~758) — if a different user signs in than the one who enrolled,
+      // ALL biometric data IS wiped at that moment.
+      //
+      // Supabase session keys (sb-*, supabase.auth.*) are NOT in this whitelist
+      // and DO get wiped — those are the standard web-session tokens, which
+      // should always clear on sign-out.
+      var keepKeys = {
+        'pfos_bio_dismissed': true,
+        // Biometric enrollment + session — the user has explicitly opted into
+        // biometric login as their auth method on this device. Preserving the
+        // tokens means biometric login actually skips the password entirely
+        // (which is the point). Wiping them on every sign-out means biometric
+        // succeeds at WebAuthn but Supabase setSession() then fails for lack
+        // of a token — defeating the feature.
+        //
+        // Refresh tokens rotate on use and expire on Supabase's side (~1 week
+        // of inactivity by default), so stale tokens don't accumulate forever.
+        // Cross-user attack is prevented by the SIGNED_IN handler at line ~758
+        // which wipes everything when a different user signs in.
+        'pfos_biometric_registered': true,
+        'pfos_biometric_cred': true,
+        'pfos_biometric_user_id': true,
+        'pfos_biometric_token': true,
+        'pfos_biometric_refresh': true
+      };
       for(var i=0;i<localStorage.length;i++){
         var k = localStorage.key(i);
         if(!k) continue;
+        if(keepKeys[k]) continue;
         if(k.indexOf('pfos_')===0 || k.indexOf('sb-')===0 || k.indexOf('supabase.auth.')===0){
           keysToRemove.push(k);
         }
