@@ -30345,7 +30345,12 @@ function _cpBuildCard(a,idx,isUnassigned){
   // adjusted max by including the same boosts we added into _sliderEffective.
   var _cascadeBoostHere=Math.max(0,_sliderEffective-(parseInt(a.amount)||0));
   var _sliderTotalMax=_slMax+_curContribSlide+_cascadeBoostHere;
-  var _sliderTotalMin=_curContribSlide;// can't slide below the user's current real-world contribution
+  // Slider lower bound. For cards backed by an existing retirement or investment
+  // account, the slider can travel all the way down to $0 — the user may want
+  // to set their contribution lower than what they're doing today. For unlinked
+  // planning cards (a new Roth IRA they haven't opened, etc.), there's no current
+  // contribution to reduce, so the floor stays at currentContrib (which is 0).
+  var _sliderTotalMin=(a._retAccountId||a._investmentId)?0:_curContribSlide;
   // ── Joint / shared-card slider variants (Hybrid couples) ──────────────
   // Three variants based on ownership + household:
   //   • Joint card in Hybrid household → DUAL sliders (your portion + spouse portion)
@@ -30361,7 +30366,19 @@ function _cpBuildCard(a,idx,isUnassigned){
   // sliders (match-capture + additional contribution) on the same card.
   // Both write to the same retAccount on Apply. _hasMatch is set by the
   // seeder when matchPct > 0 and the account type supports match.
-  var _renderMatchDual=(!_renderDual && !_renderRequest && a._hasMatch && a._retAccountId);
+  //
+  // Skip the dual-slider when there's nothing for it to control: the user is
+  // already at-or-above their match ceiling AND hasn't staged any extras on
+  // either side. In that state the dual-slider would show two disabled/inert
+  // controls, and the only meaningful action the user can take on this card
+  // is to adjust their contribution (up via IRS headroom, or down). Falling
+  // through to the single slider gives them that.
+  var _matchPctPre=parseFloat((_match&&_match.matchPct)||0);
+  var _monIncPre=parseFloat((_match&&_match.monthlyIncome)||0);
+  var _curContribPre=parseFloat((_match&&_match.currentContrib)||0);
+  var _ceilPre=Math.round(_monIncPre*(_matchPctPre/100));
+  var _alreadyCapturedNoExtras=(_ceilPre>0&&_curContribPre>=_ceilPre&&!parseFloat(a.matchAmount||0)&&!parseFloat(a.extraAmount||0));
+  var _renderMatchDual=(!_renderDual && !_renderRequest && a._hasMatch && a._retAccountId && !_alreadyCapturedNoExtras);
   if(_renderMatchDual){
     // Read live match info from the linked retAccount so that salary or
     // matchPct changes in pfos-main propagate without needing a re-seed.
@@ -30394,8 +30411,24 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<div style="font-size:11px;color:var(--mu)">'+_infoMD.matchPct+'% up to '+fmt(_ceilMD)+'/mo</div>';
     h+='</div>';
     h+='<div style="display:flex;align-items:center;gap:8px">';
-    h+='<input type="range" data-cpmatchidx="'+idx+'" data-cpmatchside="match" min="0" max="'+_matchHeadMD+'" step="5" value="'+Math.min(_matchValMD,_matchHeadMD)+'" oninput="_cpSlideMatchExtra('+idx+',\'match\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:var(--gr);height:6px"'+(_matchHeadMD===0?' disabled':'')+'>';
-    h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpMatchAmt'+idx+'" value="'+Math.round(_matchValMD)+'" min="0" max="'+_matchHeadMD+'" step="5" oninput="_cpSlideMatchExtra('+idx+',\'match\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"'+(_matchHeadMD===0?' disabled':'')+'></div>';
+    if(_matchHeadMD===0 && _capturedMD){
+      // Fully captured: replace the otherwise-empty disabled slider with a
+      // filled green bar so the visual matches the "captured" status.
+      // Underlying data semantics unchanged (matchAmount = 0; nothing to add).
+      h+='<div style="flex:1;height:6px;background:rgba(34,197,94,.25);border-radius:3px;position:relative;overflow:hidden">';
+      h+='<div style="position:absolute;inset:0;background:var(--gr);border-radius:3px"></div>';
+      h+='</div>';
+      h+='<div class="inp-prefix" style="width:90px;flex-shrink:0;opacity:.7"><span class="pfx">$</span><input class="inp" type="number" id="cpMatchAmt'+idx+'" value="'+Math.round(_curMD)+'" disabled style="padding-left:22px;min-height:30px;font-size:13px;width:100%;cursor:not-allowed"></div>';
+    } else {
+      // Match slider: travels from -currentContrib (full stop on contributions)
+      // up to +matchHead (capture full match). Slider value is the planned delta,
+      // but the number input next to it displays the resulting TOTAL contribution
+      // so the user always sees the target dollar amount. Input oninput converts
+      // target back to delta via (target − currentContrib).
+      var _matchSliderMin = -_curMD;
+      h+='<input type="range" data-cpmatchidx="'+idx+'" data-cpmatchside="match" min="'+_matchSliderMin+'" max="'+_matchHeadMD+'" step="5" value="'+Math.max(_matchSliderMin,Math.min(_matchValMD,_matchHeadMD))+'" oninput="_cpSlideMatchExtra('+idx+',\'match\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:var(--gr);height:6px">';
+      h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpMatchAmt'+idx+'" value="'+Math.round(_curMD+_matchValMD)+'" min="0" max="'+(_curMD+_matchHeadMD)+'" step="5" oninput="_cpSlideMatchExtra('+idx+',\'match\',(parseInt(this.value)||0)-'+_curMD+')" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+    }
     h+='</div>';
     if(_matchHeadMD===0 && _capturedMD){
       h+='<div style="font-size:11px;color:var(--gr);margin-top:3px;font-style:italic">Match fully captured by current contribution.</div>';
@@ -30492,10 +30525,14 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _jointEligible_isType=_jointEligible[a.type]===1;
   // Treat undefined/missing owner as 'self' so legacy cards (added before
   // owner-tagging was wired up) still get the Hybrid sharing controls.
-  // Backfill is handled at load time too (see _cpEnsurePlanLoaded), but
-  // belt-and-suspenders the gate here.
+  // Also accept 'personal' — the retirement and brokerage seeders default to
+  // 'personal' (mirroring pfos-main's retAccount.owner field default for
+  // user-owned accounts). For Hybrid sharing purposes 'self' and 'personal'
+  // are equivalent ("this user owns it"); only 'spouse' or 'joint' divert
+  // to other paths.
   var _aOwnForBtns=a.owner||'self';
-  if(_hh==='hybrid'&&_aOwnForBtns==='self'&&!_renderDual&&!_renderRequest){
+  var _aOwnIsSelf=(_aOwnForBtns==='self'||_aOwnForBtns==='personal');
+  if(_hh==='hybrid'&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
     h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">';
     if(_jointEligible_isType){
       h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Make joint</button>';
@@ -31580,7 +31617,10 @@ function _cpBuildCard(a,idx,isUnassigned){
     // Done is replaced with "↗ Apply to my account" because Done's modal
     // is for NEW accounts and would create a duplicate.
     if(a._retAccountId || a._investmentId){
-      var _hasChange = (parseFloat(a.amount) || 0) > 0;
+      // Show Apply whenever the slider value differs from current contribution.
+      // a.amount holds the slider-vs-current delta; any non-zero delta means
+      // the user has a change to commit, whether they dragged up or down.
+      var _hasChange = Math.abs(parseFloat(a.amount) || 0) > 0.01;
       if(_hasChange){
         h+='<button onclick="_cpApplyAccountContrib('+idx+')" title="Update your real account contribution in your financial data" style="padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.45);color:#5B9BFF;cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(91,155,255,.28)\'" onmouseout="this.style.background=\'rgba(91,155,255,.18)\'">↗ Apply to my account</button>';
       } else {
@@ -39819,7 +39859,6 @@ function _cpSlideMatchExtra(i, side, v){
   var a = CPLAN.allocations[i];
   if(!a || !a._hasMatch || !a._retAccountId)return;
   var newVal = parseInt(String(v).replace(/[^0-9.\-]/g,'')) || 0;
-  if(newVal < 0)newVal = 0;
   // Re-resolve match info live from pfos-main data so changes to salary or
   // matchPct propagate without requiring a re-seed (#6 live reason text +
   // #4 bi-directional sync foundation).
@@ -39831,9 +39870,18 @@ function _cpSlideMatchExtra(i, side, v){
   // Per-side headrooms (extras semantics).
   var matchHead = Math.max(0, ceil - cur);
   var extraHead = Math.max(0, irsMax - matchHead);
-  // Clamp to per-side headroom
-  if(side === 'match' && newVal > matchHead)newVal = matchHead;
-  if(side === 'extra' && newVal > extraHead)newVal = extraHead;
+  // Match side handles the user's adjustment to their actual contribution —
+  // travels from -cur (full stop on contributions) up to +matchHead (capture
+  // full match). Extra side is for additional contribution above match and
+  // stays >= 0; reductions belong on the match side.
+  if(side === 'match'){
+    if(newVal > matchHead)newVal = matchHead;
+    if(newVal < -cur)newVal = -cur;
+  }
+  if(side === 'extra'){
+    if(newVal < 0)newVal = 0;
+    if(newVal > extraHead)newVal = extraHead;
+  }
   // Available-budget cap on COMBINED extras. Pull pool/breathing math from
   // the same source _cpSlide uses so the two paths agree.
   var _surplusS = CPLAN.surplus || 0;
@@ -39855,9 +39903,15 @@ function _cpSlideMatchExtra(i, side, v){
     combined = (parseFloat(a.matchAmount) || 0) + (parseFloat(a.extraAmount) || 0);
   }
   a.amount = combined;// keep a.amount as the canonical sum for simulator/projections
-  // Sync DOM elements on the dragged side to the clamped value
+  // Sync DOM elements on the dragged side. Match-side number input shows the
+  // resulting TOTAL contribution (cur + matchAmount); extra-side input shows
+  // the raw additional contribution. Slider thumb tracks the delta directly.
   var inpId = side === 'match' ? ('cpMatchAmt' + i) : ('cpExtraAmt' + i);
-  var inp = document.getElementById(inpId);if(inp)inp.value = newVal;
+  var inp = document.getElementById(inpId);
+  if(inp){
+    if(side === 'match')inp.value = Math.round(cur + (parseFloat(a.matchAmount) || 0));
+    else inp.value = newVal;
+  }
   var sliderEl = document.querySelector('input[type="range"][data-cpmatchidx="' + i + '"][data-cpmatchside="' + side + '"]');
   if(sliderEl)sliderEl.value = newVal;
   // Update combined + after-Apply totals
@@ -40005,7 +40059,9 @@ function _cpDismissStateCBanner(){
 async function _cpConvertToJoint(i){
   var a=CPLAN.allocations[i];if(!a)return;
   if(CPLAN._householdType!=='hybrid'){_cpToast('Joint cards require a Hybrid couple');return;}
-  if(a.owner!=='self'){_cpToast('This card is already joint or spouse-owned');return;}
+  // Accept 'self' or 'personal' (both mean user-owned — seeders default to
+  // 'personal'). Anything else (joint/spouse) is already not eligible.
+  if(a.owner!=='self'&&a.owner!=='personal'&&a.owner){_cpToast('This card is already joint or spouse-owned');return;}
   // Type allowlist mirrors the UI gating so this is hard to misuse even if
   // the button is somehow rendered on an excluded type.
   var _jointEligible={ef:1,edu:1,house:1,custom:1,invest:1,debt:1};
@@ -40133,8 +40189,12 @@ function _cpSlide(i,v){
             ||document.getElementById('cpManual'+i);
   var _curContrib=_slidEl?(parseInt(_slidEl.getAttribute('data-cpcurrent'))||0):0;
   var _newTotal=parseInt(String(v).replace(/[^0-9.\-]/g,''))||0;
-  var _newAmt=Math.max(0,_newTotal-_curContrib);// Extra = max(0, Total − currentContrib)
   var _a=CPLAN.allocations[i];
+  // For cards linked to an existing account, the slider tracks the user's target
+  // contribution. Whatever they drag to becomes the target — no floor at current.
+  // For unlinked planning cards, the original floor stays (extras can't go below
+  // zero on a card with no current contribution).
+  var _newAmt=(_a&&(_a._retAccountId||_a._investmentId))?(_newTotal-_curContrib):Math.max(0,_newTotal-_curContrib);
   // P4: if this is a Done insurance allocation, cap the new amount at the current
   // amount (no increases). Decreases are allowed (user can effectively surrender).
   if(_a){
