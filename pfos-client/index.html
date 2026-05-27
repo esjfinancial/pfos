@@ -21966,7 +21966,7 @@ function _cpMatchExisting(a, opts){
         // When the allocation is linked to a specific investment via
         // _investmentId, filter to ONLY that entry — otherwise we'd aggregate
         // all brokerage accounts onto every linked card and over-display.
-        if(a._investmentId && iv.id !== a._investmentId)return;
+        if(a._investmentId && String(iv.id) !== String(a._investmentId))return;
         bal+=parseFloat(iv.balance)||0;
         contrib+=parseFloat(iv.monthlyContrib)||0;
         var lbl=iv.provider||iv.accountLabel||'';
@@ -22310,7 +22310,7 @@ function _cpApplyInvestmentContrib(idx){
   }
   var curContrib = parseFloat(iv.monthlyContrib) || 0;
   var linkedCards = (CPLAN.allocations || []).filter(function(c){
-    return c && c._investmentId === a._investmentId;
+    return c && String(c._investmentId) === String(a._investmentId);
   });
   var sumExtras = linkedCards.reduce(function(t, c){return t + (parseFloat(c.amount) || 0);}, 0);
   var newContrib = Math.round(curContrib + sumExtras);
@@ -22332,7 +22332,7 @@ function _cpApplyInvestmentContrib(idx){
   linkedCards.forEach(function(c){ c.amount = 0; });
   try{
     if(APP._portalFd && APP._portalFd.S && APP._portalFd.S.investments){
-      var localIv = APP._portalFd.S.investments.find(function(x){return x && x.id === a._investmentId;});
+      var localIv = APP._portalFd.S.investments.find(function(x){return x && String(x.id) === String(a._investmentId);});
       if(localIv) localIv.monthlyContrib = newContrib;
     }
   }catch(e){}
@@ -22369,7 +22369,7 @@ function _cpApplyRetAccountContrib(idx){
   // + extra-card from the same source). Each card's a.amount is an EXTRA
   // on top of currentContrib; total commitment = currentContrib + sum(extras).
   var linkedCards = (CPLAN.allocations || []).filter(function(c){
-    return c && c._retAccountId === a._retAccountId;
+    return c && String(c._retAccountId) === String(a._retAccountId);
   });
   var sumExtras = linkedCards.reduce(function(t, c){return t + (parseFloat(c.amount) || 0);}, 0);
   var newContrib = Math.round(info.currentContrib + sumExtras);
@@ -22420,7 +22420,7 @@ function _cpApplyRetAccountContrib(idx){
   // waiting for the pfos-main → parent round-trip.
   try{
     if(APP._portalFd && APP._portalFd.S && APP._portalFd.S.retAccounts){
-      var localR = APP._portalFd.S.retAccounts.find(function(rr){return rr && rr.id === a._retAccountId;});
+      var localR = APP._portalFd.S.retAccounts.find(function(rr){return rr && String(rr.id) === String(a._retAccountId);});
       if(localR) localR.contrib = newContrib;
     }
   }catch(e){}
@@ -24584,9 +24584,12 @@ function _cpLinkAIAllocationsToAccounts(){
         // Live reason tokens (same as DIY dual-slider seeder)
         a.reason='{{MATCH_PCT}} employer match on {{MONTHLY_WAGE}}/mo wages = {{MATCH_CEILING}}/mo ceiling. Use the top slider to capture the match, the bottom slider for additional contributions.';
       } else {
-        // Non-match retirement (roth/trad_ira) — single slider with extras semantics.
-        // The render path uses a.amount as EXTRAS (added to data-cpcurrent at render).
-        a.amount=Math.round(neededExtrasR);
+        // Non-match retirement (roth/trad_ira) — single slider with delta semantics.
+        // For linked accounts a.amount IS the delta vs currentContrib and can be
+        // negative when AI recommends a reduction. The render path adds it to the
+        // displayed currentContrib (via data-cpcurrent) so the slider thumb sits
+        // at the AI's target total.
+        a.amount=Math.round(aAmt-curContribR);
         if(aAmt<curContribR){a._aiBelowCurrent=true;}
       }
       linkedCount++;
@@ -24612,7 +24615,7 @@ function _cpLinkAIAllocationsToAccounts(){
       a._aiLinked=true;
       a._aiOriginalAmount=aAmt;
       var curIvContrib=parseFloat(ivMatch.monthlyContrib)||0;
-      a.amount=Math.round(Math.max(0,aAmt-curIvContrib));
+      a.amount=Math.round(aAmt-curIvContrib);
       if(aAmt<curIvContrib){a._aiBelowCurrent=true;}
       linkedCount++;
       return;
@@ -26981,10 +26984,27 @@ function _cpShowApproachFork(){
     {key:'tax_free',label:'Tax-Free Income',icon:'🛡️',desc:'Roth IRA, HSA, IUL, Whole Life, IBC. Tax-free access via policy loans and Roth withdrawals.',color:'#22C55E',taxRatio:0},
     {key:'hybrid',label:'Hybrid',icon:'⚡',desc:'Best vehicle for each purpose regardless of category. Mathematically optimized based on your specific numbers.',color:'#A855F7',taxRatio:0.5}
   ];
+  // Which AI cards to actually render? Only the ones that already have data in
+  // CPLAN._approaches OR are currently being generated (CPLAN._cpGenInProgress).
+  // If the user has never run AI, we DO NOT show three perpetually-spinning
+  // "Analyzing…" cards — that's misleading. Filter cards down to what's real.
+  var _genActive = !!CPLAN._cpGenInProgress;
+  var _renderCards = cards.filter(function(cd){
+    return _genActive || ap.hasOwnProperty(cd.key);
+  });
+  var _earlyDiy=CPLAN._diyPlan;
+  var _earlyDiyHasWork=_earlyDiy && _earlyDiy.allocations && _earlyDiy.allocations.some(function(a){return(parseFloat(a.amount)||0)>0;});
+  // Header copy adapts to what's actually rendered. If no AI cards remain, the
+  // page is really just "Your DIY plan" with a Generate-AI option below.
   var h='<div style="padding:20px">';
   h+='<div style="text-align:center;margin-bottom:24px">';
-  h+='<div style="font-family:var(--fh);font-size:22px;font-weight:800;color:var(--wh);margin-bottom:6px">Choose Your Strategy</div>';
-  h+='<div style="font-size:14px;color:var(--mu);line-height:1.6">Three approaches built from your exact financial data. Same surplus (<strong style="color:var(--gr)">'+fmt(_pool)+'/mo</strong>), different vehicles.</div>';
+  if(_renderCards.length === 0 && _earlyDiyHasWork){
+    h+='<div style="font-family:var(--fh);font-size:22px;font-weight:800;color:var(--wh);margin-bottom:6px">Your Plan</div>';
+    h+='<div style="font-size:14px;color:var(--mu);line-height:1.6">Continue editing your DIY plan, or compare against an AI-built strategy. You have <strong style="color:var(--gr)">'+fmt(_pool)+'/mo</strong> available to deploy.</div>';
+  } else {
+    h+='<div style="font-family:var(--fh);font-size:22px;font-weight:800;color:var(--wh);margin-bottom:6px">Choose Your Strategy</div>';
+    h+='<div style="font-size:14px;color:var(--mu);line-height:1.6">'+(_renderCards.length>1?'Approaches built from your exact financial data. ':'')+'Same surplus (<strong style="color:var(--gr)">'+fmt(_pool)+'/mo</strong>)'+(_renderCards.length>1?', different vehicles.':'.')+'</div>';
+  }
   h+='</div>';
   // Stale-data banner — appears when current surplus/income/age differs from
   // the values in effect when these approaches were generated.
@@ -27001,16 +27021,17 @@ function _cpShowApproachFork(){
       +'<button onclick="_cpConfirmedAIGen()" style="padding:9px 18px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.08em;background:rgba(234,179,8,.15);border:1px solid rgba(234,179,8,.45);color:var(--yl);border-radius:4px;cursor:pointer;white-space:nowrap;min-height:36px">🔄 Regenerate All</button>'
     +'</div>';
   }
-  // Detect DIY existence early so the AI grid can be sized to accommodate it.
-  // When DIY work exists, use 4 columns (Traditional / Tax-Free / Hybrid / DIY)
-  // so all cards sit on one row with consistent visual treatment. Without this
-  // detection, the DIY card landed on its own row below the 3 AI cards with
-  // empty space next to it — awkward layout.
-  var _earlyDiy=CPLAN._diyPlan;
-  var _earlyDiyHasWork=_earlyDiy && _earlyDiy.allocations && _earlyDiy.allocations.some(function(a){return(parseFloat(a.amount)||0)>0;});
-  var _forkColCount=_earlyDiyHasWork?4:3;
-  h+='<div style="display:grid;grid-template-columns:repeat('+_forkColCount+',1fr);gap:14px;margin-bottom:20px">';
-  cards.forEach(function(cd){
+  // Grid sizing: count actually-rendered AI cards + 1 if DIY work exists.
+  // When only DIY exists (no AI cards), center the card by using a 1-column
+  // grid so it doesn't sprawl across the whole row.
+  var _aiCardCount = _renderCards.length;
+  var _forkColCount = _aiCardCount + (_earlyDiyHasWork ? 1 : 0);
+  if(_forkColCount === 0)_forkColCount = 1;
+  // For visual balance: if only the DIY card is showing, center it at a
+  // reasonable max-width so it doesn't stretch edge-to-edge.
+  var _gridMaxWidth = (_aiCardCount === 0 && _earlyDiyHasWork) ? 'max-width:340px;margin:0 auto 20px;' : 'margin-bottom:20px;';
+  h+='<div style="display:grid;grid-template-columns:repeat('+_forkColCount+',1fr);gap:14px;'+_gridMaxWidth+'">';
+  _renderCards.forEach(function(cd){
     var data=ap[cd.key];
     var isLoading=!ap.hasOwnProperty(cd.key);
     var failed=ap.hasOwnProperty(cd.key)&&!data;
@@ -27355,35 +27376,47 @@ function _cpShowApproachFork(){
     h+='<div style="font-size:32px;margin-bottom:8px">🔧</div>';
     h+='<div style="font-family:var(--fh);font-size:16px;font-weight:800;color:var(--wh);margin-bottom:4px">My DIY Plan</div>';
     h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-bottom:16px;min-height:36px">'+_diyCount+' funded allocation'+(_diyCount!==1?'s':'')+' built by you. Click View to continue editing or Use This Plan to commit.</div>';
-    // Projected retirement value — same format as AI cards (color + "M" suffix when >= 1M)
-    var _diyRetMillions=_diyRetVal/1000000;
-    var _diyRetDisplay=_diyRetMillions>=1?'$'+_diyRetMillions.toFixed(1)+'M':fmt(Math.round(_diyRetVal));
-    h+='<div style="font-family:var(--fd);font-size:42px;font-weight:300;color:'+_diyColor+';margin-bottom:2px;line-height:1.1">'+_diyRetDisplay+'</div>';
-    h+='<div style="font-size:12px;color:var(--mu);margin-bottom:6px">projected at retirement</div>';
-    h+='<div style="font-size:10px;color:var(--mu);font-style:italic;margin-bottom:12px">Estimated end-state — see plan view for the full year-by-year trajectory</div>';
-    // Retirement income breakdown (mirrors AI card structure)
+    // Projected retirement value — identical format to AI cards (fmtK at 28px).
+    h+='<div style="margin-bottom:14px">';
+    h+='<div style="font-family:var(--fd);font-size:28px;color:'+_diyColor+'">'+fmtK(_diyRetVal)+'</div>';
+    h+='<div style="font-size:12px;color:var(--mu)">projected at retirement</div>';
+    h+='<div style="font-size:10px;color:var(--mu);opacity:.6">Estimated end-state — see plan view for the full year-by-year trajectory</div>';
+    h+='</div>';
+    // Retirement income with tax breakdown — identical structure to AI cards
     if(_diyRetInc>0){
-      h+='<div style="background:rgba(91,155,255,.04);border-radius:4px;padding:10px 12px;margin-bottom:12px;text-align:left;font-size:11px;color:var(--mu);line-height:1.6">';
-      h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--wh);text-align:center;margin-bottom:6px">RETIREMENT INCOME</div>';
-      h+='<div style="text-align:center;margin-bottom:6px"><span style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(_diyRetInc)+'/mo</span> <span style="font-size:11px;color:var(--mu)">gross</span></div>';
+      h+='<div style="margin-bottom:14px;padding:10px;background:rgba(0,0,0,.15);border-radius:4px">';
+      h+='<div style="font-size:11px;color:var(--mu);letter-spacing:.06em;margin-bottom:6px">RETIREMENT INCOME</div>';
+      h+='<div style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(_diyRetInc)+'/mo <span style="font-size:12px;color:var(--mu)">gross</span></div>';
       if(_diyTotalTax>0){
-        h+='<div style="text-align:center;color:var(--rd);font-size:11px;margin-bottom:4px">− '+fmt(_diyTotalTax)+' tax ('+_diyBlendedPct+'% blended)</div>';
-        h+='<div style="text-align:center"><span style="font-family:var(--fd);font-size:13px;color:var(--wh);font-weight:700">'+fmt(_diyNetInc)+'/mo</span> <span style="font-size:11px;color:var(--mu)">net after tax</span></div>';
+        h+='<div style="font-size:13px;color:var(--rd);margin:3px 0">− '+fmt(_diyTotalTax)+' tax ('+_diyBlendedPct+'% blended)</div>';
+        h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">'+fmt(_diyNetInc)+'/mo <span style="font-size:11px;font-weight:400;color:var(--mu)">net after tax</span></div>';
       } else {
-        h+='<div style="text-align:center"><span style="font-family:var(--fd);font-size:13px;color:var(--gr);font-weight:700">'+fmt(_diyRetInc)+'/mo</span> <span style="font-size:11px;color:var(--mu)">tax-free</span></div>';
+        h+='<div style="font-size:13px;color:var(--gr);margin:3px 0">$0 tax — accessed tax-free</div>';
+        h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--gr)">'+fmt(_diyRetInc)+'/mo <span style="font-size:11px;font-weight:400;color:var(--mu)">tax-free</span></div>';
       }
-      // Bucket breakdown
-      if(_diyBkInc.ord>0 || _diyBkInc.ltcg>0 || _diyBkInc.free>0){
-        h+='<div style="border-top:1px solid rgba(91,155,255,.1);margin-top:8px;padding-top:6px;font-size:11px;color:var(--mu);line-height:1.7">';
-        if(_diyBkInc.ord>0)h+='<div style="display:flex;justify-content:space-between"><span>Ordinary income (Trad 401k/IRA)</span><span style="color:var(--wh)">'+fmt(_diyBkInc.ord)+'/mo</span> <span style="color:var(--rd);margin-left:6px">-'+fmt(_diyBkTax.ord)+'</span></div>';
-        if(_diyBkInc.ltcg>0)h+='<div style="display:flex;justify-content:space-between"><span>LTCG (taxable brokerage)</span><span style="color:var(--wh)">'+fmt(_diyBkInc.ltcg)+'/mo</span> <span style="color:var(--rd);margin-left:6px">-'+fmt(_diyBkTax.ltcg)+'</span></div>';
-        if(_diyBkInc.free>0)h+='<div style="display:flex;justify-content:space-between"><span>Tax-free (Roth, HSA, ins. loans)</span><span style="color:var(--wh)">'+fmt(_diyBkInc.free)+'/mo</span> <span style="color:var(--gr);margin-left:6px">$0</span></div>';
+      // Bucket breakdown — same markup as AI cards (only render when 2+ buckets)
+      var _diyBkLines=[];
+      if(_diyBkInc.ord>0)_diyBkLines.push({label:'Ordinary income (Trad 401k/IRA)',inc:_diyBkInc.ord,tax:_diyBkTax.ord,rate:_diyRetTaxPct});
+      if(_diyBkInc.ltcg>0)_diyBkLines.push({label:'LTCG (taxable brokerage)',inc:_diyBkInc.ltcg,tax:_diyBkTax.ltcg,rate:15});
+      if(_diyBkInc.free>0)_diyBkLines.push({label:'Tax-free (Roth, HSA, ins. loans)',inc:_diyBkInc.free,tax:0,rate:0});
+      if(_diyBkLines.length>=2){
+        h+='<div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(100,116,139,.15)">';
+        _diyBkLines.forEach(function(bl){
+          var _diyBkColor=bl.rate===0?'var(--gr)':(bl.label.indexOf('LTCG')>=0?'var(--yl)':'var(--mu)');
+          h+='<div style="display:flex;justify-content:space-between;align-items:center;font-size:11px;line-height:1.5;margin-bottom:1px">';
+          h+='<span style="color:var(--mu);flex:1">'+bl.label+'</span>';
+          h+='<span style="color:var(--wh);font-family:var(--fd);font-size:11px;margin:0 6px">'+fmt(bl.inc)+'/mo</span>';
+          h+='<span style="color:'+_diyBkColor+';font-family:var(--fd);font-size:11px;min-width:42px;text-align:right">'+(bl.rate>0?'-'+fmt(bl.tax):'$0')+'</span>';
+          h+='</div>';
+        });
         h+='</div>';
       }
       h+='</div>';
     }
-    // Monthly deployed
-    h+='<div style="font-size:13px;color:var(--mu);margin-bottom:14px"><span style="font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(Math.round(_diyMonthly))+'</span>/mo deployed</div>';
+    // Monthly deployed — identical to AI cards
+    h+='<div style="margin-bottom:14px"><div style="font-family:var(--fd);font-size:16px;color:var(--wh)">'+fmt(Math.round(_diyMonthly))+'<span style="font-size:12px;color:var(--mu)">/mo deployed</span></div>';
+    if(Math.round(_diyMonthly)!==_pool)h+='<div style="font-size:11px;color:var(--yl)">target: '+fmt(_pool)+'/mo</div>';
+    h+='</div>';
     // Button stack — matches AI cards
     h+='<div style="display:flex;flex-direction:column;gap:6px">';
     h+='<button onclick="_cpStartSelfBuild()" title="Load your DIY plan to continue editing. Switch returns here." style="width:100%;padding:8px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px;border:1px solid rgba(91,155,255,.2);background:transparent;color:'+_diyColor+'">👁 View This Plan</button>';
@@ -30115,8 +30148,8 @@ function _cpBuildCard(a,idx,isUnassigned){
           var _iR2 = _cpResolveMatchInfo(_rR2,_scopeR2);
           _liveReason = _liveReason
             .replace(/\{\{MATCH_PCT\}\}/g, (_iR2.matchPct||0) + '%')
-            .replace(/\{\{MATCH_CEILING\}\}/g, '$' + fmt(_iR2.matchCeiling||0))
-            .replace(/\{\{MONTHLY_WAGE\}\}/g, '$' + fmt(_iR2.monthlyWage||0));
+            .replace(/\{\{MATCH_CEILING\}\}/g, fmt(_iR2.matchCeiling||0))
+            .replace(/\{\{MONTHLY_WAGE\}\}/g, fmt(_iR2.monthlyWage||0));
         }
       }catch(_eR){}
     }
@@ -30254,14 +30287,28 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _total=(_match.currentContrib||0)+(parseFloat(a.amount)||0);
     h+='<div style="display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin:6px 0;padding:8px 10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:3px;font-size:12px">';
     if(_match.currentContrib>0){
-      h+='<span style="color:var(--mu)">Currently:</span> <span style="font-family:var(--fd);color:var(--wh);font-weight:600">'+fmt(_match.currentContrib)+'/mo</span>';
-      h+='<span style="color:var(--mu)">+ Extra:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+color+';font-weight:600">'+fmt(a.amount)+'/mo</span>';
-      h+='<span style="color:var(--mu)">= Total:</span> <span id="cpTotal'+idx+'" style="font-family:var(--fd);color:var(--gr);font-weight:700">'+fmt(_total)+'/mo</span>';
+      var _curAmt=parseFloat(_match.currentContrib)||0;
+      var _plannedAmt=_curAmt + (parseFloat(a.amount)||0);
+      if(_plannedAmt<0)_plannedAmt=0;
+      var _delta=_plannedAmt - _curAmt;
+      var _hasDelta=Math.abs(_delta)>0.5;
+      h+='<span style="color:var(--mu)">Currently:</span> <span style="font-family:var(--fd);color:var(--wh);font-weight:600">'+fmt(_curAmt)+'/mo</span>';
+      if(_hasDelta){
+        var _arrowSym=_delta>0?'▲':'▼';
+        var _planColor=_delta>0?'var(--gr)':'#F97316';
+        h+='<span style="color:var(--mu)">→ Planned:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+_planColor+';font-weight:700">'+fmt(_plannedAmt)+'/mo</span>';
+        h+='<span style="font-size:11px;color:'+_planColor+';font-weight:600" id="cpTotal'+idx+'">'+_arrowSym+' '+fmt(Math.abs(_delta))+'/mo</span>';
+      } else {
+        // No change staged — slider matches current contribution.
+        h+='<span id="cpExtra'+idx+'" style="font-size:11px;color:var(--gr);font-style:italic">no change planned</span>';
+        h+='<span id="cpTotal'+idx+'" style="display:none"></span>';
+      }
     } else {
       // No current monthly contribution. Show balance or match availability
       // alone if either is present — both are useful starting context.
       h+='<span style="color:var(--mu)">No current contribution</span>';
-      h+='<span style="color:var(--mu)">· Extra:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+color+';font-weight:600">'+fmt(a.amount)+'/mo</span>';
+      h+='<span style="color:var(--mu)">· Planned:</span> <span id="cpExtra'+idx+'" style="font-family:var(--fd);color:'+color+';font-weight:600">'+fmt(Math.max(0,parseFloat(a.amount)||0))+'/mo</span>';
+      h+='<span id="cpTotal'+idx+'" style="display:none"></span>';
     }
     if(_match.currentBalance>0){
       h+='<span style="color:var(--mu);margin-left:auto">Existing balance: <span style="color:var(--wh);font-family:var(--fd)">'+fmtK(_match.currentBalance)+'</span></span>';
@@ -30416,6 +30463,18 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _totalMaxMD = Math.max(_curMD, Math.min(_irsMaxTotalMD, _budgetCapTotalMD));
     // Extra slider cap = total cap minus the match ceiling (extra rides above match).
     var _extraCapMD = Math.max(0, _totalMaxMD - _ceilMD);
+    // Reconcile matchAmount/extraAmount against the canonical total. a.amount
+    // is the delta vs currentContrib, so the target total = currentContrib +
+    // a.amount. If the stored matchAmount + extraAmount disagrees (legacy data
+    // saved under old semantics, or partial drag interrupted), recompute from
+    // the target: match-portion first (up to ceiling), extra is whatever's left.
+    // This guarantees the dual-slider thumbs always reflect the big-number total.
+    var _targetTotalMD = Math.max(0, _curMD + (parseFloat(a.amount)||0));
+    var _storedSumMD = (parseFloat(a.matchAmount)||0) + (parseFloat(a.extraAmount)||0);
+    if(Math.abs(_storedSumMD - _targetTotalMD) > 0.5){
+      a.matchAmount = Math.min(_targetTotalMD, _ceilMD);
+      a.extraAmount = Math.max(0, _targetTotalMD - _ceilMD);
+    }
     var _matchValMD = Math.min(parseFloat(a.matchAmount)||0, _ceilMD);
     var _extraValMD = Math.min(parseFloat(a.extraAmount)||0, _extraCapMD);
     // Extra slider can only be active when the match is fully captured.
@@ -30450,7 +30509,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='</div>';
     // Combined total — direct actual contribution display (matchAmount + extraAmount)
     var _totalMD = Math.round(_matchValMD + _extraValMD);
-    h+='<div style="font-size:11px;color:var(--mu);text-align:right;padding-top:6px;border-top:1px dashed rgba(91,155,255,.12)">Total contribution: <strong style="color:var(--wh)" id="cpMatchTotalAfter'+idx+'">$'+fmt(_totalMD)+'</strong>/mo'+(_curMD>0?(' · was $'+fmt(_curMD)+'/mo'):'')+'</div>';
+    h+='<div style="font-size:11px;color:var(--mu);text-align:right;padding-top:6px;border-top:1px dashed rgba(91,155,255,.12)">Total contribution: <strong style="color:var(--wh)" id="cpMatchTotalAfter'+idx+'">'+fmt(_totalMD)+'</strong>/mo'+(_curMD>0?(' · was '+fmt(_curMD)+'/mo'):'')+'</div>';
     h+='</div>';
   } else if(_renderDual){
     // Dual slider: amountSelf and amountSpouse each have their own input.
@@ -39028,9 +39087,24 @@ function _cpRenderChart(targetId,bucket){
     // baseline (extras compounding) while preventing the misleading "plan
     // < baseline" gap that confused the user when the plan was sparse.
     if(bucket!=='all'&&Array.isArray(totalData)&&Array.isArray(baselineData)&&baselineData.length===totalData.length){
-      totalData=totalData.map(function(v,i){
-        return Math.max(parseFloat(v)||0,parseFloat(baselineData[i])||0);
+      // Skip the floor when the user has any linked card explicitly planning a
+      // reduction below their current contribution (a.amount < 0 on a card with
+      // _retAccountId or _investmentId). In that case the divergence below
+      // baseline is intentional — flooring would hide their planned change.
+      // Filter to bucket-scoped allocations so cross-bucket reductions don't
+      // suppress the floor on other buckets.
+      var _bucketHasPlannedReduction=(CPLAN.allocations||[]).some(function(a){
+        if(!a)return false;
+        var _aOwn=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
+        if(_aOwn!==bucket)return false;
+        if(!(a._retAccountId||a._investmentId))return false;
+        return (parseFloat(a.amount)||0) < -0.5;
       });
+      if(!_bucketHasPlannedReduction){
+        totalData=totalData.map(function(v,i){
+          return Math.max(parseFloat(v)||0,parseFloat(baselineData[i])||0);
+        });
+      }
     }
     // Build rawSeries from sim.allocSeries for displacement bands
     rawSeries={};
@@ -39921,10 +39995,47 @@ function _cpSlideMatchExtra(i, side, v){
   }
   // Combined total line (right-aligned under the dual-slider block)
   var aftEl = document.getElementById('cpMatchTotalAfter' + i);
-  if(aftEl)aftEl.textContent = '$' + fmt(Math.round(totalContrib));
+  if(aftEl)aftEl.textContent = fmt(Math.round(totalContrib));
   // Big-number total at top-right of card
   var amtEl = document.getElementById('cpAmt' + i);
   if(amtEl)amtEl.textContent = fmt(Math.round(totalContrib));
+  // Context line above dual-slider — "Currently → Planned" with delta arrow
+  var _deltaMX = totalContrib - cur;
+  var _hasDeltaMX = Math.abs(_deltaMX) > 0.5;
+  var extraElMX = document.getElementById('cpExtra' + i);
+  var totalElMX = document.getElementById('cpTotal' + i);
+  if(extraElMX){
+    if(_hasDeltaMX){
+      var _planColorMX = _deltaMX > 0 ? 'var(--gr)' : '#F97316';
+      extraElMX.style.color = _planColorMX;
+      extraElMX.style.fontWeight = '700';
+      extraElMX.style.fontFamily = 'var(--fd)';
+      extraElMX.style.fontStyle = 'normal';
+      extraElMX.style.fontSize = '';
+      extraElMX.textContent = fmt(Math.round(totalContrib)) + '/mo';
+    } else {
+      extraElMX.style.color = 'var(--gr)';
+      extraElMX.style.fontWeight = '400';
+      extraElMX.style.fontFamily = '';
+      extraElMX.style.fontStyle = 'italic';
+      extraElMX.style.fontSize = '11px';
+      extraElMX.textContent = 'no change planned';
+    }
+  }
+  if(totalElMX){
+    if(_hasDeltaMX){
+      var _arrowMX = _deltaMX > 0 ? '▲' : '▼';
+      var _planColorT2 = _deltaMX > 0 ? 'var(--gr)' : '#F97316';
+      totalElMX.style.display = '';
+      totalElMX.style.color = _planColorT2;
+      totalElMX.style.fontWeight = '600';
+      totalElMX.style.fontSize = '11px';
+      totalElMX.textContent = _arrowMX + ' ' + fmt(Math.abs(_deltaMX)) + '/mo';
+    } else {
+      totalElMX.style.display = 'none';
+      totalElMX.textContent = '';
+    }
+  }
   // Toggle Apply button / Synced badge visibility based on whether the slider
   // value differs from current. No full re-render needed — both elements exist
   // in the DOM and we just flip their display.
@@ -40250,13 +40361,45 @@ function _cpSlide(i,v){
   var _curContribAmt=parseInt((_matchAmt&&_matchAmt.currentContrib)||0)||0;
   var amtEl=document.getElementById('cpAmt'+i);
   if(amtEl)amtEl.textContent=fmt(_curContribAmt+(parseFloat(a.amount)||0));
-  // 1a. Update existing-account context line ("Currently $X + Extra $Y = $Z total")
-  // when present. Slider drives the EXTRA value; total = currentContrib + extra.
+  // 1a. Update existing-account context line ("Currently $X → Planned $Y").
+  // Slider drives a.amount (delta vs currentContrib). Planned total = current + delta.
+  // For reductions the planned value clamps at 0 (can't contribute negative).
+  var _delta=parseFloat(a.amount)||0;
+  var _plannedAmt=Math.max(0, _curContribAmt + _delta);
+  var _hasDeltaLive=Math.abs(_delta)>0.5;
   var extraEl=document.getElementById('cpExtra'+i);
-  if(extraEl)extraEl.textContent=fmt(a.amount)+'/mo';
   var totalEl=document.getElementById('cpTotal'+i);
+  if(extraEl){
+    if(_hasDeltaLive){
+      var _planColor=_delta>0?'var(--gr)':'#F97316';
+      extraEl.style.color=_planColor;
+      extraEl.style.fontWeight='700';
+      extraEl.style.fontFamily='var(--fd)';
+      extraEl.style.fontStyle='normal';
+      extraEl.style.fontSize='';
+      extraEl.textContent=fmt(_plannedAmt)+'/mo';
+    } else {
+      extraEl.style.color='var(--gr)';
+      extraEl.style.fontWeight='400';
+      extraEl.style.fontFamily='';
+      extraEl.style.fontStyle='italic';
+      extraEl.style.fontSize='11px';
+      extraEl.textContent='no change planned';
+    }
+  }
   if(totalEl){
-    totalEl.textContent=fmt(_curContribAmt+(parseInt(a.amount)||0))+'/mo';
+    if(_hasDeltaLive){
+      var _arrowSymLive=_delta>0?'▲':'▼';
+      var _planColorT=_delta>0?'var(--gr)':'#F97316';
+      totalEl.style.display='';
+      totalEl.style.color=_planColorT;
+      totalEl.style.fontWeight='600';
+      totalEl.style.fontSize='11px';
+      totalEl.textContent=_arrowSymLive+' '+fmt(Math.abs(_delta))+'/mo';
+    } else {
+      totalEl.style.display='none';
+      totalEl.textContent='';
+    }
   }
   // 1b. Update reason text — interpolate {{AMOUNT}} with the live a.amount so
   // body prose stays in sync with the slider (no more stale "$291/mo" text).
