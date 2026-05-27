@@ -1679,6 +1679,151 @@ function pfosShowError(msg, detail){
   console.error('[PFOS Error Boundary]', msg, detail);
 }
 
+// ── PFOS NATIVE DIALOG REPLACEMENTS ──────────────────────────────────────────
+// Toast, confirm-modal, input-modal helpers — drop-in replacements for native
+// alert/confirm/prompt with proper PFOS styling and non-blocking UX.
+
+function _advShowToast(msg,kind){
+  var toast=document.createElement('div');
+  var bg=kind==='error'?'rgba(239,68,68,.95)':kind==='warning'?'rgba(234,179,8,.95)':'rgba(34,197,94,.95)';
+  toast.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:'+bg+';color:#fff;padding:10px 18px;border-radius:6px;font-family:var(--fh);font-size:12px;font-weight:700;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.3);transition:opacity .3s;max-width:90vw';
+  toast.textContent=msg;
+  document.body.appendChild(toast);
+  setTimeout(function(){toast.style.opacity='0';setTimeout(function(){toast.remove();},300);},2800);
+}
+
+function _advEscapeHtmlForModal(s){
+  if(s==null) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+// Reusable confirm modal — drop-in async replacement for native confirm().
+// Returns a Promise resolving to true (confirmed) or false (cancelled/dismissed).
+// opts: { title, message, detail, confirmLabel, cancelLabel, confirmStyle, icon }
+//   confirmStyle: 'danger' | 'warning' | 'success' | 'primary' (default 'primary')
+//   cancelLabel: '' or null hides the cancel button entirely (info-modal mode)
+function _advConfirmModal(opts){
+  opts = opts || {};
+  return new Promise(function(resolve){
+    var styles = {
+      danger:   {bg:'#EF4444', border:'rgba(239,68,68,.4)'},
+      warning:  {bg:'#EAB308', border:'rgba(234,179,8,.4)'},
+      success:  {bg:'#22C55E', border:'rgba(34,197,94,.4)'},
+      primary:  {bg:'#5B9BFF', border:'rgba(91,155,255,.4)'}
+    };
+    var sty = styles[opts.confirmStyle] || styles.primary;
+    var title = _advEscapeHtmlForModal(opts.title || 'Confirm');
+    var message = opts.message ? _advEscapeHtmlForModal(opts.message).replace(/\n/g,'<br>') : '';
+    var detail = opts.detail ? '<div style="margin-top:14px;padding:12px 14px;background:rgba(0,0,0,.25);border-left:3px solid '+sty.border+';border-radius:4px;font-size:12px;line-height:1.55;color:rgba(255,255,255,.78)">'+_advEscapeHtmlForModal(opts.detail).replace(/\n/g,'<br>')+'</div>' : '';
+    var icon = opts.icon ? '<div style="font-size:32px;margin-bottom:10px;text-align:center">'+opts.icon+'</div>' : '';
+    var confirmLabel = _advEscapeHtmlForModal(opts.confirmLabel || 'Confirm');
+    var hasCancel = !!(opts.cancelLabel);
+    var cancelLabel = hasCancel ? _advEscapeHtmlForModal(opts.cancelLabel) : '';
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px';
+    overlay.innerHTML =
+      '<div style="background:linear-gradient(180deg,#1A2332 0%,#0F1722 100%);border:1px solid rgba(255,255,255,.12);border-radius:10px;max-width:480px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.5);position:relative">'
+      +'<button type="button" data-act="cancel" style="position:absolute;top:10px;right:12px;background:transparent;border:none;color:rgba(255,255,255,.5);font-size:20px;cursor:pointer;line-height:1;padding:4px 8px">✕</button>'
+      +icon
+      +'<div style="font-family:var(--fh);font-size:14px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#fff;text-align:center;margin-bottom:12px">'+title+'</div>'
+      +(message?'<div style="font-size:13px;line-height:1.6;color:rgba(255,255,255,.85);text-align:center">'+message+'</div>':'')
+      +detail
+      +'<div style="margin-top:20px;display:flex;gap:10px;justify-content:flex-end;flex-wrap:wrap">'
+      +(hasCancel?'<button type="button" data-act="cancel" style="padding:9px 18px;background:transparent;border:1px solid rgba(255,255,255,.2);border-radius:5px;color:rgba(255,255,255,.75);font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">'+cancelLabel+'</button>':'')
+      +'<button type="button" data-act="confirm" style="padding:9px 18px;background:'+sty.bg+';border:none;border-radius:5px;color:#fff;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">'+confirmLabel+'</button>'
+      +'</div>'
+      +'</div>';
+    var done = false;
+    function finish(result){
+      if(done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey);
+      overlay.style.opacity = '0';
+      setTimeout(function(){ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); },150);
+      resolve(result);
+    }
+    function onKey(e){
+      if(e.key === 'Escape'){ e.preventDefault(); finish(false); }
+      else if(e.key === 'Enter'){ e.preventDefault(); finish(true); }
+    }
+    overlay.addEventListener('click', function(e){
+      if(e.target === overlay){ finish(false); return; }
+      var btn = e.target.closest('button[data-act]');
+      if(!btn) return;
+      finish(btn.getAttribute('data-act') === 'confirm');
+    });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    setTimeout(function(){
+      var cbtn = overlay.querySelector('button[data-act="confirm"]');
+      if(cbtn) cbtn.focus();
+    },50);
+  });
+}
+
+// Reusable input modal — drop-in async replacement for native prompt().
+// Returns a Promise resolving to the entered string, or null if cancelled.
+function _advInputModal(opts){
+  opts = opts || {};
+  return new Promise(function(resolve){
+    var title = _advEscapeHtmlForModal(opts.title || 'Enter value');
+    var message = opts.message ? _advEscapeHtmlForModal(opts.message).replace(/\n/g,'<br>') : '';
+    var placeholder = _advEscapeHtmlForModal(opts.placeholder || '');
+    var defaultValue = _advEscapeHtmlForModal(opts.defaultValue || '');
+    var confirmLabel = _advEscapeHtmlForModal(opts.confirmLabel || 'OK');
+    var cancelLabel = _advEscapeHtmlForModal(opts.cancelLabel || 'Cancel');
+    var inputType = opts.inputType || 'text';
+    var multiline = !!opts.multiline;
+    var inputHtml = multiline
+      ? '<textarea data-input style="width:100%;padding:10px 12px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.15);border-radius:5px;color:#fff;font-size:13px;font-family:var(--fs);outline:none;resize:vertical;min-height:80px" placeholder="'+placeholder+'">'+defaultValue+'</textarea>'
+      : '<input data-input type="'+_advEscapeHtmlForModal(inputType)+'" value="'+defaultValue+'" placeholder="'+placeholder+'" style="width:100%;padding:10px 12px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.15);border-radius:5px;color:#fff;font-size:13px;font-family:var(--fs);outline:none;box-sizing:border-box">';
+    var overlay = document.createElement('div');
+    overlay.style.cssText = 'position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px';
+    overlay.innerHTML =
+      '<div style="background:linear-gradient(180deg,#1A2332 0%,#0F1722 100%);border:1px solid rgba(255,255,255,.12);border-radius:10px;max-width:480px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.5);position:relative">'
+      +'<button type="button" data-act="cancel" style="position:absolute;top:10px;right:12px;background:transparent;border:none;color:rgba(255,255,255,.5);font-size:20px;cursor:pointer;line-height:1;padding:4px 8px">✕</button>'
+      +'<div style="font-family:var(--fh);font-size:14px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#fff;margin-bottom:12px">'+title+'</div>'
+      +(message?'<div style="font-size:13px;line-height:1.55;color:rgba(255,255,255,.78);margin-bottom:14px">'+message+'</div>':'')
+      +inputHtml
+      +'<div style="margin-top:18px;display:flex;gap:10px;justify-content:flex-end">'
+      +'<button type="button" data-act="cancel" style="padding:9px 18px;background:transparent;border:1px solid rgba(255,255,255,.2);border-radius:5px;color:rgba(255,255,255,.75);font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">'+cancelLabel+'</button>'
+      +'<button type="button" data-act="confirm" style="padding:9px 18px;background:#5B9BFF;border:none;border-radius:5px;color:#fff;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">'+confirmLabel+'</button>'
+      +'</div>'
+      +'</div>';
+    var done = false;
+    var inp = null;
+    function finish(result){
+      if(done) return;
+      done = true;
+      document.removeEventListener('keydown', onKey);
+      overlay.style.opacity = '0';
+      setTimeout(function(){ if(overlay.parentNode) overlay.parentNode.removeChild(overlay); },150);
+      resolve(result);
+    }
+    function submit(){
+      var val = inp ? inp.value : '';
+      finish(val);
+    }
+    function onKey(e){
+      if(e.key === 'Escape'){ e.preventDefault(); finish(null); }
+      else if(e.key === 'Enter' && !multiline){ e.preventDefault(); submit(); }
+    }
+    overlay.addEventListener('click', function(e){
+      if(e.target === overlay){ finish(null); return; }
+      var btn = e.target.closest('button[data-act]');
+      if(!btn) return;
+      if(btn.getAttribute('data-act') === 'confirm') submit();
+      else finish(null);
+    });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+    setTimeout(function(){
+      inp = overlay.querySelector('[data-input]');
+      if(inp){ inp.focus(); if(!multiline && inp.select) inp.select(); }
+    },50);
+  });
+}
+
 window.addEventListener('error', function(e){
   // Only show boundary for critical load errors, not minor runtime errors
   if(e.filename && (e.filename.includes('pfos') || e.filename === window.location.href)){
@@ -1764,28 +1909,86 @@ function _updateLastSaved(){
 // ── RESTORE PREVIOUS DATA ──
 async function _restorePreviousData(clientId){
   var cid=clientId||APP.currentClientId;
-  if(!cid){alert('No client selected.');return;}
+  if(!cid){_advShowToast('No client selected.','warning');return;}
   try{
     var {data:row}=await db.from('client_profiles').select('id,previous_financial_data,previous_financial_data_2,previous_financial_data_3').eq('client_id',cid).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(!row){alert('No profile found.');return;}
+    if(!row){_advShowToast('No profile found.','warning');return;}
     var backups=[];
     if(row.previous_financial_data&&row.previous_financial_data.calcs)backups.push({label:'Last save (1 back)',data:row.previous_financial_data});
     if(row.previous_financial_data_2&&row.previous_financial_data_2.calcs)backups.push({label:'2 versions back',data:row.previous_financial_data_2});
     if(row.previous_financial_data_3&&row.previous_financial_data_3.calcs)backups.push({label:'3 versions back',data:row.previous_financial_data_3});
-    if(!backups.length){alert('No backups found.');return;}
-    var choice=0;
-    if(backups.length>1){
-      var msg='Which version?\n';
-      backups.forEach(function(b,i){msg+=(i+1)+'. '+b.label+' (income: $'+Math.round((b.data.calcs||{}).inc||0).toLocaleString()+'/mo)\n';});
-      var input=prompt(msg+'Enter number:');if(!input)return;choice=parseInt(input)-1;
-      if(isNaN(choice)||choice<0||choice>=backups.length){alert('Invalid.');return;}
+    if(!backups.length){_advShowToast('No backups found.','warning');return;}
+    var choice = 0;
+    if(backups.length > 1){
+      var picked = await _advBackupPicker(backups);
+      if(picked === null) return;
+      choice = picked;
+    } else {
+      var ok = await _advConfirmModal({
+        title:'Restore backup?',
+        message:'Restore "'+backups[0].label+'" for this client?',
+        detail:'This will overwrite the current data.',
+        confirmLabel:'Restore',
+        cancelLabel:'Cancel',
+        confirmStyle:'warning',
+        icon:'↩'
+      });
+      if(!ok) return;
     }
-    if(!confirm('Restore "'+backups[choice].label+'" for this client?'))return;
     var prev=backups[choice].data;
     var scores={cfScore:(prev.calcs||{}).cfScore,protScore:(prev.calcs||{}).protScore,growScore:(prev.calcs||{}).growScore,effScore:(prev.calcs||{}).effScore};
     await db.from('client_profiles').update({financial_data:prev,scores:scores,allow_data_downgrade:true,updated_at:new Date().toISOString()}).eq('id',row.id);
-    alert('Data restored! Refreshing...');window.location.reload();
-  }catch(e){alert('Restore failed: '+e.message);}
+    _advShowToast('✓ Data restored! Refreshing...');
+    setTimeout(function(){ window.location.reload(); }, 800);
+  }catch(e){_advShowToast('Restore failed: '+e.message,'error');}
+}
+
+// Picker modal for multiple backups — radio buttons + restore button.
+function _advBackupPicker(backups){
+  return new Promise(function(resolve){
+    var rowsHtml = backups.map(function(b, i){
+      var inc = (b.data.calcs||{}).inc || 0;
+      return '<label style="display:block;padding:12px;background:rgba(0,0,0,.2);border:1px solid rgba(255,255,255,.1);border-radius:6px;margin-bottom:8px;cursor:pointer">'
+        +'<input type="radio" name="backup_choice" value="'+i+'"'+(i===0?' checked':'')+' style="margin-right:10px;vertical-align:middle">'
+        +'<span style="color:#fff;font-weight:600;font-size:13px">'+_advEscapeHtmlForModal(b.label)+'</span>'
+        +'<div style="font-size:11px;color:rgba(255,255,255,.6);margin-top:4px;margin-left:24px">income: $'+Math.round(inc).toLocaleString()+'/mo</div>'
+        +'</label>';
+    }).join('');
+    var overlay = document.createElement('div');
+    overlay.style.cssText='position:fixed;inset:0;z-index:99998;background:rgba(0,0,0,.6);backdrop-filter:blur(4px);display:flex;align-items:center;justify-content:center;padding:20px';
+    overlay.innerHTML =
+      '<div style="background:linear-gradient(180deg,#1A2332 0%,#0F1722 100%);border:1px solid rgba(255,255,255,.12);border-radius:10px;max-width:480px;width:100%;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.5);position:relative">'
+      +'<button type="button" data-act="cancel" style="position:absolute;top:10px;right:12px;background:transparent;border:none;color:rgba(255,255,255,.5);font-size:20px;cursor:pointer;line-height:1;padding:4px 8px">✕</button>'
+      +'<div style="font-family:var(--fh);font-size:14px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:#fff;margin-bottom:6px">Restore Backup</div>'
+      +'<div style="font-size:12px;color:rgba(255,255,255,.6);margin-bottom:16px">Choose which version to restore. The current data will be overwritten.</div>'
+      +rowsHtml
+      +'<div style="margin-top:18px;display:flex;gap:10px;justify-content:flex-end">'
+      +'<button type="button" data-act="cancel" style="padding:9px 18px;background:transparent;border:1px solid rgba(255,255,255,.2);border-radius:5px;color:rgba(255,255,255,.75);font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">Cancel</button>'
+      +'<button type="button" data-act="confirm" style="padding:9px 18px;background:#EAB308;border:none;border-radius:5px;color:#fff;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;cursor:pointer">Restore</button>'
+      +'</div>'
+      +'</div>';
+    var done = false;
+    function finish(result){
+      if(done) return; done = true;
+      document.removeEventListener('keydown', onKey);
+      if(overlay.parentNode) overlay.parentNode.removeChild(overlay);
+      resolve(result);
+    }
+    function submit(){
+      var picked = overlay.querySelector('input[name="backup_choice"]:checked');
+      finish(picked ? parseInt(picked.value,10) : null);
+    }
+    function onKey(e){ if(e.key==='Escape'){ e.preventDefault(); finish(null); } }
+    overlay.addEventListener('click', function(e){
+      if(e.target === overlay){ finish(null); return; }
+      var btn = e.target.closest('button[data-act]');
+      if(!btn) return;
+      if(btn.getAttribute('data-act') === 'confirm') submit();
+      else finish(null);
+    });
+    document.addEventListener('keydown', onKey);
+    document.body.appendChild(overlay);
+  });
 }
 
 // ── ADVISOR SETTINGS & SCHEDULING ────────────────────────────────────────────
@@ -1876,16 +2079,27 @@ function toggleBiometricEnrollment(checkbox){
       if(status)status.textContent=msg;
     });
   } else {
-    // Disable
-    if(!confirm('Disable Face ID / Fingerprint sign-in on this device? You\'ll need to sign in with your password next time.'))
-      { checkbox.checked=true; return; }
-    try{
-      localStorage.removeItem('pfos_biometric_registered');
-      localStorage.removeItem('pfos_biometric_cred');
-      localStorage.removeItem('pfos_biometric_token');
-      localStorage.removeItem('pfos_biometric_refresh');
-    }catch(e){}
-    if(status)status.textContent='Use biometric authentication to sign in faster on this device.';
+    // Disable — show modal, revert checkbox visual state while it's open
+    checkbox.checked = true;
+    _advConfirmModal({
+      title:'Disable biometric sign-in?',
+      message:'Disable Face ID / Fingerprint sign-in on this device?',
+      detail:"You'll need to sign in with your password next time.",
+      confirmLabel:'Disable',
+      cancelLabel:'Keep enabled',
+      confirmStyle:'warning',
+      icon:'🔒'
+    }).then(function(ok){
+      if(!ok) return; // checkbox already restored to checked
+      checkbox.checked = false;
+      try{
+        localStorage.removeItem('pfos_biometric_registered');
+        localStorage.removeItem('pfos_biometric_cred');
+        localStorage.removeItem('pfos_biometric_token');
+        localStorage.removeItem('pfos_biometric_refresh');
+      }catch(e){}
+      if(status)status.textContent='Use biometric authentication to sign in faster on this device.';
+    });
   }
 }
 
@@ -1895,12 +2109,12 @@ async function saveAdvisorSettings(){
     var schedulingUrl=(document.getElementById('asSchedulingUrl')||{}).value||'';
     if(schedulingUrl&&!schedulingUrl.startsWith('http')){schedulingUrl='https://'+schedulingUrl;}
     var {error}=await db.from('users').update({name:name,scheduling_url:schedulingUrl}).eq('id',APP.user.id);
-    if(error){alert('Failed to save: '+error.message);return;}
+    if(error){_advShowToast('Failed to save: '+error.message,'error');return;}
     APP.userData=Object.assign(APP.userData||{},{name:name,scheduling_url:schedulingUrl});
     var nameEl=document.getElementById('sbUserName');if(nameEl&&name)nameEl.textContent=name;
     closeModal('advisorSettingsModal');
-    alert('Settings saved!');
-  }catch(e){alert('Failed to save: '+e.message);}
+    _advShowToast('✓ Settings saved!');
+  }catch(e){_advShowToast('Failed to save: '+e.message,'error');}
 }
 function getSchedulingLink(client){
   var url=(APP.userData&&APP.userData.scheduling_url)||'';
@@ -1913,14 +2127,14 @@ function getSchedulingLink(client){
 function openSchedulingLink(clientId){
   var client=(APP.myClients||[]).find(function(c){return c.id===clientId;})||(APP.allClients||[]).find(function(c){return c.id===clientId;});
   var url=getSchedulingLink(client);
-  if(!url){alert('No scheduling link configured. Click your name in the sidebar to add one.');return;}
+  if(!url){_advShowToast('No scheduling link configured. Click your name in the sidebar to add one.','warning');return;}
   window.open(url,'_blank','noreferrer');
 }
 function sendSchedulingEmail(clientId){
   var client=(APP.myClients||[]).find(function(c){return c.id===clientId;})||(APP.allClients||[]).find(function(c){return c.id===clientId;});
-  if(!client||!client.email){alert('No email found for this client.');return;}
+  if(!client||!client.email){_advShowToast('No email found for this client.','warning');return;}
   var url=getSchedulingLink(client);
-  if(!url){alert('No scheduling link configured. Click your name in the sidebar to add one.');return;}
+  if(!url){_advShowToast('No scheduling link configured. Click your name in the sidebar to add one.','warning');return;}
   var name=(client.name||'').split(' ')[0]||'there';
   var advisorName=(APP.userData&&APP.userData.name)||'Your advisor';
   var subject=encodeURIComponent('Schedule Your Financial Review — '+advisorName);
@@ -2003,23 +2217,57 @@ async function renderRequestsContent(){
   }catch(e){el.innerHTML='<div style="color:var(--rd);font-size:12px;padding:20px;text-align:center">Failed to load: '+esc(e.message)+'</div>';}
 }
 async function _approveAgent(userId){
-  if(!confirm('Approve this agent?'))return;
-  try{await db.from('users').update({status:'active'}).eq('id',userId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  var ok = await _advConfirmModal({
+    title:'Approve agent?',
+    message:'Approve this agent?',
+    confirmLabel:'Approve',
+    cancelLabel:'Cancel',
+    confirmStyle:'success',
+    icon:'✓'
+  });
+  if(!ok) return;
+  try{await db.from('users').update({status:'active'}).eq('id',userId);renderRequestsContent();_updateRequestsBadge();}catch(e){_advShowToast('Error: '+e.message,'error');}
 }
 async function _rejectAgent(userId){
-  var reason=prompt('Rejection reason (optional):');
-  try{await db.from('users').update({status:'rejected'}).eq('id',userId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  var reason = await _advInputModal({
+    title:'Reject agent',
+    message:'Provide an optional reason for rejection. This is logged but not sent to the user.',
+    placeholder:'e.g. credentials not verified',
+    confirmLabel:'Reject',
+    cancelLabel:'Cancel',
+    multiline:true
+  });
+  // null = cancelled (don't reject); empty string = proceed without reason
+  if(reason === null) return;
+  try{await db.from('users').update({status:'rejected'}).eq('id',userId);renderRequestsContent();_updateRequestsBadge();}catch(e){_advShowToast('Error: '+e.message,'error');}
 }
 async function _approveUnlink(reqId,clientId){
-  if(!confirm('Approve this unlink request?'))return;
-  try{await db.from('unlink_requests').update({status:'approved'}).eq('id',reqId);await db.from('clients').update({user_id:null}).eq('id',clientId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  var ok = await _advConfirmModal({
+    title:'Approve unlink request?',
+    message:'Approve this unlink request?',
+    confirmLabel:'Approve',
+    cancelLabel:'Cancel',
+    confirmStyle:'primary',
+    icon:'🔗'
+  });
+  if(!ok) return;
+  try{await db.from('unlink_requests').update({status:'approved'}).eq('id',reqId);await db.from('clients').update({user_id:null}).eq('id',clientId);renderRequestsContent();_updateRequestsBadge();}catch(e){_advShowToast('Error: '+e.message,'error');}
 }
 async function _approveDelReq(reqId,clientId){
-  if(!confirm('This will PERMANENTLY delete the client account. Are you sure?'))return;
-  try{await db.from('deletion_requests').update({status:'approved'}).eq('id',reqId);await db.from('clients').delete().eq('id',clientId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  var ok = await _advConfirmModal({
+    title:'Permanently delete client?',
+    message:'This will PERMANENTLY delete the client account.',
+    detail:'Are you sure? This cannot be undone.',
+    confirmLabel:'Delete permanently',
+    cancelLabel:'Cancel',
+    confirmStyle:'danger',
+    icon:'⚠'
+  });
+  if(!ok) return;
+  try{await db.from('deletion_requests').update({status:'approved'}).eq('id',reqId);await db.from('clients').delete().eq('id',clientId);renderRequestsContent();_updateRequestsBadge();}catch(e){_advShowToast('Error: '+e.message,'error');}
 }
 async function _denyRequest(table,reqId){
-  try{await db.from(table).update({status:'denied'}).eq('id',reqId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  try{await db.from(table).update({status:'denied'}).eq('id',reqId);renderRequestsContent();_updateRequestsBadge();}catch(e){_advShowToast('Error: '+e.message,'error');}
 }
 // ── AGENTS PAGE (admin-only in dashboard) ────────────────────────────────────
 async function renderAgentsPage(){
@@ -2066,14 +2314,14 @@ async function renderAgentsPage(){
 function initials_(s){ if(!s) return '?'; var p=s.trim().split(' '); return p.length>1?(p[0][0]+p[p.length-1][0]).toUpperCase():s.slice(0,2).toUpperCase(); }
 // ── AGENT MANAGEMENT ACTIONS (admin-only in dashboard) ───────────────────────
 function openInviteAgentModal(){
-  if(APP.role!=='admin'){ alert('Only admins can invite agents.'); return; }
+  if(APP.role!=='admin'){ _advShowToast('Only admins can invite agents.','warning'); return; }
   var n=document.getElementById('agent-name'), e=document.getElementById('agent-email');
   if(n) n.value=''; if(e) e.value='';
   var errEl=document.getElementById('agentModalErr'); if(errEl) errEl.style.display='none';
   openModal('agentModal');
 }
 async function inviteAgent(){
-  if(APP.role!=='admin'){ alert('Admin only.'); return; }
+  if(APP.role!=='admin'){ _advShowToast('Admin only.','warning'); return; }
   var name  = v('agent-name');
   var email = v('agent-email');
   if(!email){ showModalErr('agentModalErr','Email is required.'); return; }
@@ -2090,69 +2338,90 @@ async function inviteAgent(){
     await loadAgents();
     await renderAgentsPage();
     closeModal('agentModal');
-    alert('Invitation sent to '+email+'! They will receive a password setup email.');
+    _advShowToast('✓ Invitation sent to '+email+'! They will receive a password setup email.');
   }catch(e){ showModalErr('agentModalErr', e.message); }
   setBtnLoading('inviteAgentBtn', false, 'Send Invitation');
 }
 async function revokeAgentAccess(agentId, agentName){
-  if(!confirm('Suspend '+agentName+'?\n\nThey will no longer be able to log in. Their clients will remain assigned to them. You can restore their access at any time.')) return;
+  var ok = await _advConfirmModal({
+    title:'Suspend agent?',
+    message:'Suspend '+agentName+'?',
+    detail:'They will no longer be able to log in. Their clients will remain assigned to them. You can restore their access at any time.',
+    confirmLabel:'Suspend',
+    cancelLabel:'Cancel',
+    confirmStyle:'warning',
+    icon:'⏸'
+  });
+  if(!ok) return;
   try{
     const { error } = await db.from('users').update({ role: 'suspended' }).eq('id', agentId);
-    if(error){ alert('Failed: ' + error.message); return; }
+    if(error){ _advShowToast('Failed: ' + error.message,'error'); return; }
     var a = APP.agents.find(function(a){ return a.id===agentId; });
     if(a) a.role = 'suspended';
     if(APP.agentMap[agentId]) APP.agentMap[agentId].role = 'suspended';
     renderAgentsPage();
-  } catch(e){ alert('Error: ' + e.message); }
+  } catch(e){ _advShowToast('Error: ' + e.message,'error'); }
 }
 async function restoreAgentAccess(agentId){
   try{
     const { error } = await db.from('users').update({ role: 'agent' }).eq('id', agentId);
-    if(error){ alert('Failed: ' + error.message); return; }
+    if(error){ _advShowToast('Failed: ' + error.message,'error'); return; }
     var a = APP.agents.find(function(a){ return a.id===agentId; });
     if(a) a.role = 'agent';
     if(APP.agentMap[agentId]) APP.agentMap[agentId].role = 'agent';
     renderAgentsPage();
-  } catch(e){ alert('Error: ' + e.message); }
+  } catch(e){ _advShowToast('Error: ' + e.message,'error'); }
 }
 async function confirmDeleteAgent(agentId, agentName){
-  if(APP.role !== 'admin'){ alert('Admin only.'); return; }
+  if(APP.role !== 'admin'){ _advShowToast('Admin only.','warning'); return; }
   var agentClients = (APP.allClients||[]).filter(function(c){ return c.user_id===agentId; });
   var pfosClients  = agentClients.filter(function(c){ return c.pfos_tier && c.pfos_tier!=='none'; });
   var otherClients = agentClients.filter(function(c){ return !c.pfos_tier || c.pfos_tier==='none'; });
-  var msg = 'Permanently delete '+agentName+'?\n\n';
-  if(!agentClients.length){ msg += 'This agent has no clients. Their profile will be removed.'; }
-  else{
-    msg += agentClients.length+' client(s) will be reassigned:\n';
-    if(pfosClients.length)  msg += '\u2022 '+pfosClients.length+' PFOS subscriber(s) \u2192 moved to Product Clients tab\n';
-    if(otherClients.length) msg += '\u2022 '+otherClients.length+' non-subscriber(s) \u2192 reassigned to Admin\n';
-    msg += '\nThis cannot be undone.';
+  var detail;
+  if(!agentClients.length){
+    detail = 'This agent has no clients. Their profile will be removed.';
+  } else {
+    var lines = [agentClients.length+' client(s) will be reassigned:'];
+    if(pfosClients.length)  lines.push('• '+pfosClients.length+' PFOS subscriber(s) → moved to Product Clients tab');
+    if(otherClients.length) lines.push('• '+otherClients.length+' non-subscriber(s) → reassigned to Admin');
+    lines.push('');
+    lines.push('This cannot be undone.');
+    detail = lines.join('\n');
   }
-  if(!confirm(msg)) return;
+  var ok = await _advConfirmModal({
+    title:'Delete agent?',
+    message:'Permanently delete '+agentName+'?',
+    detail:detail,
+    confirmLabel:'Delete permanently',
+    cancelLabel:'Cancel',
+    confirmStyle:'danger',
+    icon:'⚠'
+  });
+  if(!ok) return;
   await deleteAgent(agentId);
 }
 async function deleteAgent(agentId){
-  if(agentId === APP.user.id){ alert('You cannot delete your own account.'); return; }
+  if(agentId === APP.user.id){ _advShowToast('You cannot delete your own account.','warning'); return; }
   try{
     var agentClients = (APP.allClients||[]).filter(function(c){ return c.user_id===agentId; });
     var pfosClients  = agentClients.filter(function(c){ return c.pfos_tier && c.pfos_tier!=='none'; });
     var otherClients = agentClients.filter(function(c){ return !c.pfos_tier || c.pfos_tier==='none'; });
     if(pfosClients.length){
       const { error: e1 } = await db.from('clients').update({ user_id: APP.user.id, client_type: 'product' }).in('id', pfosClients.map(function(c){ return c.id; }));
-      if(e1){ alert('Error reassigning PFOS clients: '+e1.message); return; }
+      if(e1){ _advShowToast('Error reassigning PFOS clients: '+e1.message,'error'); return; }
     }
     if(otherClients.length){
       const { error: e2 } = await db.from('clients').update({ user_id: APP.user.id }).in('id', otherClients.map(function(c){ return c.id; }));
-      if(e2){ alert('Error reassigning other clients: '+e2.message); return; }
+      if(e2){ _advShowToast('Error reassigning other clients: '+e2.message,'error'); return; }
     }
     const { error: e3 } = await db.from('users').delete().eq('id', agentId);
-    if(e3){ alert('Error deleting agent: '+e3.message); return; }
+    if(e3){ _advShowToast('Error deleting agent: '+e3.message,'error'); return; }
     APP.agents = APP.agents.filter(function(a){ return a.id!==agentId; });
     delete APP.agentMap[agentId];
     await loadAllClients(); await loadMyClients();
     renderAgentsPage(); await renderDashboard();
-    alert('Agent deleted. PFOS clients moved to Product Clients tab.');
-  } catch(e){ alert('Error: '+e.message); }
+    _advShowToast('✓ Agent deleted. PFOS clients moved to Product Clients tab.');
+  } catch(e){ _advShowToast('Error: '+e.message,'error'); }
 }
 // ── FOLLOW-UP REMINDERS (Phase 6 — stub, full impl in client-profile) ────────
 function loadFollowUpReminders(){
@@ -2209,16 +2478,25 @@ async function updateHouseholdType(coupleLinkId, newType){
     await db.from('couple_links').update({household_type: newType}).eq('id', coupleLinkId);
     var cl = (APP_COUPLES||[]).find(function(c){ return c.id === coupleLinkId; });
     if(cl) cl.household_type = newType;
-  }catch(e){ alert('Could not update household type: '+e.message); }
+  }catch(e){ _advShowToast('Could not update household type: '+e.message,'error'); }
 }
 async function unlinkCouple(coupleLinkId, nameA, nameB){
-  if(APP.role !== 'admin'){ alert('Only admins can unlink couples.'); return; }
-  if(!confirm('Permanently unlink '+nameA+' and '+nameB+'? This cannot be undone.')) return;
+  if(APP.role !== 'admin'){ _advShowToast('Only admins can unlink couples.','warning'); return; }
+  var ok = await _advConfirmModal({
+    title:'Unlink couple?',
+    message:'Permanently unlink '+nameA+' and '+nameB+'?',
+    detail:'This cannot be undone.',
+    confirmLabel:'Unlink',
+    cancelLabel:'Cancel',
+    confirmStyle:'danger',
+    icon:'⚠'
+  });
+  if(!ok) return;
   try{
     await db.from('couple_links').delete().eq('id', coupleLinkId);
     APP_COUPLES = (APP_COUPLES||[]).filter(function(c){ return c.id !== coupleLinkId; });
     renderCouplesPage();
-  }catch(e){ alert('Unlink failed: '+e.message); }
+  }catch(e){ _advShowToast('Unlink failed: '+e.message,'error'); }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 function updatePendingBadge(){
@@ -2565,7 +2843,7 @@ function renderSystemDashboard(){
 function acceptDisclosure(){
   var check = document.getElementById('disclosureCheck');
   if(!check || !check.checked){
-    alert('Please read and check the checkbox to continue.');
+    _advShowToast('Please read and check the checkbox to continue.','warning');
     return;
   }
   try{ sessionStorage.setItem('pfos_disclosure_accepted','1'); }catch(ex){}
@@ -2573,15 +2851,24 @@ function acceptDisclosure(){
   if(modal) modal.classList.remove('open');
 }
 async function confirmDeleteClient(clientId){
-  if(APP.role !== 'admin'){ alert('Only admins can delete clients.'); return; }
-  if(!confirm('Permanently delete this client and all their data? This cannot be undone.')) return;
+  if(APP.role !== 'admin'){ _advShowToast('Only admins can delete clients.','warning'); return; }
+  var ok = await _advConfirmModal({
+    title:'Delete client?',
+    message:'Permanently delete this client and all their data?',
+    detail:'This cannot be undone.',
+    confirmLabel:'Delete permanently',
+    cancelLabel:'Cancel',
+    confirmStyle:'danger',
+    icon:'⚠'
+  });
+  if(!ok) return;
   try{
     await db.from('clients').delete().eq('id', clientId);
     APP.myClients  = APP.myClients.filter(function(c){ return c.id !== clientId; });
     APP.allClients = (APP.allClients||[]).filter(function(c){ return c.id !== clientId; });
     await renderDashboard();
-    alert('Client deleted.');
-  }catch(e){ alert('Delete failed: '+e.message); }
+    _advShowToast('✓ Client deleted.');
+  }catch(e){ _advShowToast('Delete failed: '+e.message,'error'); }
 }
 async function updateClientAgent(clientId, agentId){
   try{
@@ -2590,7 +2877,7 @@ async function updateClientAgent(clientId, agentId){
     if(idx>=0) APP.allClients[idx].user_id = agentId||null;
     var idx2 = APP.myClients.findIndex(function(c){ return c.id===clientId; });
     if(idx2>=0) APP.myClients[idx2].user_id = agentId||null;
-  }catch(e){ alert('Could not reassign agent: '+e.message); }
+  }catch(e){ _advShowToast('Could not reassign agent: '+e.message,'error'); }
 }
 async function updateClientTier(clientId, tier){
   try{
@@ -2607,7 +2894,7 @@ async function updateClientTier(clientId, tier){
     if(idx>=0){ APP.allClients[idx].pfos_tier=tier; if(updates.trial_start_date) APP.allClients[idx].trial_start_date=updates.trial_start_date; }
     var idx2 = APP.myClients.findIndex(function(c){ return c.id===clientId; });
     if(idx2>=0){ APP.myClients[idx2].pfos_tier=tier; if(updates.trial_start_date) APP.myClients[idx2].trial_start_date=updates.trial_start_date; }
-  }catch(e){ alert('Could not update tier: '+e.message); }
+  }catch(e){ _advShowToast('Could not update tier: '+e.message,'error'); }
 }
 function buildAgentDropdown(clientId, currentUserId, clientObj){
   // Build options from all agents + a "No Agent" option
@@ -2996,7 +3283,7 @@ function runPulseCheck(){
   var efLvl=parseFloat((document.getElementById('pcEFMonths')||{}).value);
   var ins=(document.getElementById('pcInsurance')||{}).value||'no';
   var age=parseInt((document.getElementById('pcAge')||{}).value)||0;
-  if(!income){alert('Tap an income range first.');return;}
+  if(!income){_advShowToast('Tap an income range first.','warning');return;}
   var score=0,flags=[];
   var dti=income>0?(debt*0.03/income*100):0;
   if(dti<15)score+=25;else if(dti<30)score+=15;else if(dti<50)score+=5;
@@ -3046,7 +3333,7 @@ function pcSaveLead(name,score){
 // ── PRE-MEETING BRIEF ───────────────────────────────────
 async function generatePreMeetingBrief(clientId){
   var client=(APP.myClients||[]).find(function(c){return c.id===clientId;});
-  if(!client){alert('Client not found.');return;}
+  if(!client){_advShowToast('Client not found.','warning');return;}
   try{
     var {data:profile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',clientId).single();
     var {data:recs}=await db.from('advisor_recommendations').select('*').eq('client_id',clientId).not('status','eq','dismissed');
@@ -3091,7 +3378,7 @@ async function generatePreMeetingBrief(clientId){
     container.innerHTML+='<button onclick="this.parentElement.remove()" style="position:absolute;top:8px;right:8px;background:none;border:none;color:var(--mu);cursor:pointer;font-size:16px">✕</button>';
     var existing=document.getElementById('preMeetingBrief');if(existing)existing.remove();
     document.body.appendChild(container);
-  }catch(e){alert('Error generating brief: '+e.message);}
+  }catch(e){_advShowToast('Error generating brief: '+e.message,'error');}
 }
 
 // ── QUICK RECOMMENDATION ────────────────────────────────
@@ -3119,13 +3406,13 @@ async function submitQuickRec(){
     if(error) throw error;
     setBtnLoading('quickRecSubmitBtn',false);
     closeModal('quickRecModal');
-    alert('✓ Recommendation added as drafted.');
+    _advShowToast('✓ Recommendation added as drafted.');
     try{var _qrClient=APP.clients&&APP.clients.find(function(c){return c.id===clientId;});if(_qrClient&&_qrClient.email){db.functions.invoke('send-notification',{body:{type:'new_recommendation',clientId:clientId,clientName:_qrClient.name||'',clientEmail:_qrClient.email,recSection:section,recText:text,recPriority:priority}}).catch(function(){});}}catch(e){}
   }catch(e){setBtnLoading('quickRecSubmitBtn',false);showModalErr('quickRecErr','Error: '+e.message);}
 }
 function startVoiceInput(){
   if(!('webkitSpeechRecognition' in window)&&!('SpeechRecognition' in window)){
-    alert('Voice input not supported in this browser. Use Chrome or Edge for voice dictation.');return;
+    _advShowToast('Voice input not supported in this browser. Use Chrome or Edge for voice dictation.','warning');return;
   }
   var SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
   var recognition=new SpeechRecognition();
@@ -3473,7 +3760,7 @@ async function advisorMarkImplemented(recId){
       await loadRecommendations(APP.currentClientId);
     }
     logAuditEvent('rec_implemented', 'recommendation', recId, {});
-  }catch(e){ console.error('advisorMarkImplemented:', e); alert('Failed to mark implemented: ' + e.message); }
+  }catch(e){ console.error('advisorMarkImplemented:', e); _advShowToast('Failed to mark implemented: ' + e.message,'error'); }
 }
 
 async function advisorRevertImplemented(recId){
@@ -3493,7 +3780,7 @@ async function advisorRevertImplemented(recId){
       await loadRecommendations(APP.currentClientId);
     }
     logAuditEvent('rec_reverted', 'recommendation', recId, {});
-  }catch(e){ console.error('advisorRevertImplemented:', e); alert('Failed to revert: ' + e.message); }
+  }catch(e){ console.error('advisorRevertImplemented:', e); _advShowToast('Failed to revert: ' + e.message,'error'); }
 }
 
 async function toggleRecLock(recId, locked){
@@ -3506,7 +3793,7 @@ async function toggleRecLock(recId, locked){
       await loadRecommendations(APP.currentClientId);
     }
     logAuditEvent(locked ? 'rec_locked' : 'rec_unlocked', 'recommendation', recId, {});
-  }catch(e){ console.error('toggleRecLock:', e); alert('Failed to toggle lock: ' + e.message); }
+  }catch(e){ console.error('toggleRecLock:', e); _advShowToast('Failed to toggle lock: ' + e.message,'error'); }
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -4010,7 +4297,7 @@ CREATE POLICY "Client reads own reports"
 // ── Bug Fix 2: downloadSystemReport — was called but never defined ──────────
 function downloadSystemReport(){
   var clients = APP.allClients || [];
-  if(!clients.length){ alert('No client data to download.'); return; }
+  if(!clients.length){ _advShowToast('No client data to download.','warning'); return; }
   var rows = [['Name','Email','Status','Tier','Agent','Added']];
   clients.forEach(function(c){
     rows.push([
@@ -4383,20 +4670,28 @@ async function sendBulkMessage(){
   var msg = (document.getElementById('bulkMsgText')||{}).value||'';
   if(!msg.trim()){ var e=document.getElementById('bulkMsgErr'); if(e){e.textContent='Please enter a message.';e.style.display='block';} return; }
   var clients = APP.role==='admin' ? (APP.allClients||[]) : (APP.myClients||[]);
-  if(!confirm('Send this message to all '+clients.length+' client'+(clients.length!==1?'s':'')+'?')) return;
+  var ok = await _advConfirmModal({
+    title:'Send to all clients?',
+    message:'Send this message to all '+clients.length+' client'+(clients.length!==1?'s':'')+'?',
+    confirmLabel:'Send',
+    cancelLabel:'Cancel',
+    confirmStyle:'primary',
+    icon:'📨'
+  });
+  if(!ok) return;
   setBtnLoading('bulkMsgBtn',true,'Sending...');
   try{
     var clients = APP.role==='admin' ? (APP.allClients||[]) : (APP.myClients||[]);
     var rows = clients.map(function(c){ return {client_id:c.id,type:'bulk',message:msg.trim(),is_read:false,created_at:new Date().toISOString()}; });
-    if(!rows.length){ alert('No clients to message.'); setBtnLoading('bulkMsgBtn',false,'Send to All Clients'); return; }
+    if(!rows.length){ _advShowToast('No clients to message.','warning'); setBtnLoading('bulkMsgBtn',false,'Send to All Clients'); return; }
     // Insert in batches of 50
     for(var i=0;i<rows.length;i+=50){
       await db.from('client_notifications').insert(rows.slice(i,i+50));
     }
     setBtnLoading('bulkMsgBtn',false,'Send to All Clients');
     closeModal('bulkMessageModal');
-    alert('Message sent to '+rows.length+' client'+(rows.length!==1?'s':'')+'.');
-  }catch(e){ setBtnLoading('bulkMsgBtn',false,'Send to All Clients'); alert('Failed: '+e.message); }
+    _advShowToast('✓ Message sent to '+rows.length+' client'+(rows.length!==1?'s':'')+'.');
+  }catch(e){ setBtnLoading('bulkMsgBtn',false,'Send to All Clients'); _advShowToast('Failed: '+e.message,'error'); }
 }
 function openCloneRecModal(){
   var sel = document.getElementById('cloneRecTarget'); if(!sel) return;
@@ -4412,7 +4707,7 @@ async function cloneRecsToClient(){
   var targetId = (document.getElementById('cloneRecTarget')||{}).value||'';
   if(!targetId){ var e=document.getElementById('cloneRecErr'); if(e){e.textContent='Select a target client.';e.style.display='block';} return; }
   var recsToClone = APP_RECS.filter(function(r){ return r.status!=='dismissed'&&r.status!=='implemented'&&r.status!=='active'; });
-  if(!recsToClone.length){ alert('No recommendations to clone.'); return; }
+  if(!recsToClone.length){ _advShowToast('No recommendations to clone.','warning'); return; }
   setBtnLoading('cloneRecBtn',true,'Cloning...');
   try{
     var rows = recsToClone.map(function(r){
@@ -4426,12 +4721,12 @@ async function cloneRecsToClient(){
     await db.from('advisor_recommendations').insert(rows);
     setBtnLoading('cloneRecBtn',false,'Clone Recommendations');
     closeModal('cloneRecModal');
-    alert(rows.length+' recommendation'+(rows.length!==1?'s':'')+' cloned successfully.');
-  }catch(e){ setBtnLoading('cloneRecBtn',false,'Clone Recommendations'); alert('Clone failed: '+e.message); }
+    _advShowToast('✓ '+rows.length+' recommendation'+(rows.length!==1?'s':'')+' cloned successfully.');
+  }catch(e){ setBtnLoading('cloneRecBtn',false,'Clone Recommendations'); _advShowToast('Clone failed: '+e.message,'error'); }
 }
 async function exportClientsCSV(){
   var clients = APP.role==='admin' ? (APP.allClients||[]) : (APP.myClients||[]);
-  if(!clients.length){ alert('No clients to export.'); return; }
+  if(!clients.length){ _advShowToast('No clients to export.','warning'); return; }
   try{
     var ids = clients.map(function(c){return c.id;});
     const {data:profs} = await db.from('client_profiles').select('client_id,scores,financial_data').in('client_id',ids);
@@ -4459,7 +4754,7 @@ async function exportClientsCSV(){
     URL.revokeObjectURL(a.href);
     // ══ Audit log: track exports ══
     try{await db.from('audit_log').insert({action:'csv_export',entity_type:'clients',details:{count:clients.length,exported_by:APP.user?APP.user.id:null},created_at:new Date().toISOString()});}catch(e2){}
-  }catch(e){ alert('Export failed: '+e.message); }
+  }catch(e){ _advShowToast('Export failed: '+e.message,'error'); }
 }
 async function renderAdvisorPerformancePage(){
   var statsEl = document.getElementById('advisorPerfStats');
@@ -4768,7 +5063,7 @@ async function applyBulkRecTemplate(){
     setBtnLoading('bulkRecApplyBtn',false);
     closeModal('bulkRecTemplateModal');
     try{var _brClient=APP.clients&&APP.clients.find(function(c){return c.id===clientId;});if(_brClient&&_brClient.email){db.functions.invoke('send-notification',{body:{type:'new_recommendation',clientId:clientId,clientName:_brClient.name||'',clientEmail:_brClient.email,recSection:'multiple',recText:pack.length+' recommendations added',recPriority:'medium'}}).catch(function(){});}}catch(e){}
-    alert('✓ '+pack.length+' recommendations applied as drafted. Open the client profile to review and customize.');
+    _advShowToast('✓ '+pack.length+' recommendations applied as drafted. Open the client profile to review and customize.');
     renderRecPipeline();
   }catch(e){
     setBtnLoading('bulkRecApplyBtn',false);
@@ -5020,8 +5315,8 @@ async function renderClientLeaderboard(){
 // ── Bug Fix 3: submitSituationChange — was called but never defined ─────────
 async function submitSituationChange(){
   var text = (document.getElementById('situationText')||{}).value||'';
-  if(!text.trim()){ alert('Please describe what changed.'); return; }
-  if(!APP.user){ alert('Not signed in.'); return; }
+  if(!text.trim()){ _advShowToast('Please describe what changed.','warning'); return; }
+  if(!APP.user){ _advShowToast('Not signed in.','warning'); return; }
   setBtnLoading('situationBtn', true, 'Sending...');
   try{
     // Send as a notification to the agent (stored as message)
@@ -5037,10 +5332,10 @@ async function submitSituationChange(){
     }
     setBtnLoading('situationBtn', false, 'Notify My Advisor');
     closeModal('situationModal');
-    alert('Your advisor has been notified of the change.');
+    _advShowToast('✓ Your advisor has been notified of the change.');
   }catch(e){
     setBtnLoading('situationBtn', false, 'Notify My Advisor');
-    alert('Failed to send: ' + e.message);
+    _advShowToast('Failed to send: ' + e.message,'error');
   }
 }
 function openDeletionRequestModal(){
@@ -5051,15 +5346,15 @@ function openDeletionRequestModal(){
 async function submitDeletionRequest(){
   var reason=(document.getElementById('deletionReason')||{}).value||'';
   var confirm=(document.getElementById('deletionConfirmText')||{}).value||'';
-  if(confirm.trim()!=='DELETE'){ alert('Please type DELETE in uppercase to confirm.'); return; }
+  if(confirm.trim()!=='DELETE'){ _advShowToast('Please type DELETE in uppercase to confirm.','warning'); return; }
   setBtnLoading('deletionSubmitBtn',true,'Submitting...');
   try{
     await db.from('deletion_requests').insert({client_id:APP.currentClientId,reason:reason.trim()||null,status:'pending',created_at:new Date().toISOString()});
     logAuditEvent('deletion_requested','client',APP.currentClientId,{reason:reason.trim()});
     setBtnLoading('deletionSubmitBtn',false,'Submit Deletion Request');
     closeModal('deletionRequestModal');
-    alert('Your deletion request has been submitted. An administrator will review it.');
-  }catch(e){ setBtnLoading('deletionSubmitBtn',false,'Submit Deletion Request'); alert('Failed: '+e.message); }
+    _advShowToast('✓ Your deletion request has been submitted. An administrator will review it.');
+  }catch(e){ setBtnLoading('deletionSubmitBtn',false,'Submit Deletion Request'); _advShowToast('Failed: '+e.message,'error'); }
 }
 function openAgentFinances(){
   showPage('my-finances');
@@ -5137,7 +5432,7 @@ async function saveAgentProfile(){
     if(ind){ind.className='save-indicator saved';ind.textContent='✓ Saved';setTimeout(function(){ind.style.display='none';},2500);}
   }catch(e){
     if(ind){ind.style.display='none';}
-    alert('Save failed: '+e.message);
+    _advShowToast('Save failed: '+e.message,'error');
   }
 }
 function setPurchased(val){
@@ -5360,7 +5655,7 @@ function reviewItem(c,isOverdue){
 }
 // ── Review Reminder Functions ─────────────────────────────────────────────
 async function sendSingleReminder(clientId, email, name, reviewDate, btnEl){
-  if(!email){ alert('This client has no email address.'); return; }
+  if(!email){ _advShowToast('This client has no email address.','warning'); return; }
   if(btnEl){ btnEl.textContent='Sending...'; btnEl.disabled=true; }
   try{
     var lastDate = reviewDate ? new Date(reviewDate).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}) : null;
@@ -5371,15 +5666,23 @@ async function sendSingleReminder(clientId, email, name, reviewDate, btnEl){
     }});
     if(btnEl){ btnEl.textContent='✓ Sent'; btnEl.style.color='var(--gr)'; btnEl.style.borderColor='rgba(34,197,94,.3)'; }
   }catch(e){
-    alert('Failed to send reminder: '+e.message);
+    _advShowToast('Failed to send reminder: '+e.message,'error');
     if(btnEl){ btnEl.textContent='📧 Remind'; btnEl.disabled=false; }
   }
 }
 async function sendOverdueReminders(){
   var today = new Date();
   var overdue = APP.myClients.filter(function(c){ return c.next_review_date && new Date(c.next_review_date)<today && c.email; });
-  if(!overdue.length){ alert('No overdue clients with email addresses.'); return; }
-  if(!confirm('Send review reminders to '+overdue.length+' overdue client'+(overdue.length!==1?'s':'')+'?')) return;
+  if(!overdue.length){ _advShowToast('No overdue clients with email addresses.','warning'); return; }
+  var ok = await _advConfirmModal({
+    title:'Send overdue reminders?',
+    message:'Send review reminders to '+overdue.length+' overdue client'+(overdue.length!==1?'s':'')+'?',
+    confirmLabel:'Send reminders',
+    cancelLabel:'Cancel',
+    confirmStyle:'primary',
+    icon:'📧'
+  });
+  if(!ok) return;
   var btn=document.getElementById('sendOverdueRemindersBtn');
   if(btn){ btn.textContent='⏳ Sending...'; btn.disabled=true; }
   var sent=0, failed=0;
@@ -5396,7 +5699,7 @@ async function sendOverdueReminders(){
     }catch(e){ failed++; }
   }
   if(btn){ btn.textContent='📧 Send Reminders to All Overdue'; btn.disabled=false; }
-  alert('Sent '+sent+' reminder'+(sent!==1?'s':'')+(failed>0?'. '+failed+' failed.':'.'));
+  _advShowToast('✓ Sent '+sent+' reminder'+(sent!==1?'s':'')+(failed>0?'. '+failed+' failed.':'.'));
 }
 function setLoginTab(tab){ APP.loginTab=tab; document.getElementById('tabAdvisor').classList.toggle('active',tab==='advisor'); document.getElementById('tabClient').classList.toggle('active',tab==='client'); document.getElementById('advisorLoginForm').style.display=tab==='advisor'?'block':'none'; document.getElementById('clientLoginForm').style.display=tab==='client'?'block':'none'; document.getElementById('forgotForm').style.display='none'; clearLoginMessages(); }
 function initials(s){ if(!s) return '?'; var parts=s.split(' '); return (parts[0]?parts[0][0]:'')+(parts[1]?parts[1][0]:''); }
@@ -6132,7 +6435,7 @@ async function advSaveRec(){
     if(error) throw error;
     try{if(_advCurrentClient.email){db.functions.invoke('send-notification',{body:{type:'new_recommendation',clientId:_advCurrentClient.id,clientName:_advCurrentClient.name||'',clientEmail:_advCurrentClient.email,recSection:'calculator_analysis',recText:note||calcTitle,recPriority:priority}}).catch(function(){});}}catch(e){}
     if(btn){btn.textContent='Saved!';btn.style.background='var(--gr)';setTimeout(function(){btn.textContent='Save Another';btn.style.background='';btn.disabled=false;var ta=document.getElementById('advRecNote');if(ta)ta.value='';},2000);}
-  }catch(err){alert('Error: '+err.message);var btn=document.querySelector('#advRecBar .btn-or');if(btn){btn.textContent='Try Again';btn.disabled=false;}}
+  }catch(err){_advShowToast('Error: '+err.message,'error');var btn=document.querySelector('#advRecBar .btn-or');if(btn){btn.textContent='Try Again';btn.disabled=false;}}
 }
 </script>
 <script>
@@ -6216,13 +6519,13 @@ function calcToggleHTML(prefix,calcFn){
 function calcShareCTA(){
   return '<div style="display:flex;gap:8px;margin-top:14px">'
   +'<button onclick="if(navigator.share)navigator.share({title:document.getElementById(\'insCalcTitle\').textContent,text:\'Check out this financial tool from PFOS\'}).catch(function(){});else{navigator.clipboard.writeText(window.location.href);this.textContent=\'✓ Copied!\';var b=this;setTimeout(function(){b.textContent=\'📋 SHARE RESULTS\'},2000)}" style="flex:1;padding:10px;border:1px solid rgba(91,155,255,.3);border-radius:4px;background:rgba(91,155,255,.08);color:#5B9BFF;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:.2s">📋 SHARE RESULTS</button>'
-  +'<button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else alert(\'Contact your advisor to discuss these results.\')" style="flex:1;padding:10px;border:1px solid rgba(249,115,22,.3);border-radius:4px;background:rgba(249,115,22,.08);color:var(--or);font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:.2s">💬 DISCUSS WITH ADVISOR</button></div>';
+  +'<button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else _advShowToast(\'Contact your advisor to discuss these results.\')" style="flex:1;padding:10px;border:1px solid rgba(249,115,22,.3);border-radius:4px;background:rgba(249,115,22,.08);color:var(--or);font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:.2s">💬 DISCUSS WITH ADVISOR</button></div>';
 }
 
 function calcAdvisorTeaser(numbers){
   return '<div style="padding:12px;background:linear-gradient(135deg,rgba(249,115,22,.06),rgba(249,115,22,.02));border:1px solid rgba(249,115,22,.2);border-radius:4px;margin-top:10px;text-align:center">'
   +'<div style="font-size:11px;color:var(--wh);line-height:1.6;margin-bottom:8px">'+numbers+'</div>'
-  +'<button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else alert(\'Contact your advisor.\')" style="padding:10px 20px;background:var(--or);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer">REQUEST FREE CONSULTATION →</button></div>';
+  +'<button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else _advShowToast(\'Contact your advisor.\')" style="padding:10px 20px;background:var(--or);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer">REQUEST FREE CONSULTATION →</button></div>';
 }
 
 function calcShareBtn(){
@@ -10787,7 +11090,7 @@ function calcCCPayoff(){
   h+='<div style="text-align:center;padding:10px;background:rgba(0,0,0,.1);border-radius:4px"><div style="font-size:9px;color:var(--mu)">IBC</div><div style="font-family:var(--fd);font-size:18px;color:var(--or)">~'+ibcMonths+' mo</div><div style="font-size:10px;color:var(--gr);font-weight:700">'+fmtK(ibcCV)+' cash value</div></div>';
   h+='</div>';
   h+='<div style="font-size:11px;color:var(--mu);line-height:1.7;margin-bottom:8px">Pay off all cards in ~'+ibcMonths+' months while simultaneously building <span style="color:var(--gr);font-weight:700">'+fmtK(ibcCV)+' in cash value</span> growing tax-free + <span style="color:#5B9BFF;font-weight:700">'+fmtK(ibcDB)+' death benefit</span> protecting your family. Your money works twice.</div>';
-  h+='<div style="text-align:center"><button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else alert(\'Contact your advisor.\')" style="padding:10px 24px;background:var(--or);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer">Want to Learn How? Request Free Consultation →</button></div>';
+  h+='<div style="text-align:center"><button onclick="if(typeof openConsultModal===\'function\')openConsultModal();else _advShowToast(\'Contact your advisor.\')" style="padding:10px 24px;background:var(--or);border:none;border-radius:4px;color:#fff;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;cursor:pointer">Want to Learn How? Request Free Consultation →</button></div>';
   h+='</div>';
 
   // ── Verdict ──
@@ -17538,7 +17841,7 @@ async function runAIPolicyCompare(){
   var resEl=document.getElementById('pc_ai_results');
   var manualEl=document.getElementById('pc_results');
   var filesData=_pc_files.filter(function(f){return f!==null;});
-  if(filesData.length<2){alert('Please upload at least 2 policy illustrations.');return;}
+  if(filesData.length<2){_advShowToast('Please upload at least 2 policy illustrations.','warning');return;}
 
   btn.textContent='⏳ ANALYZING '+filesData.length+' POLICIES... (this can take up to 2 minutes)';
   btn.disabled=true;btn.style.opacity='0.6';
