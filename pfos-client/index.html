@@ -21930,13 +21930,16 @@ function _cpMatchExisting(a, opts){
       if(a.type==='iul')matches=(pType.indexOf('iul')>=0||pType.indexOf('indexed universal')>=0)&&!pIbc;
       else if(a.type==='wl')matches=(pType.indexOf('whole life')>=0||pType==='wl')&&!pIbc;
       else if(a.type==='ibc')matches=pIbc;
+      // When the card is linked to a specific policy via _policyId, scope to
+      // only that one. Otherwise aggregate all matching policies of this type.
+      if(matches && a._policyId && String(p.id) !== String(a._policyId))matches=false;
       if(matches){
         bal+=parseFloat(p.cashValue)||0;
         contrib+=parseFloat(p.premium)||0;
         if(p.company)labels.push(p.company);
       }
     });
-    if(a.type==='ibc'&&owner!=='spouse'){
+    if(a.type==='ibc'&&owner!=='spouse'&&!a._policyId){
       ibcPolicies.forEach(function(p){
         bal+=parseFloat(p.cashValue)||0;
         // ibcPolicies have no separate premium field; whole-life premium captured above
@@ -22290,6 +22293,9 @@ function _cpApplyAccountContrib(idx){
   if(a._investmentId){
     return _cpApplyInvestmentContrib(idx);
   }
+  if(a._policyId){
+    return _cpApplyPolicyPremium(idx);
+  }
   if(typeof _cpToast === 'function') _cpToast('Cannot apply — no linked account');
 }
 
@@ -22337,10 +22343,117 @@ function _cpApplyInvestmentContrib(idx){
     }
   }catch(e){}
   _cpMarkModified();
+  // Sync tracking entries for all linked cards (see retirement Apply for rationale)
+  try{
+    var _atkI = (typeof _trackKey==='function')?_trackKey():'';
+    if(_atkI && typeof _cpTracking!=='undefined'){
+      if(!_cpTracking[_atkI])_cpTracking[_atkI]={};
+      linkedCards.forEach(function(c){
+        var _cIdx = CPLAN.allocations.indexOf(c);
+        if(_cIdx<0)return;
+        _cpTracking[_atkI][_cIdx] = {done:false, actual:newContrib, ts:Date.now(), source:'apply'};
+      });
+      if(typeof _trackSave==='function')_trackSave();
+      if(typeof renderClientTracking==='function')renderClientTracking();
+    }
+  }catch(_eT){}
   _cpRenderPlanV2();
   if(typeof _cpToast === 'function'){
     var label = iv.provider || iv.accountLabel || 'brokerage';
     _cpToast('✓ Updated ' + label + ' to $' + (typeof fmt === 'function' ? fmt(newContrib) : newContrib) + '/mo');
+  }
+}
+
+// ── _cpFindPolicyById ──────────────────────────────────────────────────────
+// Look up an S.policies entry by id with string-coerce equality (same defensive
+// pattern as _cpFindRetAccountById / _cpFindInvestmentById). Used by the policy
+// Apply path and any future code that needs to read live policy premium data.
+function _cpFindPolicyById(policyId, scope){
+  if(!policyId) return null;
+  var policies;
+  if(scope==='spouse' && CPLAN && CPLAN._partner && CPLAN._partner.policies){
+    policies = CPLAN._partner.policies || [];
+  } else {
+    var rawS = (APP._portalFd && APP._portalFd.S) || {};
+    policies = rawS.policies || [];
+  }
+  var targetId = String(policyId);
+  return policies.find(function(p){return p && String(p.id) === targetId;}) || null;
+}
+
+// ── _cpApplyPolicyPremium ──────────────────────────────────────────────────
+// Commit path for IUL/WL/IBC linked-policy cards. User dragged the slider and
+// clicked "Apply to my policy"; this updates the policy's premium in main with
+// the slider's target value. The slider's max is locked at the policy's setup-
+// time premium ceiling (a._policyPremiumCeiling) — the Apply path enforces the
+// same cap defensively in case any other code path violated the slider clamp.
+function _cpApplyPolicyPremium(idx){
+  var a = CPLAN.allocations[idx];
+  if(!a || !a._policyId){
+    if(typeof _cpToast === 'function') _cpToast('Cannot apply — no linked policy');
+    return;
+  }
+  var p = _cpFindPolicyById(a._policyId);
+  if(!p){
+    if(typeof _cpToast === 'function') _cpToast('Policy not found in your financial data');
+    return;
+  }
+  var curPremium = parseFloat(p.premium) || 0;
+  // Sum all cards linked to this policy. In practice there's only one per
+  // policy, but we keep the same shape as the retirement/investment paths.
+  var linkedCards = (CPLAN.allocations || []).filter(function(c){
+    return c && String(c._policyId) === String(a._policyId);
+  });
+  var sumExtras = linkedCards.reduce(function(t, c){return t + (parseFloat(c.amount) || 0);}, 0);
+  var newPremium = Math.round(curPremium + sumExtras);
+  if(newPremium < 0) newPremium = 0;// can't pay negative premium
+  // Hard cap: never exceed the locked policy premium ceiling. Insurance
+  // contracts don't let you arbitrarily raise the premium post-issue.
+  var ceiling = parseFloat(a._policyPremiumCeiling) || 0;
+  if(ceiling > 0 && newPremium > ceiling) newPremium = ceiling;
+  try{
+    if(typeof _cpSendToPfosMain === 'function'){
+      _cpSendToPfosMain('update_policy', {
+        id: a._policyId,
+        premium: newPremium,
+        _planLinked: true,
+        _planAllocType: a.type,
+        _planAllocName: a.customName || CP_NM[a.type] || ''
+      });
+    }
+  }catch(e){
+    console.warn('[cpApply] update_policy failed:', e);
+    if(typeof _cpToast === 'function') _cpToast('Could not update — please try again');
+    return;
+  }
+  // Reset linked-card amounts to 0 — slider re-baselines at the new premium.
+  linkedCards.forEach(function(c){ c.amount = 0; });
+  // Update local _portalFd cache so the next render reads the new premium.
+  try{
+    if(APP._portalFd && APP._portalFd.S && APP._portalFd.S.policies){
+      var localP = APP._portalFd.S.policies.find(function(pp){return pp && String(pp.id) === String(a._policyId);});
+      if(localP) localP.premium = newPremium;
+    }
+  }catch(e){}
+  _cpMarkModified();
+  // Sync tracking entries for all linked cards (see retirement Apply for rationale)
+  try{
+    var _atkP = (typeof _trackKey==='function')?_trackKey():'';
+    if(_atkP && typeof _cpTracking!=='undefined'){
+      if(!_cpTracking[_atkP])_cpTracking[_atkP]={};
+      linkedCards.forEach(function(c){
+        var _cIdx = CPLAN.allocations.indexOf(c);
+        if(_cIdx<0)return;
+        _cpTracking[_atkP][_cIdx] = {done:false, actual:newPremium, ts:Date.now(), source:'apply'};
+      });
+      if(typeof _trackSave==='function')_trackSave();
+      if(typeof renderClientTracking==='function')renderClientTracking();
+    }
+  }catch(_eT){}
+  _cpRenderPlanV2();
+  if(typeof _cpToast === 'function'){
+    var label = p.company || (CP_NM[a.type] || a.type);
+    _cpToast('✓ Updated ' + label + ' premium to $' + (typeof fmt === 'function' ? fmt(newPremium) : newPremium) + '/mo');
   }
 }
 
@@ -22425,6 +22538,23 @@ function _cpApplyRetAccountContrib(idx){
     }
   }catch(e){}
   _cpMarkModified();
+  // Sync tracking entries for all linked cards so the Tracking tab reflects
+  // the new committed amount immediately. These linked cards are "ongoing"
+  // (done:false) — the user keeps the contribution going monthly and can
+  // re-Apply whenever it changes.
+  try{
+    var _atk = (typeof _trackKey==='function')?_trackKey():'';
+    if(_atk && typeof _cpTracking!=='undefined'){
+      if(!_cpTracking[_atk])_cpTracking[_atk]={};
+      linkedCards.forEach(function(c){
+        var _cIdx = CPLAN.allocations.indexOf(c);
+        if(_cIdx<0)return;
+        _cpTracking[_atk][_cIdx] = {done:false, actual:newContrib, ts:Date.now(), source:'apply'};
+      });
+      if(typeof _trackSave==='function')_trackSave();
+      if(typeof renderClientTracking==='function')renderClientTracking();
+    }
+  }catch(_eT){}
   _cpRenderPlanV2();
   if(typeof _cpToast === 'function'){
     var accountLabel = r.provider || (CP_NM[a.type] || a.type);
@@ -22710,10 +22840,37 @@ function renderClientPlanTracking(){
   _cpEnsurePlanLoaded();
   if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length){el.innerHTML='<div style="text-align:center;padding:40px"><div style="font-size:36px;margin-bottom:12px">📋</div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">No Plan Yet</div><div style="font-size:13px;color:var(--mu);margin:6px 0 16px">Create a financial plan first.</div><button onclick="showClientPage(\'plan\');initClientPlan()" style="padding:10px 24px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;min-height:40px">Build My Plan →</button></div>';return;}
   var h='',mk=_trackKey(),md=_cpTracking[mk]||{};
-  var funded=CPLAN.allocations.filter(function(a){return a.amount>0;}),actions=CPLAN.allocations.filter(function(a){return a.amount===0&&(a.type==='protection'||a.type==='custom');});
+  // Helper: returns the actual monthly contribution the user is committed to
+  // for this allocation. For linked cards (Type 1b), a.amount is the DELTA
+  // vs the real-world current — so the planned total = currentContrib + a.amount.
+  // For unlinked cards, a.amount IS the planned total.
+  function _trkPlannedAmt(a){
+    if(!a)return 0;
+    if(a._retAccountId && typeof _cpFindRetAccountById==='function'){
+      var _r=_cpFindRetAccountById(a._retAccountId);
+      var _cur=_r?(parseFloat(_r.contrib)||0):0;
+      return Math.max(0, _cur + (parseFloat(a.amount)||0));
+    }
+    if(a._investmentId && typeof _cpFindInvestmentById==='function'){
+      var _iv=_cpFindInvestmentById(a._investmentId);
+      var _curIv=_iv?(parseFloat(_iv.monthlyContrib)||0):0;
+      return Math.max(0, _curIv + (parseFloat(a.amount)||0));
+    }
+    if(a._policyId && typeof _cpFindPolicyById==='function'){
+      var _p=_cpFindPolicyById(a._policyId);
+      var _curP=_p?(parseFloat(_p.premium)||0):0;
+      return Math.max(0, _curP + (parseFloat(a.amount)||0));
+    }
+    return parseFloat(a.amount)||0;
+  }
+  // "Funded" = anything actively contributing this month. Transformed cards
+  // have a.amount=0 (delta semantics) but a real ongoing contribution —
+  // include them by checking _retAccountId/_investmentId/_policyId presence.
+  var funded=CPLAN.allocations.filter(function(a){return a.amount>0 || a._retAccountId || a._investmentId || a._policyId;});
+  var actions=CPLAN.allocations.filter(function(a){return a.amount===0 && !a._retAccountId && !a._investmentId && !a._policyId && (a.type==='protection'||a.type==='custom');});
   var done=0;funded.forEach(function(a){var i=CPLAN.allocations.indexOf(a);if(md[i]&&md[i].done)done++;});
   var total=funded.length,pct=total>0?Math.round(done/total*100):0,mn=new Date().toLocaleDateString('en-US',{month:'long',year:'numeric'});
-  var tp=funded.reduce(function(t,a){return t+a.amount;},0),ta=0;funded.forEach(function(a){var i=CPLAN.allocations.indexOf(a);if(md[i]&&md[i].done)ta+=md[i].actual||a.amount;});
+  var tp=funded.reduce(function(t,a){return t+_trkPlannedAmt(a);},0),ta=0;funded.forEach(function(a){var i=CPLAN.allocations.indexOf(a);if(md[i]&&md[i].done)ta+=md[i].actual||_trkPlannedAmt(a);});
   // YTD totals
   var ytdPlanned=0,ytdActual=0;
   funded.forEach(function(a){var i=CPLAN.allocations.indexOf(a);var ytd=_trackGetYTD(i);ytdPlanned+=ytd.planned;ytdActual+=ytd.actual;});
@@ -22733,6 +22890,9 @@ function renderClientPlanTracking(){
     var c2=CP_COL[a.type]||'#94A3B8',ic=CP_IC[a.type]||'⭐',nm=a.customName||CP_NM[a.type]||a.type,bc=isDone?'var(--gr)':isMiss?'var(--rd)':c2,lnk=_trackFindAccount(a);
     var streak=_trackGetStreak(idx);
     var calEntry=_cpPlanCalendar[idx];
+    // Per-card planned dollars. For linked cards this is currentContrib + a.amount
+    // (the real ongoing commitment); for unlinked cards it's just a.amount.
+    var _plannedAmt=_trkPlannedAmt(a);
     h+='<div style="display:flex;align-items:center;gap:14px;padding:16px;background:linear-gradient(135deg,rgba(14,14,56,.9),rgba(9,9,46,.8));border:1px solid var(--bd);border-left:3px solid '+bc+';border-radius:0 4px 4px 0;margin-bottom:8px;backdrop-filter:blur(8px)'+(isDone?';opacity:.6':'')+'">';
     h+='<div style="width:42px;height:42px;border-radius:10px;background:linear-gradient(135deg,'+c2+'22,'+c2+'08);display:flex;align-items:center;justify-content:center;font-size:20px;flex-shrink:0">'+ic+'</div>';
     h+='<div style="flex:1"><div style="display:flex;align-items:center;gap:6px"><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">'+nm+'</div>';
@@ -22741,27 +22901,27 @@ function renderClientPlanTracking(){
     // Phase D: show actual amount with status-aware styling. Full = green, partial = yellow.
     var _actualLine='';
     if(isDone){
-      var _act=d2.actual||a.amount;
-      if(_act<a.amount){
+      var _act=d2.actual||_plannedAmt;
+      if(_act<_plannedAmt){
         _actualLine=' · Actual: <strong style="color:var(--yl)">'+fmt(_act)+' (partial)</strong>';
-      } else if(_act>a.amount){
+      } else if(_act>_plannedAmt){
         _actualLine=' · Actual: <strong style="color:var(--gr)">'+fmt(_act)+' (over)</strong>';
-      } else if(d2.actual!==a.amount){
+      } else if(d2.actual!==_plannedAmt){
         _actualLine=' · Actual: <strong style="color:var(--gr)">'+fmt(_act)+'</strong>';
       }
     }
-    h+='<div style="font-size:13px;color:var(--mu)">'+fmt(a.amount)+'/mo planned'+_actualLine+'</div>';
+    h+='<div style="font-size:13px;color:var(--mu)">'+fmt(_plannedAmt)+'/mo planned'+_actualLine+'</div>';
     if(lnk)h+='<div style="font-size:11px;color:#5B9BFF">🔗 '+lnk.label+'</div>';
     if(calEntry)h+='<div style="font-size:11px;color:var(--mu)">📅 Withdraws on the '+calEntry.day+ordSuffix2(calEntry.day)+'</div>';
     if(isDone&&d2.note)h+='<div style="font-size:11px;color:var(--mu);font-style:italic">📝 '+esc(d2.note)+'</div>';
-    if(a.type==='debt'&&CPLAN.debts.length){var hd=CPLAN.debts.filter(function(x){return(parseFloat(x.rate)||0)>10;});if(hd.length&&typeof _cpDebtSimulate==='function'){var ds=typeof _cpDebtSort==='function'?_cpDebtSort(hd,CPLAN.debtStrategy||'avalanche'):hd;var dr=_cpDebtSimulate(ds,a.amount);h+='<div style="font-size:11px;color:var(--or)">→ ~'+dr.months+' months</div>';}}
-    else if(['roth','401k','invest','iul','wl','edu','ibc'].indexOf(a.type)>=0){var rt=typeof _cpGetNetRate==='function'?_cpGetNetRate(a):.065;var yr2=_cpYrsToRetFor(a);var bl=0;for(var y=1;y<=yr2;y++)bl=(bl+a.amount*12)*(1+rt);h+='<div style="font-size:11px;color:var(--gr)">→ '+fmtK(Math.round(bl))+' at retirement</div>';}
-    h+='</div><div style="text-align:right;flex-shrink:0;margin-right:8px"><div style="font-family:var(--fd);font-size:22px;color:'+c2+'">'+fmt(a.amount)+'</div><div style="font-size:10px;color:var(--mu)">/mo</div></div>';
+    if(a.type==='debt'&&CPLAN.debts.length){var hd=CPLAN.debts.filter(function(x){return(parseFloat(x.rate)||0)>10;});if(hd.length&&typeof _cpDebtSimulate==='function'){var ds=typeof _cpDebtSort==='function'?_cpDebtSort(hd,CPLAN.debtStrategy||'avalanche'):hd;var dr=_cpDebtSimulate(ds,_plannedAmt);h+='<div style="font-size:11px;color:var(--or)">→ ~'+dr.months+' months</div>';}}
+    else if(['roth','401k','invest','iul','wl','edu','ibc'].indexOf(a.type)>=0){var rt=typeof _cpGetNetRate==='function'?_cpGetNetRate(a):.065;var yr2=_cpYrsToRetFor(a);var bl=0;for(var y=1;y<=yr2;y++)bl=(bl+_plannedAmt*12)*(1+rt);h+='<div style="font-size:11px;color:var(--gr)">→ '+fmtK(Math.round(bl))+' at retirement</div>';}
+    h+='</div><div style="text-align:right;flex-shrink:0;margin-right:8px"><div style="font-family:var(--fd);font-size:22px;color:'+c2+'">'+fmt(_plannedAmt)+'</div><div style="font-size:10px;color:var(--mu)">/mo</div></div>';
     if(isDone){
       // Phase D: distinguish partial from full so the user can see what they reported
-      var _act2=d2.actual||a.amount;
-      if(_act2<a.amount && _act2>0){
-        h+='<div style="padding:8px 14px;background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);border-radius:4px;font-family:var(--fh);font-size:13px;font-weight:700;color:var(--yl);text-align:center"><div>~ Partial</div><div style="font-size:11px;font-weight:600;opacity:.85">'+fmt(_act2)+' of '+fmt(a.amount)+'</div></div>';
+      var _act2=d2.actual||_plannedAmt;
+      if(_act2<_plannedAmt && _act2>0){
+        h+='<div style="padding:8px 14px;background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);border-radius:4px;font-family:var(--fh);font-size:13px;font-weight:700;color:var(--yl);text-align:center"><div>~ Partial</div><div style="font-size:11px;font-weight:600;opacity:.85">'+fmt(_act2)+' of '+fmt(_plannedAmt)+'</div></div>';
       } else {
         h+='<div style="padding:8px 16px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:13px;font-weight:700;color:var(--gr)">✓ Done</div>';
       }
@@ -30464,11 +30624,18 @@ function _cpBuildCard(a,idx,isUnassigned){
   // adjusted max by including the same boosts we added into _sliderEffective.
   var _cascadeBoostHere=Math.max(0,_sliderEffective-(parseInt(a.amount)||0));
   var _sliderTotalMax=_slMax+_curContribSlide+_cascadeBoostHere;
-  // Slider lower bound: for cards backed by an existing account, allow the
-  // user to drag all the way down to $0 (planning a reduction). For unlinked
-  // planning cards, the floor stays at currentContrib (which is 0 for new
-  // cards anyway).
-  var _sliderTotalMin=(a._retAccountId||a._investmentId)?0:_curContribSlide;
+  // Slider lower bound: for cards backed by an existing account or policy,
+  // allow the user to drag all the way down to $0 (planning a reduction).
+  // For unlinked planning cards, the floor stays at currentContrib (which is
+  // 0 for new cards anyway).
+  var _sliderTotalMin=(a._retAccountId||a._investmentId||a._policyId)?0:_curContribSlide;
+  // Policy-linked cards (IUL/WL/IBC) have a HARD CAP at the policy's
+  // premium ceiling captured at Done time. Insurance contracts don't allow
+  // arbitrarily increasing premium post-issue — only decreasing is permitted
+  // (and you can drag back up to the original limit if you reduced earlier).
+  if(a._policyId && parseFloat(a._policyPremiumCeiling) > 0){
+    _sliderTotalMax = parseFloat(a._policyPremiumCeiling);
+  }
   // ── Joint / shared-card slider variants (Hybrid couples) ──────────────
   // Three variants based on ownership + household:
   //   • Joint card in Hybrid household → DUAL sliders (your portion + spouse portion)
@@ -31731,17 +31898,22 @@ function _cpBuildCard(a,idx,isUnassigned){
     // investments) have _retAccountId or _investmentId set. For these,
     // Done is replaced with "↗ Apply to my account" because Done's modal
     // is for NEW accounts and would create a duplicate.
-    if(a._retAccountId || a._investmentId){
-      // a.amount is the delta vs currentContrib. Apply button appears whenever
-      // the slider value differs from current — in either direction. Both the
-      // button and the Synced badge are always rendered; the live-drag handler
-      // toggles display via these ids so we don't need a full re-render to
-      // flip Apply visibility.
+    if(a._retAccountId || a._investmentId || a._policyId){
+      // a.amount is the delta vs currentContrib (or currentPremium for policy
+      // cards). Apply button appears whenever the slider value differs from
+      // current — in either direction. Both the button and the Synced badge
+      // are always rendered; the live-drag handler toggles display via these
+      // ids so we don't need a full re-render to flip Apply visibility.
       var _hasChange = Math.abs(parseFloat(a.amount) || 0) > 0.01;
       var _applyDisp = _hasChange ? '' : 'none';
       var _syncDisp  = _hasChange ? 'none' : '';
-      h+='<button id="cpApplyBtn'+idx+'" onclick="_cpApplyAccountContrib('+idx+')" title="Update your real account contribution in your financial data" style="display:'+_applyDisp+';padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.45);color:#5B9BFF;cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(91,155,255,.28)\'" onmouseout="this.style.background=\'rgba(91,155,255,.18)\'">↗ Apply to my account</button>';
-      h+='<span id="cpSyncedBadge'+idx+'" style="display:'+_syncDisp+';padding:6px 12px;font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2);border-radius:3px" title="Slider matches your current contribution — no change to apply">✓ Synced with your account</span>';
+      var _isLinkedPolicy = !!a._policyId;
+      var _applyLabel = _isLinkedPolicy ? '↗ Apply to my policy' : '↗ Apply to my account';
+      var _syncedLabel = _isLinkedPolicy ? '✓ Synced with your policy' : '✓ Synced with your account';
+      var _applyTitle = _isLinkedPolicy ? 'Update your real policy premium in your financial data' : 'Update your real account contribution in your financial data';
+      var _syncedTitle = _isLinkedPolicy ? 'Slider matches your current policy premium — no change to apply' : 'Slider matches your current contribution — no change to apply';
+      h+='<button id="cpApplyBtn'+idx+'" onclick="_cpApplyAccountContrib('+idx+')" title="'+_applyTitle+'" style="display:'+_applyDisp+';padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.45);color:#5B9BFF;cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(91,155,255,.28)\'" onmouseout="this.style.background=\'rgba(91,155,255,.18)\'">'+_applyLabel+'</button>';
+      h+='<span id="cpSyncedBadge'+idx+'" style="display:'+_syncDisp+';padding:6px 12px;font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2);border-radius:3px" title="'+_syncedTitle+'">'+_syncedLabel+'</span>';
     } else {
       var _doneTooltip=(a.amount>0||_isActionOnly)
         ?'Click after you actually open this account / start contributing'
@@ -39151,7 +39323,7 @@ function _cpRenderChart(targetId,bucket){
         if(!a)return false;
         var _aOwn=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
         if(_aOwn!==bucket)return false;
-        if(!(a._retAccountId||a._investmentId))return false;
+        if(!(a._retAccountId||a._investmentId||a._policyId))return false;
         return (parseFloat(a.amount)||0) < -0.5;
       });
       if(!_bucketHasPlannedReduction){
@@ -40373,7 +40545,7 @@ function _cpSlide(i,v){
   var _a=CPLAN.allocations[i];
   // For cards linked to an existing account, a.amount can go negative (planned
   // reduction). For unlinked planning cards, the floor stays at 0.
-  var _newAmt=(_a&&(_a._retAccountId||_a._investmentId))?(_newTotal-_curContrib):Math.max(0,_newTotal-_curContrib);
+  var _newAmt=(_a&&(_a._retAccountId||_a._investmentId||_a._policyId))?(_newTotal-_curContrib):Math.max(0,_newTotal-_curContrib);
   // P4: if this is a Done insurance allocation, cap the new amount at the current
   // amount (no increases). Decreases are allowed (user can effectively surrender).
   if(_a){
@@ -40484,9 +40656,10 @@ function _cpSlide(i,v){
   //    focus loss). Cheap enough to run every tick. Only fires for debt
   //    allocations with amount > 0.
   if(a&&a.type==='debt')_cpUpdateDebtStrategyNumbers(i);
-  // 4b. Toggle Apply button / Synced badge for linked retirement/investment
-  //     cards so the visibility flips during the drag, not after a re-render.
-  if(a&&(a._retAccountId||a._investmentId)){
+  // 4b. Toggle Apply button / Synced badge for linked retirement/investment/
+  //     policy cards so the visibility flips during the drag, not after a
+  //     re-render.
+  if(a&&(a._retAccountId||a._investmentId||a._policyId)){
     var _applyHas=Math.abs(parseFloat(a.amount)||0)>0.01;
     var _slApply=document.getElementById('cpApplyBtn'+i);
     if(_slApply)_slApply.style.display=_applyHas?'':'none';
@@ -41420,6 +41593,11 @@ function _cpSubmitCompletion(){
   var idx=_cmplPendingIdx;if(idx<0)return;
   var a=CPLAN.allocations[idx];if(!a)return;
   var linkedId=Date.now();
+  // Captured by each per-type branch below — the actual monthly amount the
+  // user just committed in the Done modal. Used by the tracking sync for
+  // transformed (Type 1b) cards where a.amount becomes a delta and no longer
+  // represents the real ongoing contribution.
+  var _committedActual = 0;
   // ── Collect data based on type ──
   if(a.type==='protection'){
     var policyType=document.getElementById('cmplPolicyType').value;
@@ -41454,6 +41632,13 @@ function _cpSubmitCompletion(){
     }
     a._carrier=gCarrier;a._deathBenefit=gDB;a._cashValue=gCV;a._ibcStructured=gIBC;a._linkedId=linkedId;
     if(gPremium>0)a.amount=gPremium;
+    _committedActual = gPremium;
+    // Lock the policy's premium ceiling at creation. The slider's max is fixed
+    // at this value forever — the user can drag down to plan a reduction, drag
+    // back up to restore, but cannot exceed the original premium. Insurance
+    // policies don't let you arbitrarily increase the premium on an existing
+    // contract; new money would require a new contract or rider.
+    a._policyPremiumCeiling = gPremium;
     // pfos-main policy-type label: WL/IUL goes to their explicit type; IBC delegates to
     // the user's underlying-product choice from the new question.
     var _pfosPolicyType=a.type==='iul'?'IUL':a.type==='wl'?'Whole Life':(gIbcUnderlying==='iul'?'IUL':'Whole Life');
@@ -41464,6 +41649,7 @@ function _cpSubmitCompletion(){
     var contrib=parseFloat(document.getElementById('cmplContribution').value)||0;
     a._provider=provider;a._balance=balance;a._contribution=contrib;a._linkedId=linkedId;
     if(contrib>0)a.amount=contrib;
+    _committedActual = contrib;
     _cpSendToPfosMain('add_retirement',{id:linkedId,type:_cmplRetTypeLabel(a.type),balance:balance,contrib:contrib,contribPct:0,provider:provider,_planLinked:true,_planAllocType:a.type,_planAllocName:a.customName||CP_NM[a.type]||''});
   } else if(a.type==='edu'){
     var eduVeh=document.getElementById('cmplEduVehicle').value;
@@ -41474,6 +41660,7 @@ function _cpSubmitCompletion(){
     var eduAge=parseInt(document.getElementById('cmplEduTargetAge').value)||18;
     a.eduVehicle=eduVeh;a._provider=eduProv;a._beneficiary=eduBen;a._balance=eduBal;a._contribution=eduCon;a._targetAge=eduAge;a._linkedId=linkedId;
     if(eduCon>0)a.amount=eduCon;
+    _committedActual = eduCon;
     // 529/Coverdell → retirement account in pfos-main; WL/IUL → policy
     if(eduVeh==='wl'||eduVeh==='iul'){
       _cpSendToPfosMain('add_policy',{id:linkedId,company:eduProv,type:eduVeh==='wl'?'Whole Life':'IUL',coverage:0,premium:eduCon,cashValue:eduBal,policyNumber:'',notes:'Education: '+eduBen,ibcFlag:'no',_planLinked:true,_planAllocType:'edu',_planAllocName:a.customName||'Education ('+eduBen+')'});
@@ -41483,17 +41670,98 @@ function _cpSubmitCompletion(){
   } else {
     a._notes=(document.getElementById('cmplNotes').value||'').trim();
   }
-  // ── Mark complete ──
-  a._completed=true;a._completedDate=new Date().toISOString();
+  // ── Transform vs Complete decision ──
+  // For Done flows that CREATE an account or cash-value policy in main, the
+  // card transforms into a live linked card (Type 1b) instead of completing.
+  // The slider stays live forever and Apply is the commit gesture for future
+  // changes — same shape as cards seeded from existing data in main.
+  //
+  // Cash-value policies (IUL/WL/IBC) follow this rule REGARDLESS of which
+  // context they came from — retirement chooser, education chooser (when the
+  // vehicle is WL or IUL), or debt strategy (IBC). The slider's max is locked
+  // at the original premium (a._policyPremiumCeiling) — the user can drag
+  // down to plan a reduction or all the way to zero (temporary stop), and
+  // back up, but never above the policy's setup-time premium. Insurance
+  // contracts don't let you arbitrarily increase the premium post-issue.
+  //
+  // Account-creating Done flows (retirement and 529/Coverdell/UTMA education)
+  // also transform — the slider can move freely subject to IRS limits and
+  // budget headroom, with no fixed ceiling.
+  //
+  // For term/disability/LTC/umbrella protection and action-only items
+  // (estate, audits, etc.), the existing _completed behavior is preserved —
+  // there's no ongoing slider to control after the policy/action is in place.
+  var _transformsToLinked = false;
+  if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'].indexOf(a.type) >= 0){
+    // Retirement account just created in main with id=linkedId via add_retirement
+    a._retAccountId = linkedId;
+    a.amount = 0;// slider now matches the new currentContrib — no delta yet
+    // _hasMatch defaults to false here; the modal doesn't capture matchPct, so
+    // dual-slider only enables once the user sets matchPct in main and the
+    // card re-renders. That keeps the single-slider flow as the default for
+    // new accounts and avoids forcing an extra modal field.
+    a._hasMatch = false;
+    a.matchAmount = 0;
+    a.extraAmount = 0;
+    _transformsToLinked = true;
+  } else if(a.type === 'edu'){
+    // Education routes to two different vehicle types in main:
+    //   - 529/Coverdell/UTMA → add_retirement → account-style linked card
+    //   - WL/IUL              → add_policy     → policy-style linked card
+    //
+    // Both transform — only the underlying-storage shape differs. The user
+    // gets the same live-slider + Apply behavior across all education paths.
+    var _eduVeh = a.eduVehicle || '';
+    if(_eduVeh === 'wl' || _eduVeh === 'iul'){
+      // WL/IUL education: same as standalone IUL/WL/IBC policy cards.
+      // Slider max locked at the setup-time premium, can drag down to plan
+      // a reduction, can drag back up to the ceiling, never above.
+      a._policyId = linkedId;
+      a._policyPremiumCeiling = _committedActual;
+      a.amount = 0;
+      _transformsToLinked = true;
+    } else {
+      // 529/Coverdell/UTMA: account-style linked card.
+      a._retAccountId = linkedId;
+      a.amount = 0;
+      a._hasMatch = false;
+      a.matchAmount = 0;
+      a.extraAmount = 0;
+      _transformsToLinked = true;
+    }
+  } else if(['iul','wl','ibc'].indexOf(a.type) >= 0){
+    // Cash-value policy just created in main via add_policy. The card becomes
+    // a linked-policy card with the slider locked at the setup premium ceiling.
+    a._policyId = linkedId;
+    a._policyPremiumCeiling = _committedActual;// hard cap, never changes
+    a.amount = 0;// slider sits at currentPremium = ceiling, no delta planned
+    _transformsToLinked = true;
+  }
+  // ── Mark complete ── (only for cards that did NOT transform to Type 1b)
+  if(!_transformsToLinked){
+    a._completed=true;a._completedDate=new Date().toISOString();
+  }
   closeModal('completionModal');
   _cpConfetti(a.customName||CP_NM[a.type]||a.type);
   var phaseItems=CPLAN.allocations.filter(function(a2){return a2.phase===a.phase&&a2.amount>0;});
   var allDone=phaseItems.every(function(a3){return a3._completed;});
   if(allDone&&phaseItems.length>0)setTimeout(function(){_cpConfetti('Phase '+a.phase+' Complete!');},1500);
   _cmplPendingIdx=-1;cplanSave();_cpRenderPlanV2();
-  // Sync tracking state
+  // Sync tracking state. For transformed cards (Type 1b after Done), a.amount
+  // is now the delta from currentContrib (zero on first link) — but the user's
+  // actual monthly contribution is what they just told the Done modal. Track
+  // that figure instead. Transformed cards are "active/ongoing" not "done" —
+  // future drag+Apply cycles continue to log actuals.
   var _tk=typeof _trackKey==='function'?_trackKey():'';
-  if(_tk&&typeof _cpTracking!=='undefined'){if(!_cpTracking[_tk])_cpTracking[_tk]={};_cpTracking[_tk][idx]={done:true,actual:a.amount||0,ts:Date.now()};if(typeof renderClientTracking==='function')try{renderClientTracking();}catch(e){}}
+  if(_tk&&typeof _cpTracking!=='undefined'){
+    if(!_cpTracking[_tk])_cpTracking[_tk]={};
+    if(_transformsToLinked){
+      _cpTracking[_tk][idx]={done:false,actual:_committedActual,ts:Date.now()};
+    } else {
+      _cpTracking[_tk][idx]={done:true,actual:a.amount||0,ts:Date.now()};
+    }
+    if(typeof renderClientTracking==='function')try{renderClientTracking();}catch(e){}
+  }
 }
 
 // ── Adjust growth items to accommodate a new protection premium ──
