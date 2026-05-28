@@ -8609,6 +8609,11 @@ function initExpData(){
 }
 function getMonthlyExp(key){
   var d=S.expData[key]; if(!d) return 0;
+  // .total overrides amount/subs when set. Written by the pfos-client portal's
+  // budget_realloc Accept handler (PFOS_WRITE_EXP_BUDGET) and the portal's
+  // own _catBudget reader. Acts as a "lump sum override" — the user accepts
+  // the recommendation's new monthly total without re-detailing subs.
+  if(d.total!=null&&!isNaN(parseFloat(d.total))) return parseFloat(d.total);
   var v=pf(d.amount); if(d.period==='annual') v=v/12;
   var subTotal=0;
   if(d.subs) Object.values(d.subs).forEach(function(s){ var sv=pf(s.amount); subTotal+=s.period==='annual'?sv/12:sv; });
@@ -14819,6 +14824,55 @@ function submitAdvisorRequestFromModal(){
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
         else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
       }catch(e){console.warn('PFOS_QUICK_ADD:',e);}
+      return;
+    }
+    // ── PFOS_WRITE_EXP_BUDGET ──
+    // Sent from pfos-client when the user accepts a budget_realloc
+    // recommendation. Writes a .total override to one or more categories in
+    // S.expData. getMonthlyExp honors .total as a top-level override over
+    // amount/subs, so calc() picks up the new monthly figure without needing
+    // the user to re-edit the sub-breakdown.
+    //
+    // msg.updates: [{category: 'food', total: 1200}, {category: 'discretionary', total: 600}]
+    if(msg.type==='PFOS_WRITE_EXP_BUDGET'){
+      try{
+        if(!Array.isArray(msg.updates))return;
+        if(!S.expData)S.expData={};
+        msg.updates.forEach(function(u){
+          if(!u||!u.category)return;
+          if(u.total==null||isNaN(parseFloat(u.total)))return;
+          if(!S.expData[u.category])S.expData[u.category]={amount:'',period:'monthly',expanded:false,subs:{},leakTagged:false,essential:true,recurring:true};
+          S.expData[u.category].total=parseFloat(u.total);
+        });
+        if(!S._touched)S._touched={};
+        S._touched.expData=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+        else if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+      }catch(e){console.warn('PFOS_WRITE_EXP_BUDGET:',e);}
+      return;
+    }
+    // ── PFOS_WRITE_RECS ──
+    // Sent from pfos-client every time S.budgetRecommendations is mutated
+    // (Create / Accept / Dismiss / Expire). The portal owns the rec lifecycle
+    // entirely; pfos-main only stores the field so its _doSync flush carries
+    // the latest array back to client_profiles with _touched.budgetRecommendations
+    // set — without this, the parent's section-level merge would treat the
+    // section as "untouched in incoming" and fall back to the DB's pre-mutation
+    // value, silently clobbering the portal's change.
+    //
+    // msg.recs: full current array of recommendation objects. Replace-in-place
+    // rather than diff-apply — simpler, and the array is small (capped at 3
+    // active + dismissed/expired history).
+    if(msg.type==='PFOS_WRITE_RECS'){
+      try{
+        if(!Array.isArray(msg.recs))return;
+        S.budgetRecommendations=msg.recs;
+        if(!S._touched)S._touched={};
+        S._touched.budgetRecommendations=true;
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+      }catch(e){console.warn('PFOS_WRITE_RECS:',e);}
       return;
     }
     // ── PFOS_DEBT_PAID_OFF ──
