@@ -3079,7 +3079,9 @@ function renderClientSavingsGoals(){
     if(!monthly&&hasBk)monthly=(g.buckets||[]).reduce(function(s,b){return s+(b.fixedMonthly||0);},0);
     var label=g.contributionMode==='fixed'?fmt(monthly)+'/mo fixed':'Variable';
     var h='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:8px">';
-    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">🎯 '+esc(g.name)+'</span><span style="font-family:var(--fd);font-size:16px;color:'+bc+'">'+pct+'%</span></div>';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><span style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">🎯 '+esc(g.name)+'</span>';
+    h+='<span style="display:flex;align-items:center;gap:8px"><span style="font-family:var(--fd);font-size:16px;color:'+bc+'">'+pct+'%</span>';
+    h+='<button onclick="_clientOpenGoalModal(\'edit\',\''+esc(g.id)+'\')" title="Edit goal" style="background:transparent;border:1px solid var(--bd);color:var(--mu);font-size:11px;padding:3px 8px;border-radius:3px;cursor:pointer;font-family:var(--fh);font-weight:700">Edit</button></span></div>';
     h+='<div style="height:4px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+pct+'%;background:'+bc+';border-radius:2px"></div></div>';
     h+='<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--mu)"><span>'+fmt(g.current||0)+' / '+fmt(g.target||0)+'</span><span>'+label+'</span></div>';
     if(hasBk){h+='<div style="margin-top:6px;padding-top:6px;border-top:1px solid var(--bd)">';g.buckets.forEach(function(b){var bp=b.target>0?Math.min(100,Math.round((b.current||0)/b.target*100)):0;h+='<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--mu);padding:2px 0"><span>'+esc(b.name)+'</span><span style="color:'+(bp>=100?'var(--gr)':'var(--wh)')+'">'+fmt(b.current||0)+' / '+fmt(b.target||0)+'</span></div>';});h+='</div>';}
@@ -22770,7 +22772,7 @@ function _clientOpenScheduling(){
 // Submit posts to pfos-main via PFOS_ADD_GOAL postMessage so pfos-main's S.goals stays
 // the canonical store. Optimistically writes to the local mirror so the portal's goal
 // summary refreshes immediately.
-function _clientOpenGoalModal(mode){
+function _clientOpenGoalModal(mode,editGoalId){
   var el=document.getElementById('clientGoalModal');
   if(!el){
     el=document.createElement('div');
@@ -22788,15 +22790,25 @@ function _clientOpenGoalModal(mode){
   // Default mode: if goals exist, open in "add" mode (allocating is the more
   // frequent action once goals are set up); otherwise force "create".
   mode=mode||(hasGoals?'add':'create');
-  if(!hasGoals)mode='create';
+  if(!hasGoals&&mode==='add')mode='create';
+  // Edit mode: load the goal being edited. If it can't be found, fall back to create.
+  var editGoal=null;
+  if(mode==='edit'){
+    editGoal=(S.goals||[]).filter(function(g){return g&&g.id===editGoalId;})[0]||null;
+    if(!editGoal)mode='create';
+  }
+  // Household context for the Ownership field
+  var _ht=S.householdType||'individual';
+  var _isJointHH=(_ht==='joint');
 
+  var titleTxt=mode==='add'?'Add to a Goal':mode==='edit'?'Edit Savings Goal':'New Savings Goal';
   var h='<div class="modal" style="max-width:480px">';
   h+='<button class="modal-close" onclick="closeModal(\'clientGoalModal\')" aria-label="Close">✕</button>';
-  h+='<div class="modal-hdr"><div class="modal-title">🎯 '+(mode==='add'?'Add to a Goal':'New Savings Goal')+'</div></div>';
+  h+='<div class="modal-hdr"><div class="modal-title">🎯 '+titleTxt+'</div></div>';
   h+='<div style="padding:0 4px 8px">';
 
-  // Mode toggle — only shown when the user has goals to add to
-  if(hasGoals){
+  // Mode toggle — only shown when the user has goals to add to, and not while editing
+  if(hasGoals&&mode!=='edit'){
     h+='<div style="display:flex;gap:6px;margin-bottom:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;padding:4px">';
     h+='<button onclick="_clientOpenGoalModal(\'add\')" style="flex:1;padding:8px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;border-radius:4px;cursor:pointer;border:none;background:'+(mode==='add'?'rgba(34,197,94,.18)':'transparent')+';color:'+(mode==='add'?'var(--gr)':'var(--mu)')+'">💰 Add to Goal</button>';
     h+='<button onclick="_clientOpenGoalModal(\'create\')" style="flex:1;padding:8px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;border-radius:4px;cursor:pointer;border:none;background:'+(mode==='create'?'rgba(91,155,255,.18)':'transparent')+';color:'+(mode==='create'?'#5B9BFF':'var(--mu)')+'">+ New Goal</button>';
@@ -22831,40 +22843,332 @@ function _clientOpenGoalModal(mode){
     return;
   }
 
-  // ── CREATE NEW GOAL (original flow) ──
-  // Default target date: 1 year from today
+  // ── CREATE / EDIT GOAL (full field parity with pfos-main's goal modal) ──
+  var g=editGoal||{};
+  // Defaults: new goals default target date 1yr out; edits use stored value.
   var defaultDate=new Date();defaultDate.setFullYear(defaultDate.getFullYear()+1);
   var defaultDateStr=defaultDate.toISOString().split('T')[0];
+  var dateVal=(mode==='edit')?(g.targetDate||''):defaultDateStr;
+  var isRecurring=!!g.recurring;
+  var recurInterval=g.recurringInterval||'yearly';
+  var contribMode=g.contributionMode||'fixed';
+  var isFixed=(contribMode!=='variable');
+  var calDay=(g.calendarDay!=null?String(g.calendarDay):'15');
+  var ownerVal=g.owner||(_isJointHH?'joint':'personal');
+  var priorityVal=String(g.priority||((S.goals||[]).length+1));
+  if(parseInt(priorityVal,10)>5)priorityVal='5';
+  // Working buckets array for this modal session. Cloned from the goal in edit
+  // mode so cancel doesn't mutate the live goal. The portal only COLLECTS these;
+  // pfos-main does all the roll-up math on save.
+  APP._cgmBuckets=(mode==='edit'&&Array.isArray(g.buckets))?JSON.parse(JSON.stringify(g.buckets)):[];
+  APP._cgmBucketEditIdx=null;
+  // Hidden id field for edit
+  h+='<input type="hidden" id="cgmEditId" value="'+(mode==='edit'?esc(g.id||''):'')+'">';
+  // ── Tab bar: Goal | Buckets ──
+  h+='<div style="display:flex;gap:6px;margin-bottom:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;padding:4px">';
+  h+='<button type="button" id="cgmTabGoal" onclick="_cgmTab(\'goal\')" style="flex:1;padding:8px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;border-radius:4px;cursor:pointer;border:none;background:rgba(91,155,255,.18);color:#5B9BFF">① Goal</button>';
+  h+='<button type="button" id="cgmTabBuckets" onclick="_cgmTab(\'buckets\')" style="flex:1;padding:8px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;border-radius:4px;cursor:pointer;border:none;background:transparent;color:var(--mu)">② Buckets <span id="cgmBucketCount" style="opacity:.7"></span></button>';
+  h+='</div>';
+  // ── GOAL PANEL ──
+  h+='<div id="cgmGoalPanel">';
   // Goal name
   h+='<div style="margin-bottom:12px"><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Goal Name</div>';
-  h+='<input type="text" id="cgmName" placeholder="e.g. Down Payment, Vacation, New Car" maxlength="80" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  h+='<input type="text" id="cgmName" placeholder="e.g. Vacation Fund, New Car, Emergency Fund" maxlength="80" value="'+esc(g.name||'')+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
   h+='</div>';
   // Target amount + date row
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Target Amount</div>';
-  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="number" step="100" min="0" id="cgmTarget" placeholder="0" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:15px;font-weight:700;border-radius:4px;box-sizing:border-box"></div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="number" step="100" min="0" id="cgmTarget" placeholder="0" value="'+(g.target||'')+'" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:15px;font-weight:700;border-radius:4px;box-sizing:border-box"></div>';
   h+='</div>';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Target Date <span style="text-transform:none;letter-spacing:0;color:var(--mu);font-weight:400">(optional)</span></div>';
-  h+='<input type="date" id="cgmDate" value="'+defaultDateStr+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  h+='<input type="date" id="cgmDate" value="'+esc(dateVal)+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
   h+='</div></div>';
-  // Current saved + Monthly contribution
+  // Recurring? + interval
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">';
-  h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Already Saved <span style="text-transform:none;letter-spacing:0;color:var(--mu);font-weight:400">(optional)</span></div>';
-  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="number" step="50" min="0" id="cgmCurrent" placeholder="0" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box"></div>';
-  h+='</div>';
-  h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Monthly Contribution <span style="text-transform:none;letter-spacing:0;color:var(--mu);font-weight:400">(optional)</span></div>';
-  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="number" step="25" min="0" id="cgmMonthly" placeholder="0" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box"></div>';
+  h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Recurring?</div>';
+  h+='<select id="cgmRecurring" onchange="_cgmToggleRecur()" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  h+='<option value="false"'+(!isRecurring?' selected':'')+'>One-time</option>';
+  h+='<option value="true"'+(isRecurring?' selected':'')+'>Recurring</option>';
+  h+='</select></div>';
+  h+='<div id="cgmRecurIntervalWrap" style="display:'+(isRecurring?'block':'none')+'"><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Repeat Every</div>';
+  h+='<select id="cgmRecurInterval" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  h+='<option value="yearly"'+(recurInterval==='yearly'?' selected':'')+'>Year</option>';
+  h+='<option value="quarterly"'+(recurInterval==='quarterly'?' selected':'')+'>Quarter</option>';
+  h+='</select></div></div>';
+  // Monthly contribution mode toggle (Fixed / Variable)
+  h+='<div style="margin-bottom:10px"><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Monthly Contribution</div>';
+  h+='<div style="display:flex;border:1px solid var(--bd);border-radius:4px;overflow:hidden">';
+  h+='<button type="button" id="cgmModeFixed" onclick="_cgmSetMode(\'fixed\')" style="flex:1;padding:9px;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:none;cursor:pointer;background:'+(isFixed?'rgba(0,68,191,.22)':'transparent')+';color:'+(isFixed?'#fff':'rgba(226,232,240,.4)')+'">Fixed</button>';
+  h+='<button type="button" id="cgmModeVar" onclick="_cgmSetMode(\'variable\')" style="flex:1;padding:9px;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:none;cursor:pointer;background:'+(!isFixed?'rgba(0,68,191,.22)':'transparent')+';color:'+(!isFixed?'#fff':'rgba(226,232,240,.4)')+'">Variable</button>';
   h+='</div></div>';
-  h+='<div style="font-size:13px;color:var(--mu);line-height:1.6;padding:8px 10px;background:rgba(91,155,255,.04);border-left:2px solid rgba(91,155,255,.3);border-radius:0 3px 3px 0;margin-bottom:14px">For more advanced options like recurring goals or shared/joint goals, edit the goal in <strong style="color:#5B9BFF">My Financial Data</strong> after you create it.</div>';
-  // Footer
+  // Fixed-mode fields: Amount/Month + Calendar Day
+  h+='<div id="cgmFixedWrap" style="display:'+(isFixed?'block':'none')+'"><div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">';
+  h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Amount / Month</div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="number" step="25" min="0" id="cgmMonthly" placeholder="0" value="'+(g.fixedMonthly||'')+'" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box"></div>';
+  h+='</div>';
+  h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Calendar Day</div>';
+  h+='<select id="cgmCalDay" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  [['1','1st'],['5','5th'],['10','10th'],['15','15th'],['20','20th'],['25','25th'],['last','Last day']].forEach(function(o){
+    h+='<option value="'+o[0]+'"'+(calDay===o[0]?' selected':'')+'>'+o[1]+'</option>';
+  });
+  h+='</select></div></div></div>';
+  // Variable-mode hint
+  h+='<div id="cgmVarWrap" style="display:'+(!isFixed?'block':'none')+';margin-bottom:12px"><div style="font-size:12px;color:var(--mu);line-height:1.5;padding:8px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:4px">You\'ll be prompted each month on your dashboard to enter how much you saved.</div></div>';
+  // Ownership + Current balance
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px">';
+  // Ownership hidden for joint households (always joint, one shared profile)
+  h+='<div'+(_isJointHH?' style="display:none"':'')+'><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Ownership</div>';
+  h+='<select id="cgmOwner" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  h+='<option value="personal"'+(ownerVal==='personal'?' selected':'')+'>Personal</option>';
+  h+='<option value="joint"'+(ownerVal==='joint'?' selected':'')+'>Joint</option>';
+  h+='</select></div>';
+  h+='<div'+(_isJointHH?' style="grid-column:1/-1"':'')+'><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Current Balance</div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="number" step="50" min="0" id="cgmCurrent" placeholder="0" value="'+(g.current||'')+'" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box"></div>';
+  h+='</div></div>';
+  // Priority
+  h+='<div style="margin-bottom:14px"><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Priority</div>';
+  h+='<select id="cgmPriority" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  [['1','1 — Highest'],['2','2'],['3','3'],['4','4'],['5','5 — Lowest']].forEach(function(o){
+    h+='<option value="'+o[0]+'"'+(priorityVal===o[0]?' selected':'')+'>'+o[1]+'</option>';
+  });
+  h+='</select></div>';
+  // Note: when buckets exist, Current Balance + Amount/Month are managed by the
+  // buckets (main rolls them up). _cgmRenderBuckets() disables those inputs.
+  h+='<div id="cgmRollupNote" style="display:none;font-size:12px;color:var(--mu);line-height:1.5;padding:8px 10px;background:rgba(91,155,255,.04);border-left:2px solid rgba(91,155,255,.3);border-radius:0 3px 3px 0;margin-bottom:6px">Current balance and monthly amount are totaled from your buckets — edit them on the <strong style="color:#5B9BFF">Buckets</strong> tab.</div>';
+  h+='</div>';// ← close cgmGoalPanel
+
+  // ── BUCKETS PANEL (hidden until the Buckets tab is selected) ──
+  h+='<div id="cgmBucketsPanel" style="display:none">';
+  h+='<div style="font-size:13px;color:var(--mu);line-height:1.6;margin-bottom:12px">Break this goal into buckets — sub-targets like "Flights", "Hotel", or "Phase 1". Each bucket\'s balance and monthly amount roll up into the goal total automatically.</div>';
+  h+='<div id="cgmBucketList"></div>';
+  h+='<button type="button" onclick="_cgmShowBucketForm(-1)" id="cgmAddBucketBtn" style="width:100%;padding:11px;margin-top:6px;background:rgba(91,155,255,.08);border:1px dashed rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer">+ Add Bucket</button>';
+  // Inline bucket form (hidden until Add/Edit)
+  h+='<div id="cgmBucketForm" style="display:none;margin-top:10px;padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px">';
+  h+='<input type="hidden" id="cgmBkEditIdx" value="">';
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--wh);margin-bottom:10px" id="cgmBkFormTitle">Add Bucket</div>';
+  // Bucket name
+  h+='<div style="margin-bottom:10px"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Bucket Name</div>';
+  h+='<input type="text" id="cgmBkName" placeholder="e.g. Flights, Phase 1, Down Payment" maxlength="80" style="width:100%;padding:9px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box"></div>';
+  // Target + need-by date
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">';
+  h+='<div><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Target Amount</div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:13px">$</span><input type="number" step="100" min="0" id="cgmBkTarget" placeholder="0" style="width:100%;padding:9px 9px 9px 20px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;box-sizing:border-box"></div></div>';
+  h+='<div><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Need By <span style="text-transform:none;letter-spacing:0;font-weight:400">(opt)</span></div>';
+  h+='<input type="date" id="cgmBkDate" style="width:100%;padding:9px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box"></div></div>';
+  // Recurring
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">';
+  h+='<div><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Recurring?</div>';
+  h+='<select id="cgmBkRecurring" onchange="_cgmBucketToggleRecur()" style="width:100%;padding:9px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box"><option value="false">One-time</option><option value="true">Recurring</option></select></div>';
+  h+='<div id="cgmBkRecurIntervalWrap" style="display:none"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Repeat Every</div>';
+  h+='<select id="cgmBkRecurInterval" style="width:100%;padding:9px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box"><option value="yearly">Year</option><option value="quarterly">Quarter</option></select></div></div>';
+  // Contribution mode toggle
+  h+='<div style="margin-bottom:8px"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Contribution</div>';
+  h+='<div style="display:flex;border:1px solid var(--bd);border-radius:4px;overflow:hidden">';
+  h+='<button type="button" id="cgmBkModeFixed" onclick="_cgmBucketSetMode(\'fixed\')" style="flex:1;padding:8px;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:none;cursor:pointer;background:rgba(0,68,191,.22);color:#fff">Fixed</button>';
+  h+='<button type="button" id="cgmBkModeVar" onclick="_cgmBucketSetMode(\'variable\')" style="flex:1;padding:8px;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;border:none;cursor:pointer;background:transparent;color:rgba(226,232,240,.4)">Variable</button>';
+  h+='</div></div>';
+  // Fixed wrap: amount + cal day
+  h+='<div id="cgmBkFixedWrap"><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">';
+  h+='<div><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Amount / Month</div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:13px">$</span><input type="number" step="25" min="0" id="cgmBkMonthly" placeholder="0" style="width:100%;padding:9px 9px 9px 20px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box"></div></div>';
+  h+='<div><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Calendar Day</div>';
+  h+='<select id="cgmBkCalDay" style="width:100%;padding:9px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box">';
+  [['1','1st'],['5','5th'],['10','10th'],['15','15th'],['20','20th'],['25','25th'],['last','Last day']].forEach(function(o){h+='<option value="'+o[0]+'"'+(o[0]==='15'?' selected':'')+'>'+o[1]+'</option>';});
+  h+='</select></div></div></div>';
+  // Var wrap hint
+  h+='<div id="cgmBkVarWrap" style="display:none;margin-bottom:10px"><div style="font-size:11px;color:var(--mu);line-height:1.5;padding:7px 10px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:4px">You\'ll be prompted each month to enter how much you saved toward this bucket.</div></div>';
+  // Starting balance
+  h+='<div style="margin-bottom:10px"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Starting Balance</div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:9px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:13px">$</span><input type="number" step="50" min="0" id="cgmBkBalance" placeholder="0" style="width:100%;padding:9px 9px 9px 20px;background:var(--bg-in,var(--bg-card));border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box"></div></div>';
+  // Bucket form footer
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end">';
+  h+='<button type="button" onclick="_cgmCancelBucketForm()" style="padding:8px 14px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Cancel</button>';
+  h+='<button type="button" onclick="_cgmSaveBucket()" style="padding:8px 16px;background:rgba(91,155,255,.15);border:1px solid rgba(91,155,255,.4);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer">Save Bucket</button>';
+  h+='</div>';
+  h+='</div>';// ← close cgmBucketForm
+  h+='</div>';// ← close cgmBucketsPanel
+
+  // Footer (shared — Save Goal commits goal + all buckets atomically)
+  var saveLabel=(mode==='edit')?'Save Changes':'Create Goal';
   h+='<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--bd)">';
   h+='<button onclick="closeModal(\'clientGoalModal\')" style="padding:10px 18px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Cancel</button>';
-  h+='<button onclick="_clientSubmitGoal()" id="cgmSaveBtn" style="padding:10px 22px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:var(--gr);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Create Goal</button>';
+  h+='<button onclick="_clientSubmitGoal()" id="cgmSaveBtn" style="padding:10px 22px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:var(--gr);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">'+saveLabel+'</button>';
   h+='</div>';
   h+='</div></div>';
   el.innerHTML=h;
   openModal('clientGoalModal');
+  _cgmRenderBuckets();
   setTimeout(function(){var nm=document.getElementById('cgmName');if(nm)nm.focus();},120);
+}
+
+// ── Tab switch (pure show/hide — goal field values persist, no re-render) ──
+function _cgmTab(which){
+  var gp=document.getElementById('cgmGoalPanel'),bp=document.getElementById('cgmBucketsPanel');
+  var gt=document.getElementById('cgmTabGoal'),bt=document.getElementById('cgmTabBuckets');
+  var on='rgba(91,155,255,.18)',onC='#5B9BFF',off='transparent',offC='var(--mu)';
+  if(which==='buckets'){
+    if(gp)gp.style.display='none';if(bp)bp.style.display='block';
+    if(bt){bt.style.background=on;bt.style.color=onC;}
+    if(gt){gt.style.background=off;gt.style.color=offC;}
+  } else {
+    if(bp)bp.style.display='none';if(gp)gp.style.display='block';
+    if(gt){gt.style.background=on;gt.style.color=onC;}
+    if(bt){bt.style.background=off;bt.style.color=offC;}
+  }
+}
+
+// ── Render the bucket list + update count badge + disable goal current/monthly
+// when buckets exist (those values are then totaled from buckets by main). ──
+function _cgmRenderBuckets(){
+  var list=document.getElementById('cgmBucketList');
+  var countEl=document.getElementById('cgmBucketCount');
+  var note=document.getElementById('cgmRollupNote');
+  var curEl=document.getElementById('cgmCurrent'),monEl=document.getElementById('cgmMonthly');
+  var bks=APP._cgmBuckets||[];
+  if(countEl)countEl.textContent=bks.length?'('+bks.length+')':'';
+  // Roll-up preview (display only — main is authoritative on save)
+  var sumCur=bks.reduce(function(s,b){return s+(parseFloat(b.current)||0);},0);
+  var sumMon=bks.reduce(function(s,b){return s+(parseFloat(b.fixedMonthly)||0);},0);
+  var hasBk=bks.length>0;
+  if(note)note.style.display=hasBk?'block':'none';
+  if(curEl){curEl.disabled=hasBk;curEl.style.opacity=hasBk?'.5':'1';if(hasBk)curEl.value=Math.round(sumCur);}
+  if(monEl){monEl.disabled=hasBk;monEl.style.opacity=hasBk?'.5':'1';if(hasBk)monEl.value=Math.round(sumMon);}
+  if(!list)return;
+  if(!bks.length){
+    list.innerHTML='<div style="font-size:12px;color:var(--mu);padding:14px;text-align:center;background:var(--bg-card);border:1px dashed var(--bd);border-radius:4px">No buckets yet. Add one to break this goal into sub-targets.</div>';
+    return;
+  }
+  var html='';
+  bks.forEach(function(b,i){
+    var pct=(b.target>0)?Math.min(100,Math.round((b.current||0)/b.target*100)):0;
+    var modeLabel=(b.contributionMode==='fixed')?(fmt(b.fixedMonthly||0)+'/mo'):'Variable';
+    html+='<div style="padding:10px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin-bottom:6px">';
+    html+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px"><span style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh)">'+esc(b.name||'Bucket')+'</span>';
+    html+='<span style="display:flex;gap:6px"><button type="button" onclick="_cgmShowBucketForm('+i+')" title="Edit" style="background:transparent;border:1px solid var(--bd);color:var(--mu);font-size:10px;padding:2px 7px;border-radius:3px;cursor:pointer;font-family:var(--fh);font-weight:700">Edit</button>';
+    html+='<button type="button" onclick="_cgmDeleteBucket('+i+')" title="Delete" style="background:transparent;border:1px solid rgba(239,68,68,.3);color:var(--rd);font-size:10px;padding:2px 7px;border-radius:3px;cursor:pointer;font-family:var(--fh);font-weight:700">✕</button></span></div>';
+    html+='<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--mu)"><span>'+fmt(b.current||0)+' / '+fmt(b.target||0)+(b.target>0?' ('+pct+'%)':'')+'</span><span>'+modeLabel+'</span></div>';
+    html+='</div>';
+  });
+  list.innerHTML=html;
+}
+
+// ── Show the inline bucket form (idx=-1 add, >=0 edit) ──
+function _cgmShowBucketForm(idx){
+  APP._cgmBucketEditIdx=idx;
+  var form=document.getElementById('cgmBucketForm');
+  var addBtn=document.getElementById('cgmAddBucketBtn');
+  var title=document.getElementById('cgmBkFormTitle');
+  var b=(idx>=0&&APP._cgmBuckets&&APP._cgmBuckets[idx])?APP._cgmBuckets[idx]:null;
+  // Populate
+  var set=function(id,v){var e=document.getElementById(id);if(e)e.value=(v==null?'':v);};
+  set('cgmBkEditIdx',idx);
+  set('cgmBkName',b?b.name:'');
+  set('cgmBkTarget',b?b.target:'');
+  set('cgmBkDate',b?(b.targetDate||''):'');
+  set('cgmBkRecurring',b&&b.recurring?'true':'false');
+  set('cgmBkRecurInterval',b?(b.recurringInterval||'yearly'):'yearly');
+  set('cgmBkMonthly',b?b.fixedMonthly:'');
+  set('cgmBkCalDay',b?(b.calendarDay!=null?String(b.calendarDay):'15'):'15');
+  set('cgmBkBalance',b?b.current:'');
+  if(title)title.textContent=(idx>=0)?'Edit Bucket':'Add Bucket';
+  _cgmBucketToggleRecur();
+  _cgmBucketSetMode((b&&b.contributionMode==='variable')?'variable':'fixed');
+  if(form)form.style.display='block';
+  if(addBtn)addBtn.style.display='none';
+  var nm=document.getElementById('cgmBkName');if(nm)setTimeout(function(){nm.focus();},60);
+}
+
+function _cgmCancelBucketForm(){
+  var form=document.getElementById('cgmBucketForm');
+  var addBtn=document.getElementById('cgmAddBucketBtn');
+  if(form)form.style.display='none';
+  if(addBtn)addBtn.style.display='block';
+  APP._cgmBucketEditIdx=null;
+}
+
+function _cgmBucketToggleRecur(){
+  var sel=document.getElementById('cgmBkRecurring');
+  var wrap=document.getElementById('cgmBkRecurIntervalWrap');
+  if(sel&&wrap)wrap.style.display=(sel.value==='true')?'block':'none';
+}
+
+function _cgmBucketSetMode(mode){
+  var fb=document.getElementById('cgmBkModeFixed'),vb=document.getElementById('cgmBkModeVar');
+  var fw=document.getElementById('cgmBkFixedWrap'),vw=document.getElementById('cgmBkVarWrap');
+  var on='rgba(0,68,191,.22)',onC='#fff',off='transparent',offC='rgba(226,232,240,.4)';
+  if(mode==='fixed'){
+    if(fb){fb.style.background=on;fb.style.color=onC;}
+    if(vb){vb.style.background=off;vb.style.color=offC;}
+    if(fw)fw.style.display='block';if(vw)vw.style.display='none';
+  } else {
+    if(vb){vb.style.background=on;vb.style.color=onC;}
+    if(fb){fb.style.background=off;fb.style.color=offC;}
+    if(fw)fw.style.display='none';if(vw)vw.style.display='block';
+  }
+}
+
+// ── Save the bucket form into the working array (no math — just collect) ──
+function _cgmSaveBucket(){
+  var nameEl=document.getElementById('cgmBkName');
+  var name=(nameEl&&nameEl.value||'').trim();
+  if(!name){if(nameEl){nameEl.style.borderColor='var(--rd)';nameEl.focus();}return;}
+  var fixedWrap=document.getElementById('cgmBkFixedWrap');
+  var isFixed=fixedWrap?fixedWrap.style.display!=='none':true;
+  var calRaw=(document.getElementById('cgmBkCalDay')||{}).value||'15';
+  var recurring=((document.getElementById('cgmBkRecurring')||{}).value==='true');
+  // Canonical bucket shape (matches pfos-main's saveSavingsBucket)
+  var bucket={
+    id:(APP._cgmBucketEditIdx>=0&&APP._cgmBuckets[APP._cgmBucketEditIdx])?APP._cgmBuckets[APP._cgmBucketEditIdx].id:('bk_portal_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,5)),
+    name:name,
+    target:parseFloat((document.getElementById('cgmBkTarget')||{}).value)||0,
+    targetDate:(document.getElementById('cgmBkDate')||{}).value||null,
+    recurring:recurring,
+    recurringInterval:recurring?((document.getElementById('cgmBkRecurInterval')||{}).value||'yearly'):null,
+    contributionMode:isFixed?'fixed':'variable',
+    fixedMonthly:isFixed?(parseFloat((document.getElementById('cgmBkMonthly')||{}).value)||0):0,
+    calendarDay:isFixed?(calRaw==='last'?'last':(parseInt(calRaw,10)||15)):15,
+    current:parseFloat((document.getElementById('cgmBkBalance')||{}).value)||0,
+    percentage:0,transactions:[],status:'active'
+  };
+  if(!APP._cgmBuckets)APP._cgmBuckets=[];
+  if(APP._cgmBucketEditIdx>=0&&APP._cgmBuckets[APP._cgmBucketEditIdx]){
+    // Preserve existing transactions on edit
+    bucket.transactions=APP._cgmBuckets[APP._cgmBucketEditIdx].transactions||[];
+    APP._cgmBuckets[APP._cgmBucketEditIdx]=bucket;
+  } else {
+    APP._cgmBuckets.push(bucket);
+  }
+  _cgmCancelBucketForm();
+  _cgmRenderBuckets();
+}
+
+function _cgmDeleteBucket(idx){
+  if(!APP._cgmBuckets||idx<0||idx>=APP._cgmBuckets.length)return;
+  APP._cgmBuckets.splice(idx,1);
+  _cgmRenderBuckets();
+}
+
+// Toggle recurring-interval visibility
+function _cgmToggleRecur(){
+  var sel=document.getElementById('cgmRecurring');
+  var wrap=document.getElementById('cgmRecurIntervalWrap');
+  if(sel&&wrap)wrap.style.display=(sel.value==='true')?'block':'none';
+}
+
+// Toggle Fixed/Variable contribution mode in the goal modal
+function _cgmSetMode(mode){
+  var fb=document.getElementById('cgmModeFixed'),vb=document.getElementById('cgmModeVar');
+  var fw=document.getElementById('cgmFixedWrap'),vw=document.getElementById('cgmVarWrap');
+  var on='rgba(0,68,191,.22)',onC='#fff',off='transparent',offC='rgba(226,232,240,.4)';
+  if(mode==='fixed'){
+    if(fb){fb.style.background=on;fb.style.color=onC;}
+    if(vb){vb.style.background=off;vb.style.color=offC;}
+    if(fw)fw.style.display='block';if(vw)vw.style.display='none';
+  } else {
+    if(vb){vb.style.background=on;vb.style.color=onC;}
+    if(fb){fb.style.background=off;fb.style.color=offC;}
+    if(fw)fw.style.display='none';if(vw)vw.style.display='block';
+  }
 }
 
 // Live preview of resulting balance when allocating to an existing goal
@@ -22939,11 +23243,12 @@ function _clientSubmitGoalContribution(){
   try{if(typeof renderClientTracking==='function')renderClientTracking();}catch(e){}
 }
 
-// ── Submit the new goal ──
-//   1. Validate + build the goal object
-//   2. Optimistically write to the local mirror (S.goals) so the portal updates instantly
-//   3. Post PFOS_ADD_GOAL to pfos-main for canonical save
-//   4. Refresh portal goal displays
+// ── Submit the goal (create or edit) ──
+//   1. Validate + read the full field set (matches pfos-main's saveSavingsGoal)
+//   2. CREATE: build canonical goal, push to local mirrors, post PFOS_ADD_GOAL
+//      EDIT: replace goal in-place (preserving buckets/transactions/allocationMode),
+//            post PFOS_EDIT_GOAL
+//   3. Refresh portal goal displays
 function _clientSubmitGoal(){
   var nameEl=document.getElementById('cgmName');
   var name=(nameEl&&nameEl.value||'').trim();
@@ -22957,30 +23262,119 @@ function _clientSubmitGoal(){
     if(tEl){tEl.style.borderColor='var(--rd)';tEl.focus();}
     return;
   }
+  var editId=(document.getElementById('cgmEditId')||{}).value||'';
+  var isEdit=!!editId;
   var targetDate=(document.getElementById('cgmDate')||{}).value||null;
   var current=parseFloat((document.getElementById('cgmCurrent')||{}).value)||0;
-  var monthly=parseFloat((document.getElementById('cgmMonthly')||{}).value)||0;
-  // Build the goal in the canonical shape pfos-main expects
+  // Contribution mode comes from the Fixed/Variable toggle state, mirroring
+  // pfos-main's `isFixed = gm-fixedWrap.style.display !== 'none'`.
+  var fixedWrap=document.getElementById('cgmFixedWrap');
+  var isFixed=fixedWrap?fixedWrap.style.display!=='none':true;
+  var monthly=isFixed?(parseFloat((document.getElementById('cgmMonthly')||{}).value)||0):0;
+  var calDayRaw=(document.getElementById('cgmCalDay')||{}).value||'15';
+  var calendarDay=isFixed?(calDayRaw==='last'?'last':(parseInt(calDayRaw,10)||15)):15;
+  var recurring=((document.getElementById('cgmRecurring')||{}).value==='true');
+  var recurringInterval=recurring?((document.getElementById('cgmRecurInterval')||{}).value||'yearly'):null;
+  var priority=parseInt((document.getElementById('cgmPriority')||{}).value,10)||1;
+  // Household-aware owner: joint households always 'joint' (one shared profile);
+  // otherwise use the Ownership dropdown (default 'personal').
+  var _gS=(_lastPfosState&&_lastPfosState.state)||(APP._portalFd&&APP._portalFd.S)||{};
+  var _ht=_gS.householdType||'individual';
+  var owner=(_ht==='joint')?'joint':((document.getElementById('cgmOwner')||{}).value||'personal');
+  // Buckets collected in this modal session. The portal does NO roll-up math —
+  // it just ships these to pfos-main, which totals parent current/fixedMonthly
+  // from them (its saveSavingsBucket roll-up logic, applied on receipt).
+  var buckets=Array.isArray(APP._cgmBuckets)?APP._cgmBuckets:[];
+
+  if(isEdit){
+    // ── EDIT: replace fields in-place on both mirrors, preserve nested data ──
+    var didEdit=false;
+    function _applyEdit(St){
+      if(!St||!St.goals)return;
+      for(var i=0;i<St.goals.length;i++){
+        var ex=St.goals[i];
+        if(!ex||ex.id!==editId)continue;
+        ex.name=name;
+        ex.target=target;
+        ex.targetDate=targetDate||null;
+        ex.recurring=recurring;
+        ex.recurringInterval=recurringInterval;
+        ex.contributionMode=isFixed?'fixed':'variable';
+        ex.fixedMonthly=monthly;
+        ex.calendarDay=calendarDay;
+        ex.current=current;
+        ex.owner=owner;
+        ex.priority=priority;
+        // Apply the collected buckets. Display roll-up only (main is the
+        // authoritative source — it recomputes the same way on receipt).
+        ex.buckets=JSON.parse(JSON.stringify(buckets));
+        if(ex.buckets.length){
+          ex.current=ex.buckets.reduce(function(s,b){return s+(parseFloat(b.current)||0);},0);
+          if((ex.allocationMode||'bottom_up')==='bottom_up')ex.fixedMonthly=ex.buckets.reduce(function(s,b){return s+(parseFloat(b.fixedMonthly)||0);},0);
+        }
+        if(!ex.allocationMode)ex.allocationMode='bottom_up';
+        if(!ex.transactions)ex.transactions=[];
+        ex.status=ex.status||'active';
+        ex._migrated=true;
+        if(!St._touched)St._touched={};
+        St._touched.goals=true;
+        didEdit=true;
+        break;
+      }
+    }
+    if(_lastPfosState&&_lastPfosState.state)_applyEdit(_lastPfosState.state);
+    if(APP._portalFd&&APP._portalFd.S)_applyEdit(APP._portalFd.S);
+    // Post the edit to pfos-main for canonical save (buckets included — main rolls up)
+    try{
+      var frameE=getPFOSFrame();
+      if(frameE&&frameE.contentWindow){
+        frameE.contentWindow.postMessage({type:'PFOS_EDIT_GOAL',goalId:editId,fields:{
+          name:name,target:target,targetDate:targetDate||null,recurring:recurring,
+          recurringInterval:recurringInterval,contributionMode:isFixed?'fixed':'variable',
+          fixedMonthly:monthly,calendarDay:calendarDay,current:current,owner:owner,priority:priority
+        },buckets:buckets},'https://pfos.esjfinancial.com');
+      }
+    }catch(e){console.warn('Portal edit-goal postMessage:',e);}
+    closeModal('clientGoalModal');
+    var toastE=document.createElement('div');
+    toastE.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:rgba(34,197,94,.95);color:#fff;padding:10px 18px;border-radius:6px;font-family:var(--fh);font-size:13px;font-weight:700;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.3);transition:opacity .3s';
+    toastE.textContent='✓ "'+name+'" updated';
+    document.body.appendChild(toastE);
+    setTimeout(function(){toastE.style.opacity='0';setTimeout(function(){toastE.remove();},300);},2400);
+    try{if(typeof renderClientSavingsGoals==='function')renderClientSavingsGoals();}catch(e){}
+    return;
+  }
+
+  // ── CREATE: build the goal in the canonical shape pfos-main expects ──
+  // Buckets are attached; main rolls parent current/fixedMonthly up from them.
+  var _bk=JSON.parse(JSON.stringify(buckets));
+  var _createCurrent=current,_createMonthly=monthly;
+  if(_bk.length){
+    _createCurrent=_bk.reduce(function(s,b){return s+(parseFloat(b.current)||0);},0);
+    _createMonthly=_bk.reduce(function(s,b){return s+(parseFloat(b.fixedMonthly)||0);},0);
+  }
   var goal={
-    id:'sg_portal_'+Date.now().toString(36),// portal-prefixed; pfos-main will keep this id
+    id:'sg_portal_'+Date.now().toString(36),// portal-prefixed; pfos-main keeps this id
     name:name,
     target:target,
     targetDate:targetDate||null,
-    recurring:false,
-    recurringInterval:null,
-    contributionMode:monthly>0?'fixed':'variable',
-    fixedMonthly:monthly,
-    calendarDay:15,
-    current:current,
-    owner:'personal',
-    priority:1,
+    recurring:recurring,
+    recurringInterval:recurringInterval,
+    contributionMode:isFixed?'fixed':'variable',
+    fixedMonthly:_createMonthly,
+    calendarDay:calendarDay,
+    current:_createCurrent,
+    owner:owner,
+    priority:priority,
     allocationMode:'bottom_up',
-    buckets:[],transactions:[],status:'active',_migrated:true,_source:'portal'
+    buckets:_bk,transactions:[],status:'active',_migrated:true,_source:'portal'
   };
   // Optimistic local write so the portal's goal display refreshes instantly
   if(_lastPfosState&&_lastPfosState.state){
     if(!_lastPfosState.state.goals)_lastPfosState.state.goals=[];
     _lastPfosState.state.goals.push(goal);
+    if(!_lastPfosState.state._touched)_lastPfosState.state._touched={};
+    _lastPfosState.state._touched.goals=true;
   }
   if(APP._portalFd&&APP._portalFd.S){
     if(!APP._portalFd.S.goals)APP._portalFd.S.goals=[];
