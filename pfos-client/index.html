@@ -1290,7 +1290,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="sb-item active" id="cnav-overview" onclick="showClientPage('overview')"><span class="icon">📊</span> Dashboard</div>
       <div class="sb-item" id="cnav-pfos" onclick="showClientPage('pfos')"><span class="icon">⚡</span> My Financial Data</div>
       <div class="sb-item" id="cnav-plan" onclick="showClientPage('plan');initClientPlan()"><span class="icon">🗺️</span> My Financial Plan</div>
-      <div class="sb-item" id="cnav-spending" onclick="showClientPage('spending');renderSpendingAnalysis()"><span class="icon">💰</span> My Spending</div>
+      <div class="sb-item" id="cnav-spending" onclick="showClientPage('spending');renderSpendingAnalysis()"><span class="icon">💰</span> My Spending <span id="cnavSpendBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:11px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
       <div class="sb-item" id="cnav-tracking" onclick="showClientPage('tracking');renderClientTracking()"><span class="icon">✅</span> Financial Plan Tracking</div>
       <div class="sb-item" id="cnav-projections" onclick="showClientPage('projections');renderClientProjections()"><span class="icon">📈</span> Financial Projections</div>
       <div class="sb-item" id="cnav-analysis" onclick="showClientPage('analysis');renderClientAnalysis()"><span class="icon">🔍</span> Financial Analysis</div>
@@ -2467,6 +2467,7 @@ async function initAuth(){
       APP.user = null; APP.role = 'agent';
       // Phase 5 — drop the joint-financials realtime subscription on logout.
       try{ if(typeof _cpUnsubscribeFromJointFinancials === 'function') _cpUnsubscribeFromJointFinancials(); }catch(e){}
+      try{ if(typeof _cpUnsubscribeFromJointProfile === 'function') _cpUnsubscribeFromJointProfile(); }catch(e){}
       // Clear ALL cached financial data so a different user doesn't see previous user's data
       try{
         ['pfos_profile_client_id','pfos_pending_user','pfos_client_tags_v1',
@@ -2690,6 +2691,10 @@ function updateMobileTools(){
   renderBillCalendar();
   // Phase G: render the spending pulse card on the dashboard
   try{if(typeof _clientRenderSpendPulse==='function')_clientRenderSpendPulse();}catch(e){}
+  // Item 4.9: refresh recommendations nav badge on initial portal render so
+  // the count shows up before the user navigates to My Spending. Subsequent
+  // updates flow through _portalRecsWrite.
+  try{if(typeof _portalRecsUpdateBadge==='function')_portalRecsUpdateBadge();}catch(e){}
 }
 
 // ── CLIENT TRACKING CHARTS ──
@@ -4503,6 +4508,7 @@ async function loadClientDataIntoPFOS(clientId){
   // (and toasts) for the previous client because RLS allows advisors to read
   // both their clients' couple_links rows.
   try{ if(typeof _cpUnsubscribeFromJointFinancials === 'function') _cpUnsubscribeFromJointFinancials(); }catch(e){}
+  try{ if(typeof _cpUnsubscribeFromJointProfile === 'function') _cpUnsubscribeFromJointProfile(); }catch(e){}
   // Detect couple link for this client. The in-memory APP_COUPLES list is only
   // populated for advisors via loadCouples() (which uses APP.myClients — empty
   // for logged-in clients). For client mode, do a direct DB lookup so the
@@ -4671,6 +4677,9 @@ async function loadClientDataIntoPFOS(clientId){
   // for Hybrid households. Helper no-ops for non-Hybrid. Wrapped in try/catch
   // so a subscription failure doesn't block the load.
   try{ if(typeof _cpSubscribeToJointFinancials === 'function') _cpSubscribeToJointFinancials(); }catch(e){ console.warn('[joint-rt] subscribe at load failed:', e); }
+  // Joint households share a single client_profiles row — subscribe so a
+  // partner save surfaces a refresh banner here. No-ops for Hybrid/Separate.
+  try{ if(typeof _cpSubscribeToJointProfile === 'function') _cpSubscribeToJointProfile(); }catch(e){ console.warn('[joint-profile-rt] subscribe at load failed:', e); }
   // Allow saves now that real data has been sent to iframe
   _pfosDataLoaded=true;
   // Sync plan data to pfos-main iframe after plan initializes
@@ -5450,23 +5459,36 @@ async function renderJourneyTimeline(){/* removed — journey tab deprecated */}
 
 // ── Compute current spending status (portal version of _acctSpendStatus) ──
 // Mirrors the pfos-main implementation but reads portal-side state.
-function _portalSpendStatus(){
+function _portalSpendStatus(viewCtx){
   var fd=APP._portalFd||{};
   var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
   var calcs=APP._portalCalcs||(fd.calcs)||(_lastPfosState&&_lastPfosState.calcs)||{};
   var entries=S.spendingEntries||[];
-  var now=new Date();var curMonth=now.getMonth(),curYear=now.getFullYear();
+  var now=new Date();
+  // viewCtx lets the spending dashboard be pointed at a past month. Defaults
+  // to the current month when not provided (preserves existing behavior for
+  // banner/popup/pulse-card callers that always want live status).
+  // For past months, day-of-month is treated as the full month — every day is
+  // elapsed — so pace-based heuristics compute against the final monthly
+  // total rather than a partial-month projection. paceRatio comes out ~1.0
+  // (or higher if over budget); projected equals actual spend. severity then
+  // reflects how the finished month turned out.
+  var curMonth=(viewCtx&&viewCtx.month!=null)?viewCtx.month:now.getMonth();
+  var curYear=(viewCtx&&viewCtx.year!=null)?viewCtx.year:now.getFullYear();
+  var isCurrent=(curMonth===now.getMonth()&&curYear===now.getFullYear());
   var daysInMonth=new Date(curYear,curMonth+1,0).getDate();
-  var dayOfMonth=now.getDate();
+  var dayOfMonth=isCurrent?now.getDate():daysInMonth;
   var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
   var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
   var moneyIn=Math.round(calcs.inc||0);
   if(moneyIn<=0){
     return{severity:'ok',paceRatio:0,overspend:0,categories:[],reasons:[],projected:0,daysLeft:daysInMonth-dayOfMonth,
       monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'}),
-      moneyIn:0,moneyOut:0,dayOfMonth:dayOfMonth,daysInMonth:daysInMonth,pctSpent:0,pctOfMonthGone:0};
+      moneyIn:0,moneyOut:0,dayOfMonth:dayOfMonth,daysInMonth:daysInMonth,pctSpent:0,pctOfMonthGone:0,isCurrent:isCurrent,viewMonth:curMonth,viewYear:curYear};
   }
   var snap=S.snapshot||{};
+  // Snapshot's already-spent fudge applies ONLY when viewing the same month
+  // the snapshot was taken in. For past months that don't match, ignore.
   var isSnapMonth=snap.month===curMonth&&snap.year===curYear;
   if(isSnapMonth)moneyOut+=snap.alreadySpent||0;
   var pctSpent=Math.round((moneyOut/moneyIn)*100);
@@ -5535,7 +5557,8 @@ function _portalSpendStatus(){
     projected:projected,overspend:Math.round(overspend),
     categories:categories,reasons:reasons,
     dayOfMonth:dayOfMonth,daysInMonth:daysInMonth,daysLeft:daysInMonth-dayOfMonth,
-    monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'})
+    monthLabel:new Date(curYear,curMonth,1).toLocaleDateString('en-US',{month:'long',year:'numeric'}),
+    isCurrent:isCurrent,viewMonth:curMonth,viewYear:curYear
   };
 }
 
@@ -5791,6 +5814,1235 @@ function _portalCalNav(dir){
   _portalCalMonth+=dir;
   if(_portalCalMonth>11){_portalCalMonth=0;_portalCalYear++;}
   if(_portalCalMonth<0){_portalCalMonth=11;_portalCalYear--;}
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MY SPENDING DASHBOARD — MONTH PICKER STATE + HELPERS
+// ═══════════════════════════════════════════════════════════════════════════
+// Time-aware spending view. The dashboard (tiles, banner, category bars, recent
+// entries, calendar, etc.) can be pointed at any month that has data, plus the
+// current month. State is module-scope (mirrors _portalCalMonth/Year above):
+//   null,null         → follow current month / date
+//   month,year        → view that specific past month
+//
+// All downstream code reads through _portalSpendStatus(viewCtx) and the
+// _portalSpendViewMonth/Year vars directly inside _portalRenderSpendDashboard.
+// Independent from _portalCalMonth/Year (which is calendar-grid-only).
+var _portalSpendViewMonth=null,_portalSpendViewYear=null;
+
+// Return all unique year-month pairs that have at least one spendingEntry, in
+// descending order (newest first). Always includes the current month even if
+// no entries exist yet so the user can always return to today.
+// Used by the month-picker dropdown and the prev/next arrow bounds check.
+function _portalGetDataBearingMonths(){
+  var fd=APP._portalFd||{};
+  var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
+  var entries=S.spendingEntries||[];
+  var seen={};
+  entries.forEach(function(e){
+    if(!e||!e.date)return;
+    var d=new Date(e.date);
+    if(isNaN(d.getTime()))return;
+    var key=d.getFullYear()+'-'+d.getMonth();
+    if(!seen[key])seen[key]={month:d.getMonth(),year:d.getFullYear(),count:0};
+    seen[key].count++;
+  });
+  var now=new Date();
+  var curKey=now.getFullYear()+'-'+now.getMonth();
+  if(!seen[curKey])seen[curKey]={month:now.getMonth(),year:now.getFullYear(),count:0};
+  return Object.keys(seen).map(function(k){return seen[k];}).sort(function(a,b){
+    if(a.year!==b.year)return b.year-a.year;
+    return b.month-a.month;
+  });
+}
+
+// Step the spending view month forward (dir=+1, toward newer / today) or back
+// (dir=-1, toward older). Stays within data-bearing months — won't skip into
+// empty months. If the new selection lands on the current real month, reset
+// state to null so the view tracks future date changes correctly.
+// Also resets the calendar's own nav state (_portalCalMonth/Year) so the
+// embedded bill calendar follows the picker. Without this, the user could
+// pick October via the spending picker, then use the calendar's own ‹›
+// arrows to peek at September, leaving the two views inconsistent.
+function _portalSpendNavMonth(dir){
+  var months=_portalGetDataBearingMonths();
+  var curM,curY;
+  if(_portalSpendViewMonth!==null){curM=_portalSpendViewMonth;curY=_portalSpendViewYear;}
+  else{var now=new Date();curM=now.getMonth();curY=now.getFullYear();}
+  var idx=-1;
+  for(var i=0;i<months.length;i++){
+    if(months[i].month===curM&&months[i].year===curY){idx=i;break;}
+  }
+  if(idx<0)idx=0;
+  // months[] is descending (newest first). dir=-1 (prev arrow ‹) → older →
+  // higher index. dir=+1 (next arrow ›) → newer → lower index.
+  var newIdx=idx+(dir<0?1:-1);
+  if(newIdx<0||newIdx>=months.length)return;
+  var sel=months[newIdx];
+  var now2=new Date();
+  if(sel.month===now2.getMonth()&&sel.year===now2.getFullYear()){
+    _portalSpendViewMonth=null;_portalSpendViewYear=null;
+  } else {
+    _portalSpendViewMonth=sel.month;_portalSpendViewYear=sel.year;
+  }
+  _portalCalMonth=null;_portalCalYear=null;
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+
+// Jump directly to a specific month from the dropdown. value is "month-year"
+// string ("9-2025") or the sentinel "current". Also resets calendar nav state
+// (see comment on _portalSpendNavMonth for why).
+function _portalSpendJumpToMonth(value){
+  if(value==='current'){
+    _portalSpendViewMonth=null;_portalSpendViewYear=null;
+  } else {
+    var parts=String(value||'').split('-');
+    if(parts.length!==2)return;
+    var m=parseInt(parts[0],10),y=parseInt(parts[1],10);
+    if(isNaN(m)||isNaN(y))return;
+    var now=new Date();
+    if(m===now.getMonth()&&y===now.getFullYear()){
+      _portalSpendViewMonth=null;_portalSpendViewYear=null;
+    } else {
+      _portalSpendViewMonth=m;_portalSpendViewYear=y;
+    }
+  }
+  _portalCalMonth=null;_portalCalYear=null;
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// HISTORICAL PROGRESS — WINDOW STATE + AGGREGATOR
+// ═══════════════════════════════════════════════════════════════════════════
+// "Zoom out" lens on the spending data. Independent of the month picker (which
+// drives the live monthly dashboard). User picks a time window — YTD, past 3
+// months, past 6, past 12, or lifetime — and gets aggregate spend, category
+// breakdown, recurring locked-in, and a direction delta vs the prior-equivalent
+// window.
+//
+// Window key → meaning:
+//   'YTD'      → Jan 1 of current year through current month (inclusive)
+//   '3mo'     → current month + previous 2 (3 calendar months total)
+//   '6mo'     → current month + previous 5
+//   '12mo'    → current month + previous 11
+//   'lifetime' → all entries from earliest data to current month
+//
+// Default window: '3mo' (per product spec — smallest sample size that means
+// anything for behavioral patterns).
+var _portalSpendWindow='3mo';
+
+function _portalSpendSetWindow(key){
+  _portalSpendWindow=key;
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+
+// Compute aggregate spending stats for the selected window.
+// Returns null only if there are zero entries in the window. Otherwise returns
+// a populated stats object (totalSpent=0 is valid — means "window covered, no
+// spending recorded"; null means "window has no data at all").
+//
+// Approximation notes:
+//   - monthsCovered uses whole calendar months (no day-weighting). For a
+//     partial current month this slightly over-counts months and under-counts
+//     avg-monthly. The simplification is acceptable for v1; the delta against
+//     prior window is the most meaningful comparison and is unaffected.
+//   - Recurring is the sum of is_recurring-flagged entries in the window
+//     divided by months. Doesn't dedup multiple logs of the same subscription
+//     or normalize by recurrence_freq. "Avg monthly cost of recurring entries
+//     in the window" rather than "true monthly locked-in." Sufficient for v1's
+//     behavioral-signal purpose.
+//   - avgIncome reads from S.snapshots if present (per-month) and falls back
+//     to current calcs.inc when snapshots don't cover the window.
+function _portalSpendHistoricalAggregate(windowKey){
+  windowKey=windowKey||'3mo';
+  var fd=APP._portalFd||{};
+  var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=APP._portalCalcs||fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
+  var entries=S.spendingEntries||[];
+  var now=new Date();
+  var curM=now.getMonth(),curY=now.getFullYear();
+
+  // Resolve window bounds + prior window (for delta) + display label.
+  var start,end,monthsCovered,label,priorStart,priorEnd,priorLabel;
+  if(windowKey==='YTD'){
+    start={month:0,year:curY};
+    end={month:curM,year:curY};
+    monthsCovered=curM+1;
+    label='Year to date';
+    priorStart={month:0,year:curY-1};
+    priorEnd={month:curM,year:curY-1};
+    priorLabel='Same period last year';
+  } else if(windowKey==='lifetime'){
+    // Earliest entry month across the dataset
+    var earliestY=curY,earliestM=curM;
+    var foundAny=false;
+    entries.forEach(function(e){
+      if(!e||!e.date)return;
+      var d=new Date(e.date);
+      if(isNaN(d.getTime()))return;
+      foundAny=true;
+      var ey=d.getFullYear(),em=d.getMonth();
+      if(ey<earliestY||(ey===earliestY&&em<earliestM)){
+        earliestY=ey;earliestM=em;
+      }
+    });
+    if(!foundAny){earliestY=curY;earliestM=curM;}
+    start={month:earliestM,year:earliestY};
+    end={month:curM,year:curY};
+    monthsCovered=(curY-earliestY)*12+(curM-earliestM)+1;
+    if(monthsCovered<1)monthsCovered=1;
+    label='Lifetime';
+    priorStart=null;priorEnd=null;priorLabel=null;
+  } else {
+    // '3mo' / '6mo' / '12mo'
+    var n=parseInt(String(windowKey).replace('mo',''),10)||3;
+    var startTotal=curY*12+curM-(n-1);
+    var startY=Math.floor(startTotal/12);
+    var startM=startTotal%12;
+    if(startM<0){startM+=12;startY-=1;}
+    start={month:startM,year:startY};
+    end={month:curM,year:curY};
+    monthsCovered=n;
+    label='Past '+n+' months';
+    var priorStartTotal=startTotal-n;
+    var priorEndTotal=startTotal-1;
+    var psY=Math.floor(priorStartTotal/12),psM=priorStartTotal%12;
+    var peY=Math.floor(priorEndTotal/12),peM=priorEndTotal%12;
+    if(psM<0){psM+=12;psY-=1;}
+    if(peM<0){peM+=12;peY-=1;}
+    priorStart={month:psM,year:psY};
+    priorEnd={month:peM,year:peY};
+    priorLabel='Prior '+n+' months';
+  }
+
+  // Inclusive month-bucket containment check.
+  function _inWindow(e,s,en){
+    if(!e||!e.date)return false;
+    var d=new Date(e.date);
+    if(isNaN(d.getTime()))return false;
+    var entryKey=d.getFullYear()*12+d.getMonth();
+    var startKey=s.year*12+s.month;
+    var endKey=en.year*12+en.month;
+    return entryKey>=startKey&&entryKey<=endKey;
+  }
+
+  var windowEntries=entries.filter(function(e){return _inWindow(e,start,end);});
+  var totalSpent=windowEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
+  var totalEntries=windowEntries.length;
+  // Lifetime with zero entries — return null to signal empty-state render.
+  if(windowKey==='lifetime'&&totalEntries===0)return null;
+
+  // Category map mirrors the live dashboard's color/icon palette so the
+  // Historical donut visually anchors with the current-month one.
+  var catMap={
+    food:{label:'Food',icon:'🍽️',color:'#22C55E'},
+    housing:{label:'Housing',icon:'🏠',color:'#5B9BFF'},
+    transportation:{label:'Transportation',icon:'🚗',color:'#A855F7'},
+    utilities:{label:'Utilities',icon:'⚡',color:'#EAB308'},
+    insurance:{label:'Insurance',icon:'🛡️',color:'#06B6D4'},
+    discretionary:{label:'Entertainment',icon:'🎬',color:'#EC4899'},
+    subscriptions:{label:'Subscriptions',icon:'📱',color:'#8B5CF6'},
+    activeSavings:{label:'Active Savings',icon:'📈',color:'#10B981'},
+    estate:{label:'Estate',icon:'📜',color:'#F97316'},
+    misc:{label:'Other',icon:'📦',color:'#94A3B8'}
+  };
+  var catTotals={};
+  windowEntries.forEach(function(e){
+    var k=e.category||e.category_bucket||'misc';
+    catTotals[k]=(catTotals[k]||0)+(parseFloat(e.amount)||0);
+  });
+  var byCategory=Object.keys(catTotals).map(function(k){
+    var info=catMap[k]||{label:k,icon:'📦',color:'#94A3B8'};
+    var total=catTotals[k];
+    return{
+      key:k,label:info.label,icon:info.icon,color:info.color,
+      total:Math.round(total),
+      pct:totalSpent>0?Math.round(total/totalSpent*100):0
+    };
+  }).sort(function(a,b){return b.total-a.total;});
+
+  // Recurring locked-in. Simplification: sum is_recurring entries in window
+  // and divide by months. Doesn't dedup or normalize by frequency.
+  var recurringRaw=windowEntries.reduce(function(t,e){
+    return t+(e.is_recurring?(parseFloat(e.amount)||0):0);
+  },0);
+  var recurringMonthly=monthsCovered>0?Math.round(recurringRaw/monthsCovered):0;
+
+  // Avg monthly income from snapshots; fall back to live calcs.inc.
+  var snaps=(S.snapshots&&S.snapshots.length)?S.snapshots:(APP._supabaseSnapshots||[]);
+  var incTotal=0,incCount=0;
+  if(snaps&&snaps.length){
+    var startKey=start.year*12+start.month;
+    var endKey=end.year*12+end.month;
+    snaps.forEach(function(snap){
+      if(!snap)return;
+      var sm=snap.month,sy=snap.year;
+      if(sm==null||sy==null)return;
+      var snapKey=sy*12+sm;
+      if(snapKey>=startKey&&snapKey<=endKey){
+        var sIncome=parseFloat(snap.income);
+        if(!isNaN(sIncome)){incTotal+=sIncome;incCount++;}
+      }
+    });
+  }
+  var avgIncome=incCount>0?Math.round(incTotal/incCount):Math.round(calcs.inc||0);
+  var avgMonthly=monthsCovered>0?Math.round(totalSpent/monthsCovered):0;
+
+  // Direction delta — compare totalSpent to prior-equivalent window.
+  // Null when there's no prior window (lifetime) or no prior data.
+  var direction=null;
+  if(priorStart&&priorEnd){
+    var priorEntries=entries.filter(function(e){return _inWindow(e,priorStart,priorEnd);});
+    var priorTotal=priorEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
+    if(priorTotal>0){
+      var deltaPct=Math.round(((totalSpent-priorTotal)/priorTotal)*100);
+      direction={
+        priorTotal:Math.round(priorTotal),
+        deltaPct:deltaPct,
+        deltaDir:deltaPct>0?'up':deltaPct<0?'down':'flat'
+      };
+    }
+  }
+
+  return{
+    key:windowKey,label:label,
+    start:start,end:end,monthsCovered:monthsCovered,
+    totalSpent:Math.round(totalSpent),avgMonthly:avgMonthly,
+    totalEntries:totalEntries,
+    byCategory:byCategory,
+    recurringMonthly:recurringMonthly,
+    avgIncome:avgIncome,
+    direction:direction,priorWindowLabel:priorLabel
+  };
+}
+
+// ─── HISTORICAL PROGRESS RENDERER ─────────────────────────────────────────
+// Returns HTML for the "zoom-out" block inside My Spending. Window buttons
+// across the top, donut + top-categories + delta in the body, recurring
+// breakout below. Independent of the month picker — Historical Progress is
+// always present, regardless of which month the live dashboard is showing.
+function _portalRenderHistoricalProgress(){
+  var agg=_portalSpendHistoricalAggregate(_portalSpendWindow);
+  var windowOpts=[
+    {key:'YTD',label:'YTD'},
+    {key:'3mo',label:'3mo'},
+    {key:'6mo',label:'6mo'},
+    {key:'12mo',label:'12mo'},
+    {key:'lifetime',label:'Lifetime'}
+  ];
+
+  // Build the window-button row (always shown so the user can switch windows
+  // even from an empty state).
+  function _hBtnRow(){
+    var h='<div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px">';
+    windowOpts.forEach(function(w){
+      var isSel=(w.key===_portalSpendWindow);
+      var bg=isSel?'rgba(91,155,255,.18)':'transparent';
+      var bd=isSel?'rgba(91,155,255,.5)':'var(--bd)';
+      var fg=isSel?'#5B9BFF':'var(--mu)';
+      h+='<button onclick="_portalSpendSetWindow(\''+w.key+'\')" style="padding:7px 14px;background:'+bg+';border:1px solid '+bd+';color:'+fg+';font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.06em;border-radius:3px;cursor:pointer;min-height:32px;transition:.15s">'+w.label+'</button>';
+    });
+    h+='</div>';
+    return h;
+  }
+
+  var h='<div class="sec-group">';
+  h+='<div class="sec-group-title">📊 Historical Progress</div>';
+  h+=_hBtnRow();
+
+  // Empty state — no data in the selected window. Other windows might still
+  // have data; encourage switching.
+  if(!agg||agg.totalEntries===0){
+    h+='<div style="padding:24px 18px;text-align:center;background:var(--bg-card);border:1px dashed var(--bd);border-radius:4px">';
+    h+='<div style="font-size:32px;margin-bottom:8px">📭</div>';
+    h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:4px">No data for this window yet</div>';
+    h+='<div style="font-size:13px;color:var(--mu);line-height:1.6">Try a wider window above, or start logging expenses to build history.</div>';
+    h+='</div></div>';
+    return h;
+  }
+
+  // Donut data — reuse _portalSvgDonut from the live dashboard so the
+  // palette/style anchors with "Where Every Dollar Goes" above. Pass each
+  // category as a slice. Same color map as the live monthly donut.
+  var donutData=agg.byCategory.map(function(c){
+    return{l:c.icon+' '+c.label,v:c.total,c:c.color};
+  });
+
+  // Two-column grid: donut + top-categories sidebar
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start" class="trk-grid-2">';
+
+  // Left: donut + totals
+  h+='<div>';
+  h+=_portalSvgDonut(donutData,220,agg.label);
+  h+='<div style="text-align:center;margin-top:4px">';
+  h+='<div style="font-family:var(--fd);font-size:22px;color:var(--wh)">'+fmt(agg.totalSpent)+'</div>';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin-top:2px">'+esc(agg.label)+' · total spent</div>';
+  if(agg.avgMonthly>0&&agg.monthsCovered>1){
+    h+='<div style="font-size:12px;color:var(--mu);margin-top:4px">~'+fmt(agg.avgMonthly)+'/mo average';
+    if(agg.avgIncome>0){
+      var pctOfInc=Math.round(agg.avgMonthly/agg.avgIncome*100);
+      h+=' · '+pctOfInc+'% of income';
+    }
+    h+='</div>';
+  }
+  h+='</div>';
+  h+='</div>';
+
+  // Right: top categories ranked list (limit 5 for at-a-glance scan)
+  h+='<div>';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Top Categories</div>';
+  var topCats=agg.byCategory.slice(0,5);
+  if(!topCats.length){
+    h+='<div style="font-size:13px;color:var(--mu);font-style:italic">No category data</div>';
+  } else {
+    topCats.forEach(function(c){
+      var bw=Math.min(100,c.pct);// width relative to total
+      h+='<div style="margin-bottom:7px">';
+      h+='<div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:2px">';
+      h+='<span style="color:var(--wh)">'+c.icon+' '+esc(c.label)+'</span>';
+      h+='<span style="font-family:var(--fh);font-weight:700;color:var(--wh)">'+fmt(c.total)+' <span style="color:var(--mu);font-weight:400">('+c.pct+'%)</span></span>';
+      h+='</div>';
+      h+='<div style="height:5px;background:rgba(0,68,191,.06);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+bw+'%;background:'+c.color+';border-radius:2px"></div></div>';
+      h+='</div>';
+    });
+  }
+
+  // Direction delta — single line under top categories. Null for lifetime
+  // (no prior window) or when prior had zero spend.
+  if(agg.direction){
+    var d=agg.direction;
+    var dirCol,dirIcon,dirVerb;
+    if(d.deltaDir==='up'){dirCol='var(--rd)';dirIcon='↑';dirVerb='up';}
+    else if(d.deltaDir==='down'){dirCol='var(--gr)';dirIcon='↓';dirVerb='down';}
+    else {dirCol='var(--mu)';dirIcon='→';dirVerb='flat';}
+    h+='<div style="margin-top:10px;padding:8px 10px;background:var(--bg-card);border:1px solid var(--bd);border-radius:3px;font-size:12px;color:var(--mu);line-height:1.5">';
+    h+='<span style="color:'+dirCol+';font-family:var(--fh);font-weight:700">'+dirIcon+' '+dirVerb+' '+Math.abs(d.deltaPct)+'%</span> vs '+esc(agg.priorWindowLabel||'prior window');
+    h+=' ('+fmt(d.priorTotal)+')';
+    h+='</div>';
+  }
+  h+='</div>';// close right column
+  h+='</div>';// close grid
+
+  // Recurring breakout — separate widget below the grid
+  if(agg.recurringMonthly>0){
+    var pctOfAvg=agg.avgMonthly>0?Math.round(agg.recurringMonthly/agg.avgMonthly*100):0;
+    var pctOfIncStr='';
+    if(agg.avgIncome>0){
+      var pctOfInc2=Math.round(agg.recurringMonthly/agg.avgIncome*100);
+      pctOfIncStr=' · '+pctOfInc2+'% of income';
+    }
+    h+='<div style="margin-top:14px;padding:10px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:3px;font-size:13px;color:rgba(226,232,240,.85);line-height:1.6">';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:4px">🔁 Recurring locked-in</div>';
+    h+='~<strong style="color:var(--wh)">'+fmt(agg.recurringMonthly)+'/mo</strong> of this spending is on recurring entries';
+    if(pctOfAvg>0)h+=' (<strong>'+pctOfAvg+'%</strong> of average monthly'+pctOfIncStr+')';
+    h+='.</div>';
+  }
+
+  h+='</div>';// close sec-group
+  return h;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BEHAVIORAL PLAN ENGINE — STORAGE LAYER
+// ═══════════════════════════════════════════════════════════════════════════
+// Recommendations live on S.budgetRecommendations as a flat array. Each entry:
+//   {
+//     id: 'rec_<base36>_<hex>',
+//     type: 'budget_realloc' | 'opportunity' | 'plan_vs_reality',
+//     status: 'pending' | 'accepted' | 'dismissed' | 'expired',
+//     createdAt: ISO timestamp,
+//     appliedAt: ISO timestamp | null,
+//     payload: { ... }  // type-specific shape, filled in by the detector
+//   }
+//
+// Persistence: dual-mirror writes (_lastPfosState.state AND APP._portalFd.S)
+// plus _touched flag, same pattern as spendingEntries. Survives reloads via
+// the beforeunload keepalive flush. Also added to _protectedSections (line
+// ~9259) so existing recs survive cross-session merges.
+//
+// IMPORTANT — pfos-main dependency: this section name is new to pfos-main.
+// The current pfos-main state blob will accept the field (Postgres JSONB is
+// permissive), but pfos-main's own _protectedSections list does NOT include
+// budgetRecommendations. If pfos-main reads + rewrites the state, recs could
+// be lost on round-trip. RESOLVED 2026-05-28: pfos-main loads state via
+// Object.assign (no _protectedSections mechanism — unknown fields preserved
+// automatically). Round-trip races now closed by PFOS_WRITE_RECS handler in
+// pfos-main + matching post in _portalRecsWrite below.
+
+// ── BEHAVIORAL ENGINE TUNING CONSTANTS ────────────────────────────────────
+// Centralized for one-place adjustment as test-user data accumulates. Change
+// values here, not in detector/runner bodies. Each documents what it controls
+// + rationale at its current setting.
+var _PFOS_RECS_CONFIG={
+  // ── Lifecycle ──
+  expireAfterDays:90,              // Pending recs auto-flip to 'expired' after this
+  cooldownAfterDismissDays:30,     // No same-type rec within this many days of a dismissal
+  maxActiveAtOnce:3,               // Hard cap on simultaneously-pending recs
+  minEntriesToDetect:10,           // Skip detection if user has fewer entries (onboarding)
+  // ── budget_realloc detection ──
+  bgrChronicMonthsRequired:3,      // Over (or under) in this many of last 6 months
+  bgrOverRatioThreshold:1.10,      // 110% of budget = "over"
+  bgrUnderRatioThreshold:0.70,     // 70% of budget = "under"
+  bgrMinAvgOverage:50,             // Don't flag categories with <$50/mo avg overage
+  bgrMaxMoveFraction:0.25,         // Cap suggested move at this fraction of source budget
+  bgrMinMoveAmount:50,             // Don't suggest moves smaller than this
+  bgrRoundTo:25,                   // Round suggested move to nearest multiple
+  // ── opportunity detection ──
+  oppMinAvgSurplus:100,            // Need at least this much avg monthly surplus
+  oppMinSurplusPct:5,              // ...AND surplus must be >= this % of income
+  oppIncrementFraction:0.5,        // Bump allocation by this fraction of surplus
+  oppMaxIncrement:500,             // Cap increment to keep changes incremental
+  oppMinIncrement:50,              // Don't suggest tiny increments
+  oppRoundTo:25,                   // Round to nearest multiple
+  // ── plan_vs_reality (popup tradeoff trigger) ──
+  pvrMonthsOfDataRequired:6,       // Need this many months of any data
+  pvrChronicMonthsOverIncome:4     // ...with at least this many over income to surface
+};
+
+function _portalRecsList(){
+  var fd=APP._portalFd||{};
+  var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
+  return S.budgetRecommendations||[];
+}
+
+// Active = pending + not expired by createdAt age. Throttling logic (max
+// active, no-repeat-within-cooldown) lives in _portalRecsRunDetection.
+function _portalRecsGetActive(){
+  var now=Date.now();
+  var maxAgeMs=_PFOS_RECS_CONFIG.expireAfterDays*24*60*60*1000;
+  return _portalRecsList().filter(function(r){
+    if(!r||r.status!=='pending')return false;
+    var created=r.createdAt?new Date(r.createdAt).getTime():0;
+    return (now-created)<maxAgeMs;
+  });
+}
+
+// Write a mutation to both mirrors + set _touched so the beforeunload flush
+// picks it up. Pattern mirrors _portalSubmitAddExpense's optimistic-write
+// flow (see line ~7730). All recs mutations route through here.
+function _portalRecsWrite(mutation){
+  if(_lastPfosState&&_lastPfosState.state){
+    if(!_lastPfosState.state.budgetRecommendations)_lastPfosState.state.budgetRecommendations=[];
+    mutation(_lastPfosState.state.budgetRecommendations);
+    if(!_lastPfosState.state._touched)_lastPfosState.state._touched={};
+    _lastPfosState.state._touched.budgetRecommendations=true;
+  }
+  if(APP._portalFd&&APP._portalFd.S){
+    if(!APP._portalFd.S.budgetRecommendations)APP._portalFd.S.budgetRecommendations=[];
+    mutation(APP._portalFd.S.budgetRecommendations);
+    if(!APP._portalFd.S._touched)APP._portalFd.S._touched={};
+    APP._portalFd.S._touched.budgetRecommendations=true;
+  }
+  // Push the post-mutation array to pfos-main so its S matches what we just
+  // wrote here. Without this, pfos-main's next _doSync flush would post stale
+  // recs to the parent — and because pfos-main's _touched.budgetRecommendations
+  // would be false in that flush, the parent's section-level merge would fall
+  // back to the DB's pre-mutation value and silently clobber the update.
+  //
+  // pfos-main's PFOS_WRITE_RECS handler stores the array + flags _touched so
+  // the next debounced flush carries the right state. Best-effort: if the
+  // iframe isn't ready or the handler doesn't exist (older pfos-main), the
+  // beforeunload PATCH in this file still persists the local mirror directly,
+  // so the user's data isn't lost — just the in-session round-trip isn't as
+  // clean.
+  try{
+    var frame=getPFOSFrame();
+    if(frame&&frame.contentWindow){
+      var recs=(_lastPfosState&&_lastPfosState.state&&_lastPfosState.state.budgetRecommendations)||
+               (APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.budgetRecommendations)||[];
+      frame.contentWindow.postMessage({type:'PFOS_WRITE_RECS',recs:recs},'https://pfos.esjfinancial.com');
+    }
+  }catch(_e){console.warn('PFOS_WRITE_RECS post:',_e);}
+  // Refresh the My Spending nav badge — count may have changed.
+  try{if(typeof _portalRecsUpdateBadge==='function')_portalRecsUpdateBadge();}catch(_){}
+}
+
+// Update the count badge on the My Spending sidebar nav item. Mirrors the
+// existing notifBadge pattern. Idempotent — safe to call from many sites
+// (renderSpendingAnalysis, every _portalRecsWrite, page load).
+function _portalRecsUpdateBadge(){
+  var el=document.getElementById('cnavSpendBadge');
+  if(!el)return;
+  var count=_portalRecsGetActive().length;
+  if(count<=0){el.style.display='none';return;}
+  el.style.display='';
+  el.textContent=String(count);
+}
+
+function _portalRecsCreate(rec){
+  if(!rec||!rec.type||!rec.payload)return null;
+  rec.id=rec.id||('rec_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));
+  rec.status=rec.status||'pending';
+  rec.createdAt=rec.createdAt||new Date().toISOString();
+  rec.appliedAt=rec.appliedAt||null;
+  _portalRecsWrite(function(list){list.push(rec);});
+  return rec;
+}
+
+function _portalRecsUpdate(id,mutation){
+  _portalRecsWrite(function(list){
+    for(var i=0;i<list.length;i++){
+      if(list[i]&&list[i].id===id){mutation(list[i]);break;}
+    }
+  });
+}
+
+function _portalRecsDismiss(id){
+  _portalRecsUpdate(id,function(r){r.status='dismissed';r.appliedAt=new Date().toISOString();});
+}
+
+function _portalRecsAccept(id){
+  _portalRecsUpdate(id,function(r){r.status='accepted';r.appliedAt=new Date().toISOString();});
+}
+
+function _portalRecsExpire(id){
+  _portalRecsUpdate(id,function(r){r.status='expired';});
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BEHAVIORAL PLAN ENGINE — PATTERN DETECTOR
+// ═══════════════════════════════════════════════════════════════════════════
+// Scans the last 6 months of spending data and returns an array of UNSAVED
+// recommendation objects. Caller (trigger wiring in Commit 4.4) applies
+// throttling rules and saves via _portalRecsCreate.
+//
+// Two proactive recommendation types:
+//
+//   1. budget_realloc — moves budget $ from a chronically-under category to
+//      a chronically-over one. Detection: category over 110% of budget in
+//      3+ of last 6 months AND avg overage >= $50; paired with a category
+//      under 70% of budget in 3+ of last 6 months. Cap move at 25% of source
+//      budget; round to nearest $25.
+//
+//   2. opportunity — sustained surplus suggests bumping a plan allocation.
+//      Detection: last 3 months all have data, avg monthly surplus >= $100
+//      AND >= 5% of income. Suggests increasing a phase-2/3 plan allocation
+//      by half the surplus (capped at $500, rounded to $25).
+//
+// A third type (plan_vs_reality) is NOT produced here — per locked scope it
+// surfaces only inside the existing overspend popup as one of three buttons
+// (Cut spending / Reduce plan / Income options), never as a proactive rec.
+// Wired into _portalSpendShowPopup in Commit 4.8 if reached.
+//
+// Requires >= 3 months of any spending data to run. Returns [] otherwise.
+function _portalRecsDetect(){
+  var fd=APP._portalFd||{};
+  var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=APP._portalCalcs||fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
+  var entries=S.spendingEntries||[];
+  var expData=S.expData||{};
+  var now=new Date();
+  var curM=now.getMonth(),curY=now.getFullYear();
+
+  // Last 6 months (current + 5 prior). Build per-month totals + per-category.
+  var thisKey=curY*12+curM;
+  var months=[];
+  for(var i=0;i<6;i++){
+    var t=thisKey-i;
+    var y=Math.floor(t/12),m=((t%12)+12)%12;
+    months.push({m:m,y:y,key:t,total:0,byCat:{}});
+  }
+  entries.forEach(function(e){
+    if(!e||!e.date)return;
+    var d=new Date(e.date);
+    if(isNaN(d.getTime()))return;
+    var k=d.getFullYear()*12+d.getMonth();
+    for(var mi=0;mi<months.length;mi++){
+      if(months[mi].key===k){
+        months[mi].total+=parseFloat(e.amount)||0;
+        var cat=e.category||e.category_bucket||'misc';
+        months[mi].byCat[cat]=(months[mi].byCat[cat]||0)+(parseFloat(e.amount)||0);
+        break;
+      }
+    }
+  });
+  var monthsWithData=months.filter(function(mn){return mn.total>0;}).length;
+  if(monthsWithData<3)return [];
+
+  var recs=[];
+
+  // ── budget_realloc ──────────────────────────────────────────────────────
+  // Per-category budget lookup mirrors _portalRenderSpendDashboard's logic.
+  function _catBudget(catKey){
+    var ed=expData[catKey];
+    if(!ed)return 0;
+    if(ed.total!=null)return parseFloat(ed.total)||0;
+    if(ed.amount!=null){var a=parseFloat(ed.amount)||0;return ed.period==='annual'?a/12:a;}
+    if(ed.subs){var t=0;Object.keys(ed.subs).forEach(function(sk){var sub=ed.subs[sk];t+=(parseFloat(sub&&sub.amount)||parseFloat(sub)||0);});return t;}
+    return 0;
+  }
+  var bucketLabels={
+    food:'Food',housing:'Housing',transportation:'Transportation',
+    utilities:'Utilities',insurance:'Insurance',discretionary:'Entertainment',
+    subscriptions:'Subscriptions',activeSavings:'Active Savings',
+    estate:'Estate',misc:'Other'
+  };
+  var catStats={};
+  Object.keys(bucketLabels).forEach(function(c){
+    var budget=_catBudget(c);
+    if(budget<=0)return;
+    var spends=months.map(function(mn){return mn.byCat[c]||0;});
+    var totalSpend=spends.reduce(function(t,s){return t+s;},0);
+    var avgSpent=totalSpend/months.length;
+    var monthsOver=spends.filter(function(s){return s>=budget*_PFOS_RECS_CONFIG.bgrOverRatioThreshold;}).length;
+    var monthsUnder=spends.filter(function(s){return s>0&&s<=budget*_PFOS_RECS_CONFIG.bgrUnderRatioThreshold;}).length;
+    catStats[c]={budget:budget,avgSpent:avgSpent,avgOverage:avgSpent-budget,monthsOver:monthsOver,monthsUnder:monthsUnder};
+  });
+  var overCats=Object.keys(catStats).filter(function(c){
+    return catStats[c].monthsOver>=_PFOS_RECS_CONFIG.bgrChronicMonthsRequired&&catStats[c].avgOverage>=_PFOS_RECS_CONFIG.bgrMinAvgOverage;
+  });
+  var underCats=Object.keys(catStats).filter(function(c){
+    return catStats[c].monthsUnder>=_PFOS_RECS_CONFIG.bgrChronicMonthsRequired&&catStats[c].avgSpent<catStats[c].budget*_PFOS_RECS_CONFIG.bgrUnderRatioThreshold;
+  });
+  if(overCats.length>0&&underCats.length>0){
+    // Pair the biggest over with the biggest under. One rec per detection run.
+    overCats.sort(function(a,b){return catStats[b].avgOverage-catStats[a].avgOverage;});
+    underCats.sort(function(a,b){
+      return (catStats[b].budget-catStats[b].avgSpent)-(catStats[a].budget-catStats[a].avgSpent);
+    });
+    var fromCat=underCats[0],toCat=overCats[0];
+    var underSlack=catStats[fromCat].budget-catStats[fromCat].avgSpent;
+    var move=Math.min(underSlack,catStats[toCat].avgOverage,catStats[fromCat].budget*_PFOS_RECS_CONFIG.bgrMaxMoveFraction);
+    move=Math.round(move/_PFOS_RECS_CONFIG.bgrRoundTo)*_PFOS_RECS_CONFIG.bgrRoundTo;
+    if(move>=_PFOS_RECS_CONFIG.bgrMinMoveAmount){
+      recs.push({
+        type:'budget_realloc',
+        payload:{
+          fromCategory:fromCat,fromLabel:bucketLabels[fromCat]||fromCat,
+          fromBudget:Math.round(catStats[fromCat].budget),
+          fromAvgSpent:Math.round(catStats[fromCat].avgSpent),
+          toCategory:toCat,toLabel:bucketLabels[toCat]||toCat,
+          toBudget:Math.round(catStats[toCat].budget),
+          toAvgSpent:Math.round(catStats[toCat].avgSpent),
+          moveAmount:move,
+          monthsOfData:monthsWithData,
+          monthsOver:catStats[toCat].monthsOver,
+          monthsUnder:catStats[fromCat].monthsUnder
+        }
+      });
+    }
+  }
+
+  // ── opportunity ─────────────────────────────────────────────────────────
+  // Sustained 3-month surplus → suggest bumping a plan allocation.
+  var inc=Math.round(calcs.inc||0);
+  if(inc>0){
+    var last3=months.slice(0,3);
+    var allHaveData=last3.every(function(mn){return mn.total>0;});
+    if(allHaveData){
+      var avgSpend=last3.reduce(function(t,mn){return t+mn.total;},0)/3;
+      var avgSurplus=inc-avgSpend;
+      var surplusPct=(avgSurplus/inc)*100;
+      if(avgSurplus>=_PFOS_RECS_CONFIG.oppMinAvgSurplus&&surplusPct>=_PFOS_RECS_CONFIG.oppMinSurplusPct){
+        var allocs=(typeof CPLAN!=='undefined'&&CPLAN.allocations)?CPLAN.allocations:[];
+        var funded=allocs.filter(function(a){return a&&(a.amount||0)>0;});
+        if(funded.length>0){
+          var growthAllocs=funded.filter(function(a){return a.phase==2||a.phase==3;});
+          var target=growthAllocs[0]||funded[0];
+          var increment=Math.min(Math.round(avgSurplus*_PFOS_RECS_CONFIG.oppIncrementFraction/_PFOS_RECS_CONFIG.oppRoundTo)*_PFOS_RECS_CONFIG.oppRoundTo,_PFOS_RECS_CONFIG.oppMaxIncrement);
+          if(increment>=_PFOS_RECS_CONFIG.oppMinIncrement){
+            recs.push({
+              type:'opportunity',
+              payload:{
+                targetAllocType:target.type,
+                targetAllocName:target.customName||target.type||'Plan allocation',
+                currentAmount:Math.round(target.amount),
+                proposedAmount:Math.round(target.amount)+increment,
+                increment:increment,
+                avgSurplus:Math.round(avgSurplus),
+                surplusPct:Math.round(surplusPct)
+              }
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return recs;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BEHAVIORAL PLAN ENGINE — THROTTLING + APPLY
+// ═══════════════════════════════════════════════════════════════════════════
+// Run detector + apply throttling rules + save survivors.
+// Throttling:
+//   - max 3 active recs (skip if already at limit)
+//   - no repeat of same TYPE within 30 days of last dismissal
+//   - first-expire pass: any rec older than 90 days flips to status='expired'
+//
+// Idempotency: stores last-run timestamp on S.recsLastRunAt. Trigger wiring
+// (4.4) calls this at most once per calendar month. Safe to call manually too.
+function _portalRecsRunDetection(){
+  // Step 1: expire-pass — flip stale pending recs to 'expired'
+  var nowMs=Date.now();
+  var maxAgeMs=_PFOS_RECS_CONFIG.expireAfterDays*24*60*60*1000;
+  _portalRecsList().forEach(function(r){
+    if(!r||r.status!=='pending')return;
+    var created=r.createdAt?new Date(r.createdAt).getTime():0;
+    if(nowMs-created>=maxAgeMs)_portalRecsExpire(r.id);
+  });
+
+  // Step 2: throttle check — already at the active limit? bail
+  var active=_portalRecsGetActive();
+  if(active.length>=_PFOS_RECS_CONFIG.maxActiveAtOnce)return {created:0,reason:'at-limit'};
+
+  // Step 3: detect candidates
+  var candidates=_portalRecsDetect();
+  if(!candidates.length)return {created:0,reason:'no-candidates'};
+
+  // Step 4: filter — no repeat of same type within cooldown window of dismissal
+  var cooldownMs=_PFOS_RECS_CONFIG.cooldownAfterDismissDays*24*60*60*1000;
+  var allRecs=_portalRecsList();
+  var blockedTypes={};
+  allRecs.forEach(function(r){
+    if(!r||r.status!=='dismissed')return;
+    var applied=r.appliedAt?new Date(r.appliedAt).getTime():0;
+    if(nowMs-applied<cooldownMs)blockedTypes[r.type]=true;
+  });
+  // Also block types that already have a pending rec (no duplicates)
+  active.forEach(function(r){blockedTypes[r.type]=true;});
+
+  var room=_PFOS_RECS_CONFIG.maxActiveAtOnce-active.length;
+  var created=0;
+  for(var i=0;i<candidates.length&&room>0;i++){
+    var c=candidates[i];
+    if(blockedTypes[c.type])continue;
+    _portalRecsCreate(c);
+    blockedTypes[c.type]=true;// don't create two of the same type in one pass
+    created++;
+    room--;
+  }
+
+  // Stamp last-run time for trigger throttling (Commit 4.4)
+  _portalRecsWrite(function(){
+    if(_lastPfosState&&_lastPfosState.state)_lastPfosState.state.recsLastRunAt=new Date().toISOString();
+    if(APP._portalFd&&APP._portalFd.S)APP._portalFd.S.recsLastRunAt=new Date().toISOString();
+  });
+
+  return {created:created,reason:'ran'};
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BEHAVIORAL PLAN ENGINE — UI RENDERER
+// ═══════════════════════════════════════════════════════════════════════════
+// Card-style render for each pending rec. Wired into _portalRenderSpendDashboard
+// between Plan Alignment (6) and Historical Progress (6.5).
+//
+// Buttons:
+//   - Dismiss: real, marks rec as dismissed, re-renders dashboard
+//   - Modify: navigates to the page where the user can manually edit the
+//     underlying setting (expData budgets for budget_realloc; plan allocations
+//     for opportunity). For v1 this is a navigation, not a pre-filled modal.
+//   - Accept: stubbed with a notice toast — actual apply path requires
+//     pfos-main message handler updates and ships in a follow-up commit.
+function _portalRenderRecommendations(){
+  var active=_portalRecsGetActive();
+  if(!active.length)return '';
+
+  var h='<div class="sec-group">';
+  h+='<div class="sec-group-title">💡 Recommendations ('+active.length+')</div>';
+  h+='<div style="font-size:13px;color:var(--mu);margin-bottom:12px;line-height:1.6">Based on the past 3-6 months of your spending behavior. Tap Accept to apply, Modify to tweak, Dismiss to hide.</div>';
+  active.forEach(function(rec){h+=_portalRecCard(rec);});
+  h+='</div>';
+  return h;
+}
+
+function _portalRecCard(rec){
+  if(!rec||!rec.payload)return '';
+  var p=rec.payload;
+  var typeMeta={
+    budget_realloc:{icon:'⚖️',label:'BUDGET REALLOCATION',color:'#5B9BFF'},
+    opportunity:{icon:'📈',label:'OPPORTUNITY',color:'var(--gr)'},
+    plan_vs_reality:{icon:'⚠️',label:'PLAN REVIEW',color:'var(--or)'}
+  };
+  var t=typeMeta[rec.type]||{icon:'💡',label:'RECOMMENDATION',color:'var(--mu)'};
+
+  var h='<div style="background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+t.color+';border-radius:4px;padding:14px;margin-bottom:10px">';
+  h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:8px">';
+  h+='<span style="font-size:14px">'+t.icon+'</span>';
+  h+='<span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;color:'+t.color+'">'+t.label+'</span>';
+  h+='</div>';
+
+  if(rec.type==='budget_realloc'){
+    var overage=p.toAvgSpent-p.toBudget;
+    var slack=p.fromBudget-p.fromAvgSpent;
+    h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:8px">Your budget is misaligned with reality</div>';
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:12px">';
+    h+='Over the past '+p.monthsOfData+' months, you\'ve overspent <strong style="color:var(--wh)">'+esc(p.toLabel)+'</strong> by an average of <strong style="color:var(--or)">'+fmt(overage)+'/mo</strong>, ';
+    h+='while <strong style="color:var(--wh)">'+esc(p.fromLabel)+'</strong> has come in <strong style="color:var(--gr)">'+fmt(slack)+'/mo under</strong>.<br><br>';
+    h+='<strong style="color:#5B9BFF">Suggested:</strong> Move <strong>'+fmt(p.moveAmount)+'/mo</strong> from '+esc(p.fromLabel)+' budget to '+esc(p.toLabel)+' budget.';
+    h+='</div>';
+  } else if(rec.type==='opportunity'){
+    h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:8px">You have unused capacity</div>';
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:12px">';
+    h+='Over the past 3 months you\'ve averaged <strong style="color:var(--gr)">'+fmt(p.avgSurplus)+'/mo under budget</strong> ('+p.surplusPct+'% of income). That\'s '+fmt(p.avgSurplus*12)+'/year not deployed anywhere.<br><br>';
+    h+='<strong style="color:#5B9BFF">Suggested:</strong> Increase <strong>'+esc(p.targetAllocName)+'</strong> from <strong>'+fmt(p.currentAmount)+'/mo</strong> to <strong>'+fmt(p.proposedAmount)+'/mo</strong> (+'+fmt(p.increment)+').';
+    h+='</div>';
+  } else {
+    h+='<div style="font-size:13px;color:var(--mu)">Unknown recommendation type.</div>';
+  }
+
+  h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
+  h+='<button onclick="_portalRecAccept(\''+esc(rec.id)+'\')" style="padding:8px 16px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:var(--gr);font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.06em;border-radius:3px;cursor:pointer;min-height:32px">✓ Accept</button>';
+  h+='<button onclick="_portalRecModify(\''+esc(rec.id)+'\')" style="padding:8px 16px;background:transparent;border:1px solid rgba(91,155,255,.3);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.06em;border-radius:3px;cursor:pointer;min-height:32px">Modify</button>';
+  h+='<button onclick="_portalRecDismiss(\''+esc(rec.id)+'\')" style="padding:8px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.06em;border-radius:3px;cursor:pointer;min-height:32px">Dismiss</button>';
+  h+='</div>';
+  h+='</div>';
+  return h;
+}
+
+// Small toast helper (matches the success toast in _portalSubmitAddExpense's
+// pattern but generalized for info/warning/success).
+function _portalRecToast(msg,kind){
+  var bg=kind==='warn'?'rgba(234,179,8,.95)':kind==='info'?'rgba(91,155,255,.95)':'rgba(34,197,94,.95)';
+  var toast=document.createElement('div');
+  toast.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:'+bg+';color:#fff;padding:10px 18px;border-radius:6px;font-family:var(--fh);font-size:13px;font-weight:700;z-index:99999;box-shadow:0 4px 14px rgba(0,0,0,.3);transition:opacity .3s;max-width:90vw;text-align:center';
+  toast.textContent=msg;
+  document.body.appendChild(toast);
+  setTimeout(function(){toast.style.opacity='0';setTimeout(function(){toast.remove();},300);},3000);
+}
+
+// ─── Accept: dispatch by rec type ─────────────────────────────────────────
+// Each rec type has its own apply function that handles the actual data
+// mutation, confirmation, persistence, and post-apply UX. Async because each
+// path awaits a confirmation modal.
+function _portalRecAccept(id){
+  var recs=_portalRecsList();
+  var rec=null;
+  for(var i=0;i<recs.length;i++)if(recs[i]&&recs[i].id===id){rec=recs[i];break;}
+  if(!rec){_portalRecToast('Recommendation not found.','warn');return;}
+  if(rec.type==='budget_realloc')return _portalRecApplyBudgetRealloc(id);
+  if(rec.type==='opportunity')return _portalRecApplyOpportunity(id);
+  _portalRecToast('Auto-apply for this rec type ships in a follow-up.','info');
+}
+
+// ─── Apply: budget_realloc ────────────────────────────────────────────────
+// Writes new .total to both source and dest categories in S.expData. The
+// dashboard's getCategoryBudget logic prefers .total over .amount/.subs, so a
+// .total write is the canonical override regardless of the existing shape.
+//
+// Persistence: dual-mirror local write + _touched.expData + PFOS_WRITE_EXP_BUDGET
+// to pfos-main (handler at line ~14837 in pfos-main applies the change there
+// so its _doSync flush carries the right state). beforeunload PATCH (line
+// ~9882 here) is the canonical save to client_profiles regardless.
+//
+// opts.overrideAmount — use this move amount instead of payload's moveAmount
+//                       (set by the Modify modal after user adjustment)
+// opts.skipConfirm     — bypass the _cpConfirmModal step (true when called
+//                       from the Modify modal, which has already confirmed)
+async function _portalRecApplyBudgetRealloc(id,opts){
+  opts=opts||{};
+  var recs=_portalRecsList();
+  var rec=null;
+  for(var i=0;i<recs.length;i++)if(recs[i]&&recs[i].id===id){rec=recs[i];break;}
+  if(!rec||rec.type!=='budget_realloc')return;
+  var p=rec.payload;
+  var moveAmount=(opts.overrideAmount!=null&&!isNaN(parseFloat(opts.overrideAmount)))
+    ? parseFloat(opts.overrideAmount):p.moveAmount;
+  // Defensive validation — modify modal already clamps, but a direct caller
+  // could pass anything. Min $25, max source budget (no negative budgets).
+  if(moveAmount<_PFOS_RECS_CONFIG.bgrRoundTo)moveAmount=_PFOS_RECS_CONFIG.bgrRoundTo;
+  if(moveAmount>p.fromBudget)moveAmount=p.fromBudget;
+  var newFromTotal=Math.max(0,p.fromBudget-moveAmount);
+  var newToTotal=p.toBudget+moveAmount;
+
+  if(!opts.skipConfirm){
+    var ok=await _cpConfirmModal({
+      title:'Move '+fmt(moveAmount)+'/mo between budgets?',
+      message:'<strong>'+esc(p.fromLabel)+'</strong>: '+fmt(p.fromBudget)+'/mo → <strong>'+fmt(newFromTotal)+'/mo</strong><br>'+
+              '<strong>'+esc(p.toLabel)+'</strong>: '+fmt(p.toBudget)+'/mo → <strong>'+fmt(newToTotal)+'/mo</strong><br><br>'+
+              'You can change either category back in My Financial Data anytime.',
+      confirmLabel:'Move '+fmt(moveAmount)+'/mo',
+      confirmStyle:'primary',
+      icon:'⚖️'
+    });
+    if(!ok)return;
+  }
+
+  function _writeMirror(S){
+    if(!S)return;
+    if(!S.expData)S.expData={};
+    if(!S.expData[p.fromCategory])S.expData[p.fromCategory]={};
+    if(!S.expData[p.toCategory])S.expData[p.toCategory]={};
+    S.expData[p.fromCategory].total=newFromTotal;
+    S.expData[p.toCategory].total=newToTotal;
+    if(!S._touched)S._touched={};
+    S._touched.expData=true;
+  }
+  if(_lastPfosState&&_lastPfosState.state)_writeMirror(_lastPfosState.state);
+  if(APP._portalFd&&APP._portalFd.S)_writeMirror(APP._portalFd.S);
+
+  // Push to pfos-main so its S has the change before next _doSync flush.
+  try{
+    var frame=getPFOSFrame();
+    if(frame&&frame.contentWindow){
+      frame.contentWindow.postMessage({
+        type:'PFOS_WRITE_EXP_BUDGET',
+        updates:[
+          {category:p.fromCategory,total:newFromTotal},
+          {category:p.toCategory,total:newToTotal}
+        ]
+      },'https://pfos.esjfinancial.com');
+    }
+  }catch(e){console.warn('PFOS_WRITE_EXP_BUDGET:',e);}
+
+  _portalRecsAccept(id);
+  _portalRecToast('✓ '+fmt(moveAmount)+'/mo moved from '+p.fromLabel+' to '+p.toLabel+'.','success');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+
+// ─── Apply: opportunity ───────────────────────────────────────────────────
+// CPLAN.allocations is fully local. cplanSave() is the existing canonical
+// write to client_profiles + plan_versions. Zero pfos-main dependency.
+//
+// opts.overrideProposedAmount — use this new amount instead of payload's
+//                               proposedAmount (set by Modify modal)
+// opts.skipConfirm            — bypass _cpConfirmModal step
+async function _portalRecApplyOpportunity(id,opts){
+  opts=opts||{};
+  var recs=_portalRecsList();
+  var rec=null;
+  for(var i=0;i<recs.length;i++)if(recs[i]&&recs[i].id===id){rec=recs[i];break;}
+  if(!rec||rec.type!=='opportunity')return;
+  var p=rec.payload;
+
+  if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length){
+    _portalRecToast('Plan not loaded — open My Plan first.','warn');
+    return;
+  }
+
+  // Find target allocation by type. Match first funded one of that type.
+  var allocIdx=-1;
+  for(var i2=0;i2<CPLAN.allocations.length;i2++){
+    var a=CPLAN.allocations[i2];
+    if(!a)continue;
+    if(a.type===p.targetAllocType&&(a.amount||0)>0){allocIdx=i2;break;}
+  }
+  if(allocIdx<0){
+    _portalRecToast('Original allocation no longer in your plan. It may have been changed.','warn');
+    return;
+  }
+
+  var proposedAmount=(opts.overrideProposedAmount!=null&&!isNaN(parseFloat(opts.overrideProposedAmount)))
+    ? parseFloat(opts.overrideProposedAmount):p.proposedAmount;
+  // Floor at current+round-increment (won't accept a decrease via Modify here;
+  // user can do that manually in My Plan).
+  var minProposed=p.currentAmount+_PFOS_RECS_CONFIG.oppRoundTo;
+  if(proposedAmount<minProposed)proposedAmount=minProposed;
+  var increment=proposedAmount-p.currentAmount;
+
+  if(!opts.skipConfirm){
+    var ok=await _cpConfirmModal({
+      title:'Increase '+esc(p.targetAllocName)+'?',
+      message:'Raise this allocation from <strong>'+fmt(p.currentAmount)+'/mo</strong> to <strong>'+fmt(proposedAmount)+'/mo</strong> (+'+fmt(increment)+').<br><br>'+
+              'The Live Plan will recalculate immediately. You can adjust it again in My Plan anytime.',
+      confirmLabel:'Increase by '+fmt(increment),
+      confirmStyle:'success',
+      icon:'📈'
+    });
+    if(!ok)return;
+  }
+
+  CPLAN.allocations[allocIdx].amount=proposedAmount;
+  CPLAN.modified=true;
+  try{
+    if(typeof cplanSave==='function')cplanSave();
+  }catch(e){console.warn('cplanSave from opportunity apply:',e);}
+
+  _portalRecsAccept(id);
+  _portalRecToast('✓ '+esc(p.targetAllocName)+' raised to '+fmt(proposedAmount)+'/mo.','success');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+
+// ─── Modify: dispatch to type-specific editor modal ───────────────────────
+// Each modal pre-fills the suggested value, lets user adjust within validated
+// bounds, and shows real-time before/after. Apply skips the second confirm
+// modal (the modify modal IS the confirmation surface).
+function _portalRecModify(id){
+  var recs=_portalRecsList();
+  var rec=null;
+  for(var i=0;i<recs.length;i++)if(recs[i]&&recs[i].id===id){rec=recs[i];break;}
+  if(!rec){_portalRecToast('Recommendation not found.','warn');return;}
+  if(rec.type==='budget_realloc')return _portalRecOpenModifyBudgetRealloc(rec);
+  if(rec.type==='opportunity')return _portalRecOpenModifyOpportunity(rec);
+  _portalRecToast('Modify not yet supported for this type — use Accept or Dismiss.','info');
+}
+
+// ─── Modify modal: budget_realloc ─────────────────────────────────────────
+function _portalRecOpenModifyBudgetRealloc(rec){
+  var p=rec.payload;
+  // Bounds: min = round-to (e.g. $25), max = fromBudget (don't make source
+  // negative). Stored on a temp slot on the input element; Apply reads it.
+  var minMove=_PFOS_RECS_CONFIG.bgrRoundTo;
+  var maxMove=p.fromBudget;
+  var initial=p.moveAmount;
+  if(initial>maxMove)initial=maxMove;
+  if(initial<minMove)initial=minMove;
+  var step=_PFOS_RECS_CONFIG.bgrRoundTo;
+
+  var el=document.getElementById('portalRecModifyModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='portalRecModifyModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('portalRecModifyModal');};
+    document.body.appendChild(el);
+  }
+  var h='<div class="modal" style="max-width:520px">';
+  h+='<button class="modal-close" onclick="closeModal(\'portalRecModifyModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">⚖️ Adjust Budget Reallocation</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  // Reasoning recap
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:14px">';
+  h+='Over the past '+p.monthsOfData+' months, <strong>'+esc(p.toLabel)+'</strong> has averaged <strong style="color:var(--or)">'+fmt(p.toAvgSpent-p.toBudget)+'/mo over</strong> its budget, while <strong>'+esc(p.fromLabel)+'</strong> has run <strong style="color:var(--gr)">'+fmt(p.fromBudget-p.fromAvgSpent)+'/mo under</strong>.';
+  h+='</div>';
+  // Input
+  h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;padding:14px;margin-bottom:12px">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Move from '+esc(p.fromLabel)+' to '+esc(p.toLabel)+'</div>';
+  h+='<div style="display:flex;align-items:center;gap:10px;justify-content:center">';
+  h+='<button onclick="_portalRecModifyStep(-'+step+',\'br\')" aria-label="Decrease" style="width:36px;height:36px;background:transparent;border:1px solid var(--bd);color:var(--wh);font-size:18px;border-radius:3px;cursor:pointer">−</button>';
+  h+='<div style="display:flex;align-items:center;gap:4px"><span style="font-family:var(--fd);font-size:20px;color:var(--mu)">$</span>';
+  h+='<input id="portalRecModifyInput" type="number" min="'+minMove+'" max="'+maxMove+'" step="'+step+'" value="'+initial+'" oninput="_portalRecModifyRecompute(\'br\')" style="width:100px;padding:6px 8px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd);font-size:20px;font-weight:700;text-align:center;border-radius:3px">';
+  h+='<span style="font-family:var(--fh);font-size:12px;color:var(--mu);margin-left:4px">/mo</span></div>';
+  h+='<button onclick="_portalRecModifyStep('+step+',\'br\')" aria-label="Increase" style="width:36px;height:36px;background:transparent;border:1px solid var(--bd);color:var(--wh);font-size:18px;border-radius:3px;cursor:pointer">+</button>';
+  h+='</div>';
+  h+='<div style="text-align:center;margin-top:8px;font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:600;letter-spacing:.04em">Range: '+fmt(minMove)+' – '+fmt(maxMove)+'/mo · suggested '+fmt(p.moveAmount)+'</div>';
+  h+='</div>';
+  // Resulting state
+  h+='<div style="background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:4px;padding:12px;margin-bottom:14px">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Resulting budgets</div>';
+  h+='<div style="display:flex;justify-content:space-between;padding:5px 0;font-size:13px"><span style="color:var(--wh)">'+esc(p.fromLabel)+'</span><span style="font-family:var(--fh)"><span style="color:var(--mu)">'+fmt(p.fromBudget)+' → </span><strong id="portalRecModifyFromAfter" style="color:var(--or)">'+fmt(p.fromBudget-initial)+'</strong><span style="color:var(--mu)">/mo</span></span></div>';
+  h+='<div style="display:flex;justify-content:space-between;padding:5px 0;font-size:13px"><span style="color:var(--wh)">'+esc(p.toLabel)+'</span><span style="font-family:var(--fh)"><span style="color:var(--mu)">'+fmt(p.toBudget)+' → </span><strong id="portalRecModifyToAfter" style="color:var(--gr)">'+fmt(p.toBudget+initial)+'</strong><span style="color:var(--mu)">/mo</span></span></div>';
+  h+='</div>';
+  // Buttons
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'portalRecModifyModal\')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Cancel</button>';
+  h+='<button onclick="_portalRecModifyApply(\''+esc(rec.id)+'\',\'br\')" style="padding:9px 16px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Apply</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  // Stash payload context for recompute/apply
+  APP._portalRecModifyCtx={mode:'br',recId:rec.id,p:p,minMove:minMove,maxMove:maxMove};
+  openModal('portalRecModifyModal');
+}
+
+// ─── Modify modal: opportunity ────────────────────────────────────────────
+function _portalRecOpenModifyOpportunity(rec){
+  var p=rec.payload;
+  // Bounds: floor at current + round-to ($25). Ceiling is current + avg
+  // surplus (don't suggest more than they actually have surplus for).
+  var minProposed=p.currentAmount+_PFOS_RECS_CONFIG.oppRoundTo;
+  var maxProposed=p.currentAmount+Math.max(_PFOS_RECS_CONFIG.oppRoundTo,p.avgSurplus);
+  var initial=p.proposedAmount;
+  if(initial>maxProposed)initial=maxProposed;
+  if(initial<minProposed)initial=minProposed;
+  var step=_PFOS_RECS_CONFIG.oppRoundTo;
+
+  var el=document.getElementById('portalRecModifyModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='portalRecModifyModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('portalRecModifyModal');};
+    document.body.appendChild(el);
+  }
+  var h='<div class="modal" style="max-width:520px">';
+  h+='<button class="modal-close" onclick="closeModal(\'portalRecModifyModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">📈 Adjust Allocation Increase</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  // Reasoning
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:14px">';
+  h+='You\'ve averaged <strong style="color:var(--gr)">'+fmt(p.avgSurplus)+'/mo</strong> under budget over the past 3 months ('+p.surplusPct+'% of income). Headroom to redirect into <strong>'+esc(p.targetAllocName)+'</strong>.';
+  h+='</div>';
+  // Input
+  h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;padding:14px;margin-bottom:12px">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">New '+esc(p.targetAllocName)+' allocation</div>';
+  h+='<div style="display:flex;align-items:center;gap:10px;justify-content:center">';
+  h+='<button onclick="_portalRecModifyStep(-'+step+',\'opp\')" aria-label="Decrease" style="width:36px;height:36px;background:transparent;border:1px solid var(--bd);color:var(--wh);font-size:18px;border-radius:3px;cursor:pointer">−</button>';
+  h+='<div style="display:flex;align-items:center;gap:4px"><span style="font-family:var(--fd);font-size:20px;color:var(--mu)">$</span>';
+  h+='<input id="portalRecModifyInput" type="number" min="'+minProposed+'" max="'+maxProposed+'" step="'+step+'" value="'+initial+'" oninput="_portalRecModifyRecompute(\'opp\')" style="width:120px;padding:6px 8px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fd);font-size:20px;font-weight:700;text-align:center;border-radius:3px">';
+  h+='<span style="font-family:var(--fh);font-size:12px;color:var(--mu);margin-left:4px">/mo</span></div>';
+  h+='<button onclick="_portalRecModifyStep('+step+',\'opp\')" aria-label="Increase" style="width:36px;height:36px;background:transparent;border:1px solid var(--bd);color:var(--wh);font-size:18px;border-radius:3px;cursor:pointer">+</button>';
+  h+='</div>';
+  h+='<div style="text-align:center;margin-top:8px;font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:600;letter-spacing:.04em">Range: '+fmt(minProposed)+' – '+fmt(maxProposed)+'/mo · suggested '+fmt(p.proposedAmount)+'</div>';
+  h+='</div>';
+  // Resulting state
+  h+='<div style="background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:4px;padding:12px;margin-bottom:14px">';
+  h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--gr);margin-bottom:8px">Resulting allocation</div>';
+  h+='<div style="display:flex;justify-content:space-between;padding:5px 0;font-size:13px"><span style="color:var(--wh)">'+esc(p.targetAllocName)+'</span><span style="font-family:var(--fh)"><span style="color:var(--mu)">'+fmt(p.currentAmount)+' → </span><strong id="portalRecModifyTargetAfter" style="color:var(--gr)">'+fmt(initial)+'</strong><span style="color:var(--mu)">/mo (+<span id="portalRecModifyIncrement">'+fmt(initial-p.currentAmount)+'</span>)</span></span></div>';
+  h+='</div>';
+  // Buttons
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'portalRecModifyModal\')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Cancel</button>';
+  h+='<button onclick="_portalRecModifyApply(\''+esc(rec.id)+'\',\'opp\')" style="padding:9px 16px;background:linear-gradient(135deg,#16A34A,#22C55E);border:none;color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Apply</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  APP._portalRecModifyCtx={mode:'opp',recId:rec.id,p:p,minMove:minProposed,maxMove:maxProposed};
+  openModal('portalRecModifyModal');
+}
+
+// ─── Modify modal: shared step/recompute/apply helpers ────────────────────
+function _portalRecModifyStep(delta,mode){
+  var inp=document.getElementById('portalRecModifyInput');
+  if(!inp)return;
+  var v=parseFloat(inp.value)||0;
+  v+=delta;
+  var ctx=APP._portalRecModifyCtx||{};
+  if(v<ctx.minMove)v=ctx.minMove;
+  if(v>ctx.maxMove)v=ctx.maxMove;
+  inp.value=v;
+  _portalRecModifyRecompute(mode);
+}
+
+function _portalRecModifyRecompute(mode){
+  var inp=document.getElementById('portalRecModifyInput');
+  var ctx=APP._portalRecModifyCtx||{};
+  if(!inp||!ctx.p)return;
+  var v=parseFloat(inp.value);
+  if(isNaN(v))v=0;
+  // Clamp on blur-ish; don't fight the user mid-typing too hard
+  if(v<ctx.minMove)v=ctx.minMove;
+  if(v>ctx.maxMove)v=ctx.maxMove;
+  if(mode==='br'){
+    var fromAfter=document.getElementById('portalRecModifyFromAfter');
+    var toAfter=document.getElementById('portalRecModifyToAfter');
+    if(fromAfter)fromAfter.textContent=fmt(Math.max(0,ctx.p.fromBudget-v));
+    if(toAfter)toAfter.textContent=fmt(ctx.p.toBudget+v);
+  } else if(mode==='opp'){
+    var tgt=document.getElementById('portalRecModifyTargetAfter');
+    var incEl=document.getElementById('portalRecModifyIncrement');
+    if(tgt)tgt.textContent=fmt(v);
+    if(incEl)incEl.textContent=fmt(v-ctx.p.currentAmount);
+  }
+}
+
+function _portalRecModifyApply(id,mode){
+  var inp=document.getElementById('portalRecModifyInput');
+  var ctx=APP._portalRecModifyCtx||{};
+  if(!inp||!ctx.p){closeModal('portalRecModifyModal');return;}
+  var v=parseFloat(inp.value);
+  if(isNaN(v)){_portalRecToast('Enter a valid amount.','warn');return;}
+  if(v<ctx.minMove)v=ctx.minMove;
+  if(v>ctx.maxMove)v=ctx.maxMove;
+  closeModal('portalRecModifyModal');
+  // skipConfirm: the modify modal IS the confirmation surface; chaining a
+  // second confirm modal would be redundant friction.
+  if(mode==='br'){
+    _portalRecApplyBudgetRealloc(id,{overrideAmount:v,skipConfirm:true});
+  } else if(mode==='opp'){
+    _portalRecApplyOpportunity(id,{overrideProposedAmount:v,skipConfirm:true});
+  }
+}
+
+function _portalRecDismiss(id){
+  _portalRecsDismiss(id);
   if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
 }
 
@@ -6491,10 +7743,20 @@ function _portalRenderSpendDashboard(){
   var fd=APP._portalFd||{};
   var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
   var calcs=APP._portalCalcs||fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
-  var status=_portalSpendStatus();
+  // Resolve picker state → effective month/year. null on state vars means
+  // "follow current". status() reads the same context so all derived metrics
+  // (tiles, banner, bars) reflect the selected month.
+  var _spvCtx={month:_portalSpendViewMonth,year:_portalSpendViewYear};
+  var status=_portalSpendStatus(_spvCtx);
   var entries=S.spendingEntries||[];
   var now=new Date();
-  var curMonth=now.getMonth(),curYear=now.getFullYear();
+  // curMonth/curYear are the selected month, NOT today. All downstream filters
+  // (monthEntries, calendar render, recent entries, category bars) use these.
+  // For the live current month, _spvCtx is {null,null} and these fall through
+  // to now.getMonth()/getFullYear() — identical to pre-picker behavior.
+  var curMonth=(_portalSpendViewMonth!=null)?_portalSpendViewMonth:now.getMonth();
+  var curYear=(_portalSpendViewYear!=null)?_portalSpendViewYear:now.getFullYear();
+  var isCurrentMonth=(curMonth===now.getMonth()&&curYear===now.getFullYear());
   var monthEntries=entries.filter(function(e){
     var d=new Date(e.date);
     return d.getMonth()===curMonth&&d.getFullYear()===curYear;
@@ -6519,11 +7781,49 @@ function _portalRenderSpendDashboard(){
 
   var h='';
 
-  // ── 1. Header + Add Expense + Savings Goal action row ──
+  // ── 1. Header (month picker) + Add Expense + Savings Goal action row ──
+  // Month picker replaces the static month label. Built from
+  // _portalGetDataBearingMonths so only months with data + the current month
+  // show in the dropdown. Prev/next arrows step through the same list.
+  // State: _portalSpendViewMonth/Year (module-scope, near _portalCalNav).
   h+='<div class="sec-group">';
-  h+='<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px;margin-bottom:14px">';
-  h+='<div><div class="sec-hdr">'+monthNames[curMonth]+' '+curYear+'</div>';
-  h+='<div style="font-family:var(--fh);font-size:13px;color:var(--mu);margin-top:2px">Day '+status.dayOfMonth+' of '+status.daysInMonth+' · '+status.daysLeft+' days remaining</div></div>';
+  h+='<div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:8px;margin-bottom:14px">';
+  h+='<div style="flex:1;min-width:240px">';
+  var _spvMonths=_portalGetDataBearingMonths();
+  var _spvIdx=-1;
+  for(var _spvI=0;_spvI<_spvMonths.length;_spvI++){
+    if(_spvMonths[_spvI].month===curMonth&&_spvMonths[_spvI].year===curYear){_spvIdx=_spvI;break;}
+  }
+  var _spvHasPrev=_spvIdx<_spvMonths.length-1;// older months exist (higher idx)
+  var _spvHasNext=_spvIdx>0;// newer months exist (lower idx)
+  h+='<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap">';
+  // Prev arrow ‹ — older month
+  h+='<button onclick="_portalSpendNavMonth(-1)"'+(!_spvHasPrev?' disabled':'')+' aria-label="Previous month" style="background:none;border:1px solid '+(_spvHasPrev?'rgba(91,155,255,.3)':'var(--bd)')+';color:'+(_spvHasPrev?'#5B9BFF':'var(--mu)')+';cursor:'+(_spvHasPrev?'pointer':'not-allowed')+';font-size:18px;width:30px;height:32px;border-radius:3px;display:inline-flex;align-items:center;justify-content:center;opacity:'+(_spvHasPrev?'1':'.4')+';padding:0;line-height:1">‹</button>';
+  // Month dropdown
+  h+='<select onchange="_portalSpendJumpToMonth(this.value)" aria-label="Jump to month" style="padding:6px 28px 6px 10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:15px;font-weight:700;border-radius:3px;cursor:pointer;min-height:32px;letter-spacing:.02em">';
+  _spvMonths.forEach(function(m){
+    var key=m.month+'-'+m.year;
+    var label=monthNames[m.month]+' '+m.year;
+    var isCurrentOpt=(m.month===now.getMonth()&&m.year===now.getFullYear());
+    if(isCurrentOpt)label+=' (current)';
+    var selAttr=(m.month===curMonth&&m.year===curYear)?' selected':'';
+    h+='<option value="'+key+'"'+selAttr+'>'+label+'</option>';
+  });
+  h+='</select>';
+  // Next arrow › — newer month
+  h+='<button onclick="_portalSpendNavMonth(1)"'+(!_spvHasNext?' disabled':'')+' aria-label="Next month" style="background:none;border:1px solid '+(_spvHasNext?'rgba(91,155,255,.3)':'var(--bd)')+';color:'+(_spvHasNext?'#5B9BFF':'var(--mu)')+';cursor:'+(_spvHasNext?'pointer':'not-allowed')+';font-size:18px;width:30px;height:32px;border-radius:3px;display:inline-flex;align-items:center;justify-content:center;opacity:'+(_spvHasNext?'1':'.4')+';padding:0;line-height:1">›</button>';
+  // TODAY shortcut when viewing a past month
+  if(!isCurrentMonth){
+    h+='<button onclick="_portalSpendJumpToMonth(\'current\')" style="background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.08em;padding:6px 10px;border-radius:3px;cursor:pointer;min-height:32px">TODAY</button>';
+  }
+  h+='</div>';
+  // Day-of-month sub-line — current month only. Retrospective wording for
+  // past months comes in the next commit; for now the line just hides when
+  // we're not viewing the current month so we don't lie about "Day X of Y".
+  if(isCurrentMonth){
+    h+='<div style="font-family:var(--fh);font-size:13px;color:var(--mu);margin-top:6px">Day '+status.dayOfMonth+' of '+status.daysInMonth+' · '+status.daysLeft+' days remaining</div>';
+  }
+  h+='</div>';
   h+='</div>';
   // Quick action row — matches pfos-main visually
   h+='<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">';
@@ -6558,6 +7858,17 @@ function _portalRenderSpendDashboard(){
 
   // ── 6. PLAN ALIGNMENT — committed vs deployed (portal-only, reads CPLAN) ──
   try{h+=_planAlignmentCard();}catch(e){console.warn('Plan alignment:',e);}
+
+  // ── 6.25 RECOMMENDATIONS — behavioral plan engine surface ──
+  // Only renders when there are pending recommendations (auto-hides when none).
+  // Detection runs via the trigger at the top of renderSpendingAnalysis.
+  try{h+=_portalRenderRecommendations();}catch(e){console.warn('Recommendations:',e);}
+
+  // ── 6.5 HISTORICAL PROGRESS — zoom-out lens (independent of month picker) ──
+  // Window buttons + aggregate donut + top categories + recurring breakout +
+  // direction delta. Always present, regardless of which month the picker is
+  // on. Default window: '3mo' (set on the _portalSpendWindow var).
+  try{h+=_portalRenderHistoricalProgress();}catch(e){console.warn('Historical progress:',e);}
 
   // ── 7. Where Your Money Went — categorical bars with budgets, sorted desc ──
   if(monthEntries.length>0){
@@ -6661,7 +7972,11 @@ function _portalRenderSpendDashboard(){
   try{h+=_portalSmartAlertsBlock(status,bills,monthEntries);}catch(e){console.warn('Smart alerts:',e);}
 
   // ── 12. This Week vs Last Week ──
-  if(entries.length>0){
+  // Current month only — uses `now` as the anchor for week math, so the math
+  // is wrong for past months (would show current-week entries regardless of
+  // picker selection). For past-month review, the full Recent/All Expenses
+  // list below carries the per-day detail.
+  if(isCurrentMonth&&entries.length>0){
     var weekStart=new Date(now);weekStart.setDate(now.getDate()-now.getDay());weekStart.setHours(0,0,0,0);
     var lastWeekStart=new Date(weekStart);lastWeekStart.setDate(lastWeekStart.getDate()-7);
     var thisWeekTotal=entries.filter(function(e){var d=new Date(e.date);return d>=weekStart;}).reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
@@ -6679,10 +7994,16 @@ function _portalRenderSpendDashboard(){
     }
   }
 
-  // ── 13. Recent entries (now editable: ✏️ + ✕) ──
+  // ── 13. Recent / All entries (editable: ✏️ + ✕) ──
+  // Current month: capped at 10 most-recent for at-a-glance scan.
+  // Past month: uncapped — past months are review-only, user wants the full
+  // record. Label changes to "All [Month] Expenses" to set expectations.
   if(monthEntries.length>0){
-    var recent=monthEntries.slice().sort(function(a,b){return new Date(b.date)-new Date(a.date);}).slice(0,10);
-    h+='<div class="sec-group"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div class="sec-group-title" style="margin-bottom:0">Recent Expenses</div><span style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:600">'+monthEntries.length+' this month</span></div>';
+    var recentCap=isCurrentMonth?10:monthEntries.length;
+    var recent=monthEntries.slice().sort(function(a,b){return new Date(b.date)-new Date(a.date);}).slice(0,recentCap);
+    var recentTitle=isCurrentMonth?'Recent Expenses':'All '+monthNames[curMonth]+' Expenses';
+    var recentCountLabel=isCurrentMonth?(monthEntries.length+' this month'):(monthEntries.length+' total');
+    h+='<div class="sec-group"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div class="sec-group-title" style="margin-bottom:0">'+recentTitle+'</div><span style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:600">'+recentCountLabel+'</span></div>';
     var icMap={food:'🍽️',housing:'🏠',transportation:'🚗',discretionary:'🎬',subscriptions:'📱',utilities:'⚡',insurance:'🛡️',misc:'📦',activeSavings:'📈'};
     recent.forEach(function(e){
       var bk=e.category||e.category_bucket||'misc';
@@ -6718,9 +8039,15 @@ function _portalRenderSpendDashboard(){
 function _ordSuffix(n){var s=['th','st','nd','rd'];var v=n%100;return s[(v-20)%10]||s[v]||s[0];}
 
 // ── Inline accountability banner (portal version) ──
+// Renders one of three forms based on status:
+//   1. Past month (isCurrent=false) → retrospective summary, no click handler.
+//      "October finished at $4,200 of $5,000 (84%) — under budget" type copy.
+//      Past months are settled; surfacing pace warnings or "view impact" CTAs
+//      would be confusing since the user can't change a finished month.
+//   2. Current + severity ok → compact "on track" line, no click handler.
+//   3. Current + severity non-ok → clickable card that opens the impact popup.
 function _portalSpendBanner(status){
   if(!status)status=_portalSpendStatus();
-  var on=status.severity!=='ok';
   var theme={
     ok:{bg:'rgba(34,197,94,.06)',bd:'rgba(34,197,94,.18)',fg:'var(--gr)',icon:'✅'},
     caution:{bg:'rgba(234,179,8,.06)',bd:'rgba(234,179,8,.22)',fg:'var(--yl)',icon:'👁️'},
@@ -6728,6 +8055,31 @@ function _portalSpendBanner(status){
     over:{bg:'rgba(239,68,68,.07)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️'}
   };
   var t=theme[status.severity]||theme.ok;
+  var on=status.severity!=='ok';
+  // Past month: retrospective summary
+  if(status.isCurrent===false){
+    var retroIcon=t.icon;
+    var retroLabel;
+    var retroDetail;
+    var pctOfBudget=status.moneyIn>0?Math.round(status.moneyOut/status.moneyIn*100):0;
+    if(status.severity==='over'){
+      retroLabel='OVER BUDGET';
+      retroDetail=esc(status.monthLabel)+' finished at '+fmt(status.moneyOut)+' of '+fmt(status.moneyIn)+' ('+pctOfBudget+'%) — '+fmt(status.moneyOut-status.moneyIn)+' over.';
+    } else if(status.severity==='warning'||status.severity==='caution'){
+      retroLabel='CLOSE CALL';
+      retroDetail=esc(status.monthLabel)+' finished at '+fmt(status.moneyOut)+' of '+fmt(status.moneyIn)+' ('+pctOfBudget+'%) — under budget but tight.';
+    } else {
+      retroLabel='ON TRACK';
+      retroDetail=esc(status.monthLabel)+' finished at '+fmt(status.moneyOut)+' of '+fmt(status.moneyIn)+' ('+pctOfBudget+'%) — solid month.';
+    }
+    var rh='<div style="padding:11px 13px;background:'+t.bg+';border:1px solid '+t.bd+';border-left:3px solid '+t.fg+';border-radius:4px;margin-bottom:14px">';
+    rh+='<div style="display:flex;align-items:flex-start;gap:9px">';
+    rh+='<span style="font-size:16px;line-height:1">'+retroIcon+'</span>';
+    rh+='<div><div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.06em;color:'+t.fg+';text-transform:uppercase">'+retroLabel+'</div>';
+    rh+='<div style="font-size:13px;color:rgba(226,232,240,.85);margin-top:2px">'+retroDetail+'</div>';
+    rh+='</div></div></div>';
+    return rh;
+  }
   if(!on){
     return'<div style="padding:10px 12px;background:'+t.bg+';border:1px solid '+t.bd+';border-radius:4px;font-size:13px;color:'+t.fg+';margin-bottom:14px">'+t.icon+' On track — spending under pace</div>';
   }
@@ -6820,6 +8172,65 @@ function _portalSpendShowPopup(forceShow){
     }
     h+='</div></div>';
   }
+
+  // 4. PLAN-vs-REALITY tradeoff — chronic-overspend three-button choice.
+  // Surfaces only here (never as a proactive recommendation) per locked scope.
+  // Trigger: overspent 4+ of the last 6 months. Computed inline rather than
+  // calling the recs detector — this is real-time popup state, not a stored
+  // recommendation.
+  try{
+    var pvrFd=APP._portalFd||{};
+    var pvrS=pvrFd.S||(_lastPfosState&&_lastPfosState.state)||{};
+    var pvrCalcs=APP._portalCalcs||pvrFd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
+    var pvrInc=Math.round(pvrCalcs.inc||0);
+    if(pvrInc>0){
+      var pvrEntries=pvrS.spendingEntries||[];
+      var pvrNow=new Date();
+      var pvrCurKey=pvrNow.getFullYear()*12+pvrNow.getMonth();
+      var pvrMonths=[];
+      for(var pvrI=0;pvrI<_PFOS_RECS_CONFIG.pvrMonthsOfDataRequired;pvrI++){
+        var pvrT=pvrCurKey-pvrI;
+        pvrMonths.push({key:pvrT,total:0});
+      }
+      pvrEntries.forEach(function(e){
+        if(!e||!e.date)return;
+        var d=new Date(e.date);
+        if(isNaN(d.getTime()))return;
+        var k=d.getFullYear()*12+d.getMonth();
+        for(var mi=0;mi<pvrMonths.length;mi++){
+          if(pvrMonths[mi].key===k){pvrMonths[mi].total+=parseFloat(e.amount)||0;break;}
+        }
+      });
+      var pvrMonthsWithData=pvrMonths.filter(function(mn){return mn.total>0;}).length;
+      var pvrMonthsOver=pvrMonths.filter(function(mn){return mn.total>pvrInc;}).length;
+      // Need 4+ overspent months AND 6 months of any data (otherwise too noisy
+      // to claim "chronic"). Show only when current popup is over/warning.
+      if(pvrMonthsWithData>=_PFOS_RECS_CONFIG.pvrMonthsOfDataRequired&&pvrMonthsOver>=_PFOS_RECS_CONFIG.pvrChronicMonthsOverIncome&&(status.severity==='over'||status.severity==='warning')){
+        var pvrAvgOver=0,pvrOverCount=0;
+        pvrMonths.forEach(function(mn){if(mn.total>pvrInc){pvrAvgOver+=(mn.total-pvrInc);pvrOverCount++;}});
+        var pvrAvgMonthlyOver=pvrOverCount>0?Math.round(pvrAvgOver/pvrOverCount):0;
+        var pvrYearlyLost=pvrAvgMonthlyOver*12;
+        var pvrCompounded='';
+        try{
+          var imp=_portalSpendPlanImpact(pvrAvgMonthlyOver);
+          if(imp&&imp.compoundedShortfall>0){
+            pvrCompounded=' Over '+imp.yearsToRetirement+' yrs at 6.5%, that\'s ~'+fmtK(imp.compoundedShortfall)+' in lost growth.';
+          }
+        }catch(_pvre){}
+        h+='<div style="margin-bottom:12px;padding:12px 14px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.25);border-left:3px solid var(--rd);border-radius:4px">';
+        h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--rd);margin-bottom:6px">⚠ Persistent overspend — '+pvrMonthsOver+' of '+_PFOS_RECS_CONFIG.pvrMonthsOfDataRequired+' months</div>';
+        h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:10px">';
+        h+='You\'ve overspent in <strong>'+pvrMonthsOver+' of the last '+_PFOS_RECS_CONFIG.pvrMonthsOfDataRequired+' months</strong> by an average of <strong style="color:var(--rd)">'+fmt(pvrAvgMonthlyOver)+'/mo</strong> (~'+fmt(pvrYearlyLost)+'/year).'+pvrCompounded;
+        h+='<br><br>Three ways forward:</div>';
+        h+='<div style="display:flex;flex-direction:column;gap:6px">';
+        h+='<button onclick="_portalPlanVsRealityCut();closeModal(\'portalSpendModal\')" style="padding:9px 12px;text-align:left;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:3px;cursor:pointer;min-height:38px">✂ Cut spending — show me where</button>';
+        h+='<button onclick="_portalPlanVsRealityReducePlan();closeModal(\'portalSpendModal\')" style="padding:9px 12px;text-align:left;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.25);color:var(--yl);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:3px;cursor:pointer;min-height:38px">📉 Reduce my plan to match reality</button>';
+        h+='<button onclick="_portalPlanVsRealityIncome();closeModal(\'portalSpendModal\')" style="padding:9px 12px;text-align:left;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.25);color:var(--gr);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:3px;cursor:pointer;min-height:38px">💰 Increase income — what are my options</button>';
+        h+='</div>';
+        h+='</div>';
+      }
+    }
+  }catch(_pvr){console.warn('Plan-vs-reality block:',_pvr);}
   // Footer
   h+='<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;padding-top:12px;border-top:1px solid var(--bd)">';
   h+='<button onclick="closeModal(\'portalSpendModal\')" style="padding:9px 16px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">I\'ll handle it</button>';
@@ -6844,6 +8255,11 @@ function _portalSpendShowPopup(forceShow){
 
 // ── Auto-show popup on My Spending tab open ──
 function _portalSpendMaybeShowPopup(){
+  // Suppress when viewing a past month — the accountability popup is about
+  // current-state pace and live plan-impact, both of which are meaningless
+  // for a finished month. Surfacing it while the user is examining history
+  // would be confusing (popup describes current state, page shows past).
+  if(typeof _portalSpendViewMonth!=='undefined'&&_portalSpendViewMonth!==null)return;
   var status=_portalSpendStatus();
   if(status.severity==='ok')return;
   var key=_portalSpendTriggerKey(status);
@@ -6868,6 +8284,95 @@ function _portalSpendScrollToCats(){
     var el=document.getElementById('portalSpendCatHdr');
     if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
   },200);
+}
+
+// ─── PLAN-vs-REALITY: three sub-flow handlers ─────────────────────────────
+// Triggered from the chronic-overspend tradeoff section inside
+// _portalSpendShowPopup. Each handler is intentionally lightweight for v1 —
+// they navigate or surface guidance rather than launching deep modals. Each
+// can be expanded later (e.g., reduce-plan could become a per-allocation
+// adjustment sheet; income options could be a dedicated content panel).
+
+function _portalPlanVsRealityCut(){
+  // Reuses the existing "Show me what to cut" affordance — scrolls to the
+  // category breakdown so the user can see what's over budget.
+  if(typeof showClientPage==='function')showClientPage('spending');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+  _portalSpendScrollToCats();
+}
+
+function _portalPlanVsRealityReducePlan(){
+  // Navigate to My Plan with a guidance toast. A future enhancement could
+  // pre-open an "audit" or "reduce" mode in the plan UI; for now the user
+  // adjusts allocation amounts manually.
+  if(typeof showClientPage==='function'){
+    showClientPage('plan');
+    if(typeof initClientPlan==='function')initClientPlan();
+  }
+  _portalRecToast('Reduce one or more plan allocations to match what you can actually deploy.','info');
+}
+
+function _portalPlanVsRealityIncome(){
+  // Income-side options. The default copy is intentionally grounded — concrete
+  // tactics, not generic self-help. Each item names what to do, how to start,
+  // and what success looks like, in the voice of a financial advisor having
+  // a real conversation with a client who needs a plan, not a pep talk.
+  var el=document.getElementById('portalIncomeOptionsModal');
+  if(!el){
+    el=document.createElement('div');
+    el.id='portalIncomeOptionsModal';
+    el.className='modal-bg';
+    el.setAttribute('role','dialog');
+    el.setAttribute('aria-modal','true');
+    el.onclick=function(ev){if(ev.target===el)closeModal('portalIncomeOptionsModal');};
+    document.body.appendChild(el);
+  }
+  var h='<div class="modal" style="max-width:540px">';
+  h+='<button class="modal-close" onclick="closeModal(\'portalIncomeOptionsModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title">💰 Income Options</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:14px">You can lower expenses, lower the plan, or raise income. The first two are subtraction. This is the only one that compounds. Five paths most people haven\'t fully explored:</div>';
+  var ideas=[
+    {
+      icon:'📈',
+      title:'Ask for a raise — with data',
+      desc:'Most raises are left on the table because nobody asks. Build the case: quantified wins from the last 12 months, current market rate for your role, what you\'re asking for, what you\'ll accept. Schedule the conversation — don\'t ambush it. Quiet asks get quiet answers.'
+    },
+    {
+      icon:'🔄',
+      title:'Test the market',
+      desc:'Even if you have no intention of leaving, an outside offer is the most accurate measurement of your value. Interviewing once a year tells you what you\'re actually worth. The 10-20% jumps usually come from changes, not from raises.'
+    },
+    {
+      icon:'💼',
+      title:'Add one income stream',
+      desc:'Not a burnout side hustle — one income source. Consulting one weekend a month, a rental, dividends from a serious portfolio, a niche skill you can sell on contract. The hardest dollar is the first $500/month. After that the system is proven and scaling is mechanical.'
+    },
+    {
+      icon:'🛠️',
+      title:'Become more valuable in your field',
+      desc:'Look at the job listings one level above where you are now. What skills, credentials, or certifications appear repeatedly? Pick one you can earn in 6-12 months. The right specialty inside your industry can shift your comp band entirely, not just your salary.'
+    },
+    {
+      icon:'📊',
+      title:'Keep more of what you earn',
+      desc:'Sometimes the raise is in what you don\'t pay, not what you bring in. Max your employer match (it\'s free money you\'re leaving). Move savings into pre-tax accounts where appropriate. For high earners, IBC and properly-structured permanent life can shift where your dollars work without changing your top line. This is the lever your advisor can pull with you.'
+    }
+  ];
+  ideas.forEach(function(idea){
+    h+='<div style="display:flex;gap:10px;padding:11px 0;border-bottom:1px solid rgba(0,68,191,.08)">';
+    h+='<span style="font-size:20px;flex-shrink:0;line-height:1.2">'+idea.icon+'</span>';
+    h+='<div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:4px">'+idea.title+'</div>';
+    h+='<div style="font-size:12px;color:var(--mu);line-height:1.55">'+idea.desc+'</div></div>';
+    h+='</div>';
+  });
+  h+='<div style="margin-top:14px;padding:11px 13px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:3px;font-size:12px;color:var(--mu);line-height:1.6">Pick <strong style="color:var(--wh)">one</strong>. The mistake is running all five at once and finishing none. Quarterly goal, weekly action, monthly check-in. When it\'s in motion, pick the next one.</div>';
+  h+='<div style="display:flex;justify-content:flex-end;margin-top:14px;padding-top:12px;border-top:1px solid var(--bd)">';
+  h+='<button onclick="closeModal(\'portalIncomeOptionsModal\')" style="padding:9px 18px;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:36px">Got it</button>';
+  h+='</div>';
+  h+='</div></div>';
+  el.innerHTML=h;
+  openModal('portalIncomeOptionsModal');
 }
 
 // ── Add-expense overlay modal ──
@@ -7241,6 +8746,47 @@ function _portalSubmitAddExpense(){
   if(typeof prefill._onSubmit==='function'){
     try{prefill._onSubmit(entry);}catch(e){console.warn('Portal add-expense onSubmit callback:',e);}
   }
+  // 7. Reactive plan-impact popup on submit
+  // ─────────────────────────────────────────────────────────────────────
+  // The accountability popup (_portalSpendShowPopup) shows the plan-impact
+  // story — compounded shortfall, retirement projection change, course-correct
+  // suggestion. Previously this only fired on tab open via
+  // _portalSpendMaybeShowPopup, which meant a user logging a $1,500 surprise
+  // car repair didn't see the impact in the moment they entered it. They'd
+  // only see it next time they navigated to My Spending — long after the
+  // emotional weight of the decision had faded.
+  //
+  // Trigger conditions:
+  //   - expense_type 'emergency' or 'big_purchase': force-show (user
+  //     explicitly flagged the entry as impact-worthy)
+  //   - otherwise: defer to _portalSpendMaybeShowPopup, which is
+  //     severity-aware + dedup-aware (won't re-show for the same
+  //     month + severity + ~$50 overspend bucket)
+  //
+  // Skip in edit mode — the impact-moment already happened on the original
+  // entry. Editing shouldn't re-traumatize the user with a fresh popup.
+  //
+  // Slight delay (700ms for emergency/big_purchase, none for normal) so the
+  // success toast lands first and the dashboard re-renders before the popup
+  // overlays on top.
+  if(!isEdit){
+    try{
+      // Suppress if the picker is on a past month — user is in review mode,
+      // not active-budget mode. _portalSpendMaybeShowPopup already has this
+      // guard but emergency/big_purchase force-show bypasses it; check here
+      // so all reactive trigger paths are consistent.
+      var _spvOnPast=(typeof _portalSpendViewMonth!=='undefined'&&_portalSpendViewMonth!==null);
+      if(!_spvOnPast){
+        if(expType==='emergency'||expType==='big_purchase'){
+          setTimeout(function(){
+            if(typeof _portalSpendShowPopup==='function')_portalSpendShowPopup(true);
+          },700);
+        } else {
+          if(typeof _portalSpendMaybeShowPopup==='function')_portalSpendMaybeShowPopup();
+        }
+      }
+    }catch(e){console.warn('Plan-impact popup on submit:',e);}
+  }
 }
 
 
@@ -7317,6 +8863,26 @@ function renderSpendingAnalysis(){
     el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:12px 0">Enter your financial data in <strong style="color:#5B9BFF">My Financial Data</strong> to see spending analysis.</div>';
     return;
   }
+
+  // Behavioral plan engine — once-per-calendar-month detection trigger.
+  // Skipped during onboarding (<10 entries total = insufficient history),
+  // throttled by S.recsLastRunAt timestamp checked inside the helper.
+  // Wrapped in try/catch so a detector bug never blocks the dashboard render.
+  try{
+    var _entriesCount=(S.spendingEntries||[]).length;
+    var _lastRun=S.recsLastRunAt;
+    var _shouldRun=false;
+    if(_entriesCount>=_PFOS_RECS_CONFIG.minEntriesToDetect){
+      if(!_lastRun){_shouldRun=true;}
+      else{
+        var _lr=new Date(_lastRun),_now=new Date();
+        if(_lr.getMonth()!==_now.getMonth()||_lr.getFullYear()!==_now.getFullYear())_shouldRun=true;
+      }
+    }
+    if(_shouldRun&&typeof _portalRecsRunDetection==='function'){
+      _portalRecsRunDetection();
+    }
+  }catch(e){console.warn('Recs detection trigger:',e);}
 
   var totalExp=calcs.baseExp||0;
   var inc=calcs.inc||1;
@@ -8670,7 +10236,7 @@ window.addEventListener('message',async function(e){
       var touched=state._touched||{};
       if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
         var exS=ex.data.financial_data.S;
-        var _protectedSections=['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot'];
+        var _protectedSections=['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations'];
         _protectedSections.forEach(function(sec){
           if(!touched[sec]){
             var exVal=exS[sec];
@@ -25318,6 +26884,13 @@ function _cpStartSelfBuild(){
     ibc:{type:'ibc',phase:3},
     existing_policy:{type:'wl',phase:3}
   };
+  // If a partner has shared a card of one of these types with this user, the
+  // user's household already has coverage for it — don't seed a duplicate
+  // placeholder. Exclusions are per-person tax accounts (Roth IRA, 401k, HSA,
+  // Traditional IRA) where the IRS limit is per-person, so both spouses
+  // legitimately need their own card. Joint cards in CPLAN.allocations are
+  // already covered by the existing type-level dedup below.
+  var _pscDedupTypes={ef:1,debt:1,protection:1,invest:1,rollover:1,ibc:1,wl:1};
   flags.forEach(function(f){
     var sol=solMap[f.action];
     if(!sol)return;
@@ -25329,6 +26902,11 @@ function _cpStartSelfBuild(){
       dup=CPLAN.allocations.some(function(a){return a.type==='protection'&&a.flagTitle===f.title;});
     } else {
       dup=CPLAN.allocations.some(function(a){return a.type===sol.type;});
+    }
+    // Extended dedup: also skip if a partner-shared card of this type exists
+    // (whitelisted types only — per-person tax accounts excluded).
+    if(!dup && _pscDedupTypes[sol.type] && Array.isArray(CPLAN.partnerSharedCards)){
+      dup=CPLAN.partnerSharedCards.some(function(c){return c&&c.type===sol.type;});
     }
     if(dup)return;
     // Map protection sub-flag to a distinct card header so users see
@@ -25450,6 +27028,19 @@ function _cpSyncFlagsToUnassigned(){
       alreadyIn=CPLAN.allocations.some(function(a){return a.type===directMap[act];});
     } else if(act==='401k'){
       alreadyIn=CPLAN.allocations.some(function(a){return a.type==='401k';});
+    }
+    // Extended dedup: also treat a partner-shared card of a whitelisted type
+    // as "already represented" so this sync doesn't recreate a duplicate every
+    // render. Excludes per-person tax accounts (Roth IRA, 401k, HSA, Trad IRA)
+    // where IRS limits are per-person; both spouses legitimately need their own.
+    if(!alreadyIn && Array.isArray(CPLAN.partnerSharedCards) && CPLAN.partnerSharedCards.length){
+      var _pscRenderDedup={ef:1,debt:1,protection:1,invest:1,rollover:1,ibc:1,wl:1,umbrella:1,estate:1};
+      var checkType=null;
+      if(actionOnlyMap.hasOwnProperty(act)){var _t=actionOnlyMap[act]; if(_t)checkType=_t;}
+      else if(directMap[act]) checkType=directMap[act];
+      if(checkType && _pscRenderDedup[checkType]){
+        alreadyIn=CPLAN.partnerSharedCards.some(function(c){return c&&c.type===checkType;});
+      }
     }
     if(alreadyIn)return;
     // Map flag title to a meaningful card header for protection sub-types.
@@ -28894,6 +30485,111 @@ function _cpUnsubscribeFromJointFinancials(){
   CPLAN._jointFinancialsChannel = null;
 }
 
+// ════════════════════════════════════════════════════════════════════════════
+// JOINT HOUSEHOLD — REALTIME SYNC: client_profiles shared row
+// ════════════════════════════════════════════════════════════════════════════
+// Joint couples share ONE client_profiles row (the one under client_a_id).
+// When one spouse saves their plan via cplanSave(), the other spouse's
+// CPLAN.allocations is now stale until they manually reload. This subscription
+// listens for UPDATEs on the shared row and surfaces a refresh banner.
+//
+// Design choice: we do NOT auto-overwrite CPLAN.allocations because the user
+// may be mid-edit and silently losing their work would be hostile. Instead the
+// existing _partnerUpdatedBanner is shown with a "Refresh now" affordance so
+// the user opts in.
+//
+// Self-echo suppression: cplanSave() stamps _lastSelfProfileSaveAt right after
+// firing the UPDATE; the handler skips events within 1.5s of that stamp.
+//
+// Only Joint households need this — Hybrid/Separate have per-spouse rows so a
+// realtime UPDATE on this row only ever comes from us. Skip subscribe for them.
+
+function _cpSubscribeToJointProfile(){
+  if(CPLAN._jointProfileChannel)return;// already subscribed
+  if(!APP.currentClientId)return;
+  var couple = (typeof getCoupleForClient === 'function') ? getCoupleForClient(APP.currentClientId) : null;
+  if(!couple) return;
+  if(couple.household_type !== 'joint') return;// only Joint shares the profile row
+  if(!db || !db.channel) return;
+  // Find the profile row id for the shared client. We filter on profile.client_id
+  // rather than profile.id so the subscription stays valid even if the row id
+  // changes (unlikely but defensive). Both spouses' cplanSave writes target this
+  // same client_id, so any partner UPDATE triggers our handler.
+  var sharedClientId = couple.client_a_id;
+  try{
+    var channel = db.channel('joint_profile:'+sharedClientId)
+      .on('postgres_changes', {
+        event: 'UPDATE',
+        schema: 'public',
+        table: 'client_profiles',
+        filter: 'client_id=eq.'+sharedClientId
+      }, function(payload){
+        // Self-echo suppression — skip events within 1.5s of our own save
+        var lastSelf = CPLAN._lastSelfProfileSaveAt || 0;
+        if(Date.now() - lastSelf < 1500) return;
+        var row = payload && payload.new;
+        if(!row) return;
+        // Surface a banner so the user knows the plan they're looking at is
+        // stale. The existing _partnerUpdatedBanner UI in _cpRenderPlanV2
+        // handles the dismiss interaction; auto-refresh is intentionally NOT
+        // done to avoid clobbering mid-edit work.
+        CPLAN._partnerUpdatedBanner = {
+          at: Date.now(),
+          source: 'joint_profile',
+          updatedAt: row.updated_at || null
+        };
+        try{ if(typeof _cpRenderPlanV2 === 'function') _cpRenderPlanV2(); }catch(e){}
+      })
+      .subscribe();
+    CPLAN._jointProfileChannel = channel;
+  }catch(e){ console.warn('[joint-profile-rt] subscribe failed:', e); }
+}
+
+function _cpUnsubscribeFromJointProfile(){
+  if(!CPLAN._jointProfileChannel) return;
+  try{
+    if(typeof db !== 'undefined' && db.removeChannel){
+      db.removeChannel(CPLAN._jointProfileChannel);
+    } else if(CPLAN._jointProfileChannel.unsubscribe){
+      CPLAN._jointProfileChannel.unsubscribe();
+    }
+  }catch(e){ console.warn('[joint-profile-rt] unsubscribe failed:', e); }
+  CPLAN._jointProfileChannel = null;
+}
+
+// ── _cpRefreshFromPartnerSave ──────────────────────────────────────────────
+// Triggered from the Joint-household partner-updated banner's "Refresh now"
+// button. Pulls the latest allocation_plan from client_profiles and replaces
+// the in-memory CPLAN state, then re-renders.
+//
+// If the user has unsaved local changes (CPLAN.modified===true), confirm
+// before discarding. Otherwise refresh silently. Full page reload is the
+// simplest path to a clean state and matches what the user would do manually.
+async function _cpRefreshFromPartnerSave(){
+  try{
+    if(CPLAN.modified===true && typeof _cpConfirmModal==='function'){
+      var ok=await _cpConfirmModal({
+        title:'Refresh and discard your changes?',
+        message:'You have unsaved edits on this device. Refreshing will discard them and load your partner\'s latest version of the plan.',
+        confirmLabel:'Discard & refresh',
+        confirmStyle:'warning',
+        icon:'🔄'
+      });
+      if(!ok)return;
+    }
+    CPLAN._partnerUpdatedBanner=null;
+    // Page reload guarantees clean rehydration through the normal load path
+    // (PFOS_LOAD → client_profiles fetch → CPLAN init → subscriptions). Doing
+    // a partial in-place refresh would require carefully un-doing every piece
+    // of derived state (charts, simulations, _diyPlan, _approaches, etc.)
+    // which is much more error-prone than a clean reload.
+    location.reload();
+  }catch(e){
+    console.warn('[joint-profile-rt] refresh failed:',e);
+    try{location.reload();}catch(_){}
+  }
+}
+
 // ── Phase D: lazy-load partner data once for AI calls. Returns a promise. ──
 async function _cpLoadPartnerForAI(){
   if(CPLAN._partnerForAILoaded)return CPLAN._partnerForAICache||null;
@@ -29756,13 +31452,25 @@ function _cpRenderPlanV2(){
 
   // ── Partner-updated Banner (Hybrid couples — joint card edited by spouse) ──
   // Set by the realtime subscription handler when the partner saves a joint
-  // card change. Auto-dismisses on the next manual render or after the user
-  // explicitly closes it. Doesn't block editing — informational only.
+  // card change OR (for Joint households) the shared client_profiles row. The
+  // joint-card case auto-refreshes data via _cpSubscribeToShared. The
+  // joint-profile case does NOT auto-overwrite — it shows a "Refresh now"
+  // button so the user opts in (avoids clobbering mid-edit work).
   if(CPLAN._partnerUpdatedBanner){
     var _spName=(CPLAN._partner&&CPLAN._partner.firstName)||'Your spouse';
+    var _bnrSrc=CPLAN._partnerUpdatedBanner.source||'';
+    var _isProfileSync=(_bnrSrc==='joint_profile');
+    var _bnrMsg=_isProfileSync
+      ? 'They just saved changes to your shared plan. Refresh to see the latest.'
+      : 'A joint card was just edited. Your view has been refreshed automatically.';
     h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 16px;margin-bottom:12px;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.3);border-left:4px solid #A855F7;border-radius:4px;flex-wrap:wrap;gap:10px">';
-    h+='<div style="display:flex;align-items:center;gap:10px"><span style="font-size:18px">🔄</span><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#A855F7">Plan updated by '+esc(_spName)+'</div><div style="font-size:13px;color:var(--mu)">A joint card was just edited. Your view has been refreshed automatically.</div></div></div>';
+    h+='<div style="display:flex;align-items:center;gap:10px"><span style="font-size:18px">🔄</span><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#A855F7">Plan updated by '+esc(_spName)+'</div><div style="font-size:13px;color:var(--mu)">'+_bnrMsg+'</div></div></div>';
+    h+='<div style="display:flex;gap:8px">';
+    if(_isProfileSync){
+      h+='<button onclick="_cpRefreshFromPartnerSave()" style="padding:6px 12px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.4);color:#A855F7;cursor:pointer;border-radius:2px;min-height:30px">🔄 Refresh now</button>';
+    }
     h+='<button onclick="CPLAN._partnerUpdatedBanner=null;_cpRenderPlanV2()" style="padding:6px 12px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:30px">Dismiss</button>';
+    h+='</div>';
     h+='</div>';
   }
 
@@ -43117,21 +44825,56 @@ function cplanSave(){
       return;
     }
     db.from('client_profiles').update({allocation_plan:plan,updated_at:new Date().toISOString()}).eq('id',check.data.id).then(function(r){
+      // Echo-suppression timestamp for the Joint-household client_profiles
+      // realtime subscription. Stamped right after the write fires so the
+      // subscription handler can detect and skip our own echo (1.5s window).
+      // Only meaningful for Joint households (single shared profile row); for
+      // Hybrid/Separate the per-user row only fires for own writes anyway.
+      CPLAN._lastSelfProfileSaveAt=Date.now();
       var b2=document.getElementById('cplanSaveBtn');
       if(b2){
-        if(r.error){b2.textContent='⚠ Save failed';b2.style.color='var(--rd)';console.error('Plan save error:',r.error);}
+        if(r.error){b2.textContent='⚠ Save failed';b2.style.color='var(--rd)';console.error('Plan save error:',r.error);
+          setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},2000);
+        }
         else{
           b2.textContent='✓ Saved';b2.style.color='var(--gr)';CPLAN.modified=false;
           // Auto-save plan version history
           db.from('plan_versions').insert({client_id:_svId,plan_data:plan,source:CPLAN.planMode==='ai'?'ai_generated':CPLAN.hasAdvisor?'advisor':'manual',summary:cleanAllocs.length+' allocations, '+fmt(CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0))+'/mo deployed, health score: '+(_cpCalcHealthScore()||0)}).then(function(){}).catch(function(){});
           // Hybrid couples: sync joint cards to the shared couple_links row so
-          // the partner sees the updates. Fire-and-forget; partner will receive
-          // a realtime UPDATE event and refresh their view.
+          // the partner sees the updates. Wait on the promise — if the joint
+          // sync fails, downgrade "✓ Saved" to "⚠ Joint cards not saved" so
+          // the user knows their joint-bucket edits didn't reach the partner.
+          // Personal portion is already persisted to client_profiles above.
           if(CPLAN._householdType==='hybrid'&&typeof _cpSharedCardsApi!=='undefined'&&_cpSharedCardsApi){
-            try{_cpSharedCardsApi.syncJointCards().catch(function(_e){console.warn('[shared] joint sync after save:',_e);});}catch(_e){console.warn('[shared] joint sync:',_e);}
+            CPLAN._sharedSaveInFlight=true;
+            try{
+              _cpSharedCardsApi.syncJointCards().then(function(ok){
+                CPLAN._sharedSaveInFlight=false;
+                if(ok===false&&b2){
+                  b2.textContent='⚠ Joint cards not saved';
+                  b2.style.color='var(--yl)';
+                  setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},3500);
+                } else {
+                  setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},2000);
+                }
+              }).catch(function(_e){
+                CPLAN._sharedSaveInFlight=false;
+                console.warn('[shared] joint sync after save:',_e);
+                if(b2){
+                  b2.textContent='⚠ Joint cards not saved';
+                  b2.style.color='var(--yl)';
+                  setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},3500);
+                }
+              });
+            }catch(_e){
+              CPLAN._sharedSaveInFlight=false;
+              console.warn('[shared] joint sync:',_e);
+              setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},2000);
+            }
+          } else {
+            setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},2000);
           }
         }
-        setTimeout(function(){b2.textContent='💾 Save';b2.style.color='';},2000);
       }
     });
   });
