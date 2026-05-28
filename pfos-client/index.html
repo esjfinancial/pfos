@@ -6578,8 +6578,13 @@ function _portalRenderRecommendations(){
   var active=_portalRecsGetActive();
   if(!active.length)return '';
 
-  var h='<div class="sec-group">';
-  h+='<div class="sec-group-title">💡 Recommendations ('+active.length+')</div>';
+  // Prominent accent wrapper so this section catches the eye near the top of the
+  // page rather than reading as just another quiet sub-section.
+  var h='<div class="sec-group" style="background:linear-gradient(180deg,rgba(91,155,255,.06),transparent);border:1px solid rgba(91,155,255,.22);border-radius:8px;padding:14px 14px 4px;margin-bottom:16px;box-shadow:0 0 0 1px rgba(91,155,255,.06),0 6px 22px rgba(91,155,255,.08)">';
+  h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
+  h+='<span style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF">💡 Recommendations</span>';
+  h+='<span style="display:inline-flex;align-items:center;justify-content:center;min-width:20px;height:20px;padding:0 6px;background:#5B9BFF;color:#fff;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:10px">'+active.length+'</span>';
+  h+='</div>';
   h+='<div style="font-size:13px;color:var(--mu);margin-bottom:12px;line-height:1.6">Based on the past 3-6 months of your spending behavior. Tap Accept to apply, Modify to tweak, Dismiss to hide.</div>';
   active.forEach(function(rec){h+=_portalRecCard(rec);});
   h+='</div>';
@@ -7794,6 +7799,14 @@ function _portalRenderSpendDashboard(){
   h+='<div style="text-align:right;margin-bottom:12px"><button onclick="_portalShowSnapshotSetup()" style="background:none;border:1px solid rgba(91,155,255,.2);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.06em;padding:6px 14px;border-radius:2px;cursor:pointer;min-height:32px">📍 Recalibrate Starting Point</button></div>';
   h+='</div>';// close hero sec-group
 
+  // ── 4.5 RECOMMENDATIONS — behavioral plan engine surface ──
+  // Surfaced HIGH (right under the accountability banner) so the actionable
+  // "here's what to do" pairs with the "here's what's wrong" banner instead of
+  // being buried mid-page. Only renders when there are pending recommendations
+  // (auto-hides when none). Detection runs via the trigger at the top of
+  // renderSpendingAnalysis.
+  try{h+=_portalRenderRecommendations();}catch(e){console.warn('Recommendations:',e);}
+
   // ── 5. WHERE EVERY DOLLAR GOES — mirrors Home page (pfos-main renderHome) ──
   // Combined donut: budgeted expenses + plan allocations + unallocated.
   // Same data shape and layout as Home so the two pages visually anchor together.
@@ -7801,11 +7814,6 @@ function _portalRenderSpendDashboard(){
 
   // ── 6. PLAN ALIGNMENT — committed vs deployed (portal-only, reads CPLAN) ──
   try{h+=_planAlignmentCard();}catch(e){console.warn('Plan alignment:',e);}
-
-  // ── 6.25 RECOMMENDATIONS — behavioral plan engine surface ──
-  // Only renders when there are pending recommendations (auto-hides when none).
-  // Detection runs via the trigger at the top of renderSpendingAnalysis.
-  try{h+=_portalRenderRecommendations();}catch(e){console.warn('Recommendations:',e);}
 
   // ── 6.5 HISTORICAL PROGRESS — zoom-out lens (independent of month picker) ──
   // Window buttons + aggregate donut + top categories + recurring breakout +
@@ -7845,7 +7853,7 @@ function _portalRenderSpendDashboard(){
       return{key:bk,info:bucketMap[bk],spent:spent,budget:budget};
     }).filter(function(c){return c.spent>0||c.budget>0;}).sort(function(a,b){return b.spent-a.spent;});
     if(catList.length>0){
-      h+='<div class="sec-group"><div class="sec-group-title">Where Your Money Went</div>';
+      h+='<div class="sec-group" id="portalSpendCatHdr"><div class="sec-group-title">Where Your Money Went</div>';
       catList.forEach(function(c){
         var pct=c.budget>0?Math.min(100,Math.round(c.spent/c.budget*100)):0;
         var overPct=c.budget>0&&c.spent>c.budget;
@@ -8222,11 +8230,41 @@ function _portalSpendMaybeShowPopup(){
 }
 
 // ── Scroll helper for "Show me what to cut" ──
+// Ensures the user is on the My Spending page, then smooth-scrolls to the
+// per-category breakdown ("Where Your Money Went") and briefly highlights it so
+// the jump is obvious. Falls back to other known category headers if needed.
 function _portalSpendScrollToCats(){
+  // Make sure the spending view is actually showing before we try to scroll.
+  try{
+    var onSpending=false;
+    var sp=document.getElementById('cpg-spending');
+    if(sp&&sp.classList&&sp.classList.contains('active'))onSpending=true;
+    if(!onSpending&&typeof showClientPage==='function'){showClientPage('spending');if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();}
+  }catch(e){}
   setTimeout(function(){
     var el=document.getElementById('portalSpendCatHdr');
-    if(el)el.scrollIntoView({behavior:'smooth',block:'start'});
-  },200);
+    // Prefer the recommendations section if one is showing — it names the exact
+    // move to make ("shift $X from A to B"), which IS "what to cut".
+    var recHdr=null;
+    var titles0=document.querySelectorAll('.sec-group');
+    for(var j=0;j<titles0.length;j++){if(/recommendations/i.test(titles0[j].textContent||'')){recHdr=titles0[j];break;}}
+    if(recHdr)el=recHdr;
+    if(!el){
+      // Fallbacks: any rendered category section
+      var titles=document.querySelectorAll('.sec-group-title');
+      for(var i=0;i<titles.length;i++){if(/where your money|by category/i.test(titles[i].textContent||'')){el=titles[i].closest?titles[i].closest('.sec-group'):titles[i].parentElement;break;}}
+    }
+    if(!el)return;
+    el.scrollIntoView({behavior:'smooth',block:'start'});
+    // Brief highlight pulse so the user's eye lands on the right place
+    try{
+      var prev=el.style.transition,prevBox=el.style.boxShadow,prevRad=el.style.borderRadius;
+      el.style.transition='box-shadow .4s ease';
+      el.style.borderRadius='6px';
+      el.style.boxShadow='0 0 0 2px rgba(91,155,255,.6)';
+      setTimeout(function(){el.style.boxShadow=prevBox||'none';setTimeout(function(){el.style.transition=prev||'';el.style.borderRadius=prevRad||'';},450);},1100);
+    }catch(e){}
+  },220);
 }
 
 // ─── PLAN-vs-REALITY: three sub-flow handlers ─────────────────────────────
