@@ -868,7 +868,7 @@ html[data-theme="light"] .tip-pop{background:#FFFFFF!important;color:#334155!imp
           <div class="pfos-client-meta" id="pfosClientMeta">Financial Operating System</div>
         </div>
         <div class="pfos-actions">
-          <span class="save-indicator" id="saveIndicator">Saving...</span>
+          <span class="save-indicator" id="saveIndicator"></span>
           <button class="pfos-btn pfos-btn-gr" onclick="saveClientData()">💾 Save to Client</button>
           <button class="pfos-btn pfos-btn-or" onclick="generateAndSaveReport()">⚡ Generate & Save Report</button>
           <button class="pfos-btn pfos-btn-bl" onclick="closePFOS()">← Back to Client</button>
@@ -1077,6 +1077,21 @@ var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=fa
 var _sessionStart=null,_sessionClientId=null;
 var _sessionTimer=null,_sessionWarnTimer=null;
 var SESSION_WARN_MS=25*60*1000,SESSION_IDLE_MS=30*60*1000,_lastReset=0;
+// ── Async timeout wrapper. Prevents hung db/auth calls from blocking
+// session timeout, logout, or save flow. Default 8s. Throws Error('TIMEOUT:<label>').
+function _withTimeout(promise, ms, label){
+  var to, settled=false;
+  return new Promise(function(resolve, reject){
+    to = setTimeout(function(){
+      if(!settled){ settled=true; reject(new Error('TIMEOUT:'+(label||'unknown'))); }
+    }, ms||8000);
+    Promise.resolve(promise).then(function(v){
+      if(!settled){ settled=true; clearTimeout(to); resolve(v); }
+    }, function(e){
+      if(!settled){ settled=true; clearTimeout(to); reject(e); }
+    });
+  });
+}
 var RATE_LIMIT_MAX=5,RATE_LIMIT_WINDOW_MS=10*60*1000;
 var _errorLog=[],_errorCount=0,_agentPfosLoaded=false,_reportReadyResolve=null;
 
@@ -1169,8 +1184,8 @@ async function goBackToClientList(){
       } else if(isNaN(calcs.inc)||isNaN(calcs.netCF)){console.log('[PFOS-CP] goBack: skipping save — NaN');
       } else {
       var pp={client_id:saveToId,financial_data:{S:_lastPfosState.state,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-      var ex=await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-      if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+      var ex=await _withTimeout(db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle(),5000,'goBack_select');
+      if(ex&&ex.data)await _withTimeout(db.from('client_profiles').update(pp).eq('id',ex.data.id),5000,'goBack_update');
       }
     }
   }catch(e){}
@@ -1212,6 +1227,16 @@ async function initAuth(){
 
   db.auth.onAuthStateChange(async function(event, session){
     if(event === 'SIGNED_IN' && session){ APP.user = session.user; await determineRoleAndRoute(); }
+    else if(event === 'TOKEN_REFRESHED' && session){
+      // Silent token refresh — just update local user ref, don't re-route
+      // (re-running determineRoleAndRoute leaves "Signing in..." stuck on screen
+      // if the users-table query hangs during an unstable session).
+      APP.user = session.user;
+      console.log('[PFOS-CP] Token refreshed silently');
+    }
+    else if(event === 'USER_UPDATED' && session){
+      APP.user = session.user;
+    }
     else if(event === 'SIGNED_OUT'){
       APP.user = null; APP.role = 'agent';
       try{
@@ -1235,15 +1260,32 @@ async function initAuth(){
   });
 }
 async function determineRoleAndRoute(){
+  // Helper: clear the "Signing in..." message. Called on every exit path
+  // so the indicator can't stick if a query hangs or the flow short-circuits.
+  function hideLoginMsg(){
+    var _lm=document.getElementById('loginMsg');if(_lm){_lm.textContent='';_lm.style.display='none';}
+  }
   try {
     // Show a visible "loading" state so we know routing is running
     showLoginMsg('Signing in...');
 
-    // Query own user row — include status for pending approval check
-    const { data: ud, error: ue } = await db.from('users').select('id,email,name,role,status,rejection_message,scheduling_url').eq('id', APP.user.id).maybeSingle();
+    // Query own user row — include status for pending approval check.
+    // 8s timeout so a hung query doesn't strand the user on "Signing in..." forever.
+    var ud, ue;
+    try {
+      var _userRes = await _withTimeout(db.from('users').select('id,email,name,role,status,rejection_message,scheduling_url').eq('id', APP.user.id).maybeSingle(),8000,'role_users_select');
+      ud = _userRes.data; ue = _userRes.error;
+    } catch(_tErr) {
+      hideLoginMsg();
+      showLoginErr('Connection timed out checking account. Please refresh and try again.');
+      setBtnLoading('loginBtn', false, '⚡ Sign In');
+      setBtnLoading('clientLoginBtn', false, 'Access My Dashboard');
+      return;
+    }
 
     if(ue){
       // Table might not exist yet
+      hideLoginMsg();
       showLoginErr('users table error: ' + ue.message + ' — Have you run the setup SQL in Supabase?');
       setBtnLoading('loginBtn', false, '⚡ Sign In');
       setBtnLoading('clientLoginBtn', false, 'Access My Dashboard');
@@ -1255,9 +1297,10 @@ async function determineRoleAndRoute(){
       APP.role = ud.role || 'agent';
       // Block suspended accounts before routing
       if(APP.role === 'suspended'){
+        hideLoginMsg();
         showLoginErr('Your account has been suspended. Please contact an administrator.');
         setBtnLoading('loginBtn', false, '⚡ Sign In');
-        await db.auth.signOut();
+        try { await _withTimeout(db.auth.signOut(),5000,'role_signOut'); } catch(_e){}
         return;
       }
       // Pending / rejected agents — write sessionStorage so dashboard can show
@@ -1271,36 +1314,51 @@ async function determineRoleAndRoute(){
             rejection_message: ud.rejection_message || ''
           }));
         }catch(ex){}
+        hideLoginMsg();
         await routeToStaffDashboard();
         return;
       }
       // If agent/admin came here to view a client profile, stay on this page
       if(sessionStorage.getItem('pfos_profile_client_id')){
         var _le=document.getElementById('loginErr');if(_le){_le.textContent='';_le.style.display='none';}
-        var _lm=document.getElementById('loginMsg');if(_lm){_lm.textContent='';_lm.style.display='none';}
+        hideLoginMsg();
         showScreen('profileScreen');
         return;
       }
+      hideLoginMsg();
       await routeToStaffDashboard();
       return;
     }
 
     // No users row — check if they're a client
-    const { data: cd, error: ce } = await db.from('clients').select('*').eq('email', APP.user.email).maybeSingle();
+    var cd, ce;
+    try {
+      var _cliRes = await _withTimeout(db.from('clients').select('*').eq('email', APP.user.email).maybeSingle(),8000,'role_clients_select');
+      cd = _cliRes.data; ce = _cliRes.error;
+    } catch(_tErr2) {
+      hideLoginMsg();
+      showLoginErr('Connection timed out. Please refresh and try again.');
+      setBtnLoading('loginBtn', false, '⚡ Sign In');
+      setBtnLoading('clientLoginBtn', false, 'Access My Dashboard');
+      return;
+    }
     if(cd){
       APP.role = 'client';
       APP.currentClientId = cd.id;
       APP.currentClient = cd;
+      hideLoginMsg();
       routeToClientPortal();
       return;
     }
 
     // No row anywhere — show a helpful message
+    hideLoginMsg();
     showLoginErr('Account not set up. Run this in Supabase SQL Editor: INSERT INTO users (id, email, name, role) VALUES (\'' + APP.user.id + '\', \'' + APP.user.email + '\', \'Admin\', \'admin\');');
     setBtnLoading('loginBtn', false, '⚡ Sign In');
 
   } catch(e){
     console.error('determineRoleAndRoute error:', e);
+    hideLoginMsg();
     showLoginErr('Routing error: ' + e.message);
     setBtnLoading('loginBtn', false, '⚡ Sign In');
     setBtnLoading('clientLoginBtn', false, 'Access My Dashboard');
@@ -2576,15 +2634,25 @@ async function doLogout(){
       } else {
       var _logoutState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _logoutState._touched;
       var pp={client_id:saveToId,financial_data:{S:_logoutState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-      var ex=await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-      if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
-      console.log('[PFOS-CP] logout: saved ('+_logoutTouched.length+' sections touched)');
+      // 5s timeout per call — if DB is dead we still want to reach signOut + redirect
+      try {
+        var ex=await _withTimeout(db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle(),5000,'logout_select');
+        if(ex&&ex.data) await _withTimeout(db.from('client_profiles').update(pp).eq('id',ex.data.id),5000,'logout_update');
+        console.log('[PFOS-CP] logout: saved ('+_logoutTouched.length+' sections touched)');
+      } catch(_logErr) {
+        console.warn('[PFOS-CP] logout: save timeout/error — proceeding to signOut anyway:', _logErr.message);
+      }
       }
     } else {
       console.log('[PFOS-CP] logout: no sections touched — skipping save to protect existing data');
     }
   }catch(e){console.warn('Pre-logout save failed:',e);}
-  await db.auth.signOut();
+  // Always attempt signOut, with a timeout so we never block here
+  try { await _withTimeout(db.auth.signOut(),5000,'signOut'); }
+  catch(_soErr) { console.warn('[PFOS-CP] signOut timeout/error — forcing redirect:', _soErr.message); }
+  // Guaranteed redirect: storage is already cleared; this ensures user lands on login
+  // even if signOut hung or the SIGNED_OUT event never fires.
+  try { window.location.href = '/'; } catch(_navErr) {}
 }
 // ── PROGRESS PANELS (shared with client-portal) ───────────────────────────────
 async function loadProgressPanels(clientId, isClientPortal){
@@ -5875,6 +5943,12 @@ window.addEventListener('message', async function(e){
     return;
   }
   if(msg.type === 'PFOS_DATA_CHANGE'){
+    // Iframe activity bridge: edits happen inside the iframe (cross-document
+    // boundary), so the parent's document-level activity listeners never fire.
+    // Each PFOS_DATA_CHANGE arrival IS evidence of user activity. Reset the
+    // session idle timer so it doesn't auto-logout while user is actively
+    // editing. _throttleReset has its own 10s throttle so spamming is safe.
+    try { if(typeof _throttleReset === 'function') _throttleReset(); } catch(_actErr){}
     console.log('[PFOS-CP] PFOS_DATA_CHANGE received. calcs.inc:', msg.state&&msg.state.calcs?msg.state.calcs.inc:'NO CALCS');
     if(!_pfosDataLoaded){console.log('[PFOS-CP] Skipping save — data not loaded yet');return;}
     var clientId = APP.currentClientId;
@@ -5922,7 +5996,7 @@ window.addEventListener('message', async function(e){
         // If incoming weight is low, compare against existing data
         if(_inW<20){
           try{
-            var _gEx=await db.from('client_profiles').select('financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            var _gEx=await _withTimeout(db.from('client_profiles').select('financial_data').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle(),8000,'firstSaveGuard_select');
             if(_gEx&&_gEx.data&&_gEx.data.financial_data){
               var _exS=_gEx.data.financial_data.S||{};
               var _exC=_gEx.data.financial_data.calcs||{};
@@ -5957,7 +6031,14 @@ window.addEventListener('message', async function(e){
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
 
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
-      var ex = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2,data_version').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var ex;
+      try { ex = await _withTimeout(db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2,data_version').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle(),8000,'save_select'); }
+      catch(_tErr) {
+        console.warn('[PFOS-CP] ⛔ DB select timeout — connection may be dead. Aborting save.', _tErr.message);
+        var _indT=document.getElementById('saveIndicator')||document.getElementById('clientSaveIndicator');
+        if(_indT){_indT.className='save-indicator';_indT.textContent='⛔ Connection lost — refresh to sign in';_indT.style.color='#EF4444';}
+        return;
+      }
       var mergedState = JSON.parse(JSON.stringify(state));
       var touched = state._touched || {};
       // ══ MULTI-TAB CONFLICT DETECTION ══
@@ -6004,17 +6085,35 @@ window.addEventListener('message', async function(e){
         }
       }
 
+      var _saveSucceeded = false;
+      var _failureMsg = null;
       if(ex&&ex.data){
-        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+        var _r;
+        try { _r = await _withTimeout(db.from('client_profiles').update(pp).eq('id',ex.data.id),8000,'save_update'); }
+        catch(_tErr) { _r = {error:{message:_tErr.message}}; }
         if(_r.error){
-          if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS-CP] ⛔ Database blocked destructive overwrite — existing data preserved');
-          } else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS-CP] ⛔ Rate limit — too many saves, skipping');
-          } else {console.error('[PFOS-CP] Supabase SAVE FAILED:',_r.error.message);_queueFailedSave(saveToId,{financial_data:pp.financial_data,scores:pp.scores,updated_at:pp.updated_at});}
-        } else {console.log('[PFOS-CP] Supabase SAVE: OK');_updateLastSaved();}
+          if(_r.error.message&&_r.error.message.indexOf('TIMEOUT')>=0){console.warn('[PFOS-CP] ⛔ Save timeout — connection may be dead'); _failureMsg='⛔ Connection lost — refresh to sign in';
+          } else if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS-CP] ⛔ Database blocked destructive overwrite — existing data preserved'); _failureMsg='⛔ Save blocked (data protection)';
+          } else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS-CP] ⛔ Rate limit — too many saves, skipping'); _failureMsg='⛔ Rate-limited — pause editing 60s';
+          } else {console.error('[PFOS-CP] Supabase SAVE FAILED:',_r.error.message);_queueFailedSave(saveToId,{financial_data:pp.financial_data,scores:pp.scores,updated_at:pp.updated_at}); _failureMsg='⚠ Save failed (queued for retry)';}
+        } else {console.log('[PFOS-CP] Supabase SAVE: OK');_updateLastSaved(); _saveSucceeded=true;}
       }
-      else { var _r2=await db.from('client_profiles').insert(pp); console.log('[PFOS-CP] Supabase INSERT:',_r2.error?'FAILED: '+_r2.error.message:'OK'); }
+      else {
+        var _r2;
+        try { _r2 = await _withTimeout(db.from('client_profiles').insert(pp),8000,'save_insert'); }
+        catch(_tErr2) { _r2 = {error:{message:_tErr2.message}}; }
+        if(_r2.error){console.log('[PFOS-CP] Supabase INSERT FAILED: '+_r2.error.message); _failureMsg=(_r2.error.message.indexOf('TIMEOUT')>=0?'⛔ Connection lost — refresh to sign in':'⚠ Save failed');
+        } else {console.log('[PFOS-CP] Supabase INSERT: OK'); _saveSucceeded=true;}
+      }
       var ind = document.getElementById('saveIndicator') || document.getElementById('clientSaveIndicator');
-      if(ind){ ind.className='save-indicator saved'; ind.textContent='✓ Auto-saved'; setTimeout(function(){ind.className='save-indicator';},2000); }
+      if(ind){
+        if(_saveSucceeded){
+          ind.className='save-indicator saved'; ind.textContent='✓ Auto-saved'; ind.style.color='';
+          setTimeout(function(){ind.className='save-indicator';},2000);
+        } else if(_failureMsg){
+          ind.className='save-indicator'; ind.textContent=_failureMsg; ind.style.color='#EF4444';
+        }
+      }
       // Always update display — PFOS is the live data source
       var _freshFD={S:state,calcs:calcs,riskProfile:state.riskProfile||state.risk_profile||'moderate'};
       renderProfileSnapshot(_freshFD, scores);
