@@ -7621,6 +7621,17 @@ function _cpSustainableMonthly(balance,yearsInRet,realAnnualReturn){
   return balance*(r/(1-Math.pow(1+r,-n)));
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// PORTED FROM PFOS-CLIENT — helper used by _cpRunSimulation for sustainable
+// withdrawal horizon. APP._portalFd → APP._currentClientFd.
+// ═══════════════════════════════════════════════════════════════════════════
+function _cpYearsInRetirement(){
+  var rawS=(typeof APP!=='undefined'&&APP._currentClientFd&&APP._currentClientFd.S)||{};
+  var lifeExp=parseInt((rawS.calcs&&rawS.calcs.retLifeExp))||90;
+  var retAge=CPLAN.retirementAge||65;
+  return Math.max(1,lifeExp-retAge);
+}
+
 function _cpRenderIncomeReplacement(){
   var el=document.getElementById('cplanIncomeReplace');if(!el)return;
   if(CPLAN.income<=0){el.innerHTML='';return;}
@@ -8252,21 +8263,87 @@ function _cpRunSimulation(){
   var years=30;
   var maxMonths=years*12;
 
+  // Reset the match-claim ledger so this simulation cycle establishes its own
+  // first-claim ordering. Without this, claims from a prior render cycle would
+  // persist into the simulation's precompute loop and zero out legitimate
+  // allocation matches. See _cpMatchClaims comment block.
+  if(typeof _cpResetMatchClaims==='function')_cpResetMatchClaims();
+
+  // ── Tracking gate (per-allocation) ─────────────────────────────────────
+  // The gate's job is to keep the projection HONEST: contributions only count
+  // once the user has actually opened the account and started funding it.
+  //
+  // BUT — if we apply the gate to a freshly-converted AI plan where NOTHING
+  // has been marked Done yet, the chart shows $1.1M of idle-cash math that
+  // looks identical for every plan and badly misrepresents what the plan
+  // would actually achieve. Users seeing the plan for the first time need
+  // to see the TRAJECTORY the plan promises so they can choose intelligently.
+  //
+  // Resolution: auto-detect mode based on plan state.
+  //   - If ANY growth allocation has _completed=true, we're in "tracked" mode
+  //     and the gate enforces real-world honesty (only completed items grow).
+  //   - If NO growth allocation is completed, we're in "trajectory" mode and
+  //     the gate is bypassed — the simulator shows what would happen if the
+  //     user started funding everything today.
+  // CPLAN._projectionMode='preview' or 'tracked' can override the auto behavior.
+  //
+  // Action-only types (protection, umbrella, estate, ibc_audit, annuity_research,
+  // diversify) are exempt: they have amount=0 anyway, so gating them changes nothing.
+  // Their _staticPremium (e.g. monthly life-insurance premium after completion) is
+  // already factored into _cpAvailableBudget and the deployment bar overlay; it's
+  // not a growth contribution.
+  var _anyCompleted=CPLAN.allocations.some(function(a){
+    if(!a||a.amount<=0)return false;
+    // Action-only types don't count — they're tracked via _staticPremium not _completed
+    if(typeof _cpActionOnlyTypes!=='undefined'&&_cpActionOnlyTypes[a.type])return false;
+    return !!a._completed;
+  });
+  var _projMode=CPLAN._projectionMode||'auto';
+  var _gateActive;
+  if(_projMode==='preview')_gateActive=false;
+  else if(_projMode==='tracked')_gateActive=true;
+  else _gateActive=_anyCompleted; // auto: gate engages once user starts marking items Done
+
+  function _cpIsTrackable(a){
+    if(!a)return false;
+    if(typeof _cpActionOnlyTypes!=='undefined'&&_cpActionOnlyTypes[a.type])return true;
+    if(!_gateActive)return true; // trajectory mode — count all planned contributions
+    // IBC-debt-strategy allocations stay trackable regardless of _completed
+    // state. The IBC card represents an opened policy that's actively funding
+    // debt-elimination loans — its mechanics (loan-take, freed-min repayment,
+    // CV=AV recovery) drive cascade events that the rest of the projection
+    // depends on. Without this exception, if the user has marked ANY OTHER
+    // card Done (which engages _gateActive), the unmarked IBC card fails
+    // _cpIsTrackable, the simulator's `debtA = find(...&&_cpIsTrackable(a))`
+    // returns undefined, the IBC branch never runs, no _ibcContinues event
+    // ever emits, and the Phase 3+ "WL Continuation" card never appears —
+    // even though IBC is the selected strategy. The IBC card is conceptually
+    // a long-term commitment the user opens once and runs for years; the
+    // "Done" click semantics don't fit it well.
+    if(a._ibcDebtStrategy)return true;
+    return !!a._completed;
+  }
+  // Expose for downstream consumers (chart annotations, score tooltips, etc.)
+  CPLAN._sim_gateActive=_gateActive;
+
   // ── 1. Calculate cascade events ──
   var events=[];
-  // EF completion
-  var efA=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
+  // EF completion — only fires if the EF card has been marked complete (i.e., user
+  // is actually contributing). Otherwise the EF target is never hit by simulated
+  // contributions and no cascade event should be planned.
+  var efA=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0&&_cpIsTrackable(a);});
   var efRemaining=Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0));
   if(efA&&efRemaining>0){
     var efMo=Math.ceil(efRemaining/efA.amount);
-    events.push({month:efMo,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF funded',_sourceOwner:efA.owner||'self'});
+    events.push({month:efMo,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF funded',allocIdx:CPLAN.allocations.indexOf(efA)});
   } else if(efA&&efRemaining<=0){
     // EF already funded — immediately free
-    events.push({month:0,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF already funded',_sourceOwner:efA.owner||'self'});
+    events.push({month:0,type:'ef',freed:efA.amount,cascade:efA.cascade,label:'EF already funded',allocIdx:CPLAN.allocations.indexOf(efA)});
   }
-  // Debt completion — only accelerate high-rate debts (>10% APR)
+  // Debt completion — only accelerate high-rate debts (>10% APR). Same gate: extra
+  // debt payment must be marked complete (user is actually paying extra each month).
   var _RATE_THRESHOLD=10;
-  var debtA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
+  var debtA=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0&&_cpIsTrackable(a);});
   var allDebts=CPLAN.debts.filter(function(d){return(parseFloat(d.balance)||0)>0;});
   var hiRateDebts=allDebts.filter(function(d){return(parseFloat(d.rate)||0)>_RATE_THRESHOLD;});
   var loRateDebts=allDebts.filter(function(d){return(parseFloat(d.rate)||0)<=_RATE_THRESHOLD;});
@@ -8275,47 +8352,128 @@ function _cpRunSimulation(){
   var debtSim=null;
   if(debtA&&hiRateDebts.length>0){
     var debtSorted=_cpDebtSort(hiRateDebts,CPLAN.debtStrategy||'avalanche');
-    debtSim=_cpDebtSimulate(debtSorted,debtA.amount);
-    // IBC debt strategy: IBC premium continues as growth vehicle after debt payoff
-    var _ibcPremiumPortion=0;
     if(CPLAN.debtStrategy==='ibc'&&debtA.amount>0){
-      // IBC premium = ~35% of debt allocation (or user-set _ibcPremium)
-      _ibcPremiumPortion=debtA._ibcPremium||Math.round(debtA.amount*0.35);
-      // Only the actual credit card payment portion gets freed (extra + minimums), NOT the IBC premium
-      var _creditCardFreed=Math.max(0,debtA.amount-_ibcPremiumPortion)+hiRateMin;
-      // Calculate CV = AV recovery: freed minimums repay policy loans before redistributing
-      var _totalLoans=hiRateDebts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
-      var _loanRate=0.05/12;// 5% policy loan rate
-      var _loanBal=_totalLoans;
-      var _cvAvMonths=0;
-      for(var _lm=0;_lm<360&&_loanBal>0;_lm++){
-        _loanBal=_loanBal*(1+_loanRate)-_creditCardFreed;
-        if(_loanBal<=0){_cvAvMonths=_lm+1;break;}
-      }
-      var _cvAvRecoveryMonth=debtSim.months+_cvAvMonths;
-      // Event 1: At debt-free — IBC premium continues, but freed mins go to loan repayment (freed=0 for redistribution)
-      events.push({month:debtSim.months,type:'debt',freed:0,cascade:'',label:'High-rate debt free — freed minimums repaying IBC policy loans',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion,_ibcLoanRepayment:_creditCardFreed,_sourceOwner:debtA.owner||'self'});
-      // Event 2: At CV=AV recovery — NOW freed minimums redistribute to growth
-      if(_cvAvRecoveryMonth>debtSim.months){
-        events.push({month:_cvAvRecoveryMonth,type:'ibc_recovery',freed:_creditCardFreed,cascade:debtA.cascade,label:'IBC loans repaid (CV=AV) — freed minimums now redistributing',_ibcRecovery:true,_sourceOwner:debtA.owner||'self'});
+      // ── True IBC mechanics — replaces the prior 35/65 split fiction ──
+      // 100% of debtA.amount flows to the policy as premium. Debts get minimums only.
+      // _cpCalcIBCDebt produces accurate timing for both debt-free and CV=AV recovery,
+      // matching the visualization on the debt card.
+      // Pass debtA.monthlyLoanRepay as the user-repay override so when the user
+      // adjusts the loan-repayment slider on the IBC continuation card, the
+      // sim recomputes the loan-paydown trajectory accordingly. The override is
+      // ignored before all debts are loan-paid-off (the accumulation phase
+      // continues to use freed-minimums naturally).
+      var _userRepayInput=(typeof debtA.monthlyLoanRepay==='number'&&debtA.monthlyLoanRepay>0)?debtA.monthlyLoanRepay:null;
+      var ibcSim=_cpCalcIBCDebt(hiRateDebts,debtA.amount,_userRepayInput);
+      if(ibcSim&&ibcSim.eligible){
+        var ibcDebtFreeMonth=ibcSim.months;
+        var ibcFullFreeMonth=ibcSim.fullFreeMonth;
+        // Event 1: at debt-free month — original credit-card debts are gone, paid via policy
+        // loans. The full extra (debtA.amount) keeps flowing to the policy as a growth contrib.
+        // Freed minimums (hiRateMin) all redirect to repaying policy loans — no growth
+        // redistribution yet, so freed:0.
+        events.push({
+          month:ibcDebtFreeMonth,
+          type:'debt',
+          freed:0,
+          cascade:'',
+          label:'High-rate debt free — freed minimums repaying IBC policy loans',
+          debtOrder:ibcSim.payoffLog.map(function(p){return{name:p.name,month:p.month};}),
+          _ibcContinues:debtA.amount,
+          _ibcLoanRepayment:hiRateMin,
+          // Loan balance at debt-free month, read from the IBC sim series. The
+          // sim tracks per-month loanBal; at debt-free month the balance is what
+          // the policy owes itself after all debt-payoff loans were taken out.
+          // Consumer (_cpRunSimulation cascade engine) populates a.loanBalance
+          // from this value so the existing loan-repayment slider UI can display
+          // the correct outstanding balance and project the payoff timeline.
+          _ibcLoanBalance:(ibcSim.series&&ibcSim.series[ibcDebtFreeMonth-1]&&ibcSim.series[ibcDebtFreeMonth-1].loanBal)||0,
+          allocIdx:CPLAN.allocations.indexOf(debtA)
+        });
+        // Event 2: at CV=AV recovery month — policy loans are paid off. Branch on user choice.
+        //   'continue' (default): keep policy. Freed minimums redistribute to growth via cascade.
+        //                         Extra continues to policy uninterrupted.
+        //   'cancel': surrender policy. Cash value becomes a one-time inflow (after tax on the
+        //             gain). Both extra and freed minimums redistribute to growth from this
+        //             month forward. Tax estimate is computed in the UI; the simulator just
+        //             routes the cash flow correctly.
+        var endChoice=debtA._ibcEndChoice||'continue';
+        if(ibcFullFreeMonth>ibcDebtFreeMonth){
+          if(endChoice==='cancel'){
+            // Option B: surrender. The lump sum (estimated) plus the recurring extra
+            // and freed minimums all redirect. Route per user's destination choice
+            // stored on debtA._ibcOptionBDestination — values:
+            //   'proportional' (default): cascade across all growth allocations
+            //   '<allocation type>'      : direct all to that specific allocation
+            //   '__new__'                : cascade to default (user will add new alloc separately)
+            // The lump sum is conceptually a one-time inflow; the cascade routes the recurring portion.
+            var optBDest = debtA._ibcOptionBDestination || 'proportional';
+            var surrenderCascade = (optBDest === 'proportional' || optBDest === '__new__')
+              ? (debtA.cascade || 'savings')  // proportional → use existing cascade plumbing
+              : optBDest;                      // specific allocation type
+            events.push({
+              month:ibcFullFreeMonth,
+              type:'ibc_recovery',
+              freed:hiRateMin+debtA.amount,
+              cascade:surrenderCascade,
+              label:'IBC policy surrendered — extra + freed minimums redistributing',
+              _ibcRecovery:true,
+              _ibcChoice:'cancel',
+              _ibcVehicleAtSurrender:ibcSim.vehicle,
+              _ibcOptBDestination:optBDest,
+              allocIdx:CPLAN.allocations.indexOf(debtA)
+            });
+          } else {
+            events.push({
+              month:ibcFullFreeMonth,
+              type:'ibc_recovery',
+              freed:hiRateMin,
+              cascade:debtA.cascade,
+              label:'IBC loans repaid (CV=AV) — freed minimums now redistributing',
+              _ibcRecovery:true,
+              _ibcChoice:'continue',
+              allocIdx:CPLAN.allocations.indexOf(debtA)
+            });
+          }
+        } else {
+          // Edge: instant CV=AV recovery (loans repaid in same month as last debt cleared).
+          events.push({
+            month:ibcDebtFreeMonth,
+            type:'debt',
+            freed:hiRateMin,
+            cascade:debtA.cascade,
+            label:'High-rate debt free (instant CV=AV)',
+            debtOrder:ibcSim.payoffLog.map(function(p){return{name:p.name,month:p.month};}),
+            _ibcContinues:debtA.amount,
+            allocIdx:CPLAN.allocations.indexOf(debtA)
+          });
+        }
+        // Per-debt milestones for the timeline view
+        ibcSim.payoffLog.forEach(function(p){
+          events.push({month:p.month,type:'debt_milestone',freed:0,cascade:'',label:p.name+' paid via policy loan'});
+        });
       } else {
-        // Instant recovery (unlikely but handle gracefully)
-        events.push({month:debtSim.months,type:'debt',freed:_creditCardFreed,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,_ibcContinues:_ibcPremiumPortion,_sourceOwner:debtA.owner||'self'});
+        // IBC ineligible (insufficient surplus). Fall back to standard avalanche timing
+        // so the simulator still produces a sensible cascade.
+        debtSim=_cpDebtSimulate(debtSorted,debtA.amount);
+        events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free (IBC ineligible — fell back to standard payoff)',debtOrder:debtSim.order,allocIdx:CPLAN.allocations.indexOf(debtA)});
+        debtSim.order.forEach(function(o){events.push({month:o.month,type:'debt_milestone',freed:0,cascade:'',label:o.name+' paid off'});});
       }
     } else {
-      // Non-IBC: full debt allocation + minimums freed
-      events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,_sourceOwner:debtA.owner||'self'});
+      // Non-IBC: standard avalanche/snowball/hybrid math. Full debt allocation +
+      // sum of high-rate minimums frees up at debt-free month for cascade redistribution.
+      debtSim=_cpDebtSimulate(debtSorted,debtA.amount);
+      events.push({month:debtSim.months,type:'debt',freed:debtA.amount+hiRateMin,cascade:debtA.cascade,label:'High-rate debt free',debtOrder:debtSim.order,allocIdx:CPLAN.allocations.indexOf(debtA)});
+      debtSim.order.forEach(function(o){events.push({month:o.month,type:'debt_milestone',freed:0,cascade:'',label:o.name+' paid off'});});
     }
-    debtSim.order.forEach(function(o){events.push({month:o.month,type:'debt_milestone',freed:0,cascade:'',label:o.name+' paid off'});});
   } else if(debtA&&hiRateDebts.length===0&&allDebts.length>0){
     // No high-rate debt — all debt is low-rate, don't accelerate. Free the debt allocation immediately.
-    events.push({month:0,type:'debt',freed:debtA.amount,cascade:debtA.cascade,label:'No high-rate debt — extra redirected to growth',_sourceOwner:debtA.owner||'self'});
+    events.push({month:0,type:'debt',freed:debtA.amount,cascade:debtA.cascade,label:'No high-rate debt — extra redirected to growth',allocIdx:CPLAN.allocations.indexOf(debtA)});
   }
   // Custom/house goal completions
   CPLAN.allocations.forEach(function(a,i){
     if((a.type==='custom'||a.type==='house')&&a.target>0&&a.amount>0){
       var mo=Math.ceil(Math.max(0,(a.target-(a.goalCurrent||0)))/a.amount);
-      events.push({month:mo,type:a.type,freed:a.amount,cascade:a.cascade,label:(a.customName||CP_NM[a.type]||'Goal')+' complete',allocIdx:i,_sourceOwner:a.owner||'self'});
+      events.push({month:mo,type:a.type,freed:a.amount,cascade:a.cascade,label:(a.customName||CP_NM[a.type]||'Goal')+' complete',allocIdx:i});
     }
   });
   events.sort(function(a,b){return a.month-b.month;});
@@ -8326,39 +8484,78 @@ function _cpRunSimulation(){
   // Track cascade distributions
   var cascadeLog=[];
   events.forEach(function(ev){
-    if(ev.freed<=0||ev.type==='debt_milestone')return;
+    // Skip non-cascading events. IBC's debt-free event has freed:0 by design (freed
+    // minimums go to loan repayment, not to growth) — but it still carries _ibcContinues
+    // info that must be processed. So only short-circuit when there's truly nothing to do.
+    if(ev.type==='debt_milestone')return;
+    if(ev.freed<=0&&!ev._ibcContinues)return;
     var freed=ev.freed;var destinations=[];
-    // Phase D multi-partner: hybrid households restrict cross-partner cascade.
-    // Partner A's freed cash flows only to partner A's growth (and joint allocations);
-    // joint-source freed cash flows everywhere. Joint and individual households
-    // redistribute without owner restriction (current behavior).
+    // Phase D multi-partner: derive source allocation's owner so hybrid households
+    // can restrict cross-partner cascade. Joint-source freed cash flows everywhere;
+    // self/spouse-source flows only to matching-owner or joint destinations in hybrid.
+    var _srcAlloc=null;
+    if(ev.allocIdx!=null)_srcAlloc=CPLAN.allocations[ev.allocIdx];
+    else if(ev.type==='ef')_srcAlloc=CPLAN.allocations.find(function(a){return a.type==='ef';});
+    else if(ev.type==='debt'||ev.type==='ibc_recovery')_srcAlloc=CPLAN.allocations.find(function(a){return a.type==='debt';});
+    var _srcOwner=(_srcAlloc&&_srcAlloc.owner)||'self';
     var _isHybridCascade=(CPLAN._householdType==='hybrid');
-    var _srcOwner=ev._sourceOwner||'self';
     var _cascadeOwnerOK=function(destOwner){
       if(!_isHybridCascade)return true;
       if(_srcOwner==='joint')return true;
       var dOwn=destOwner||'self';
-      // Self-source or spouse-source can flow to own allocations OR joint allocations
       return dOwn===_srcOwner||dOwn==='joint';
     };
-    // IBC debt strategy: reclassify IBC premium as growth allocation when debt completes
+    // IBC debt strategy: at the debt-free milestone, the WL/IBC policy carries
+    // a loan balance to itself (= sum of debts paid off via policy loans, with
+    // accumulated simple interest). The continuation card transformation (in
+    // _cpRenderPlanFull's active-render block) flips the visual from "Debt" to
+    // "Whole Life Policy — Continuation". Critically: the premium ALLOCATION
+    // amount stays the same — no new dollar appears just because debts cleared.
+    // The freed debt minimums are NOT a cascade boost to the policy card; they
+    // are dollars the user is now committing to repaying the policy's loan to
+    // itself (separate from premium). They populate the standard a.loanBalance
+    // / a.monthlyLoanRepay fields so the EXISTING loan-repayment slider UI
+    // surfaces them with proper controls. When the user adjusts repayment up
+    // or down, _cpIBCRepayCommit re-runs this simulation and the next phase's
+    // arrival shifts to reflect the new payoff timeline.
     if(ev._ibcContinues&&ev._ibcContinues>0){
-      var ibcIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='ibc'&&ibcIdx<0)ibcIdx=i2;});
-      if(ibcIdx<0){
-        // No existing IBC allocation — find the debt allocation and note the continuation
-        var dIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='debt'&&dIdx<0)dIdx=i2;});
-        if(dIdx>=0){
-          allocFuture[dIdx].boosts.push({month:ev.month,amount:ev._ibcContinues,from:'IBC premium continues as growth vehicle'});
-          allocFuture[dIdx]._ibcContinuation=ev._ibcContinues;
+      // Find the debt allocation (it's about to become an IBC continuation card)
+      var dIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type==='debt'&&dIdx<0)dIdx=i2;});
+      if(dIdx>=0){
+        // Populate loan-repayment fields ONLY if not already set by user input or
+        // annual-review override. Preserves user adjustments across re-renders.
+        var _dA=CPLAN.allocations[dIdx];
+        // Loan balance at debt-free month = the simulator's tracked policy loan
+        // balance at that moment. ibcSim.series carries per-month loanBal but we
+        // don't have direct access here; ev.month is debt-free month and the IBC
+        // sim's totalLoanBalance at this point is what's owed. The sim function
+        // _cpCalcIBCDebt computes this; the cascade event ev._ibcLoanBalance
+        // carries it forward when set. Falls back to summing high-rate debt
+        // balances as a reasonable approximation when the field isn't populated.
+        var _loanBalAtDebtFree=ev._ibcLoanBalance||0;
+        if(_loanBalAtDebtFree<=0){
+          // Approximation: sum original high-rate debt balances (the loans were
+          // taken to pay off these debts, so this is the principal owed).
+          _loanBalAtDebtFree=(CPLAN.debts||[]).reduce(function(t,d){
+            return t+((parseFloat(d.rate)||0)>10?(parseFloat(d.balance)||0):0);
+          },0);
         }
-      } else {
-        // Add to existing IBC allocation
-        allocAmounts[ibcIdx]+=ev._ibcContinues;
-        allocFuture[ibcIdx].futureAmount=allocAmounts[ibcIdx];
-        allocFuture[ibcIdx].boosts.push({month:ev.month,amount:ev._ibcContinues,from:'IBC premium reclassified from debt payoff to pure growth'});
-        destinations.push({type:'ibc',name:'IBC (continued)',amount:ev._ibcContinues});
+        // Only populate if these fields are absent — respect prior user input
+        // and annual-review actuals which take precedence over simulator values.
+        if(!(_dA.loanBalance>0))_dA.loanBalance=Math.round(_loanBalAtDebtFree);
+        if(_dA.monthlyLoanRepay==null)_dA.monthlyLoanRepay=Math.round(ev._ibcLoanRepayment||0);
+        if(!_dA.loanRate)_dA.loanRate=0.05;// Standard IBC loan rate; can be overridden per-policy
+        allocFuture[dIdx]._ibcContinuation=ev._ibcContinues;
       }
     }
+    // ibc_recovery event = policy loans fully repaid (CV=AV). At this point
+    // the user's monthlyLoanRepay budget redistributes to other growth
+    // allocations via the cascade engine below. Render-side handles hiding
+    // the loan UI when the active phase is past the recovery month — we do
+    // NOT zero a.loanBalance / a.monthlyLoanRepay here, because the cascade
+    // engine runs at every _cpRunSimulation call (not time-walking), and
+    // zeroing unconditionally would erase the user's pre-recovery loan info
+    // in every simulation pass, breaking the Phase 2 loan UI entirely.
     // Specific cascade target — gate by owner match in hybrid
     if(ev.cascade){
       var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0&&_cascadeOwnerOK(a2.owner))tIdx=i2;});
@@ -8381,16 +8578,28 @@ function _cpRunSimulation(){
     if(freed>0){
       // Priority: INCREASE existing growth allocations (they're already compounding)
       // Phase D: hybrid restricts to owner-matching growth
+      // Fix #8: insurance premiums (iul/wl/ibc) are FIXED at policy inception and
+      // cannot be increased mid-policy without a new contract. Excluded from the
+      // BOOST pass so cascade redirects to non-insurance growth (Roth/401k/invest/
+      // HSA) instead. The UNFUNDED pass below (line ~30130) still allows initial
+      // funding of currently-$0 insurance allocations (Phase 2 starter pattern),
+      // which doesn't violate the lock since the policy hasn't been issued yet.
       var growth=CPLAN.allocations.map(function(a5,i5){return{a:a5,i:i5};})
-        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
+        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','invest','edu','trad_ira','solo401k','sep_ira','hsa'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
         .sort(function(a6,b6){return(a6.a.phase||99)-(b6.a.phase||99);});
       if(growth.length>0){
-        // Distribute proportionally to current allocation amounts (not equal split)
+        // BUG FIX: proportions must be computed against INITIAL freed, not the
+        // running freed value. Otherwise each iteration takes its proportional
+        // share of a shrinking pool, leaving an unallocated remainder that should
+        // have cascaded but doesn't (visible as Phase2 < Phase1 in deployment bar).
+        // First pass: distribute proportionally based on initial freed, applying IRS caps.
         var _growthTotal=growth.reduce(function(t,g){return t+allocAmounts[g.i];},0);
+        var _initialFreed=freed;
         growth.forEach(function(g){
           if(freed<=0)return;
           var proportion=_growthTotal>0?allocAmounts[g.i]/_growthTotal:(1/growth.length);
-          var per=Math.round(freed*proportion);
+          // Use INITIAL freed for proportional share, capped by what's actually still available
+          var per=Math.min(Math.round(_initialFreed*proportion),freed);
           var irsMax3=_cpIRSMax(g.a.type,g.a);
           var add3=Math.min(per,Math.max(0,irsMax3-allocAmounts[g.i]));
           if(add3>0){
@@ -8401,6 +8610,35 @@ function _cpRunSimulation(){
             freed-=add3;
           }
         });
+        // Second pass: any leftover (from IRS-capped items or rounding) gets
+        // pushed to growth items that still have IRS headroom. Iterate until
+        // fully consumed or no more headroom.
+        var _safetyIter=0;
+        while(freed>0&&_safetyIter<3){
+          _safetyIter++;
+          var distributedThisPass=0;
+          growth.forEach(function(g){
+            if(freed<=0)return;
+            var irsMax4=_cpIRSMax(g.a.type,g.a);
+            var headroom=Math.max(0,irsMax4-allocAmounts[g.i]);
+            if(headroom<=0)return;
+            // Each pass distributes proportionally to remaining headroom across
+            // items that still have room, ensuring fairness without re-shrinking.
+            var add4=Math.min(headroom,freed);
+            if(add4>0){
+              allocAmounts[g.i]+=add4;
+              allocFuture[g.i].futureAmount=allocAmounts[g.i];
+              allocFuture[g.i].boosts.push({month:ev.month,amount:add4,from:ev.label});
+              // Find existing destination entry to merge, or push new
+              var _existing=destinations.find(function(d){return d.type===g.a.type&&d.name===(g.a.customName||CP_NM[g.a.type]);});
+              if(_existing)_existing.amount+=add4;
+              else destinations.push({type:g.a.type,name:g.a.customName||CP_NM[g.a.type],amount:add4});
+              freed-=add4;
+              distributedThisPass+=add4;
+            }
+          });
+          if(distributedThisPass===0)break;// All items at IRS cap
+        }
       }
     }
     // Then: fund any remaining unfunded growth items (skip action-only items)
@@ -8427,8 +8665,243 @@ function _cpRunSimulation(){
         freed-=add2;
       });
     }
+    // ── OVERFLOW PASS ────────────────────────────────────────────────────
+    // After boost + second + unfunded passes, if `freed` is still > 0, it means
+    // every non-insurance growth allocation has hit its IRS cap (or the only
+    // growth vehicle in the plan is fixed-premium insurance like IUL/WL/IBC
+    // which can't accept additional contributions mid-policy). The previous
+    // behavior silently DROPPED this leftover — visible to the user as
+    // "Phase 2 deployment < Phase 1 deployment" in the comparison bar, even
+    // though the surplus hasn't changed. The money was disappearing in math.
+    //
+    // This pass handles the leftover by:
+    //   1. Preferring an existing 'invest' (taxable brokerage) allocation —
+    //      no real IRS limit, accepts unlimited overflow.
+    //   2. Falling back to any non-insurance growth allocation with remaining
+    //      headroom (catches edge cases where IRS computation differs slightly
+    //      between passes).
+    //   3. Final fallback: track on the cascade log as overflow so the
+    //      deployment bar can render it explicitly. This way money is never
+    //      lost — at worst it shows as "+ unallocated cash" the user can act on.
+    // Tax-Free plans without an `invest` allocation will fall through to (3).
+    if(freed>0){
+      // (1) Existing invest allocation — taxable brokerage, no real cap
+      var _investIdx=CPLAN.allocations.findIndex(function(a){return a.type==='invest';});
+      if(_investIdx>=0){
+        var _investMax=_cpIRSMax('invest',CPLAN.allocations[_investIdx]);
+        var _investHeadroom=Math.max(0,_investMax-allocAmounts[_investIdx]);
+        var _investAdd=Math.min(freed,_investHeadroom);
+        if(_investAdd>0){
+          allocAmounts[_investIdx]+=_investAdd;
+          allocFuture[_investIdx].futureAmount=allocAmounts[_investIdx];
+          if(allocFuture[_investIdx].startsMonth<0)allocFuture[_investIdx].startsMonth=ev.month;
+          allocFuture[_investIdx].boosts.push({month:ev.month,amount:_investAdd,from:ev.label+' (overflow)'});
+          var _existInv=destinations.find(function(d){return d.type==='invest';});
+          if(_existInv)_existInv.amount+=_investAdd;
+          else destinations.push({type:'invest',name:CP_NM['invest']||'Taxable Brokerage',amount:_investAdd});
+          freed-=_investAdd;
+        }
+      }
+      // (2) Any non-insurance growth allocation with headroom (very aggressive)
+      if(freed>0){
+        var _allGrowth=CPLAN.allocations.map(function(a,i){return{a:a,i:i};})
+          .filter(function(x){
+            if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection')return false;
+            // Insurance premiums (iul/wl/ibc) are normally FIXED at policy
+            // inception. EXCEPTION: allocations explicitly tagged with
+            // _overflowAbsorber:true are designed to accept additional
+            // contributions — the AI emits these (per S2 prompt block) as
+            // the destination for cascade overflow in Tax-Free / Hybrid plans
+            // that would otherwise drop money into "cash savings." Without
+            // this exception, the entire purpose of _overflowAbsorber is
+            // defeated since the filter blocks the receiving allocation.
+            var _isFixedPremiumIns=(x.a.type==='iul'||x.a.type==='wl'||x.a.type==='ibc');
+            if(_isFixedPremiumIns&&!x.a._overflowAbsorber)return false;
+            // Action-only items must not absorb cascade overflow. The AI's
+            // PHASE STRUCTURE rule (edge fn line 698) says "Do NOT cascade to
+            // action-only items (protection, estate, tax review)". The
+            // type==='custom' check catches estate planning + advisor checklist
+            // entries; type==='rollover' catches Roth conversion strategies.
+            // The (target===0 && amount===0) check catches zero-funded $0
+            // action allocations regardless of type — they have no headroom
+            // to receive contributions in any meaningful sense.
+            if(x.a.type==='custom'||x.a.type==='rollover')return false;
+            if((!x.a.target||x.a.target===0)&&(parseFloat(x.a.amount)||0)===0)return false;
+            if(!_cascadeOwnerOK(x.a.owner))return false;
+            var irsMax=_cpIRSMax(x.a.type,x.a);
+            return (irsMax-allocAmounts[x.i])>0;
+          })
+          .sort(function(a,b){
+            // Prioritize _overflowAbsorber-tagged allocations first — these
+            // exist specifically to absorb overflow, so they should receive
+            // before any other headroom-having growth vehicle.
+            var aAbs=(a.a._overflowAbsorber)?1:0;
+            var bAbs=(b.a._overflowAbsorber)?1:0;
+            if(aAbs!==bAbs)return bAbs-aAbs;
+            var aHr=_cpIRSMax(a.a.type,a.a)-allocAmounts[a.i];
+            var bHr=_cpIRSMax(b.a.type,b.a)-allocAmounts[b.i];
+            return bHr-aHr;// largest headroom first
+          });
+        _allGrowth.forEach(function(g){
+          if(freed<=0)return;
+          var irsMaxG=_cpIRSMax(g.a.type,g.a);
+          var headroomG=Math.max(0,irsMaxG-allocAmounts[g.i]);
+          var addG=Math.min(freed,headroomG);
+          if(addG>0){
+            allocAmounts[g.i]+=addG;
+            allocFuture[g.i].futureAmount=allocAmounts[g.i];
+            allocFuture[g.i].boosts.push({month:ev.month,amount:addG,from:ev.label+' (overflow)'});
+            var _existG=destinations.find(function(d){return d.type===g.a.type;});
+            if(_existG)_existG.amount+=addG;
+            else destinations.push({type:g.a.type,name:g.a.customName||CP_NM[g.a.type]||g.a.type,amount:addG});
+            freed-=addG;
+          }
+        });
+      }
+      // (3) Any leftover at this point is true overflow — stash on the event so
+      // downstream UI (deployment legend) can surface it as "+ cash savings".
+      if(freed>0){
+        // Tax-Free fallback: if we're in a Tax-Free plan AND there's an
+        // existing IBC/WL/IUL allocation (likely the policy that's already
+        // active and just had its loan repaid), allow the overflow to flow
+        // there as a paid-up additions rider — economically equivalent to
+        // the _overflowAbsorber pattern when the AI didn't explicitly tag
+        // one. Without this fallback, Tax-Free plans without invest
+        // allocations and without an _overflowAbsorber tagged allocation
+        // would drop the entire post-loan-recovery freed amount into
+        // "cash savings" — which is literally what the user is complaining
+        // about ("takes the remainder as cash savings instead of using it
+        // for more growth"). Tax-Free's whitelist precludes invest/taxable,
+        // so PUA-via-existing-policy is the only viable growth outlet.
+        // Approach detection: Tax-Free uses new-policy creation (no taxable
+        // brokerage allocation exists); Hybrid uses new-policy creation only
+        // when the user's risk class is conservative or moderate, and for
+        // moderate only when their existing risky-investment allocations are
+        // large enough to need protection (>40% of pool deployment).
+        // CPLAN._selectedApproach is the user's chosen approach key, set when
+        // they pick from the 3 strategy summary cards.
+        var _approach=CPLAN._selectedApproach||'';
+        var _hasInvest=CPLAN.allocations.some(function(a){return a.type==='invest';});
+        // Risk class from main app state. Labels are 'Conservative'/'Moderate'/'Aggressive'.
+        var _riskLbl=((window.S&&window.S.riskProfile&&window.S.riskProfile.label)||'').toLowerCase();
+        var _planIsTaxFree=(_approach==='tax_free')||(!_approach&&!_hasInvest);
+        var _planIsHybridEligible=false;
+        if(_approach==='hybrid'){
+          if(_riskLbl==='conservative')_planIsHybridEligible=true;
+          else if(_riskLbl==='moderate'){
+            // Only emit new policy if existing risky allocations (invest/taxable)
+            // are >40% of deployed pool — at that point the user has growth-side
+            // exposure that benefits from a permanent tax-free counterweight.
+            var _totalDeployed=0,_riskyDeployed=0;
+            CPLAN.allocations.forEach(function(a,i){
+              var _amt=allocAmounts[i]||0;
+              if(_amt<=0)return;
+              _totalDeployed+=_amt;
+              if(a.type==='invest')_riskyDeployed+=_amt;
+            });
+            if(_totalDeployed>0&&(_riskyDeployed/_totalDeployed)>0.4)_planIsHybridEligible=true;
+          }
+          // Aggressive: skip — user's growth thesis is taxable-brokerage-driven;
+          // a new permanent policy doesn't match their stated risk preference.
+        }
+        // Viability threshold: a brand-new permanent insurance policy needs at
+        // least ~$200/mo premium to be worth opening (smaller premiums get eaten
+        // by carrier minimums and policy fees). If freed is below this, skip
+        // new-policy creation and let it fall through to cash savings.
+        var _minViablePremium=200;
+        // Fix E: Overflow Absorber is an IBC-specific mechanism. Its design
+        // intent is to absorb the minimums freed when IBC policy loans are
+        // fully repaid (CV=AV recovery) into a new policy. On non-IBC plans
+        // (avalanche/snowball/hybrid/consolidation), freed cash from generic
+        // debt-completion or EF-completion events should NOT spawn a new
+        // permanent insurance policy — there's no policy-loan-repayment
+        // mechanic that legitimately produces the "freed minimums redirected
+        // to a new policy" pattern. Without this gate the engine fires the
+        // absorber on any cascade event with leftover freed cash, pulling
+        // money into a policy the user never asked for.
+        //
+        // _ibcRecovery and _ibcContinues are only set inside the IBC branch of
+        // the event generator (line ~32504, debtStrategy==='ibc'). Together
+        // they cover both legitimate IBC paths:
+        //   _ibcRecovery=true   → standard CV=AV recovery (Option A continue
+        //                          OR Option B surrender)
+        //   _ibcContinues>0    → instant-CV=AV edge case (loans repaid in
+        //                          same month as last debt cleared)
+        var _isIbcCascadeEvent=(ev._ibcRecovery===true)||((ev._ibcContinues||0)>0);
+        var _shouldCreateNewPolicy=_isIbcCascadeEvent&&(_planIsTaxFree||_planIsHybridEligible)&&freed>=_minViablePremium;
+        if(_shouldCreateNewPolicy){
+          // Create a NEW permanent insurance policy as the destination for this
+          // freed amount. Critical: do NOT add to an existing IUL/WL/IBC — that
+          // would violate MEC (Modified Endowment Contract) limits since
+          // permanent insurance policies are funded at design-time and adding
+          // premium post-issue typically pushes the policy past the 7-pay
+          // corridor. The MEC-safe approach is opening a NEW policy designed
+          // around the freed-cash-flow amount.
+          //
+          // Vehicle choice: match the existing IBC underlying type if any
+          // (consistency — if user is comfortable with WL, the new policy is
+          // also WL; same for IUL). Default WL for Tax-Free, IUL for Hybrid
+          // (Hybrid users typically tolerate market-linked accumulation).
+          var _existingIBCUnderlying=null;
+          CPLAN.allocations.forEach(function(a){
+            if(a._ibcUnderlyingType&&!_existingIBCUnderlying)_existingIBCUnderlying=a._ibcUnderlyingType;
+            else if((a.type==='wl'||a.type==='iul')&&!_existingIBCUnderlying)_existingIBCUnderlying=a.type;
+          });
+          var _newPolicyType=_existingIBCUnderlying||(_planIsTaxFree?'wl':'iul');
+          var _newPolicyName=(_newPolicyType==='iul'?'Indexed Universal Life Policy':'Whole Life Policy')+' — Overflow Absorber';
+          // Phase derivation: count strict-prior cascade triggers (events whose
+          // month is strictly before this event). The new policy is created BY
+          // this event firing AND lives in the phase AFTER this cascade — so:
+          //   phase = strict-prior count (cascades already settled)
+          //         + 1 (this event itself, which IS a cascade)
+          //         + 1 (the new phase that begins immediately after this cascade)
+          //       = _priorCount + 2
+          // Minimum is therefore phase 2 (first cascade fires → new policy in Phase 2),
+          // never phase 1. Phase 1 is the initial deployment, predating any cascade.
+          var _phaseHint=2;
+          if(typeof events==='object'&&events&&events.length){
+            var _priorCount=events.filter(function(e2){return (e2.month||0)<ev.month&&(e2.freed>0||e2._ibcContinues>0);}).length;
+            _phaseHint=Math.max(2,_priorCount+2);
+          }
+          var _newAlloc={
+            type:_newPolicyType,
+            amount:freed,
+            target:0,
+            phase:_phaseHint,
+            cascade:'',
+            customName:_newPolicyName,
+            reason:'A new permanent insurance policy designed around the cash freed when prior commitments completed. Funded at '+fmt(freed)+'/mo as overflow absorber. MEC-safe (designed at this premium level from inception, not added to an existing policy). Tax-free cash value accumulation; loan provisions match the existing IBC strategy if any.',
+            flagTitle:'',flagType:'opp',flagIcon:'',eduVehicle:'',owner:'self',
+            _ibcUnderlyingType:_newPolicyType,
+            _ibcDebtStrategy:false,
+            _overflowAbsorber:true,// flag so it shows differently in UI + skips IRS-cap math
+            _cascadeSpawned:true,// distinguishes cascade-engine-spawned absorbers from AI-emitted ones; pool/slider math excludes only these (their amount IS the freed cash, already counted via the source allocation)
+            _state:'proposed',
+            _policyId:'pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8),
+            _policyNumber:null,_lockedPremium:null,_openedDate:null,
+            _spawnedByOverflow:true,// flag for de-duplication on subsequent sim passes
+            _spawnEventLabel:ev.label
+          };
+          // De-dup: don't spawn the same policy twice if cascade engine re-runs.
+          var _alreadySpawned=CPLAN.allocations.some(function(a){
+            return a._spawnedByOverflow&&a._spawnEventLabel===ev.label;
+          });
+          if(!_alreadySpawned){
+            CPLAN.allocations.push(_newAlloc);
+            allocAmounts.push(freed);
+            allocFuture.push({futureAmount:freed,startsMonth:ev.month,boosts:[{month:ev.month,amount:freed,from:ev.label+' (new policy)'}]});
+            destinations.push({type:_newPolicyType,name:_newPolicyName,amount:freed});
+            freed=0;
+          }
+        }
+      }
+      if(freed>0){
+        ev._cascadeOverflow=(ev._cascadeOverflow||0)+freed;
+        freed=0;
+      }
+    }
     if(destinations.length>0){
-      cascadeLog.push({month:ev.month,source:ev.label,freed:ev.freed,destinations:destinations});
+      cascadeLog.push({month:ev.month,source:ev.label,freed:ev.freed,destinations:destinations,overflow:ev._cascadeOverflow||0});
     }
   });
 
@@ -8443,16 +8916,118 @@ function _cpRunSimulation(){
   var avgAllRate=CPLAN.totalDebt>0?allDebts.reduce(function(t,d){return t+((parseFloat(d.rate)||0)/100/12)*(parseFloat(d.balance)||0);},0)/CPLAN.totalDebt:0;
   var hiRatePmt=debtA?(debtA.amount+hiRateMin):hiRateMin;// Extra + high-rate minimums
   // Per-allocation balance tracking for chart bands
-  var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt')allocSeries[a.type+'_'+i]=[];});
+  // Per-allocation balance tracking for chart bands. Include _ibcDebtStrategy
+  // debt allocations (real WL/IUL policies whose CV grows over time and IS a
+  // retirement asset). Without this initialization the allocSeries[key] is
+  // undefined, the per-month push at line ~32790 fails silently, and the
+  // chart tooltip shows the policy contribution missing from per-allocation
+  // breakdown even though its growth is correctly included in totalData.
+  var allocSeries={};CPLAN.allocations.forEach(function(a,i){if(a.type!=='debt'||a._ibcDebtStrategy)allocSeries[a.type+'_'+i]=[];});
   var _retOnlyByYear={};
-  // Phase C: per-owner retirement tracking (joint households need separate projections per partner)
-  var _retByOwner={self:[],spouse:[],joint:[]};
   var retirementData=[];
+  // Per-bucket trackers for hybrid couples (and applies harmlessly to other household
+  // types — single-owner households fill only the _self bucket). Each is a year-by-year
+  // array parallel to retirementData / netWorthData but partitioned by allocation owner.
+  // Joint bucket aggregates allocations tagged owner==='joint'. Self/spouse buckets
+  // aggregate their respective owner-tagged allocations.
+  var _retSelfByYear={},_retSpouseByYear={},_retJointByYear={};
+  var _nwSelfByYear={},_nwSpouseByYear={},_nwJointByYear={};
+  var retirementSelfData=[],retirementSpouseData=[],retirementJointData=[];
+  var netWorthSelfData=[],netWorthSpouseData=[],netWorthJointData=[];
   // Home equity tracking — get home value from profile if homeowner
-  var _rawS2=(APP._portalFd&&APP._portalFd.S)||{};
-  var _homeValue=parseFloat((_rawS2.assets&&_rawS2.assets.re)||0);
+  var _rawS2=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+  // Home value may be a scalar (legacy pfos-main shape: assets.re is a number)
+  // or an array (newer shape: assets.re is an array of real-estate entries).
+  // parseFloat on an array returns NaN, which then poisons the entire seed
+  // computation via NaN propagation (seed += NaN → seed becomes NaN). Guard
+  // against both: detect the array shape and sum entry balances; fall back to
+  // scalar parsing for legacy data; force any NaN result to 0.
+  var _rawAssetsRE=(_rawS2.assets&&_rawS2.assets.re);
+  var _homeValue=0;
+  if(Array.isArray(_rawAssetsRE)){
+    _homeValue=_rawAssetsRE.reduce(function(t,e){return t+(parseFloat(e&&e.balance)||parseFloat(e&&e.value)||0);},0);
+  } else {
+    _homeValue=parseFloat(_rawAssetsRE)||0;
+  }
+  if(isNaN(_homeValue))_homeValue=0;
   var _homeAppreciation=0.035;// 3.5% annual appreciation
   var _mortgageBal=loRateDebts.filter(function(d){var nm=(d.name||d.type||'').toLowerCase();return nm.indexOf('house')>=0||nm.indexOf('mortgage')>=0||nm.indexOf('home')>=0;}).reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
+
+  // Phase A: how many full months have actually elapsed since plan start.
+  // Used below to substitute actual contributions (from check-ins) for past months.
+  var _monthsElapsed=_cpMonthsElapsed();
+
+  // ── Existing real-world balances and monthly contributions ─────────────
+  // Computed once per simulation (outside the year loop). For each allocation
+  // that has a matching real-world account, _curBalanceByIdx[idx] is the seed
+  // balance the projection compounds from, and _curContribByIdx[idx] is the
+  // existing monthly contribution that flows alongside the AI's recommended
+  // EXTRA each month. Allocations with no match (new accounts, brand-new
+  // strategies) get 0/0 — same behavior as before this change.
+  //
+  // Existing contributions are gated by retirement only (no income → no
+  // contribution). They are NOT gated by the tracking-complete flag or by
+  // _cpIsTrackable — that gate is for the AI's recommended extra; the user's
+  // existing real-world contribution is already happening regardless of
+  // whether they've marked the card "Done."
+  var _curBalanceByIdx={},_curContribByIdx={};
+  CPLAN.allocations.forEach(function(a,idx){
+    if(a.type==='debt'){_curBalanceByIdx[idx]=0;_curContribByIdx[idx]=0;return;}
+    var _m=(typeof _cpMatchExisting==='function')?_cpMatchExisting(a):{currentBalance:0,currentContrib:0};
+    _curBalanceByIdx[idx]=parseFloat(_m&&_m.currentBalance)||0;
+    _curContribByIdx[idx]=parseFloat(_m&&_m.currentContrib)||0;
+  });
+
+  // ── Precompute insurance CV trajectories ────────────────────────────────
+  // For WL/IUL/IBC allocations (including type='debt' with _ibcDebtStrategy:
+  // true, which IS the IBC policy itself), use _ibcProjectPolicy — the same
+  // engine the per-allocation cards and CV charts use — to compute a CV-by-
+  // month trajectory. This guarantees the retirement projection chart's
+  // values match the card's projection numbers (e.g., the IBC card showed
+  // $1.3M at age 65 while the chart showed $583K — model mismatch).
+  // _ibcProjectPolicy models year-1-vs-later premium-to-CV efficiency, PUA
+  // dividend reinvestment, and anniversary-anchored crediting, which a flat
+  // CF × annual rate cannot reproduce.
+  //
+  // Allocations WITH cascade boosts (af.boosts.length > 0) are NOT pre-
+  // computed: _ibcProjectPolicy doesn't accept mid-call premium changes.
+  // Those fall through to the inline annual formula. For typical IBC plans
+  // the IBC allocation has no boosts (freed minimums redistribute to OTHER
+  // allocations, not the policy itself), so precomputation applies.
+  //
+  // _curBalanceByIdx is honored as startingCV — preserves existing real-world
+  // CV when matched via _cpMatchExisting (audit-anchored cases).
+  var _ibcCVByMonth={};
+  var _ibcAllocFallback={};
+  CPLAN.allocations.forEach(function(a,idx){
+    var _isInsuranceAlloc=(a.type==='wl'||a.type==='iul'||a.type==='ibc'||(a.type==='debt'&&a._ibcDebtStrategy));
+    if(!_isInsuranceAlloc)return;
+    if(typeof _ibcProjectPolicy!=='function')return;
+    var _af=(allocFuture&&allocFuture[idx])||null;
+    var _hasBoosts=_af&&_af.boosts&&_af.boosts.length>0;
+    if(_hasBoosts){_ibcAllocFallback[idx]=true;return;}
+    // Resolve underlying policy type. type='ibc' uses _ibcUnderlyingType (WL
+    // fallback); type='debt' with _ibcDebtStrategy uses _ibcUnderlyingType
+    // (WL fallback); plain wl/iul use their type directly.
+    var _polType;
+    if(a.type==='iul')_polType='iul';
+    else if(a.type==='wl')_polType='wl';
+    else _polType=a._ibcUnderlyingType||'wl';
+    var _polParams=Object.assign({},_ibcPolicyDefaults(_polType),{
+      monthlyPremium:parseFloat(a.amount)||0,
+      startingCV:_curBalanceByIdx[idx]||0
+    });
+    try{
+      var _proj=_ibcProjectPolicy(_polParams,0,years*12);
+      if(_proj&&_proj.data&&_proj.data.length){
+        var _byMonth={};
+        _proj.data.forEach(function(d){_byMonth[d.month]=d.cv;});
+        _ibcCVByMonth[idx]=_byMonth;
+      } else {
+        _ibcAllocFallback[idx]=true;
+      }
+    } catch(_pErr){_ibcAllocFallback[idx]=true;}
+  });
 
   for(var yr=0;yr<=years;yr++){
     // Baseline: idle cash at 0%, ALL debt with min payments only
@@ -8461,62 +9036,202 @@ function _cpRunSimulation(){
     for(var bdm=0;bdm<yr*12;bdm++){baseDebt=Math.max(0,baseDebt*(1+avgAllRate)-totalDebtMin);if(baseDebt<1)baseDebt=0;}
     baselineData.push(Math.round(baseCash-baseDebt));
 
-    // Plan: each allocation grows with cascade-adjusted amounts
+    // Plan: each allocation grows with cascade-adjusted amounts.
+    // We walk month-by-month so that when an allocation caps (EF/house/custom hits target),
+    // the freed monthly amount is properly recaptured into unallocated surplus (unBal)
+    // and doesn't disappear from the projection.
+    //
+    // Phase A: for past months (m <= _monthsElapsed), the effective contribution is the
+    // ACTUAL amount the user contributed (per check-ins) rather than the planned amount.
+    // For future months, the planned amount is used. When no check-in exists for a past
+    // month, we fall back to planned (don't pre-emptively shift the projection).
     var totalAssets=0;
-    CPLAN.allocations.forEach(function(a,idx){
-      if(a.type==='debt')return;// Debt handled via -remDebt
-      var af=allocFuture[idx];
-      var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);
-      // Phase D multi-partner: contributions cease at owner retirement.
-      // For Roth/Trad IRA owned by retired partner, spousal IRA exception allows
-      // continued contributions while OTHER partner is still working (capped at
-      // working partner's remaining earned income capacity).
-      var _ownerRetMonth=_cpRetMonthFor(a);
-      var _aOwner=a.owner||'self';
-      var _isIRA=(a.type==='roth'||a.type==='trad_ira');
-      var _spousalIRAEligible=_isIRA&&CPLAN._partner&&(_aOwner==='self'||_aOwner==='spouse');
-      var _otherOwner=_aOwner==='self'?'spouse':'self';
-      var _otherRetMonth=_spousalIRAEligible?_cpRetMonthFor(_otherOwner):0;
-      var _spousalCap=_spousalIRAEligible?_cpWorkingPartnerIncomeRemaining(_aOwner):0;
-      var bal=0;
-      for(var m=1;m<=yr*12;m++){
+    var balByIdx={};                       // running balance per alloc, persists across months within this year
+    var unBalAccum=0;                      // running unallocated surplus (0% growth, just stacks)
+    var growthIdxList=[];                  // alloc indices we walk per month (skip debt)
+    // Include debt-typed allocations ONLY when they're IBC debt strategy:
+    // those represent a real permanent-insurance policy whose CV grows over
+    // time and contributes to retirement assets. Pure-debt allocations (avalanche/
+    // snowball card-acceleration) stay excluded since debt-elimination doesn't
+    // produce a growth balance to track.
+    CPLAN.allocations.forEach(function(a,idx){if(a.type!=='debt'||a._ibcDebtStrategy){growthIdxList.push(idx);balByIdx[idx]=_curBalanceByIdx[idx]||0;}});
+    var monthlySurplus=CPLAN.surplus||0;
+    // Phase D multi-partner: precompute per-allocation retirement-month and spousal IRA flags
+    // so the inner monthly loop doesn't recompute these for every (yr, m, idx) triple.
+    var _retCtx={};
+    growthIdxList.forEach(function(idx){
+      var a=CPLAN.allocations[idx];
+      var aOwner=a.owner||'self';
+      var isIRA=(a.type==='roth'||a.type==='trad_ira'||a.type==='ira');
+      var spousalEligible=isIRA&&CPLAN._partner&&(aOwner==='self'||aOwner==='spouse');
+      var otherOwner=aOwner==='self'?'spouse':'self';
+      _retCtx[idx]={
+        retMonth:_cpRetMonthFor(a),
+        spousalEligible:spousalEligible,
+        otherRetMonth:spousalEligible?_cpRetMonthFor(otherOwner):0,
+        spousalCap:spousalEligible?_cpWorkingPartnerIncomeRemaining(aOwner):0
+      };
+    });
+    for(var m=1;m<=yr*12;m++){
+      var monthDeployed=0;
+      growthIdxList.forEach(function(idx){
+        var a=CPLAN.allocations[idx];
+        var af=allocFuture[idx];
+        var rate=_cpGetNetRate(a);var cf=_cpGetCF(a);
         var monthlyAmt=af.currentAmount;
         af.boosts.forEach(function(b){if(m>=b.month)monthlyAmt=af.futureAmount;});
-        if((a.type==='ef'||a.type==='house'||a.type==='custom')&&a.target>0&&bal>=a.target){monthlyAmt=0;}
         // Phase D multi-partner: cease contributions at owner retirement, with spousal IRA exception
-        if(m>_ownerRetMonth){
-          if(_spousalIRAEligible&&m<=_otherRetMonth){
+        var _rc=_retCtx[idx];
+        if(_rc&&m>_rc.retMonth){
+          if(_rc.spousalEligible&&m<=_rc.otherRetMonth){
             // Spousal IRA: retired partner can keep contributing while other partner works,
-            // but capped at working partner's remaining earned income
-            monthlyAmt=Math.min(monthlyAmt,_spousalCap);
+            // but capped at working partner's remaining earned income.
+            monthlyAmt=Math.min(monthlyAmt,_rc.spousalCap);
           } else {
             monthlyAmt=0;
           }
         }
-        var contrib=monthlyAmt*cf;
-        bal=(bal+contrib)*(1+(rate/12));
-      }
+        // ── Tracking gate ─────────────────────────────────────────────────────
+        // Contribute $0 to the projection if the user hasn't marked this card
+        // complete. The deployment bar / available budget still treat this as
+        // planned, but the chart only reflects what's actually started.
+        // _cpIsTrackable handles action-only exemption.
+        if(!_cpIsTrackable(a))monthlyAmt=0;
+        if((a.type==='ef'||a.type==='house'||a.type==='custom')&&a.target>0&&balByIdx[idx]>=a.target){monthlyAmt=0;}
+        // Phase A: substitute actual contribution for past months. m is 1-indexed in this
+        // loop but _cpEffectiveContribution wants 0-indexed offset, so we pass m-1.
+        // We only substitute for months that have actually elapsed (m-1 < _monthsElapsed).
+        var effectiveAmt=monthlyAmt;
+        if((m-1)<_monthsElapsed){
+          effectiveAmt=_cpEffectiveContribution(a.type,m-1,monthlyAmt,_monthsElapsed);
+        }
+        // Phase B: layer catch-up boosts. These represent extra contributions the user
+        // committed to in specific future months to recover from a missed/partial month.
+        // Boost monthOffset is 0-indexed (matches _cpMonthsElapsed); the loop's m is
+        // 1-indexed, so we match m === monthOffset+1 (boost fires that month only, not
+        // forever after — they're one-time top-ups).
+        if(CPLAN._catchUpBoosts&&CPLAN._catchUpBoosts.length){
+          CPLAN._catchUpBoosts.forEach(function(b){
+            if(b.allocType===a.type && (m===b.monthOffset+1)){
+              effectiveAmt+=(parseFloat(b.amount)||0);
+            }
+          });
+        }
+        // ── Existing real-world contribution ──────────────────────────────
+        // The user's pre-plan baseline contribution flows alongside the AI's
+        // recommended extra. Subject to retirement gating only — no income →
+        // no contribution. Spousal IRA exception mirrors the monthlyAmt logic
+        // above (working partner's earned income can continue funding a
+        // retired partner's spousal IRA up to their remaining income cap).
+        // NOT gated by tracking-complete or goal-met because the existing
+        // baseline is already happening in real life regardless of whether
+        // the user has marked the AI's recommendation card "Done." See
+        // _cpMatchExisting for owner-aware aggregation across real accounts.
+        var _curC=_curContribByIdx[idx]||0;
+        if(_curC>0&&_rc&&m>_rc.retMonth){
+          if(_rc.spousalEligible&&m<=_rc.otherRetMonth){
+            _curC=Math.min(_curC,_rc.spousalCap);
+          } else {
+            _curC=0;
+          }
+        }
+        effectiveAmt+=_curC;
+        var contrib=effectiveAmt*cf;
+        // Project the running balance forward. Three branches:
+        //
+        // 1. INSURANCE WITH PRECOMPUTED TRAJECTORY (_ibcCVByMonth[idx] exists):
+        //    Look up CV at month m from _ibcProjectPolicy's output. This
+        //    matches the per-allocation card's projection numbers exactly —
+        //    same engine, same parameters. The card's $1.3M and chart's IBC
+        //    line now agree at every year.
+        //
+        // 2. INSURANCE FALLBACK (allocation has boosts, or projection failed):
+        //    Use annual flat-CF compounding (Fix H math). Accumulates premium
+        //    monthly without growth between anniversaries, applies the full
+        //    annual rate when m%12===0.
+        //
+        // 3. NON-INSURANCE (401k, Roth, invest, HSA, EF, custom, etc.):
+        //    Annual compounding to match the card tile formula at line ~25992:
+        //    `(_yr20+_c)*(1+_mr)` where _c is the annual contribution and _mr
+        //    is the annual rate. Switched from monthly (rate/12) compounding
+        //    so card tiles and chart series agree for every vehicle.
+        //    Accumulates contributions monthly during the year, applies the
+        //    full annual rate to the year-end balance on m%12===0.
+        var _isInsuranceVehicle=(a.type==='wl'||a.type==='iul'||a.type==='ibc'||(a.type==='debt'&&a._ibcDebtStrategy));
+        if(_isInsuranceVehicle&&_ibcCVByMonth[idx]&&!_ibcAllocFallback[idx]){
+          // Precomputed CV trajectory — set balance directly from _ibcProjectPolicy.
+          // _ibcProjectPolicy already factors premium contributions internally
+          // via the cvEfficiencyYr curve + guaranteed/dividend mechanics, so
+          // we do NOT add `contrib` separately here (would double-count).
+          var _cvAtM=_ibcCVByMonth[idx][m];
+          if(_cvAtM!=null)balByIdx[idx]=_cvAtM;
+          // monthDeployed still tracks the cash flow leaving the user's pocket
+          // for budget reconciliation (regardless of where it lands in CV).
+        } else if(_isInsuranceVehicle){
+          // Fallback for boosted insurance allocations or projection failure.
+          balByIdx[idx]=balByIdx[idx]+contrib;
+          if(m%12===0)balByIdx[idx]=balByIdx[idx]*(1+rate);
+        } else {
+          // Non-insurance — annual compounding (matches card tile formula).
+          balByIdx[idx]=balByIdx[idx]+contrib;
+          if(m%12===0)balByIdx[idx]=balByIdx[idx]*(1+rate);
+        }
+        monthDeployed+=effectiveAmt;
+      });
+      // Anything not deployed this month sits in unallocated cash at 0%
+      var leftover=Math.max(0,monthlySurplus-monthDeployed);
+      unBalAccum+=leftover;
+    }
+    // Snapshot per-allocation balances for chart series + retirement subtotal
+    // Per-owner asset sums (initialized fresh each year) so net worth and retirement
+    // can be split by owner downstream.
+    var _selfAssetsThisYr=0,_spouseAssetsThisYr=0,_jointAssetsThisYr=0;
+    var _retSelfThisYr=0,_retSpouseThisYr=0,_retJointThisYr=0;
+    growthIdxList.forEach(function(idx){
+      var a=CPLAN.allocations[idx];
+      var bal=balByIdx[idx];
       var key=a.type+'_'+idx;
       if(allocSeries[key])allocSeries[key].push(Math.round(bal));
       totalAssets+=bal;
-      // Track retirement-only assets separately
-      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'].indexOf(a.type)>=0){
+      // Per-owner asset routing: every growth balance contributes to exactly one bucket.
+      var _aOwn=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
+      if(_aOwn==='self')_selfAssetsThisYr+=bal;
+      else if(_aOwn==='spouse')_spouseAssetsThisYr+=bal;
+      else _jointAssetsThisYr+=bal;
+      // Track retirement-only assets separately. Taxable brokerage ('invest')
+      // IS counted as a retirement asset because in real-world planning that
+      // account is sold at LTCG rates, harvested for dividends, or used as
+      // an early-retirement bridge to Social Security / 59½. Excluding it
+      // made the Retirement view show ~half the actual retirement wealth and
+      // visibly disagree with the Net Worth view for plans that put $2-3M
+      // into taxable brokerage by age 65. EF / 529 / vacation goals stay
+      // excluded — those are specific-purpose buckets, not retirement income.
+      // _ibcDebtStrategy: a debt-typed allocation that's actually an IBC
+      // policy funding source. Its accumulated balance (WL cash value) IS a
+      // retirement asset post-debt-free, so include it just like any 'ibc'
+      // allocation would be included.
+      if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'].indexOf(a.type)>=0 || a._ibcDebtStrategy){
         if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
         _retOnlyByYear[yr]+=bal;
-        // Phase C: per-owner accumulator (used by joint-household income replacement display)
-        var _own=a.owner||'self';
-        if(!_retByOwner[_own])_retByOwner[_own]=[];
-        if(_retByOwner[_own][yr]==null)_retByOwner[_own][yr]=0;
-        _retByOwner[_own][yr]+=bal;
+        if(_aOwn==='self')_retSelfThisYr+=bal;
+        else if(_aOwn==='spouse')_retSpouseThisYr+=bal;
+        else _retJointThisYr+=bal;
       }
     });
+    // Persist per-owner year-end snapshots for downstream consumers
+    _retSelfByYear[yr]=_retSelfThisYr;
+    _retSpouseByYear[yr]=_retSpouseThisYr;
+    _retJointByYear[yr]=_retJointThisYr;
+    _nwSelfByYear[yr]=_selfAssetsThisYr;
+    _nwSpouseByYear[yr]=_spouseAssetsThisYr;
+    _nwJointByYear[yr]=_jointAssetsThisYr;
     // Remaining high-rate debt (accelerated payments)
     var remHi=hiRateTotal;
     for(var dm=0;dm<yr*12;dm++){remHi=Math.max(0,remHi*(1+avgHiRate)-hiRatePmt);if(remHi<1)remHi=0;}
     // Remaining low-rate debt (minimum payments only — mortgage, auto, student)
     var remLo=loRateTotal;
     for(var dm2=0;dm2<yr*12;dm2++){remLo=Math.max(0,remLo*(1+avgLoRate)-loRateMin);if(remLo<1)remLo=0;}
-    var unBal=Math.max(0,CPLAN.surplus-CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0))*12*yr;
+    var unBal=unBalAccum;
     // Home equity for NW: home value appreciates, mortgage amortizes
     var _homeEq=0;
     if(_homeValue>0){
@@ -8528,8 +9243,241 @@ function _cpRunSimulation(){
       _homeEq=Math.max(0,_curHomeVal-_remMortgage);
     }
     netWorthData.push(Math.round(totalAssets+unBal-remHi-remLo+_homeEq));
-    // Retirement-only projection (excludes edu, invest bridge, EF, custom goals, home equity)
+    // Retirement projection includes all income-producing assets at retirement:
+    // tax-advantaged retirement accounts AND taxable brokerage (sold at LTCG /
+    // harvested for dividends / used as Roth-conversion ladder source).
+    // Excludes EF (cash buffer), custom goals (specific-purpose), 529 (education),
+    // and home equity (illiquid until sold).
     retirementData.push(Math.round(_retOnlyByYear[yr]||0));
+    // Per-bucket year-end snapshots (parallel arrays).
+    // Net worth split: assets-only per owner; shared items (unallocated cash,
+    // debts, home equity) attribute to 'self' bucket as the primary balance sheet.
+    // This is a display-level attribution, not an ownership claim — the joint /
+    // spouse buckets show only the growth contribution of their owner-tagged
+    // allocations, while the self bucket additionally absorbs household-level
+    // shared liabilities and equity. Couples can compare the three deltas to
+    // see who's accumulating what.
+    retirementSelfData.push(Math.round(_retSelfThisYr));
+    retirementSpouseData.push(Math.round(_retSpouseThisYr));
+    retirementJointData.push(Math.round(_retJointThisYr));
+    // Per-bucket net worth: STRICT per-bucket — only the allocation growth
+    // tagged to that owner. Household-wide residuals (unallocated surplus,
+    // debt amortization, home equity) are intentionally excluded from per-
+    // bucket charts because they're not attributable to any single owner.
+    // Without this exclusion, the self bucket absorbed all household residual
+    // cash, making "This plan" look like $1.9M even when nothing was allocated
+    // to self-tagged cards. Household totals are still rendered correctly in
+    // the all/household chart (sim.netWorth) which keeps all those terms.
+    netWorthSelfData.push(Math.round(_selfAssetsThisYr));
+    netWorthSpouseData.push(Math.round(_spouseAssetsThisYr));
+    netWorthJointData.push(Math.round(_jointAssetsThisYr));
+  }
+
+  // ── Per-bucket baselines (the 'Do nothing' line on each chart) ─────────────
+  // For each bucket, the baseline is: that bucket's existing real-world assets
+  // compounding passively at a moderate unmanaged rate, with no new
+  // contributions. This produces a per-chart trajectory that's actually
+  // comparable to the per-chart plan trajectory — instead of overlaying the
+  // household-wide baseline on every chart, which made empty spouse/joint
+  // buckets look like they were "missing out" on the household total.
+  //
+  // Source of seed assets per bucket:
+  //   self    → user's own retAccounts + investments + (in NW view) liquid
+  //             savings + checking + home equity
+  //   spouse  → partner's retAccounts + investments (assets shared with
+  //             primary in joint households so we don't double-count)
+  //   joint   → joint-tagged investments + joint retirement balances if any
+  // For households without a partner, spouse/joint baselines stay at 0.
+  var _rawSBase=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+  var _baseRateNW=0.04;// 4% — unmanaged mixed-asset growth, real terms
+  var _baseRateRet=0.05;// 5% — same idea, retirement-account flavored
+  // Helper: sum cash entries (savings/checking) from assets, by owner. pfos-main
+  // has two shapes for cash assets:
+  //   • Legacy scalar: S.assets.savings, S.assets.checking (numbers, no owner)
+  //   • Array: S.assets.cash[] (entries with .balance + .owner per entry)
+  // The scalar form has no owner tag, so it's treated as self/personal. The
+  // array form's owner tag routes entries to the right bucket. Same for invest.
+  function _sumCashForOwner(b){
+    var total=0;
+    var assets=_rawSBase.assets||{};
+    if(Array.isArray(assets.cash)){
+      assets.cash.forEach(function(c){
+        if(!c)return;
+        var co=c.owner||'personal';
+        var bucketMatch=(b==='self'&&co!=='spouse'&&co!=='joint')
+                     || (b==='joint'&&co==='joint')
+                     || (b==='spouse'&&co==='spouse');
+        if(bucketMatch)total+=(parseFloat(c.balance)||0);
+      });
+    } else if(b==='self'){
+      // Legacy scalars are untagged → self bucket only
+      total+=parseFloat(assets.savings)||0;
+      total+=parseFloat(assets.checking)||0;
+    }
+    return total;
+  }
+  function _sumInvestForOwner(b){
+    var total=0;
+    var assets=_rawSBase.assets||{};
+    if(Array.isArray(assets.inv)){
+      assets.inv.forEach(function(i){
+        if(!i)return;
+        var io=i.owner||'personal';
+        var bucketMatch=(b==='self'&&io!=='spouse'&&io!=='joint')
+                     || (b==='joint'&&io==='joint')
+                     || (b==='spouse'&&io==='spouse');
+        if(bucketMatch)total+=(parseFloat(i.balance)||0);
+      });
+    } else if(b==='self'){
+      // Legacy scalar — untagged → self bucket
+      total+=parseFloat(assets.invest)||0;
+    }
+    return total;
+  }
+  function _bucketSeed(b,isRet){
+    var seed=0;
+    if(b==='self'){
+      seed+=( _rawSBase.retAccounts||[]).filter(function(r){return(r.owner||'personal')!=='spouse'&&(r.owner||'personal')!=='joint';}).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
+      seed+=( _rawSBase.investments||[]).filter(function(i){return(i.owner||'personal')!=='spouse'&&(i.owner||'personal')!=='joint';}).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+      // Self-tagged taxable investments from assets.inv array (or legacy scalar)
+      seed+=_sumInvestForOwner('self');
+      if(!isRet){
+        // Net worth view: include liquid (cash) + home equity for self
+        seed+=_sumCashForOwner('self');
+        seed+=Math.max(0,_homeValue-_mortgageBal);
+      }
+    } else if(b==='spouse'&&CPLAN._partner){
+      seed+=(CPLAN._partner.retAccounts||[]).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
+      seed+=(CPLAN._partner.investments||[]).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+      if(!isRet){
+        // Spouse-tagged cash on the SHARED state (visible to current user's
+        // _rawSBase only in joint households where data is co-located). In
+        // hybrid/separate, partner cash lives in partner's own profile and is
+        // reachable via CPLAN._partner.assets when available.
+        seed+=_sumCashForOwner('spouse');
+        var pAssets=(CPLAN._partner&&CPLAN._partner.assets)||{};
+        if(Array.isArray(pAssets.cash)){
+          pAssets.cash.forEach(function(c){if(c)seed+=(parseFloat(c.balance)||0);});
+        } else {
+          seed+=parseFloat(pAssets.savings)||0;
+          seed+=parseFloat(pAssets.checking)||0;
+        }
+      }
+    } else if(b==='joint'){
+      seed+=( _rawSBase.retAccounts||[]).filter(function(r){return(r.owner||'')==='joint';}).reduce(function(t,r){return t+(parseFloat(r.balance)||0);},0);
+      seed+=( _rawSBase.investments||[]).filter(function(i){return(i.owner||'')==='joint';}).reduce(function(t,i){return t+(parseFloat(i.balance)||0);},0);
+      seed+=_sumInvestForOwner('joint');
+      if(!isRet){
+        seed+=_sumCashForOwner('joint');
+      }
+    }
+    if(isNaN(seed))seed=0;// defensive — NaN poisoning would zero the whole baseline
+    return seed;
+  }
+  // Per-bucket existing monthly contribution. The 'Do nothing' baseline isn't
+  // "stop contributing entirely" — it's "keep doing what you're already doing,
+  // just don't add anything from this plan." That includes the user's current
+  // 401(k) contribution + any employer match they're capturing. Spouse bucket
+  // does the same for spouse-side accounts. Joint bucket — no per-account
+  // ongoing contributions tracked yet (joint cash typically isn't "auto-funded"
+  // in the data model; if you want it to grow, the plan EF/savings card does it).
+  function _bucketCurrentContrib(b){
+    var monthly=0;
+    if(b==='self'){
+      (_rawSBase.retAccounts||[]).forEach(function(r){
+        if(!r)return;
+        var ro=r.owner||'personal';
+        if(ro==='spouse'||ro==='joint')return;
+        var c=parseFloat(r.contrib)||0;
+        if(c<=0){
+          // contribPct fallback — same logic as in _cpMatchExisting
+          var pct=parseFloat(r.contribPct)||0;
+          var inc=parseFloat(CPLAN.income)||0;
+          if(pct>0&&inc>0)c=inc*(pct/100);
+        }
+        monthly+=c;
+        // Employer match: dollar value of matchPct × income. The match dollars
+        // only flow in when the user contributes at least matchPct of their
+        // income; otherwise the match is partial / not captured.
+        var mPct=parseFloat(r.matchPct)||0;
+        if(mPct>0){
+          var inc2=parseFloat(CPLAN.income)||0;
+          var cPct=parseFloat(r.contribPct)||0;
+          if(cPct<=0&&c>0&&inc2>0)cPct=(c/inc2)*100;
+          // Capped at matchPct — match never exceeds the announced cap
+          var matchedPct=Math.min(cPct,mPct);
+          monthly+=inc2*(matchedPct/100);
+        }
+      });
+      (_rawSBase.investments||[]).forEach(function(i){
+        if(!i)return;
+        var io=i.owner||'personal';
+        if(io==='spouse'||io==='joint')return;
+        monthly+=parseFloat(i.monthlyContrib)||0;
+      });
+    } else if(b==='spouse'&&CPLAN._partner){
+      (CPLAN._partner.retAccounts||[]).forEach(function(r){
+        if(!r)return;
+        var c=parseFloat(r.contrib)||0;
+        if(c<=0){
+          var pct=parseFloat(r.contribPct)||0;
+          var inc=parseFloat(CPLAN._partner.income)||0;
+          if(pct>0&&inc>0)c=inc*(pct/100);
+        }
+        monthly+=c;
+        var mPct=parseFloat(r.matchPct)||0;
+        if(mPct>0){
+          var inc2=parseFloat(CPLAN._partner.income)||0;
+          var cPct=parseFloat(r.contribPct)||0;
+          if(cPct<=0&&c>0&&inc2>0)cPct=(c/inc2)*100;
+          var matchedPct=Math.min(cPct,mPct);
+          monthly+=inc2*(matchedPct/100);
+        }
+      });
+      (CPLAN._partner.investments||[]).forEach(function(i){
+        if(!i)return;
+        monthly+=parseFloat(i.monthlyContrib)||0;
+      });
+    }
+    if(isNaN(monthly))monthly=0;
+    return monthly;
+  }
+  var baselineSelfNW=[],baselineSpouseNW=[],baselineJointNW=[];
+  var baselineSelfRet=[],baselineSpouseRet=[],baselineJointRet=[];
+  var _seedSelfNW=_bucketSeed('self',false),_seedSpouseNW=_bucketSeed('spouse',false),_seedJointNW=_bucketSeed('joint',false);
+  var _seedSelfRet=_bucketSeed('self',true),_seedSpouseRet=_bucketSeed('spouse',true),_seedJointRet=_bucketSeed('joint',true);
+  // Existing monthly contributions per bucket — projected forward in the
+  // baseline so 'Do nothing' actually represents the user's current trajectory.
+  var _contribSelf=_bucketCurrentContrib('self');
+  var _contribSpouse=_bucketCurrentContrib('spouse');
+  var _contribJoint=_bucketCurrentContrib('joint');
+  // Year-walk projection: each year, balance compounds at the bucket's growth
+  // rate AND receives 12 months of current contribution. The result reflects
+  // "keep doing exactly what you're doing today" — the honest 'Do nothing' line.
+  var _balSelfNW=_seedSelfNW,_balSpouseNW=_seedSpouseNW,_balJointNW=_seedJointNW;
+  var _balSelfRet=_seedSelfRet,_balSpouseRet=_seedSpouseRet,_balJointRet=_seedJointRet;
+  for(var _byr=0;_byr<=years;_byr++){
+    if(_byr===0){
+      baselineSelfNW.push(Math.round(_balSelfNW));
+      baselineSpouseNW.push(Math.round(_balSpouseNW));
+      baselineJointNW.push(Math.round(_balJointNW));
+      baselineSelfRet.push(Math.round(_balSelfRet));
+      baselineSpouseRet.push(Math.round(_balSpouseRet));
+      baselineJointRet.push(Math.round(_balJointRet));
+    } else {
+      _balSelfNW=(_balSelfNW+_contribSelf*12)*(1+_baseRateNW);
+      _balSpouseNW=(_balSpouseNW+_contribSpouse*12)*(1+_baseRateNW);
+      _balJointNW=(_balJointNW+_contribJoint*12)*(1+_baseRateNW);
+      _balSelfRet=(_balSelfRet+_contribSelf*12)*(1+_baseRateRet);
+      _balSpouseRet=(_balSpouseRet+_contribSpouse*12)*(1+_baseRateRet);
+      _balJointRet=(_balJointRet+_contribJoint*12)*(1+_baseRateRet);
+      baselineSelfNW.push(Math.round(_balSelfNW));
+      baselineSpouseNW.push(Math.round(_balSpouseNW));
+      baselineJointNW.push(Math.round(_balJointNW));
+      baselineSelfRet.push(Math.round(_balSelfRet));
+      baselineSpouseRet.push(Math.round(_balSpouseRet));
+      baselineJointRet.push(Math.round(_balJointRet));
+    }
   }
 
   // ── 4. Calculate trajectory metrics for health score ──
@@ -8542,15 +9490,49 @@ function _cpRunSimulation(){
   }
   var debtFreeMonth=debtSim?debtSim.months:0;
   // Retirement projection — use retirement-only data at retirement age (not full NW)
-  // Phase D multi-partner note: still single-event walk for now. Two-event simulation
-  // (each partner retiring at their own age, joint allocations funded by still-working
-  // partner) is gated on the joint-funding rule decision — see plan doc Phase 1 followups.
+  // Retirement projection — use retirement-only data at retirement age (not full NW)
+  // Phase D multi-partner: parameterized retirement age. Per-owner contribution cessation
+  // is handled in the inner walk above so spouse-owned allocations stop at spouse retirement.
   var _retAge=CPLAN.retirementAge||65;var _yrsToRet=Math.max(1,Math.min(years,_retAge-(CPLAN.age||35)));
   var projRetValue=retirementData[_yrsToRet]||retirementData[years]||0;
-  // Phase 2: monthly income sustainability (PMT formula) over a 25-yr retirement at 1% real return.
-  // The user's stated retirement income target is the planning standard, used for comparison
-  // elsewhere — this number expresses what the projected balance can actually sustain.
-  var projRetIncome=Math.round(_cpSustainableMonthly(projRetValue,25,0.01));
+  // Phase 2: monthly income sustainability (PMT formula) over 25-yr retirement at 1% real return.
+  // Frame against user's stated retirement income target (CPLAN.retIncome) — not 4% rule.
+  var projRetIncome=Math.round(_cpSustainableMonthly(projRetValue,_cpYearsInRetirement(),0.01));
+
+  // ── Per-bucket projection metrics (hybrid couples + general use) ──
+  // Each bucket projects to its own retirement age (self → primary's retAge,
+  // spouse → partner's retAge, joint → later of the two). Sustainable monthly
+  // income uses years-in-retirement specific to that bucket:
+  //   • self: lifeExp - primary's retAge
+  //   • spouse: lifeExp - partner's retAge
+  //   • joint: lifeExp - later-of-two retAges (the joint bucket isn't drawn down
+  //     until both are retired, so the relevant window starts at the later age
+  //     and ends at the longer-lived spouse's life expectancy; using primary's
+  //     lifeExp as proxy keeps the formula simple — joint planning assumes both
+  //     live to the lifeExp setting)
+  var _hasPartner=!!CPLAN._partner;
+  var _selfRetAge=CPLAN.retirementAge||65;
+  var _spouseRetAge=_hasPartner?(CPLAN._partner.retirementAge||65):_selfRetAge;
+  var _jointRetAge=Math.max(_selfRetAge,_spouseRetAge);
+  var _selfCurAge=CPLAN.age||35;
+  var _spouseCurAge=_hasPartner?(CPLAN._partner.age||35):_selfCurAge;
+  var _yrsToSelfRet=Math.max(1,Math.min(years,_selfRetAge-_selfCurAge));
+  var _yrsToSpouseRet=Math.max(1,Math.min(years,_spouseRetAge-_spouseCurAge));
+  // Joint bucket horizon: years until the LATER of the two partners retires
+  var _yrsToJointRet=Math.max(_yrsToSelfRet,_yrsToSpouseRet);
+  var _lifeExp=(function(){
+    var rawS3=(typeof APP!=='undefined'&&APP._currentClientFd&&APP._currentClientFd.S)||{};
+    return parseInt((rawS3.calcs&&rawS3.calcs.retLifeExp))||90;
+  })();
+  var _projRetValue_self=retirementSelfData[_yrsToSelfRet]||retirementSelfData[years]||0;
+  var _projRetValue_spouse=retirementSpouseData[_yrsToSpouseRet]||retirementSpouseData[years]||0;
+  var _projRetValue_joint=retirementJointData[_yrsToJointRet]||retirementJointData[years]||0;
+  var _yrsInRet_self=Math.max(1,_lifeExp-_selfRetAge);
+  var _yrsInRet_spouse=Math.max(1,_lifeExp-_spouseRetAge);
+  var _yrsInRet_joint=Math.max(1,_lifeExp-_jointRetAge);
+  var _projRetIncome_self=Math.round(_cpSustainableMonthly(_projRetValue_self,_yrsInRet_self,0.01));
+  var _projRetIncome_spouse=Math.round(_cpSustainableMonthly(_projRetValue_spouse,_yrsInRet_spouse,0.01));
+  var _projRetIncome_joint=Math.round(_cpSustainableMonthly(_projRetValue_joint,_yrsInRet_joint,0.01));
 
   // Store result
   CPLAN._sim={
@@ -8565,8 +9547,39 @@ function _cpRunSimulation(){
     fullFundingMonth:fullFundingMonth,
     projRetValue:projRetValue,
     projRetIncome:projRetIncome,
-    // Phase C: per-owner retirement projections (year-indexed arrays)
-    retirementByOwner:_retByOwner
+    // Per-bucket trajectories and projections — consumed by three-charts UI in
+    // Hybrid households and by per-bucket income replacement / outcomes displays.
+    netWorth_self:netWorthSelfData,
+    netWorth_spouse:netWorthSpouseData,
+    netWorth_joint:netWorthJointData,
+    retirement_self:retirementSelfData,
+    retirement_spouse:retirementSpouseData,
+    retirement_joint:retirementJointData,
+    // Per-bucket baselines (the 'Do nothing' dashed line on each chart). NW
+    // variants include liquid + home equity for self; retirement variants
+    // include only retirement-account + investment balances. Seeds are
+    // partitioned per bucket so the dashed line shows what THAT bucket's
+    // existing real-world assets compound to passively — not the household
+    // total, which made empty buckets look like missed opportunities.
+    baseline_self:baselineSelfNW,
+    baseline_spouse:baselineSpouseNW,
+    baseline_joint:baselineJointNW,
+    baselineRet_self:baselineSelfRet,
+    baselineRet_spouse:baselineSpouseRet,
+    baselineRet_joint:baselineJointRet,
+    projRetValue_self:_projRetValue_self,
+    projRetValue_spouse:_projRetValue_spouse,
+    projRetValue_joint:_projRetValue_joint,
+    projRetIncome_self:_projRetIncome_self,
+    projRetIncome_spouse:_projRetIncome_spouse,
+    projRetIncome_joint:_projRetIncome_joint,
+    yrsToSelfRet:_yrsToSelfRet,
+    yrsToSpouseRet:_yrsToSpouseRet,
+    yrsToJointRet:_yrsToJointRet,
+    // Phase A: time-anchored fields. Consumers (timeline, you-are-here marker,
+    // accountability messaging) read these to align display with real elapsed time.
+    monthsElapsed:_monthsElapsed,
+    planStartDate:CPLAN._planStartDate||null
   };
   return CPLAN._sim;
 }
@@ -9055,6 +10068,31 @@ function _cpBuildInvestAllocFromAccount(iv){
   var ivOwner=iv.owner||'personal';
   // Advisor: see spouse investments unconditionally (no _allowSpouseSeed gate)
   var ivOwnerLabel=(ivOwner==='spouse')?' [spouse]':'';
+  // HSA branch: paycheck-auto-synced HSA accounts live in S.investments with
+  // type:'hsa'. They must seed as type:'hsa' (not type:'invest') so the plan
+  // card displays correctly and downstream HSA-specific logic (IRS limits,
+  // HDHP gating, tax-treatment) applies.
+  if(ivType.indexOf('hsa')>=0){
+    var hsaDisplay=(iv.provider||iv.accountLabel||iv.label||'HSA')+ivOwnerLabel;
+    return {
+      type:'hsa',
+      _investmentId:iv.id,
+      amount:0,
+      target:0,
+      phase:1,
+      cascade:'',
+      customName:hsaDisplay,
+      owner:ivOwner,
+      reason:'Existing HSA detected from your financial data. Slider shows your current monthly contribution; drag to plan changes.',
+      // Wave 5 state-machine fields
+      _state:'proposed',
+      _policyId:null,
+      _policyNumber:null,
+      _lockedPremium:null,
+      _openedDate:null,
+      _isActionOnly:false
+    };
+  }
   var ivDisplay=(iv.provider||iv.label||'Taxable Brokerage')+ivOwnerLabel;
   return {
     type:'invest',
@@ -9228,7 +10266,11 @@ function _cpStartSelf(){
       reason:'Existing policy detected from your financial data. Current premium preset; adjust as needed.'
     }));
   });
-  // ── Seed existing taxable brokerage investments as Phase 1 cards ──
+  // ── Seed existing investments (HSA + taxable brokerage) as Phase 1 cards ──
+  // HSA accounts (paycheck-auto-synced or manual) live in S.investments with
+  // type:'hsa'. They must seed as type:'hsa' (not type:'invest') so the plan
+  // card displays correctly and downstream HSA-specific logic applies (IRS
+  // contribution limits, HDHP gating, tax-treatment, etc).
   var existingInv = rawS_seed.investments || [];
   existingInv.forEach(function(iv){
     if(!iv || !iv.id)return;
@@ -9238,11 +10280,27 @@ function _cpStartSelf(){
     if(ivType.indexOf('crypto') >= 0)return;
     var ivOwner = iv.owner || 'personal';
     // Advisor: see spouse investments unconditionally
+    var ivOwnerLabel = (ivOwner==='spouse')?' [spouse]':'';
+    // HSA branch
+    if(ivType.indexOf('hsa') >= 0){
+      var hsaDup = CPLAN.allocations.some(function(a){
+        return a.type === 'hsa' && (a.owner||'personal') === ivOwner && a._investmentId === iv.id;
+      });
+      if(hsaDup)return;
+      var hsaDisplay = (iv.provider || iv.accountLabel || iv.label || 'HSA') + ivOwnerLabel;
+      CPLAN.allocations.push(_newAlloc({type:'hsa', phase:1}, {
+        _investmentId: iv.id,
+        customName: hsaDisplay,
+        owner: ivOwner,
+        reason: 'Existing HSA detected from your financial data. Slider shows your current monthly contribution; drag to plan changes.'
+      }));
+      return;
+    }
+    // Standard taxable brokerage
     var ivDup = CPLAN.allocations.some(function(a){
       return a.type === 'invest' && (a.owner||'personal') === ivOwner && a._investmentId === iv.id;
     });
     if(ivDup)return;
-    var ivOwnerLabel = (ivOwner==='spouse')?' [spouse]':'';
     var ivDisplay = (iv.provider || iv.label || 'Taxable Brokerage') + ivOwnerLabel;
     CPLAN.allocations.push(_newAlloc({type:'invest', phase:1}, {
       _investmentId: iv.id,
