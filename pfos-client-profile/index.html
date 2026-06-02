@@ -5056,8 +5056,31 @@ function renderProfileSavingsGoals(fd){
   card.style.display='';
   var selectedGoals=(rawS.profile&&rawS.profile.selectedGoals)||rawS.selectedGoals||[];
   var h='';
+  // Keep the selected life-goal tag chips at the top ("Get out of debt",
+  // "Build emergency fund", etc.) — these are the client's chosen focus areas,
+  // not individual savings goals, so they stay as the header strip.
   if(selectedGoals.length)h+='<div style="margin-bottom:10px;display:flex;flex-wrap:wrap;gap:4px">'+selectedGoals.map(function(g){return'<span style="font-size:9px;padding:3px 8px;background:rgba(0,68,191,.08);border:1px solid rgba(0,68,191,.15);color:#5B9BFF;border-radius:2px;font-family:var(--fh);font-weight:700">'+esc(g)+'</span>';}).join('')+'</div>';
+  // Render each savings goal as the SAME full interactive plan card the client
+  // sees (icon, $/mo, slider, existing balance, cap line, phase dropdown,
+  // Done/✕) instead of a flat read-only row. Each goal already enters the plan
+  // as a `custom`/`savings_goal` allocation (see _cpStartSelf goal seed), so we
+  // locate its matching allocation by goalId/name and hand it to _cpBuildCard
+  // with the allocation's real index — that index is what wires the slider,
+  // Done, ✕ and phase controls back to the plan. If a goal has no matching
+  // allocation yet (plan not built), fall back to the original summary row so
+  // nothing disappears.
+  var allocs=(typeof CPLAN!=='undefined'&&CPLAN.allocations)?CPLAN.allocations:[];
   goals.forEach(function(g){
+    var allocIdx=-1;
+    for(var i=0;i<allocs.length;i++){
+      var a=allocs[i];if(!a)continue;
+      if((a.type==='savings_goal'||a.type==='custom')&&((g.id&&a.goalId===g.id)||(a.customName&&g.name&&a.customName===g.name))){allocIdx=i;break;}
+    }
+    if(allocIdx>=0&&typeof _cpBuildCard==='function'){
+      h+=_cpBuildCard(allocs[allocIdx],allocIdx,true);
+      return;
+    }
+    // Fallback: original read-only summary row (goal not yet in the plan)
     var pct=g.target>0?Math.min(100,Math.round((g.current||0)/g.target*100)):0;
     var bc=pct>=100?'var(--gr)':pct>=60?'#5B9BFF':'var(--yl)';
     var hasBk=g.buckets&&g.buckets.length>0;
@@ -6868,7 +6891,10 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
           var pInc=pCalcs.inc||pCalcs.income||(pRawS.incomeSources?pRawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0):0);
           var pExp=pCalcs.baseExp||pCalcs.expenses||0;
           if(!pExp&&pRawS.expData)Object.keys(pRawS.expData).forEach(function(k){pExp+=(parseFloat((pRawS.expData[k]||{}).amount)||0);});
-          var pAge=parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35;
+          // Spouse age source of truth is the spouse fields entered on THIS client's
+          // profile (pfos-main Profile → Spouse Current Age, stored as S.profile.spCurrentAge).
+          // Fall back to the linked partner's own record only when that wasn't filled in.
+          var pAge=parseInt(rawS.profile&&rawS.profile.spCurrentAge)||parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35;
           var pPlan=(partnerProfileRes&&partnerProfileRes.data&&partnerProfileRes.data.allocation_plan)||{};
           var pAllocs=(pPlan.allocations||[]).slice();
           // Phase D follow-up: enrich partner with retirement accounts, policies, employment, health
@@ -6883,11 +6909,10 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             expenses:pExp,
             surplus:Math.max(0,pInc-pExp),
             age:pAge,
-            // Phase D multi-partner retirement: pull spouse's retirement age + SS benefit
-            // from their profile. Defaults to 65 if not set so projections stay valid.
-            // Once pfos-main writes spRetAge to S.profile, this picks it up automatically.
-            // Until then, falls back to partner's own retAge or 65.
-            retirementAge:parseInt(pProfile.retAge)||65,
+            // Spouse retirement age source of truth is the spouse field entered on THIS
+            // client's profile (pfos-main Profile → Spouse Target Retirement Age, stored as
+            // S.profile.spRetAge). Fall back to the linked partner's own retAge, then 65.
+            retirementAge:parseInt(rawS.profile&&rawS.profile.spRetAge)||parseInt(pProfile.retAge)||65,
             ssBenefit:parseFloat(pProfile.ssBenefit)||0,
             retirementIncome:parseFloat(pProfile.retIncome)||0,
             allocations:pAllocs,
@@ -7712,7 +7737,7 @@ function _cpRenderIncomeReplacement(){
     }
     var h='<div style="padding:12px 16px">';
     h+='<div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">Retirement Income vs Target &middot; per partner</div>';
-    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:6px">';
+    h+='<div style="display:grid;grid-template-columns:1fr;gap:6px">';
     h+=_card(_myFirst,_myAge,_myRetAge,_myYr,_myInc,_myTarget,_myPct);
     h+=_card(_spFirst,_spAge,_spRetAge,_spYr,_spInc,_spTarget,_spPct);
     h+='</div>';
@@ -23212,11 +23237,28 @@ function _cpSetSpouseRetAge(val){
 // so the drag feels smooth even on long plans with many cards.
 function _cpSlide(idx,val){
   var a=CPLAN.allocations[idx];if(!a)return;
-  var amt=Math.max(0,parseInt(val)||0);
+  // The slider/input value is the TOTAL contribution (currentContrib + Extra)
+  // when the card is backed by an existing real-world account; a.amount stores
+  // only the EXTRA on top of what the client already contributes. Read
+  // currentContrib from the slider's data-cpcurrent attribute (set at render
+  // time from _cpMatchExisting) and subtract it so a.amount stays "extra" —
+  // without this the whole total was stored as a.amount and the card's big
+  // number (currentContrib + a.amount) double-counted the existing contribution.
+  var _slidEl=document.querySelector('input[type="range"][data-cpidx="'+idx+'"]')
+            ||document.getElementById('cpManual'+idx);
+  var _curContrib=_slidEl?(parseInt(_slidEl.getAttribute('data-cpcurrent'))||0):0;
+  var _newTotal=parseInt(String(val).replace(/[^0-9.\-]/g,''))||0;
+  // Account-linked cards may go negative (planned reduction below current);
+  // unlinked planning cards floor at 0.
+  var amt=(a._retAccountId||a._investmentId||a._policyId)?(_newTotal-_curContrib):Math.max(0,_newTotal-_curContrib);
+  // P4: a Done permanent-insurance allocation can only decrease, never increase.
+  var _isPermIns=(a.type==='iul'||a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&(a.eduVehicle==='wl'||a.eduVehicle==='iul')));
+  if(_isPermIns&&a._completed)amt=Math.min(amt,a.amount);
   a.amount=amt;
-  // Live-sync the per-card number input so the typed value tracks the slider
+  // Live-sync the per-card number input so the typed value tracks the slider.
+  // The visible inputs operate in TOTAL space, so display currentContrib + extra.
   var numInp=document.getElementById('cpAmtInput'+idx);
-  if(numInp&&document.activeElement!==numInp)numInp.value=amt;
+  if(numInp&&document.activeElement!==numInp)numInp.value=_curContrib+amt;
 }
 // Commit on slider release — runs the heavyweight path.
 function _cpSlideEnd(idx){
