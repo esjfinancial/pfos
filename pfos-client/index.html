@@ -33641,7 +33641,13 @@ function _cpBuildCard(a,idx,isUnassigned){
   // though the user's effective contribution is higher. Compute the boost-
   // adjusted max by including the same boosts we added into _sliderEffective.
   var _cascadeBoostHere=Math.max(0,_sliderEffective-(parseInt(a.amount)||0));
-  var _sliderTotalMax=_slMax+_curContribSlide+_cascadeBoostHere;
+  // Slider max is the IRS contribution limit itself (which is a TOTAL annual
+  // cap, not an extras-on-top cap). Adding _curContribSlide to it would let
+  // users plan beyond the IRS cap (e.g. current $728 + IRS-cap-as-extras $367
+  // = $1,095 total, over a $4,404/yr self-only cap). Floor at current+boost
+  // so users already over the cap can keep their existing position without
+  // the slider forcing them down, while users under the cap stop at the cap.
+  var _sliderTotalMax=Math.max(_slMax,_curContribSlide+_cascadeBoostHere);
   // Slider lower bound: for cards backed by an existing account or policy,
   // allow the user to drag all the way down to $0 (planning a reduction).
   // For unlinked planning cards, the floor stays at currentContrib (which is
@@ -36342,7 +36348,30 @@ function _cpIRSMax(type,allocOrOwner){
     monthlyMax=Math.round((72000+soloCatchup)/12);
   }
   else if(type==='sep_ira'){var sepMax=Math.min(72000,annualInc*0.25);monthlyMax=Math.round(sepMax/12);}
-  else if(type==='hsa'){var fam=(CPLAN.children&&CPLAN.children.length>0)||isMFJ;monthlyMax=Math.round(((fam?8750:4400)+(is55?1000:0))/12);}
+  else if(type==='hsa'){
+    // Resolve HSA family coverage. Priority: the LINKED HSA INVESTMENT's
+    // hsaCoverage (per-account source of truth) → the linked income source's
+    // hsaCoverage (bidirectionally synced in pfos-main) → fall back to the
+    // children/MFJ heuristic only when nothing else is available. Without
+    // this, the limit defaults to 'family' for any married client and to
+    // 'self-only' for any single client, regardless of actual HDHP coverage.
+    var fam=false;
+    if(alloc&&alloc._investmentId){
+      var rawS_h=(APP._portalFd&&APP._portalFd.S)||{};
+      var ivH=(rawS_h.investments||[]).find(function(iv){return iv&&iv.id===alloc._investmentId;});
+      if(ivH&&ivH.hsaCoverage==='family')fam=true;
+      else if(ivH&&ivH._linkedIncomeSourceId){
+        var srcH=(rawS_h.incomeSources||[]).find(function(s){return s&&s.id===ivH._linkedIncomeSourceId;});
+        if(srcH&&srcH.hsaCoverage==='family')fam=true;
+      }
+      else if(ivH&&ivH.hsaCoverage==='self')fam=false;// explicit self overrides heuristic
+    }
+    if(!fam&&!(alloc&&alloc._investmentId)){
+      // No linked investment — fall back to legacy heuristic
+      fam=(CPLAN.children&&CPLAN.children.length>0)||isMFJ;
+    }
+    monthlyMax=Math.round(((fam?8750:4400)+(is55?1000:0))/12);
+  }
   else if(type==='coverdell')monthlyMax=Math.round(2000/12);
   else if(type==='invest'){
     // Taxable brokerage has no IRS contribution cap — that's the structural
