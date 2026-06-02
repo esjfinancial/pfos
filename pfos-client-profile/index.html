@@ -7303,9 +7303,22 @@ function _cpEffectiveCapNote(type,idx){
   var ownerNote='';
   if(alloc&&CPLAN._partner&&CPLAN._householdType!=='individual'){
     var oOwner=alloc.owner||'self';
-    if(oOwner==='self')ownerNote=' &middot; 50+ catch-up uses age '+(CPLAN.age||35);
-    else if(oOwner==='spouse')ownerNote=' &middot; 50+ catch-up uses age '+(CPLAN._partner.age||35);
-    else if(oOwner==='joint')ownerNote=' &middot; joint &mdash; older partner\'s age applies';
+    // Pick the right age + name for the owner of this allocation, then
+    // word the note based on what catch-up actually applies at that age.
+    // Under 50: no catch-up exists, so a "50+ catch-up uses age N" note
+    // is misleading — just show ownership instead.
+    var _onAge=0, _onName='';
+    if(oOwner==='self'){_onAge=CPLAN.age||35;_onName=((APP.currentClient&&APP.currentClient.name)||'You').split(' ')[0]||'You';}
+    else if(oOwner==='spouse'){_onAge=CPLAN._partner.age||35;_onName=CPLAN._partner.firstName||'Partner';}
+    if(oOwner==='joint'){
+      ownerNote=' &middot; joint &mdash; older partner\'s age applies';
+    } else if(_onAge>=60&&_onAge<=63){
+      ownerNote=' &middot; 60–63 super catch-up uses age '+_onAge+' ('+esc(_onName)+')';
+    } else if(_onAge>=50){
+      ownerNote=' &middot; 50+ catch-up uses age '+_onAge+' ('+esc(_onName)+')';
+    } else {
+      ownerNote=' &middot; owner: '+esc(_onName)+' (age '+_onAge+')';
+    }
   }
   // Wave 5: advisor override toggle (only for IRS-capped types)
   var irsTypes=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa'];
@@ -9740,6 +9753,15 @@ function _cpRenderChart(targetId){
     ?Math.max(0,Math.min(years,CPLAN._partner.retirementAge-CPLAN._partner.age)):null;
   var _retSelfFirst=((APP.currentClient&&APP.currentClient.name)||'You').split(' ')[0]||'You';
   var _retSpFirst=CPLAN._partner?(CPLAN._partner.firstName||'Partner'):null;
+  // Resolve the exact retirement ages for marker labels. Without an explicit
+  // "at AGE" appended to the marker, users read the nearest x-axis tick (which
+  // is the multiple-of-5 below the actual age, e.g. "53" for a year-16 marker
+  // when current age is 38 → retire at 54) as the retirement age. The gauge
+  // text underneath says "age 54 in 16y", creating an apparent off-by-one
+  // versus the chart. Labeling the marker with the real age eliminates the
+  // confusion regardless of x-axis tick granularity.
+  var _retSelfAge=CPLAN.retirementAge||65;
+  var _retSpAge=(CPLAN._partner&&CPLAN._partner.retirementAge)||65;
   if(_retSelfYr>0&&_retSpYr!==null&&_retSpYr>0&&_retSelfYr!==_retSpYr){
     // Staggered — shade the gap window
     var _gx1=x(Math.min(_retSelfYr,_retSpYr));
@@ -9749,12 +9771,12 @@ function _cpRenderChart(targetId){
   if(_retSelfYr>0&&_retSelfYr<years){
     // Self retirement line — purple/violet
     svg+='<line x1="'+x(_retSelfYr)+'" y1="'+padT+'" x2="'+x(_retSelfYr)+'" y2="'+(H-padB)+'" stroke="rgba(168,85,247,.55)" stroke-width="1.2" stroke-dasharray="3,2"/>';
-    svg+='<text x="'+x(_retSelfYr)+'" y="'+(padT-3)+'" fill="rgba(168,85,247,.85)" font-size="7" text-anchor="middle" font-family="var(--fh)" font-weight="700">'+esc(_retSelfFirst)+' retires</text>';
+    svg+='<text x="'+x(_retSelfYr)+'" y="'+(padT-3)+'" fill="rgba(168,85,247,.85)" font-size="7" text-anchor="middle" font-family="var(--fh)" font-weight="700">'+esc(_retSelfFirst)+' retires at '+_retSelfAge+'</text>';
   }
   if(_retSpYr!==null&&_retSpYr>0&&_retSpYr<years&&_retSpYr!==_retSelfYr){
     // Spouse retirement line — pink/rose
     svg+='<line x1="'+x(_retSpYr)+'" y1="'+padT+'" x2="'+x(_retSpYr)+'" y2="'+(H-padB)+'" stroke="rgba(244,114,182,.55)" stroke-width="1.2" stroke-dasharray="3,2"/>';
-    svg+='<text x="'+x(_retSpYr)+'" y="'+(padT-3)+'" fill="rgba(244,114,182,.9)" font-size="7" text-anchor="middle" font-family="var(--fh)" font-weight="700">'+esc(_retSpFirst)+' retires</text>';
+    svg+='<text x="'+x(_retSpYr)+'" y="'+(padT-3)+'" fill="rgba(244,114,182,.9)" font-size="7" text-anchor="middle" font-family="var(--fh)" font-weight="700">'+esc(_retSpFirst)+' retires at '+_retSpAge+'</text>';
   }
   if(_cpTierHas('milestones_extra')){
   for(var m100=1;m100<=years;m100++){if(totalData[m100]>=100000&&(m100===1||totalData[m100-1]<100000)){svg+='<line x1="'+x(m100)+'" y1="'+padT+'" x2="'+x(m100)+'" y2="'+(H-padB)+'" stroke="rgba(91,155,255,.2)" stroke-width="0.5" stroke-dasharray="2,2"/>';svg+='<text x="'+x(m100)+'" y="'+(H-padB+10)+'" fill="rgba(91,155,255,.5)" font-size="7" text-anchor="middle" font-family="var(--fh)">$100k</text>';break;}}
@@ -14885,9 +14907,13 @@ function _cpMatchExisting(a, opts){
   // these resolved sources, so spouse-tagged allocations correctly read
   // spouse-side data without needing per-branch conditionals.
   var retAccts=[],policies=[],ibcPolicies=[],assets={},children=[],investments=[],incomeSources=[];
-  if(owner==='spouse'&&CPLAN._partner){
+  var _isJoint = CPLAN._householdType === 'joint';
+  if(owner==='spouse' && CPLAN._partner && !_isJoint){
     // Separate / hybrid household — partner data is in a parallel record loaded
-    // as CPLAN._partner via loadPartnerForAI.
+    // as CPLAN._partner via loadPartnerForAI. Joint households also populate
+    // CPLAN._partner but with INCOMPLETE data (no investments / incomeSources)
+    // because both partners' data lives in the same record — they go to the
+    // joint-spouse branch below instead.
     retAccts=CPLAN._partner.retAccounts||[];
     policies=CPLAN._partner.policies||[];
     investments=CPLAN._partner.investments||[];
@@ -14963,7 +14989,7 @@ function _cpMatchExisting(a, opts){
     // pfos-main captures both a dollar field (`contrib`) and percentage fields
     // (`contribPct`, `matchPct`). Users who fill ONLY the percentage end up
     // with `contrib: 0` even though they have a real contribution running.
-    if(owner==='spouse'&&CPLAN._partner){
+    if(owner==='spouse'&&CPLAN._partner&&!_isJoint){
       _outMonthlyInc=parseFloat(CPLAN._partner.income)||0;
     } else if(owner==='spouse'){
       // Joint-household spouse scope: derive monthly income from the
@@ -20058,8 +20084,17 @@ function _cpExtractRedFlags(){
     // Brokerage/mutual fund/robo = taxable equity exposure
     return t==='brokerage'||t==='mutual_fund'||t==='robo_advisor';
   });
-  // Legacy S.assets.invest also counts as existing growth exposure
-  var _legacyInvestBal=parseFloat((rawS2.assets&&rawS2.assets.invest)||0);
+  // Legacy S.assets.invest also counts as existing growth exposure — BUT only
+  // when there are no typed investments at all. When the user has migrated to
+  // per-account tracking (S.investments[] populated), the legacy field is
+  // a sum-of-balances aggregate that pfos-main's calc() builds from EVERY
+  // non-crypto typed investment, including HSA. That makes a $15K HSA show
+  // up as $15K of "legacy invest" and wrongly suppresses the growth flag.
+  // The typed-account check (_hasGrowthAcct above) is the source of truth
+  // when typed investments exist; only fall back to the legacy field for
+  // older clients that haven't migrated.
+  var _hasTypedInvestments=((rawS2.investments)||[]).length>0;
+  var _legacyInvestBal=_hasTypedInvestments?0:(parseFloat((rawS2.assets&&rawS2.assets.invest)||0));
   // Existing permanent insurance policies marked as retirement-focused (not IBC)
   var _hasPermInsurance=(rawS2.policies||[]).some(function(p){
     if(!p)return false;
