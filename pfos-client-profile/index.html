@@ -6796,6 +6796,36 @@ var _cmplPendingIdx=-1;
 var _calcForOther=false;
 // ── END PORTED GLOBALS + STATE ──
 
+// Upgrade legacy action-only protection cards (Life/Disability "Review") in
+// CPLAN.allocations into the new term_life/disability slider cards. Idempotent
+// and safe to call from any plan-load path. rawS (optional) supplies protCalcs
+// for the coverage seed; falls back to the current client's financial data.
+function _cpMigrateProtectionCards(rawS){
+  try{
+    if(!CPLAN.allocations||!CPLAN.allocations.length)return;
+    var _S=rawS||((APP._currentClientFd&&APP._currentClientFd.S)||{});
+    var _migPC=(_S&&_S.protCalcs)||{};
+    var _inc=parseFloat(CPLAN.income)||0;
+    CPLAN.allocations.forEach(function(a){
+      if(!a||a._completed)return;
+      if(a.type!=='protection')return;
+      var _nm=((a.customName||'')+' '+(a.flagTitle||'')).toLowerCase();
+      if((_nm.indexOf('life insurance')>=0||_nm.indexOf('term life')>=0)&&_nm.indexOf('disab')<0){
+        a.type='term_life';a.customName='Term Life Insurance';a._isNewTermLife=true;
+        if(a._termCoverage==null)a._termCoverage=Math.round(parseFloat(_migPC.totalRecommended)||parseFloat(_migPC.totalNeed)||0);
+        if(a._termLength==null)a._termLength=20;
+        if(!a._newPolicyId)a._newPolicyId='pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
+        if(a.phase==null)a.phase=0;
+      } else if(_nm.indexOf('disab')>=0){
+        a.type='disability';a.customName='Disability Insurance';a._isNewDisability=true;
+        if(a._diBenefit==null)a._diBenefit=Math.round(_inc*0.65);
+        if(a._diBenefitMaxGuide==null)a._diBenefitMaxGuide=Math.round(_inc*0.70);
+        if(!a._newPolicyId)a._newPolicyId='pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
+        if(a.phase==null)a.phase=0;
+      }
+    });
+  }catch(_mig){console.warn('protection migration:',_mig);}
+}
 async function _cpInitPlan(fd,allocPlan,planMeta){
   var root=document.getElementById('profileMainContent');if(!root)return;
   // Wave 5: persist fd so rich red-flag extraction can reference rawS without re-querying
@@ -6829,29 +6859,9 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
     CPLAN.allocations=allocPlan.allocations;
     if(allocPlan.debtStrategy)CPLAN.debtStrategy=allocPlan.debtStrategy;
     // ── Migration: upgrade legacy action-only protection cards (Life/Disability
-    // "Review") saved in older plans into the new term_life/disability slider
-    // cards, so existing clients get the same premium+benefit sliders as new
-    // ones. Keyed off flagTitle/customName; skips already-completed cards.
-    try{
-      var _migPC=(rawS&&rawS.protCalcs)||{};
-      CPLAN.allocations.forEach(function(a){
-        if(!a||a._completed)return;
-        var _nm=((a.customName||'')+' '+(a.flagTitle||'')).toLowerCase();
-        if(a.type==='protection'&&(_nm.indexOf('life insurance')>=0||_nm.indexOf('term life')>=0)&&_nm.indexOf('disab')<0){
-          a.type='term_life';a.customName='Term Life Insurance';a._isNewTermLife=true;
-          if(a._termCoverage==null)a._termCoverage=Math.round(parseFloat(_migPC.totalRecommended)||parseFloat(_migPC.totalNeed)||0);
-          if(a._termLength==null)a._termLength=20;
-          if(!a._newPolicyId)a._newPolicyId='pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
-          if(a.phase==null)a.phase=0;
-        } else if(a.type==='protection'&&_nm.indexOf('disab')>=0){
-          a.type='disability';a.customName='Disability Insurance';a._isNewDisability=true;
-          if(a._diBenefit==null)a._diBenefit=Math.round((parseFloat(CPLAN.income)||0)*0.65);
-          if(a._diBenefitMaxGuide==null)a._diBenefitMaxGuide=Math.round((parseFloat(CPLAN.income)||0)*0.70);
-          if(!a._newPolicyId)a._newPolicyId='pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
-          if(a.phase==null)a.phase=0;
-        }
-      });
-    }catch(_mig){console.warn('protection migration:',_mig);}
+    // "Review") into the new term_life/disability slider cards. Shared helper so
+    // every plan-load path applies it (see _cpMigrateProtectionCards).
+    _cpMigrateProtectionCards(rawS);
   }
   // Plan publish state + pending change requests (Plan Workflow)
   CPLAN._planStatus=(planMeta&&planMeta.plan_status)||'draft';
@@ -6979,8 +6989,12 @@ function _cpExtractFlags(){
   // ── No retirement savings — uses canonical _retTypesDetect list (matches what generate-recommendations considers a retirement vehicle) ──
   var _retTypesDetect=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
   var hasRet=CPLAN.allocations.some(function(a){return _retTypesDetect.indexOf(a.type)>=0&&a.amount>0;});
-  if(!hasRet&&d.age>=25&&d.income>0)
+  var _xRawSRet=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+  var hasExistingRet=(_xRawSRet.retAccounts||[]).some(function(ra){return(parseFloat(ra.balance)||0)>0||(parseFloat(ra.contrib)||0)>0;});
+  if(!hasRet&&!hasExistingRet&&d.age>=25&&d.income>0)
     flags.push({icon:'🕒',title:'No retirement savings active',desc:'Time is the most powerful factor. Starting now compounds significantly.',type:'warn',action:'retirement'});
+  else if(!hasRet&&hasExistingRet&&d.age>=25&&d.income>0)
+    flags.push({icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle.',type:'opp',action:'retirement'});
   // ── Education funding for kids ──
   if(d.children.length>0&&!CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;}))
     flags.push({icon:'🎓',title:'No education funding for '+d.children.length+' child'+(d.children.length>1?'ren':''),desc:'Tax-advantaged education savings grow significantly with time. Multiple vehicle options available.',type:'opp',action:'edu'});
@@ -7097,6 +7111,8 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
   var _spHasExistingRetPolicy=spPolicies.some(function(p){var t=(p.type||'').toLowerCase();return (t.indexOf('iul')>=0||t.indexOf('whole')>=0||p.ibcFlag==='yes')&&(parseFloat(p.premium)||parseFloat(p.cashValue)||0)>0;});
   if(!_spHasAlloc(_retTypesDetect)&&!_spHasExistingRet&&!_spHasExistingRetPolicy&&spAge>=25&&spInc>0)
     flags.push({icon:'🕒',title:'No retirement savings active'+tag,desc:spName+' has no active retirement contribution. Starting now compounds significantly.',type:'warn',action:'retirement_spouse',owner:'spouse'});
+  else if(!_spHasAlloc(_retTypesDetect)&&(_spHasExistingRet||_spHasExistingRetPolicy)&&spAge>=25&&spInc>0)
+    flags.push({icon:'🎯',title:'Add to retirement savings'+tag,desc:spName+'\'s existing retirement is a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle.',type:'opp',action:'retirement_spouse',owner:'spouse'});
   // ── Old/orphaned retirement accounts (spouse) ──
   var spOld=spRetAccts.filter(function(ra){return ra.type&&ra.type.indexOf('_old')>=0&&(parseFloat(ra.balance)||0)>0;});
   if(spOld.length>0){
@@ -14767,6 +14783,8 @@ function _cpEnsurePlanLoaded(){
   // slider, sharing UI) compare with === 'self', so the missing field hides
   // controls that should be visible. Default to 'self' on load.
   CPLAN.allocations.forEach(function(a){if(a&&!a.owner)a.owner='self';});
+  // Upgrade any legacy action-only protection cards to the new slider cards.
+  if(typeof _cpMigrateProtectionCards==='function')_cpMigrateProtectionCards();
   if(saved.debtStrategy)CPLAN.debtStrategy=saved.debtStrategy;
   if(saved.approaches)CPLAN._approaches=saved.approaches;
   if(saved.selectedApproach)CPLAN._selectedApproach=saved.selectedApproach;
@@ -20137,10 +20155,20 @@ function _cpExtractRedFlags(){
   // No retirement accounts — must match the canonical _retVehicles list used
   // elsewhere in the file (line ~23136). Otherwise the flag detection and the
   // render's "is it addressed" check disagree, producing a green-checked flag.
+  // FIX: also count the client's EXISTING retirement accounts (S.retAccounts),
+  // not just plan allocations — otherwise someone with a real 401k but no plan
+  // allocation yet is wrongly told "No retirement savings active."
   var _retTypesDetect=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
   var hasRet=CPLAN.allocations.some(function(a){return _retTypesDetect.indexOf(a.type)>=0&&a.amount>0;});
-  if(!hasRet&&d.age>=25&&d.income>0)
+  var _rawSRet=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+  var hasExistingRet=(_rawSRet.retAccounts||[]).some(function(ra){return(parseFloat(ra.balance)||0)>0||(parseFloat(ra.contrib)||0)>0;});
+  if(!hasRet&&!hasExistingRet&&d.age>=25&&d.income>0)
     flags.push({type:'warn',icon:'🕒',title:'No retirement savings active',desc:'Time is the most powerful factor in retirement planning. Starting now, even small amounts compound significantly.',action:'retirement'});
+  else if(!hasRet&&hasExistingRet&&d.age>=25&&d.income>0)
+    // Has existing retirement (e.g. a 401k) but no ADDITIONAL contribution planned.
+    // A single account often won't reach the retirement goal, so offer adding more
+    // vehicles — framed accurately as an opportunity, not "no savings."
+    flags.push({type:'opp',icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle (Roth, IRA, IUL, and more).',action:'retirement'});
   // Children but no education savings
   if(d.children.length>0&&!CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;}))
     flags.push({type:'opp',icon:'🎓',title:'No education funding for '+d.children.length+' child'+(d.children.length>1?'ren':''),desc:'Tax-advantaged education savings grow significantly with time. Multiple vehicle options available.',action:'edu'});
