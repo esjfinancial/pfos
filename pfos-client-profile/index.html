@@ -6386,17 +6386,19 @@ var CPLAN={allocations:[],surplus:0,income:0,expenses:0,totalDebt:0,debtMin:0,de
 // (umbrella, estate, ibc_audit, annuity_research, diversify) so the advisor
 // can model any vehicle a licensed insurance/financial professional would.
 var CP_COL={ef:'#5B9BFF',iul:'#A855F7',wl:'#C084FC',debt:'#F97316',roth:'#22C55E','401k':'#16A34A',roth401k:'#16A34A',house:'#EAB308',edu:'#06B6D4',invest:'#EC4899',custom:'#94A3B8',protection:'#E879F9',hsa:'#14B8A6',ibc:'#8B5CF6',trad_ira:'#059669',solo401k:'#0D9488',sep_ira:'#0891B2',rollover:'#6366F1',rental:'#D97706',
-  term_life:'#F472B6',umbrella:'#94A3B8',estate:'#94A3B8',ibc_audit:'#94A3B8',annuity_research:'#94A3B8',diversify:'#94A3B8',
+  term_life:'#F472B6',disability:'#38BDF8',umbrella:'#94A3B8',estate:'#94A3B8',ibc_audit:'#94A3B8',annuity_research:'#94A3B8',diversify:'#94A3B8',
   fixed_annuity:'#7C3AED',fia:'#9333EA',variable_annuity:'#A855F7',spia:'#6D28D9'};
 var CP_NM={ef:'Emergency Fund',debt:'Eliminate Debt',protection:'Protection Review',roth:'Roth IRA','401k':'401(k) Match',roth401k:'Roth 401(k)',iul:'Indexed Universal Life',wl:'Whole Life',house:'House Fund',edu:'Education Savings',invest:'Taxable Investment',custom:'Custom',hsa:'HSA',ibc:'Infinite Banking',trad_ira:'Traditional IRA',solo401k:'Solo 401(k)',sep_ira:'SEP IRA',rollover:'Rollover IRA',rental:'Rental Property',
   // Term life — first-class type with coverage slider (Wave 5 advisor port)
   term_life:'Term Life Insurance',
+  // Disability — first-class type with premium + monthly benefit (Stage 2)
+  disability:'Disability Insurance',
   // Action-only items (no monthly cost, advisor confirms completion)
   umbrella:'Umbrella Policy',estate:'Estate Plan',ibc_audit:'Policy Audit',annuity_research:'Annuity Research',diversify:'Diversify Income',
   // Annuity sub-types (separate from generic invest)
   fixed_annuity:'Fixed Annuity / MYGA',fia:'Fixed Indexed Annuity',variable_annuity:'Variable Annuity',spia:'Income Annuity (SPIA)'};
 var CP_IC={ef:'🏦',debt:'⚡',protection:'🛡️',roth:'🎯','401k':'🏢',roth401k:'🏢',iul:'📋',wl:'📋',house:'🏠',edu:'🎓',invest:'📈',custom:'⭐',hsa:'🏥',ibc:'🏛️',trad_ira:'📊',solo401k:'💼',sep_ira:'💼',rollover:'🔄',rental:'🏘️',
-  term_life:'🛡️',umbrella:'☂️',estate:'📜',ibc_audit:'🔍',annuity_research:'📑',diversify:'🌿',
+  term_life:'🛡️',disability:'🩺',umbrella:'☂️',estate:'📜',ibc_audit:'🔍',annuity_research:'📑',diversify:'🌿',
   fixed_annuity:'🏦',fia:'📈',variable_annuity:'📊',spia:'💰'};
 // Education vehicle name dictionary (used in the per-card edu vehicle selector)
 var CP_EDU_VEH_NM={'529':'529 Plan',coverdell:'Coverdell ESA',utma:'UTMA',wl:'Whole Life',iul:'IUL'};
@@ -16819,7 +16821,9 @@ function _cpSyncFlagsToUnassigned(){
       var t=actionOnlyMap[act];
       if(t==null) return;
       if(act==='protection'){
-        alreadyIn=_ownerAllocSome(function(a){return a.type===t&&a.flagTitle===f.title;});
+        // Life flags stage a term_life card; disability flags stage a disability
+        // card (not action-only protection), so dedup must match those types too.
+        alreadyIn=_ownerAllocSome(function(a){return (a.type===t||a.type==='term_life'||a.type==='disability')&&a.flagTitle===f.title;});
       } else {
         alreadyIn=_ownerAllocSome(function(a){return a.type===t;});
       }
@@ -16863,6 +16867,53 @@ function _cpSyncFlagsToUnassigned(){
         for(var _k in _protectionTitleMap){if(f.title.indexOf(_k)===0){_customNm=_protectionTitleMap[_k];break;}}
       }
       if(_customNm)nowFlag.customName=_customNm;
+      // Term-life routing: a life-insurance flag becomes a REAL term_life card
+      // (premium slider that counts against budget + coverage/benefit input),
+      // not an action-only prompt. Coverage seeds from main's calculated need
+      // (protCalcs.totalRecommended; spouseTotalNeed for a spouse flag). The
+      // advisor can type a higher coverage than the seeded guide-max. Disability
+      // and other protection sub-types stay action-only (handled below).
+      var _ftl=(f.title||'').toLowerCase();
+      var _isLifeFlag=(_ftl.indexOf('life insurance')>=0||_ftl.indexOf('life coverage')>=0);
+      if(_isLifeFlag){
+        var _pcTL=(APP._currentClientFd&&APP._currentClientFd.S&&APP._currentClientFd.S.protCalcs)||{};
+        var _tlCov=_isSpouseFlag
+          ? (parseFloat(_pcTL.spouseTotalNeed)||parseFloat(_pcTL.totalRecommended)||0)
+          : (parseFloat(_pcTL.totalRecommended)||parseFloat(_pcTL.totalNeed)||0);
+        CPLAN.allocations.push(_extend(nowFlag,{
+          type:'term_life',amount:0,target:0,phase:0,cascade:'',
+          customName:'Term Life Insurance',
+          _termCoverage:Math.round(_tlCov),
+          _termLength:20,
+          _isNewTermLife:true,
+          _newPolicyId:'pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)
+        }));
+        return;
+      }
+      // Disability routing: a disability flag becomes a REAL disability card
+      // (premium slider that counts against budget + monthly benefit input).
+      // Benefit defaults to ~65% of monthly income (industry 60-70% replacement);
+      // spouse flags use spouse income. Advisor can type a different benefit.
+      var _isDisabFlag=(_ftl.indexOf('disability')>=0);
+      if(_isDisabFlag){
+        var _diInc;
+        if(_isSpouseFlag){
+          var _spSrcs=((APP._currentClientFd&&APP._currentClientFd.S&&APP._currentClientFd.S.incomeSources)||[]).filter(function(s){return s&&(s.owner||'personal')==='spouse';});
+          _diInc=_spSrcs.reduce(function(t,s){return t+(typeof _incSrcMonthlyTakeHome==='function'?_incSrcMonthlyTakeHome(s):(parseFloat(s.amount)||0));},0);
+        } else {
+          _diInc=parseFloat(CPLAN.income)||0;
+        }
+        var _diBenefit=Math.round(_diInc*0.65);
+        CPLAN.allocations.push(_extend(nowFlag,{
+          type:'disability',amount:0,target:0,phase:0,cascade:'',
+          customName:'Disability Insurance',
+          _diBenefit:_diBenefit,
+          _diBenefitMaxGuide:Math.round(_diInc*0.70),
+          _isNewDisability:true,
+          _newPolicyId:'pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)
+        }));
+        return;
+      }
     }
     if(chooserActions[act]){
       // Placeholder card. Type is irrelevant for the placeholder render path; we use
@@ -19476,6 +19527,41 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _newPhaseNum=_phaseRange[_phaseRange.length-1]+1;
   h+='<option value="'+_newPhaseNum+'">+ New phase '+_newPhaseNum+'</option>';
   h+='</select></div>';
+  // ── Term life: coverage/benefit input ──
+  // The standard slider above sets the monthly PREMIUM (a.amount, counts against
+  // budget). This row sets the COVERAGE (death benefit). It defaults to main's
+  // calculated need (_termCoverage, seeded from protCalcs) and shows that as the
+  // guide-max on the slider, but the number field accepts a higher figure if the
+  // advisor wants more than the recommended amount.
+  if(a.type==='term_life'&&!a._completed){
+    var _tlCovVal=Math.max(0,parseInt(a._termCoverage)||0);
+    var _tlGuideMax=Math.max(_tlCovVal,500000);// slider guide-max — typing can exceed
+    h+='<div style="margin-top:10px;padding:12px 14px;background:rgba(244,114,182,.04);border:1px solid rgba(244,114,182,.15);border-radius:4px">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#F472B6">Coverage / Death Benefit</span><span style="font-size:11px;color:var(--mu)">Recommended: <strong style="color:var(--wh)" id="cpTermCovDisplay'+idx+'">'+fmtK(_tlCovVal)+'</strong></span></div>';
+    h+='<div style="display:flex;align-items:center;gap:8px">';
+    h+='<input type="range" min="0" max="'+_tlGuideMax+'" step="25000" value="'+Math.min(_tlCovVal,_tlGuideMax)+'" oninput="_cpSlideTermCoverage('+idx+',this.value);var n=document.getElementById(\'cpTermCovInp'+idx+'\');if(n)n.value=this.value" style="flex:1;accent-color:#F472B6;height:6px">';
+    h+='<div class="inp-prefix" style="width:130px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpTermCovInp'+idx+'" value="'+_tlCovVal+'" min="0" step="25000" oninput="_cpSetTermCoverage('+idx+',this.value)" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+    h+='</div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:6px">Set the monthly premium with the slider above. Click <strong style="color:var(--gr)">Done</strong> to add this policy to the client\'s protection.</div>';
+    h+='</div>';
+  }
+  // ── Disability: monthly benefit input ──
+  // The standard slider above sets the monthly PREMIUM (a.amount, counts against
+  // budget). This row sets the monthly BENEFIT (income replacement). It defaults
+  // to ~65% of income (_diBenefit) with the 70% figure as the guide-max, but the
+  // number field accepts any value the advisor enters.
+  if(a.type==='disability'&&!a._completed){
+    var _diVal=Math.max(0,parseInt(a._diBenefit)||0);
+    var _diMax=Math.max(_diVal,parseInt(a._diBenefitMaxGuide)||0,1000);
+    h+='<div style="margin-top:10px;padding:12px 14px;background:rgba(56,189,248,.04);border:1px solid rgba(56,189,248,.15);border-radius:4px">';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px"><span style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:#38BDF8">Monthly Benefit (income replacement)</span><span style="font-size:11px;color:var(--mu)">Recommended: <strong style="color:var(--wh)" id="cpDiBenDisplay'+idx+'">'+fmt(_diVal)+'/mo</strong></span></div>';
+    h+='<div style="display:flex;align-items:center;gap:8px">';
+    h+='<input type="range" min="0" max="'+_diMax+'" step="100" value="'+Math.min(_diVal,_diMax)+'" oninput="_cpSlideDiBenefit('+idx+',this.value);var n=document.getElementById(\'cpDiBenInp'+idx+'\');if(n)n.value=this.value" style="flex:1;accent-color:#38BDF8;height:6px">';
+    h+='<div class="inp-prefix" style="width:120px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpDiBenInp'+idx+'" value="'+_diVal+'" min="0" step="100" oninput="_cpSetDiBenefit('+idx+',this.value)" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+    h+='</div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:6px">Set the monthly premium with the slider above. Click <strong style="color:var(--gr)">Done</strong> to add this policy to the client\'s protection.</div>';
+    h+='</div>';
+  }
   // Mark complete — action-only items get the button at amount 0; funded items need an amount;
   // E6: $0 non-action allocations also get a Done button (with a different tooltip) so the
   // user can mark "acknowledged" instead of being stuck with only the X. The button is
@@ -19513,7 +19599,21 @@ function _cpBuildCard(a,idx,isUnassigned){
       var _doneTooltip=(a.amount>0||_isActionOnly)
         ?'Click after you actually open this account / start contributing'
         :'No funding amount yet — click Done to acknowledge this recommendation, or use the slider to set an amount first';
-      h+='<button onclick="_cpMarkComplete('+idx+');_cpRenderPlanFull()" title="'+_doneTooltip+'" style="padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(34,197,94,.28)\'" onmouseout="this.style.background=\'rgba(34,197,94,.18)\'">✓ Done</button>';
+      if(a.type==='term_life'&&a._isNewTermLife){
+        _doneTooltip='Adds this term life policy (premium + coverage) to the client\'s protection in their financial data';
+        h+='<button onclick="_cpDoneTermLife('+idx+')" title="'+_doneTooltip+'" style="padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(34,197,94,.28)\'" onmouseout="this.style.background=\'rgba(34,197,94,.18)\'">✓ Done — add policy</button>';
+      } else if(a.type==='disability'&&a._isNewDisability){
+        _doneTooltip='Adds this disability policy (premium + monthly benefit) to the client\'s protection in their financial data';
+        h+='<button onclick="_cpDoneDisability('+idx+')" title="'+_doneTooltip+'" style="padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(34,197,94,.28)\'" onmouseout="this.style.background=\'rgba(34,197,94,.18)\'">✓ Done — add policy</button>';
+      } else if(_cpIsNewAccountCard(a)){
+        // New retirement / investment account with a funded amount and no existing
+        // linked account — Done creates the account in the client's financial data
+        // (add_retirement / add_investment), same idea as the insurance Done flows.
+        _doneTooltip='Adds this account (with its contribution) to the client\'s retirement/investment data';
+        h+='<button onclick="_cpDoneNewAccount('+idx+')" title="'+_doneTooltip+'" style="padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(34,197,94,.28)\'" onmouseout="this.style.background=\'rgba(34,197,94,.18)\'">✓ Done — add account</button>';
+      } else {
+        h+='<button onclick="_cpMarkComplete('+idx+');_cpRenderPlanFull()" title="'+_doneTooltip+'" style="padding:6px 14px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em" onmouseover="this.style.background=\'rgba(34,197,94,.28)\'" onmouseout="this.style.background=\'rgba(34,197,94,.18)\'">✓ Done</button>';
+      }
     }
   }
   else{h+='<span style="padding:6px 12px;font-size:12px;color:var(--gr);font-family:var(--fh);font-weight:700;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.2);border-radius:3px">✓ Completed</span>';}
@@ -22421,6 +22521,19 @@ function _cpRenderPlanFull(){
   var _isHybridHH=(CPLAN._householdType==='hybrid');
   var allocated=CPLAN.allocations.reduce(function(t,a){
     if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return t;
+    // Double-charge guard: once a card's contribution/premium has been written to
+    // pfos-main (a real account or policy), main counts it as an expense that
+    // already reduces surplus. Counting a.amount here too would double-charge the
+    // same dollars (they live in two places: the plan card AND main's calc). So
+    // skip any COMPLETED card that's linked to a real main account/policy. Covers
+    // term life, disability, and newly-created retirement/investment accounts.
+    // (Apply-path cards zero a.amount on apply, so they're already $0 here.)
+    if(a._completed&&(a._policyId||a._retAccountId||a._investmentId||a.type==='term_life'||a.type==='disability'))return t;
+    // Active IBC: once marked active, the policy is in main and its premium
+    // (= a.amount on the IBC debt card) is a real expense reducing surplus. Skip
+    // it so it isn't double-charged. The IBC projection reads a.amount directly,
+    // not via this sum, so the debt/cash-value math is intact.
+    if(a._linkedPolicyId&&a._ibcState==='active')return t;
     if(_isHybridHH&&a.owner==='joint'){
       // Use this user's portion of the joint contribution. Fall back to half
       // the combined amount when amountSelf isn't set yet (newly-converted or
@@ -23538,6 +23651,179 @@ function _cpSetTermLength(idx,length){
   a._termLength=parseInt(length)||20;
   CPLAN.modified=true;
   _cpRenderPlanFull();
+}
+// Done on a NEW term life card: write the policy (premium + coverage) into
+// pfos-main via add_policy. Main stores it in S.policies and updates the
+// protection panel (total coverage / liCoverage). The monthly premium (a.amount)
+// is the payment; _termCoverage is the death benefit. Marks the card completed.
+function _cpDoneTermLife(idx){
+  var a=CPLAN.allocations[idx];if(!a||a.type!=='term_life')return;
+  var premium=Math.round(parseFloat(a.amount)||0);
+  var coverage=Math.max(0,parseInt(a._termCoverage)||0);
+  if(coverage<=0){if(typeof _cpToast==='function')_cpToast('Set a coverage amount before adding the policy');return;}
+  var polId=a._newPolicyId||('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));
+  var ownerLabel=(a.owner==='spouse')?' [spouse]':'';
+  try{
+    if(typeof _cpSendToPfosMain==='function'){
+      _cpSendToPfosMain('add_policy',{
+        id:polId,
+        company:'',
+        type:'Term Life'+ownerLabel,
+        coverage:coverage,
+        premium:premium,
+        termYears:parseInt(a._termLength)||20,
+        ibcFlag:'no',
+        cashValue:0,
+        _planLinked:true,
+        _planAllocType:'term_life',
+        _planAllocName:a.customName||'Term Life Insurance'
+      });
+    }
+  }catch(e){
+    console.warn('[cpDoneTermLife] add_policy failed:',e);
+    if(typeof _cpToast==='function')_cpToast('Could not add policy — please try again');
+    return;
+  }
+  // Update local cache so the next render/flag pass sees the new policy.
+  try{
+    if(APP._currentClientFd&&APP._currentClientFd.S){
+      if(!APP._currentClientFd.S.policies)APP._currentClientFd.S.policies=[];
+      APP._currentClientFd.S.policies.push({id:polId,company:'',type:'Term Life'+ownerLabel,coverage:coverage,premium:premium,termYears:parseInt(a._termLength)||20,ibcFlag:'no',cashValue:0,owner:(a.owner==='spouse'?'spouse':'self'),_planLinked:true,_planAllocType:'term_life',_planAllocName:a.customName||'Term Life Insurance'});
+    }
+  }catch(e){}
+  a._completed=true;a._policyId=polId;delete a._isNewTermLife;
+  CPLAN.modified=true;_cpMarkModified();
+  _cpRenderPlanFull();
+  if(typeof _cpToast==='function')_cpToast('✓ Added Term Life — '+fmtK(coverage)+' coverage, '+fmt(premium)+'/mo');
+}
+
+// Disability: live slider display update during drag (benefit only; no recompute).
+function _cpSlideDiBenefit(idx,val){
+  var a=CPLAN.allocations[idx];if(!a||a.type!=='disability')return;
+  var b=Math.max(0,parseInt(val)||0);
+  a._diBenefit=b;
+  var el=document.getElementById('cpDiBenDisplay'+idx);
+  if(el)el.textContent=fmt(b)+'/mo';
+}
+// Disability: set benefit from the typed number field (can exceed slider guide-max).
+function _cpSetDiBenefit(idx,val){
+  var a=CPLAN.allocations[idx];if(!a||a.type!=='disability')return;
+  a._diBenefit=Math.max(0,parseInt(val)||0);
+  CPLAN.modified=true;
+  _cpRenderPlanFull();
+}
+// Done on a NEW disability card: write the policy (premium + monthly benefit)
+// into pfos-main via add_policy. Main detects 'disab' in the type and sets
+// diHasCoverage='yes' + diPremium. Benefit is stored as coverage (monthly
+// income-replacement figure). Marks the card completed.
+function _cpDoneDisability(idx){
+  var a=CPLAN.allocations[idx];if(!a||a.type!=='disability')return;
+  var premium=Math.round(parseFloat(a.amount)||0);
+  var benefit=Math.max(0,parseInt(a._diBenefit)||0);
+  if(benefit<=0){if(typeof _cpToast==='function')_cpToast('Set a monthly benefit before adding the policy');return;}
+  var polId=a._newPolicyId||('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));
+  var ownerLabel=(a.owner==='spouse')?' [spouse]':'';
+  try{
+    if(typeof _cpSendToPfosMain==='function'){
+      _cpSendToPfosMain('add_policy',{
+        id:polId,
+        company:'',
+        type:'Disability'+ownerLabel,
+        coverage:benefit,// monthly income-replacement benefit
+        premium:premium,
+        ibcFlag:'no',
+        cashValue:0,
+        notes:'Monthly benefit: '+fmt(benefit)+'/mo (income replacement)',
+        _planLinked:true,
+        _planAllocType:'disability',
+        _planAllocName:a.customName||'Disability Insurance'
+      });
+    }
+  }catch(e){
+    console.warn('[cpDoneDisability] add_policy failed:',e);
+    if(typeof _cpToast==='function')_cpToast('Could not add policy — please try again');
+    return;
+  }
+  try{
+    if(APP._currentClientFd&&APP._currentClientFd.S){
+      if(!APP._currentClientFd.S.policies)APP._currentClientFd.S.policies=[];
+      APP._currentClientFd.S.policies.push({id:polId,company:'',type:'Disability'+ownerLabel,coverage:benefit,premium:premium,ibcFlag:'no',cashValue:0,owner:(a.owner==='spouse'?'spouse':'self'),notes:'Monthly benefit: '+fmt(benefit)+'/mo',_planLinked:true,_planAllocType:'disability',_planAllocName:a.customName||'Disability Insurance'});
+    }
+  }catch(e){}
+  a._completed=true;a._policyId=polId;delete a._isNewDisability;
+  CPLAN.modified=true;_cpMarkModified();
+  _cpRenderPlanFull();
+  if(typeof _cpToast==='function')_cpToast('✓ Added Disability — '+fmt(benefit)+'/mo benefit, '+fmt(premium)+'/mo premium');
+}
+
+// Retirement/investment types that, when proposed as a NEW (unlinked) funded
+// card, can be created in the client's financial data on Done.
+var _cpNewAcctRetTypes={roth:1,'401k':1,roth401k:1,trad_ira:1,solo401k:1,sep_ira:1,rollover:1};
+var _cpNewAcctInvTypes={invest:1,rental:1,house:1};
+// Is this a new-account card eligible for "Done — add account"? It must be a
+// real retirement/investment type, have a funded amount, not already be linked
+// to an existing account/policy, and not be completed/action-only.
+function _cpIsNewAccountCard(a){
+  if(!a||a._completed)return false;
+  if(a._retAccountId||a._investmentId||a._policyId)return false;// existing → uses Apply
+  if(typeof _cpIsActionOnly==='function'&&_cpIsActionOnly(a))return false;
+  if((parseFloat(a.amount)||0)<=0)return false;// need a contribution to add
+  return !!(_cpNewAcctRetTypes[a.type]||_cpNewAcctInvTypes[a.type]);
+}
+// Done on a NEW retirement/investment card: create the account in pfos-main.
+// Retirement types → add_retirement (contrib = a.amount). Investment types →
+// add_investment (monthlyContrib = a.amount). Main counts the contribution as a
+// real expense reducing surplus; the card is marked completed and is excluded
+// from the plan's allocated sum (see the allocated reducer) so the same dollars
+// aren't double-charged.
+function _cpDoneNewAccount(idx){
+  var a=CPLAN.allocations[idx];if(!a||!_cpIsNewAccountCard(a))return;
+  var contrib=Math.round(parseFloat(a.amount)||0);
+  if(contrib<=0){if(typeof _cpToast==='function')_cpToast('Set a contribution amount before adding the account');return;}
+  var acctId='acct_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
+  var nm=a.customName||CP_NM[a.type]||a.type;
+  var isInv=!!_cpNewAcctInvTypes[a.type];
+  try{
+    if(typeof _cpSendToPfosMain==='function'){
+      if(isInv){
+        _cpSendToPfosMain('add_investment',{
+          id:acctId,type:(a.type==='invest'?'brokerage':a.type),balance:0,
+          monthlyContrib:contrib,provider:'',
+          _planLinked:true,_planAllocType:a.type,_planAllocName:nm
+        });
+      } else {
+        _cpSendToPfosMain('add_retirement',{
+          id:acctId,type:a.type,balance:0,contrib:contrib,contribPct:0,provider:'',
+          _planLinked:true,_planAllocType:a.type,_planAllocName:nm
+        });
+      }
+    }
+  }catch(e){
+    console.warn('[cpDoneNewAccount] add failed:',e);
+    if(typeof _cpToast==='function')_cpToast('Could not add account — please try again');
+    return;
+  }
+  // Mirror into local cache so the next render/flag pass sees it.
+  try{
+    if(APP._currentClientFd&&APP._currentClientFd.S){
+      var S2=APP._currentClientFd.S;
+      if(isInv){
+        if(!S2.investments)S2.investments=[];
+        S2.investments.push({id:acctId,type:(a.type==='invest'?'brokerage':a.type),balance:0,monthlyContrib:contrib,provider:'',owner:(a.owner==='spouse'?'spouse':'self'),_planLinked:true,_planAllocType:a.type,_planAllocName:nm});
+      } else {
+        if(!S2.retAccounts)S2.retAccounts=[];
+        S2.retAccounts.push({id:acctId,type:a.type,balance:0,contrib:contrib,provider:'',owner:(a.owner==='spouse'?'spouse':'self'),_planLinked:true,_planAllocType:a.type,_planAllocName:nm});
+      }
+    }
+  }catch(e){}
+  // Link the card to the new account and mark completed. Linking via _retAccountId/
+  // _investmentId means future edits go through the Apply (update) path, and the
+  // allocated reducer excludes completed linked accounts from the surplus sum.
+  if(isInv)a._investmentId=acctId; else a._retAccountId=acctId;
+  a._completed=true;a._completedDate=new Date().toISOString();
+  CPLAN.modified=true;_cpMarkModified();
+  _cpRenderPlanFull();
+  if(typeof _cpToast==='function')_cpToast('✓ Added '+nm+' — '+fmt(contrib)+'/mo to the client\'s accounts');
 }
 
 // Cascade target — when this allocation completes (debt paid off, EF target reached,
