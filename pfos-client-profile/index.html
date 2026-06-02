@@ -22361,10 +22361,14 @@ function _cpRenderPlanFull(){
     var _showMine=(_cpHouseholdType==='separate'||_cpHouseholdType==='hybrid');
     var _showOurs=(_cpHouseholdType==='joint'||_cpHouseholdType==='hybrid');
     // Force the view to an allowed one. Joint defaults to "ours"; separate to
-    // "mine". If the current view isn't allowed for this type, switch it and
-    // (for ours) load the couple plan so the correct data is shown.
+    // "mine". For joint we do NOT fetch a partner profile — the combined view
+    // reads both spouses from the single shared S. Only hybrid has a real
+    // separate partner record to load.
     if(_cpPlanView==='ours'&&!_showOurs){_cpPlanView='mine';CPLAN._coupleView='mine';}
-    if(_cpPlanView==='mine'&&!_showMine){_cpPlanView='ours';CPLAN._coupleView='ours';if(!CPLAN._partnerCalcs){_cpLoadCouplePlan();return;}}
+    if(_cpPlanView==='mine'&&!_showMine){
+      _cpPlanView='ours';CPLAN._coupleView='ours';
+      if(_cpHouseholdType==='hybrid'&&!CPLAN._partnerCalcs){_cpLoadCouplePlan();return;}
+    }
     // Only render the toggle when the client actually has a choice (hybrid).
     if(_showMine&&_showOurs){
       h+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
@@ -22533,23 +22537,49 @@ function _cpRenderPlanFull(){
   }
 
   // Couple combined view
-  if(_cpPlanView==='ours'&&CPLAN._partnerCalcs){
-    var pC2=CPLAN._partnerCalcs;var pNm=CPLAN._partnerName||'Partner';
-    var myC2=APP._currentClientFd&&APP._currentClientFd.calcs||(APP._currentClientFd&&APP._currentClientFd.S&&APP._currentClientFd.S.calcs)||{};
-    var combInc2=(myC2.inc||0)+(pC2.inc||0);var combExp2=(myC2.baseExp||0)+(pC2.baseExp||0);
-    var combSurp2=Math.max(0,combInc2-combExp2);var myPct2=combInc2>0?Math.round((myC2.inc||0)/combInc2*100):50;
+  if(_cpPlanView==='ours'&&(CPLAN._partnerCalcs||_cpHouseholdType==='joint')){
+    var pNm=CPLAN._partnerName||(CPLAN._partner&&CPLAN._partner.firstName)||'Partner';
+    var _ourRawS=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+    var myC2,pC2,combInc2,combExp2,combSurp2,myPct2,_myIncShown,_spIncShown;
+    if(_cpHouseholdType==='joint'){
+      // JOINT: both spouses live in ONE shared record (pfos-main's S). calcs.inc
+      // is already the COMBINED household income — do NOT fetch or add a second
+      // profile (that double-counts). Derive the self/spouse split by summing
+      // income sources filtered by owner, the same way _cpMatchExisting splits
+      // joint data. Assets/debts are shared at the household level.
+      myC2=(APP._currentClientFd&&APP._currentClientFd.calcs)||_ourRawS.calcs||{};
+      var _srcs=_ourRawS.incomeSources||[];
+      var _spInc=_srcs.filter(function(s){return s&&(s.owner||'personal')==='spouse';}).reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0);
+      var _selfInc=_srcs.filter(function(s){return s&&(s.owner||'personal')!=='spouse';}).reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0);
+      // Combined income is the household total already in calcs; if owner-split
+      // sums don't cover it (untagged data), fall back to calcs.inc for the total.
+      combInc2=parseFloat(myC2.inc)||(_selfInc+_spInc);
+      combExp2=parseFloat(myC2.baseExp)||parseFloat(myC2.expenses)||0;
+      combSurp2=Math.max(0,combInc2-combExp2);
+      _myIncShown=_selfInc;_spIncShown=_spInc;
+      myPct2=combInc2>0?Math.round(_selfInc/combInc2*100):50;
+    } else {
+      // HYBRID: separate partner record legitimately loaded via _cpLoadCouplePlan.
+      pC2=CPLAN._partnerCalcs||{};
+      myC2=(APP._currentClientFd&&APP._currentClientFd.calcs)||(_ourRawS.calcs)||{};
+      combInc2=(myC2.inc||0)+(pC2.inc||0);combExp2=(myC2.baseExp||0)+(pC2.baseExp||0);
+      combSurp2=Math.max(0,combInc2-combExp2);
+      _myIncShown=myC2.inc||0;_spIncShown=pC2.inc||0;
+      myPct2=combInc2>0?Math.round((myC2.inc||0)/combInc2*100):50;
+    }
+    var _combDebt=(_cpHouseholdType==='joint')?(parseFloat(myC2.totalDebt)||0):((myC2.totalDebt||0)+((pC2&&pC2.totalDebt)||0));
     h+='<div class="info-card" style="padding:16px;margin-bottom:14px;border-color:rgba(168,85,247,.2);background:linear-gradient(135deg,rgba(168,85,247,.04),transparent)">';
     h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px"><span style="font-size:18px">💑</span><div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">Combined Financial Picture</div>';
     h+='<div style="font-size:13px;color:var(--mu)">You & '+esc(pNm)+'</div></div></div>';
     h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:10px">';
     h+='<div style="text-align:center;padding:10px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em">Combined Income</div><div style="font-family:var(--fd);font-size:18px;color:var(--gr)">'+fmt(combInc2)+'</div></div>';
     h+='<div style="text-align:center;padding:10px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em">Combined Surplus</div><div style="font-family:var(--fd);font-size:18px;color:var(--gr)">'+fmt(combSurp2)+'</div></div>';
-    h+='<div style="text-align:center;padding:10px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em">Combined Debt</div><div style="font-family:var(--fd);font-size:18px;color:var(--or)">'+fmtK((myC2.totalDebt||0)+(pC2.totalDebt||0))+'</div></div>';
+    h+='<div style="text-align:center;padding:10px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:10px;color:var(--mu);text-transform:uppercase;letter-spacing:.06em">Combined Debt</div><div style="font-family:var(--fd);font-size:18px;color:var(--or)">'+fmtK(_combDebt)+'</div></div>';
     h+='</div>';
     // Income split bar
     h+='<div style="display:flex;gap:2px;height:8px;border-radius:4px;overflow:hidden;margin-bottom:6px">';
     h+='<div style="width:'+myPct2+'%;background:#5B9BFF"></div><div style="width:'+(100-myPct2)+'%;background:#A855F7"></div></div>';
-    h+='<div style="display:flex;justify-content:space-between;font-size:12px"><span style="color:#5B9BFF">You: '+myPct2+'% ('+fmt(myC2.inc||0)+')</span><span style="color:#A855F7">'+esc(pNm)+': '+(100-myPct2)+'% ('+fmt(pC2.inc||0)+')</span></div>';
+    h+='<div style="display:flex;justify-content:space-between;font-size:12px"><span style="color:#5B9BFF">You: '+myPct2+'% ('+fmt(_myIncShown)+')</span><span style="color:#A855F7">'+esc(pNm)+': '+(100-myPct2)+'% ('+fmt(_spIncShown)+')</span></div>';
     // Per-bucket retirement summary (only shown when per-bucket sim is available
     // — i.e., simulator has run and produced bucket-split projections, which is
     // standard for Hybrid couples after partner load).
