@@ -6806,6 +6806,18 @@ function _cpMigrateProtectionCards(rawS){
     var _S=rawS||((APP._currentClientFd&&APP._currentClientFd.S)||{});
     var _migPC=(_S&&_S.protCalcs)||{};
     var _inc=parseFloat(CPLAN.income)||0;
+    // Self-owned monthly income (not household total) for the disability benefit
+    // seed — in a joint household CPLAN.income is the combined figure, which would
+    // overstate a single person's income-replacement need.
+    var _selfInc=(function(){
+      try{
+        var _srcs=_S.incomeSources||[];
+        if(!_srcs.length)return _inc;
+        var _s=_srcs.filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';})
+                    .reduce(function(t,s){return t+(typeof _incSrcMonthlyTakeHome==='function'?_incSrcMonthlyTakeHome(s):(parseFloat(s.amount)||0));},0);
+        return _s>0?_s:_inc;
+      }catch(e){return _inc;}
+    })();
     CPLAN.allocations.forEach(function(a){
       if(!a||a._completed)return;
       if(a.type!=='protection')return;
@@ -6820,8 +6832,15 @@ function _cpMigrateProtectionCards(rawS){
       } else if(_nm.indexOf('disab')>=0){
         a.type='disability';a.customName='Disability Insurance';a._isNewDisability=true;
         delete a._isActionOnly;// no longer action-only — it's a premium-bearing slider card
-        if(a._diBenefit==null)a._diBenefit=Math.round(_inc*0.65);
-        if(a._diBenefitMaxGuide==null)a._diBenefitMaxGuide=Math.round(_inc*0.70);
+        if(a._diBenefit==null)a._diBenefit=Math.round(_selfInc*0.65);
+        else if(_inc>0&&_selfInc>0&&_selfInc!==_inc&&a._diBenefit===Math.round(_inc*0.65)){
+          // Previously auto-seeded from household income (joint) — correct to self.
+          a._diBenefit=Math.round(_selfInc*0.65);
+        }
+        if(a._diBenefitMaxGuide==null)a._diBenefitMaxGuide=Math.round(_selfInc*0.70);
+        else if(_inc>0&&_selfInc>0&&_selfInc!==_inc&&a._diBenefitMaxGuide===Math.round(_inc*0.70)){
+          a._diBenefitMaxGuide=Math.round(_selfInc*0.70);
+        }
         if(!a._newPolicyId)a._newPolicyId='pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
         if(a.phase==null)a.phase=0;
       }
@@ -20127,29 +20146,45 @@ function _cpExtractRedFlags(){
   // gap; single filers with no dependents have an insurability + final-expense
   // + future-dependents opportunity (still worth evaluating while young/healthy
   // since rates lock in at current health classification for the term).
+  // PRIMARY income must be the primary's OWN income, not CPLAN.income (which is
+  // the household total in joint households — using it would describe Jane's
+  // coverage need against John+Jane combined income). Filter income sources to
+  // self/personal owner; falls back to CPLAN.income when no per-owner data.
+  var _selfMonthlyIncome=(function(){
+    try{
+      var _rs=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+      var _srcs=_rs.incomeSources||[];
+      if(!_srcs.length)return d.income||0;
+      var _self=_srcs.filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';})
+                     .reduce(function(t,s){return t+(typeof _incSrcMonthlyTakeHome==='function'?_incSrcMonthlyTakeHome(s):(parseFloat(s.amount)||0));},0);
+      // If filtering yields nothing (e.g., all sources unowned in a joint record),
+      // fall back to the household figure rather than showing $0.
+      return _self>0?_self:(d.income||0);
+    }catch(e){return d.income||0;}
+  })();
   var hasLife=(d.policies||[]).some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('life')>=0||t.indexOf('term')>=0;});
-  if(!hasLife&&d.income>0){
-    var _annIncLife=(d.income||0)*12;
+  if(!hasLife&&_selfMonthlyIncome>0){
+    var _annIncLife=(_selfMonthlyIncome||0)*12;
     var _hasDeps=(d.marital==='Married'||d.children.length>0);
     var _lifeMin,_lifeMax,_lifeDesc,_lifeSev;
     if(_hasDeps){
       // Breadwinner with dependents — standard 8-12x income replacement guidance
       _lifeMin=Math.round(_annIncLife*8);_lifeMax=Math.round(_annIncLife*12);
       _lifeSev='warn';
-      _lifeDesc='With dependents, a coverage gap puts your family at financial risk if something happens to you. Industry-standard guidance is 8-12x annual income for breadwinners with dependents'+(d.income?' — about '+fmtK(_lifeMin)+'-'+fmtK(_lifeMax)+' of death benefit on your '+fmtK(_annIncLife)+'/yr income':'')+'. A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.';
+      _lifeDesc='With dependents, a coverage gap puts your family at financial risk if something happens to you. Industry-standard guidance is 8-12x annual income for breadwinners with dependents — about '+fmtK(_lifeMin)+'-'+fmtK(_lifeMax)+' of death benefit on your '+fmtK(_annIncLife)+'/yr income. A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.';
     } else {
       // Single, no dependents — insurability lock-in + final expenses + future-deps prep
       _lifeMin=Math.round(_annIncLife*5);_lifeMax=Math.round(_annIncLife*10);
       _lifeSev='opp';
-      _lifeDesc='Even without current dependents, term life is worth evaluating now. Three reasons: (1) <strong style="color:var(--wh)">insurability lock-in</strong> — premiums are set at your current age and health classification, so getting coverage while young and healthy locks in low rates for 20-30 years before any future health changes raise your cost or make you uninsurable; (2) <strong style="color:var(--wh)">final expenses + non-dischargeable debts</strong> — funeral costs, private student loans (some don\'t die with you), co-signed debts, and business debts that pass to your estate; (3) <strong style="color:var(--wh)">future dependents</strong> — getting term before marriage or children is dramatically cheaper than getting it after. Industry guidance for single filers is 5-10x annual income'+(d.income?' (about '+fmtK(_lifeMin)+'-'+fmtK(_lifeMax)+' on your '+fmtK(_annIncLife)+'/yr income)':'')+'. A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.';
+      _lifeDesc='Even without current dependents, term life is worth evaluating now. Three reasons: (1) <strong style="color:var(--wh)">insurability lock-in</strong> — premiums are set at your current age and health classification, so getting coverage while young and healthy locks in low rates for 20-30 years before any future health changes raise your cost or make you uninsurable; (2) <strong style="color:var(--wh)">final expenses + non-dischargeable debts</strong> — funeral costs, private student loans (some don\'t die with you), co-signed debts, and business debts that pass to your estate; (3) <strong style="color:var(--wh)">future dependents</strong> — getting term before marriage or children is dramatically cheaper than getting it after. Industry guidance for single filers is 5-10x annual income (about '+fmtK(_lifeMin)+'-'+fmtK(_lifeMax)+' on your '+fmtK(_annIncLife)+'/yr income). A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.';
     }
     flags.push({type:_lifeSev,icon:'🛡️',title:'No life insurance detected',desc:_lifeDesc,action:'protection'});
   }
   // No disability insurance
   var hasDisab=(d.policies||[]).some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('disab')>=0;});
-  if(!hasDisab&&d.income>0){
-    var _disMonthly=Math.round((d.income||0)*0.65);
-    flags.push({type:'warn',icon:'⚡',title:'No disability coverage detected',desc:'Your income ('+fmt(d.income)+'/mo) is your most valuable asset — long-term disability is statistically more likely than premature death during working years, and Social Security disability replaces only a fraction with strict eligibility. Industry-standard guidance is 60-70% income replacement (about '+fmt(_disMonthly)+'/mo for you), own-occupation definition, benefit period to age 65. If your employer offers group LTD, verify the amount and definition. Get quotes from a licensed insurance professional.',action:'protection'});
+  if(!hasDisab&&_selfMonthlyIncome>0){
+    var _disMonthly=Math.round((_selfMonthlyIncome||0)*0.65);
+    flags.push({type:'warn',icon:'⚡',title:'No disability coverage detected',desc:'Your income ('+fmt(_selfMonthlyIncome)+'/mo) is your most valuable asset — long-term disability is statistically more likely than premature death during working years, and Social Security disability replaces only a fraction with strict eligibility. Industry-standard guidance is 60-70% income replacement (about '+fmt(_disMonthly)+'/mo for you), own-occupation definition, benefit period to age 65. If your employer offers group LTD, verify the amount and definition. Get quotes from a licensed insurance professional.',action:'protection'});
   }
   // Low savings rate
   var sr=d.income>0?(d.income-d.expenses)/d.income*100:0;
