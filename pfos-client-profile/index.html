@@ -14886,6 +14886,8 @@ function _cpMatchExisting(a, opts){
   // spouse-side data without needing per-branch conditionals.
   var retAccts=[],policies=[],ibcPolicies=[],assets={},children=[],investments=[],incomeSources=[];
   if(owner==='spouse'&&CPLAN._partner){
+    // Separate / hybrid household — partner data is in a parallel record loaded
+    // as CPLAN._partner via loadPartnerForAI.
     retAccts=CPLAN._partner.retAccounts||[];
     policies=CPLAN._partner.policies||[];
     investments=CPLAN._partner.investments||[];
@@ -14893,6 +14895,24 @@ function _cpMatchExisting(a, opts){
     incomeSources=CPLAN._partner.incomeSources||[];
     assets=CPLAN._partner.assets||{};
     // partner ibcPolicies not in our partner data model; fall through to zeros
+  } else if(owner==='spouse'){
+    // Joint household — both partners' data live in the SAME rawS arrays,
+    // distinguished by an `owner` field on each record. Filter rawS arrays
+    // to just the spouse-owned subset so downstream loops see only spouse
+    // data, matching the shape that CPLAN._partner produces for separate/
+    // hybrid households. Without this branch, spouse-owned allocations in
+    // joint households fall through to the personal scope and read the
+    // wrong partner's salaries / contributions / balances.
+    retAccts=(rawS.retAccounts||[]).filter(function(r){return r&&(r.owner||'personal')==='spouse';});
+    policies=(rawS.policies||rawS.insurancePolicies||[]).filter(function(p){return p&&(p.owner||'self')==='spouse';});
+    ibcPolicies=(rawS.ibcPolicies||[]).filter(function(p){return p&&(p.owner||'self')==='spouse';});
+    investments=(rawS.investments||[]).filter(function(iv){return iv&&(iv.owner||'personal')==='spouse';});
+    incomeSources=(rawS.incomeSources||[]).filter(function(s){return s&&(s.owner||'personal')==='spouse';});
+    // Spouse-scope balance sheet — joint household assets are shared, so use
+    // rawS.assets as-is (no per-owner split exists in the data model).
+    assets=rawS.assets||{};
+    // children also shared
+    children=rawS.children||[];
   } else {
     retAccts=rawS.retAccounts||[];
     policies=rawS.policies||rawS.insurancePolicies||[];
@@ -14945,6 +14965,26 @@ function _cpMatchExisting(a, opts){
     // with `contrib: 0` even though they have a real contribution running.
     if(owner==='spouse'&&CPLAN._partner){
       _outMonthlyInc=parseFloat(CPLAN._partner.income)||0;
+    } else if(owner==='spouse'){
+      // Joint-household spouse scope: derive monthly income from the
+      // pre-filtered spouse incomeSources (set above). Sum each source's
+      // gross-per-month: detailed mode uses take_home + deductions; simple
+      // mode uses `amount` as-is.
+      _outMonthlyInc=incomeSources.reduce(function(t,s){
+        if(!s)return t;
+        if(s.mode==='detailed'){
+          var th=parseFloat(s.take_home_per_check)||0;
+          var d4=parseFloat(s.deduction_401k)||0;
+          var dH=parseFloat(s.deduction_health)||0;
+          var dS=parseFloat(s.deduction_hsa)||0;
+          var dO=parseFloat(s.deduction_other)||0;
+          var pf=s.pay_frequency||'biweekly';
+          var checks=(typeof _checksPerMonth==='function')?_checksPerMonth(pf):2.1667;
+          var grossPer=th+d4+dH+dS+dO;
+          return t+(grossPer>0?Math.round(grossPer*checks):(parseFloat(s.amount)||0));
+        }
+        return t+(parseFloat(s.amount)||0);
+      },0);
     } else {
       _outMonthlyInc=parseFloat(CPLAN.income)||parseFloat((rawS.calcs||{}).inc)||0;
     }
@@ -14954,11 +14994,17 @@ function _cpMatchExisting(a, opts){
       // "solo_401k"). matchTypes is already in normalized form.
       var rTypeNorm=_normRetType(r.type);
       if(matchTypes.indexOf(rTypeNorm)<0)return;
-      // Owner filter: personal allocs match personal+joint retirement accounts.
-      // Spouse allocs flow through the partner branch above (different retAccts source).
-      // Joint accounts contribute to BOTH partners' views since both partially own them.
+      // Owner filter: personal allocs match personal+joint retirement accounts;
+      // spouse allocs in joint households were already filtered to spouse-only
+      // at data-resolution time, so `r.owner==='spouse'` is expected here.
+      // Joint accounts (owner not 'spouse' and not 'personal' — e.g. 'joint')
+      // contribute to both partners' views.
       var rOwner=r.owner||'personal';
-      if(rOwner==='spouse')return;// not personal scope
+      if(owner==='spouse'){
+        // pre-filtered to spouse already; no further skip needed
+      } else if(rOwner==='spouse'){
+        return;// not personal scope
+      }
       bal+=parseFloat(r.balance)||0;
       var rContrib=parseFloat(r.contrib)||0;
       // Fallback: if dollar contrib is missing but percent is set, derive
@@ -15047,7 +15093,11 @@ function _cpMatchExisting(a, opts){
       var rTypeNorm=_normRetType(r.type);
       if(rTypeNorm!=='brokerage'&&rTypeNorm!=='mutualfund'&&rTypeNorm!=='mutualfunds'&&rTypeNorm!=='taxable')return;
       var rOwner=r.owner||'personal';
-      if(rOwner==='spouse')return;
+      if(owner==='spouse'){
+        // pre-filtered to spouse-owned only
+      } else if(rOwner==='spouse'){
+        return;
+      }
       bal+=parseFloat(r.balance)||0;
       contrib+=parseFloat(r.contrib)||0;
       var lbl=r.provider||r.label||'';
@@ -15127,7 +15177,11 @@ function _cpMatchExisting(a, opts){
       var rTypeNorm=_normRetType(r.type);
       if(rTypeNorm!=='hsa')return;
       var rOwner=r.owner||'personal';
-      if(rOwner==='spouse')return;
+      if(owner==='spouse'){
+        // pre-filtered to spouse-owned only
+      } else if(rOwner==='spouse'){
+        return;
+      }
       bal+=parseFloat(r.balance)||0;
       contrib+=parseFloat(r.contrib)||0;
       var lbl=r.provider||r.label||'';
@@ -15237,18 +15291,45 @@ function _cpResolveMatchInfo(r, scope){
   // Phase 3.2: when scope === 'spouse', read income sources from CPLAN._partner
   // so spouse cards resolve match data against the partner's W-2 income, not
   // the current user's. Default (no scope) reads from current user as before.
+  // Joint-household refinement: when partner data lives in the SAME rawS arrays
+  // (CPLAN._partner is null), filter incomeSources by retAccount owner so the
+  // spouse 401k card joins to the spouse income source, not Jane's. Without
+  // this, both cards collapse to the household total via the fallback below.
   var incSources;
   if(scope==='spouse' && CPLAN && CPLAN._partner && CPLAN._partner.incomeSources){
     incSources = CPLAN._partner.incomeSources || [];
   } else {
     var rawS = (APP._currentClientFd && APP._currentClientFd.S) || {};
-    incSources = rawS.incomeSources || [];
+    var allInc = rawS.incomeSources || [];
+    var rOwn = (r.owner||'personal');
+    if(rOwn==='spouse'){
+      incSources = allInc.filter(function(s){return s && (s.owner||'personal')==='spouse';});
+    } else {
+      // personal scope — exclude spouse-tagged sources so they don't pollute
+      // the single-W2 fallback heuristic below.
+      incSources = allInc.filter(function(s){return s && (s.owner||'personal')!=='spouse';});
+    }
   }
-  // Find W-2 income source matching this retAccount's employer.
-  // We accept exact-match or substring-match either direction — users may
-  // type "Acme Corp" in one place and "Acme" in the other.
+  // Authoritative join: if the retAccount has a _linkedIncomeSourceId, use it
+  // directly. This bypasses the employer-name heuristic and is set whenever
+  // pfos-main auto-creates a 401k from a paycheck deduction (or vice versa) —
+  // the most common path. Empty-employer joint-household cases (both rows have
+  // empty employer fields) would otherwise fall through to the household-total
+  // fallback and lose per-partner wage attribution.
   var matchedSource = null;
-  if(rEmployer){
+  if(r._linkedIncomeSourceId){
+    matchedSource = incSources.find(function(s){
+      return s && String(s.id)===String(r._linkedIncomeSourceId);
+    }) || null;
+  }
+  // Reverse-direction join: some incomeSources have a _linkedRetAcctId pointing
+  // back at this retAccount. Honor it as a secondary path.
+  if(!matchedSource){
+    matchedSource = incSources.find(function(s){
+      return s && s._linkedRetAcctId && String(s._linkedRetAcctId)===String(r.id);
+    }) || null;
+  }
+  if(!matchedSource && rEmployer){
     matchedSource = incSources.find(function(s){
       if(!s || !s.employer) return false;
       var sEmp = String(s.employer).toLowerCase().trim();
