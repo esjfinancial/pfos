@@ -6934,37 +6934,9 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
       }
     }
   }catch(e){console.warn('Couple link load failed:',e);}
-  // ── Seed one-time goals as plan allocations (idempotent) ──
-  // The top "Savings Goals" box renders each goal as a full plan card by
-  // matching it to its allocation. On a freshly-loaded or empty plan (i.e. when
-  // the advisor hasn't run "Build a custom plan"/_cpStartSelf yet) goals were
-  // never turned into allocations, so the box fell back to flat rows. Seed them
-  // here, ONCE at init, deduping against any allocation that already references
-  // the goal (by goalId or name) so we never duplicate a goal that's already in
-  // a saved plan or that _cpStartSelf added. Skip recurring goals — they never
-  // "complete" in the cascade sense. Mirrors the goal-seed in _cpStartSelf.
-  try{
-    (rawS.goals||[]).forEach(function(g){
-      if(!g||!g.name)return;
-      var exists=(CPLAN.allocations||[]).some(function(a){
-        return a&&(a.type==='custom'||a.type==='savings_goal')
-          && ((g.id&&a.goalId===g.id)||(a.customName&&a.customName===g.name));
-      });
-      if(exists)return;
-      CPLAN.allocations.push({
-        type:'custom',amount:0,target:parseFloat(g.target)||0,phase:0,cascade:'',
-        customName:g.name,goalId:g.id||null,
-        goalCurrent:parseFloat(g.current||g.balance)||0,owner:g.owner||'personal'
-      });
-    });
-  }catch(_gseed){console.warn('Goal seed at init:',_gseed);}
   // Phase 1: scale loaded plans if they exceed available budget (sets _scaledOnLoad notice flag)
   _cpEnforce();
   _cpRenderPlan();
-  // Repaint the top Savings Goals box now that goals are seeded as allocations.
-  // Its first paint (during loadProfile) ran before this seed, so it would have
-  // shown flat fallback rows; this second paint resolves each goal to its card.
-  try{ if(typeof renderProfileSavingsGoals==='function') renderProfileSavingsGoals(APP._currentClientFd||fd); }catch(_grr){console.warn('Savings goals repaint:',_grr);}
 }
 function _cpExtractFlags(){
   var flags=[];
@@ -10467,9 +10439,9 @@ function _cpStartSelf(){
   (rawS.goals||[]).forEach(function(g){
     if(!g.name)return;
     if(g.recurring===true)return;
-    // Dedup: _cpInitPlan already seeds one-time goals as phase-0 custom cards,
-    // so skip any goal already represented (by goalId or name) to avoid a
-    // duplicate card when the advisor runs Build-a-custom-plan after load.
+    // Dedup: goals may already be present as phase-0 custom cards (seeded during
+    // _cpRenderPlanFull's self-mode sync), so skip any goal already represented
+    // (by goalId or name) to avoid a duplicate when Build-a-custom-plan runs.
     var _gExists=(CPLAN.allocations||[]).some(function(a){
       return a&&(a.type==='custom'||a.type==='savings_goal')
         && ((g.id&&a.goalId===g.id)||(a.customName&&a.customName===g.name));
@@ -22664,6 +22636,27 @@ function _cpRenderPlanFull(){
   // but the unassigned column would never receive subsequently-detected flags.
   if(CPLAN.planMode==='self'){
     if(typeof _cpSyncFlagsToUnassigned==='function')_cpSyncFlagsToUnassigned();
+    // Seed savings goals as unassigned cards alongside the flag-derived items,
+    // idempotently (dedup by goalId/name). This runs in the same render spot and
+    // under the same gate as the flag sync, so goals JOIN the unassigned column
+    // rather than replacing it. Doing it here (not at init) avoids racing the
+    // plan load — by the time a render runs, the real plan state is settled.
+    try{
+      var _gRawS=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+      (_gRawS.goals||[]).forEach(function(g){
+        if(!g||!g.name)return;
+        var _gExists=CPLAN.allocations.some(function(a){
+          return a&&(a.type==='custom'||a.type==='savings_goal')
+            && ((g.id&&a.goalId===g.id)||(a.customName&&a.customName===g.name));
+        });
+        if(_gExists)return;
+        CPLAN.allocations.push({
+          type:'custom',amount:0,target:parseFloat(g.target)||0,phase:0,cascade:'',
+          customName:g.name,goalId:g.id||null,
+          goalCurrent:parseFloat(g.current||g.balance)||0,owner:g.owner||'personal'
+        });
+      });
+    }catch(_gsErr){console.warn('Goal seed in render:',_gsErr);}
   }
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0;});
   if(unassigned.length){
@@ -23234,6 +23227,10 @@ function _cpRenderPlanFull(){
     try{ if(typeof _cpRenderDrawdownPlan==='function') _cpRenderDrawdownPlan(); }catch(e){console.warn('Drawdown:',e);}
     try{ if(typeof _cpRenderRebalanceTriggers==='function') _cpRenderRebalanceTriggers(); }catch(e){console.warn('Rebalance:',e);}
     try{ if(typeof _cpRenderAccountabilityBanner==='function') _cpRenderAccountabilityBanner(); }catch(e){console.warn('Accountability:',e);}
+    // Repaint the top Savings Goals box so each goal resolves to its now-seeded
+    // unassigned allocation and renders as the full card. Read-only — the box's
+    // match logic does not mutate the plan, so this can't recurse into render.
+    try{ if(typeof renderProfileSavingsGoals==='function') renderProfileSavingsGoals(APP._currentClientFd); }catch(e){console.warn('Savings goals repaint:',e);}
   },50);
 }
 function _cpSetAmount(idx,val){
