@@ -764,6 +764,7 @@ html[data-theme="light"] .tip-pop{background:#FFFFFF!important;color:#334155!imp
     <div id="profileSidebarName" style="padding:8px 16px;font-family:var(--fh);font-size:14px;font-weight:800;color:var(--wh)">—</div>
     <div id="profileSidebarMeta" style="padding:0 16px 12px;font-size:11px;color:var(--mu)"></div>
     <div class="sb-section">Actions</div>
+    <div class="sb-item" id="nav-client-profile" onclick="showPage('client-profile')"><span class="icon">🏠</span> Client Profile</div>
     <div class="sb-item" onclick="openPFOSForClient()"><span class="icon">⚡</span> Open PFOS</div>
     <div class="sb-item" id="nav-tracking" onclick="showPage('tracking');renderAdvisorTracking()"><span class="icon">✅</span> Financial Plan Tracking</div>
     <div class="sb-item" id="nav-projections" onclick="showPage('projections');renderAdvisorProjections()"><span class="icon">📈</span> Financial Projections</div>
@@ -6827,6 +6828,30 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
   if(allocPlan&&allocPlan.allocations&&allocPlan.allocations.length){
     CPLAN.allocations=allocPlan.allocations;
     if(allocPlan.debtStrategy)CPLAN.debtStrategy=allocPlan.debtStrategy;
+    // ── Migration: upgrade legacy action-only protection cards (Life/Disability
+    // "Review") saved in older plans into the new term_life/disability slider
+    // cards, so existing clients get the same premium+benefit sliders as new
+    // ones. Keyed off flagTitle/customName; skips already-completed cards.
+    try{
+      var _migPC=(rawS&&rawS.protCalcs)||{};
+      CPLAN.allocations.forEach(function(a){
+        if(!a||a._completed)return;
+        var _nm=((a.customName||'')+' '+(a.flagTitle||'')).toLowerCase();
+        if(a.type==='protection'&&(_nm.indexOf('life insurance')>=0||_nm.indexOf('term life')>=0)&&_nm.indexOf('disab')<0){
+          a.type='term_life';a.customName='Term Life Insurance';a._isNewTermLife=true;
+          if(a._termCoverage==null)a._termCoverage=Math.round(parseFloat(_migPC.totalRecommended)||parseFloat(_migPC.totalNeed)||0);
+          if(a._termLength==null)a._termLength=20;
+          if(!a._newPolicyId)a._newPolicyId='pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
+          if(a.phase==null)a.phase=0;
+        } else if(a.type==='protection'&&_nm.indexOf('disab')>=0){
+          a.type='disability';a.customName='Disability Insurance';a._isNewDisability=true;
+          if(a._diBenefit==null)a._diBenefit=Math.round((parseFloat(CPLAN.income)||0)*0.65);
+          if(a._diBenefitMaxGuide==null)a._diBenefitMaxGuide=Math.round((parseFloat(CPLAN.income)||0)*0.70);
+          if(!a._newPolicyId)a._newPolicyId='pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8);
+          if(a.phase==null)a.phase=0;
+        }
+      });
+    }catch(_mig){console.warn('protection migration:',_mig);}
   }
   // Plan publish state + pending change requests (Plan Workflow)
   CPLAN._planStatus=(planMeta&&planMeta.plan_status)||'draft';
@@ -27407,6 +27432,37 @@ function _advTrackGetYTD(idx){
   return{planned:planned,actual:actual};
 }
 function _advOrd(d){var s=['th','st','nd','rd'];var v=d%100;return s[(v-20)%10]||s[v]||s[0];}
+// Advisor-side Financial Trends snapshot — mirrors the portal's client trends
+// card so the advisor sees the same month-over-month net worth / savings / debt
+// mini-charts the client sees. Reads client_snapshots (already loaded into
+// APP._supabaseSnapshots). Snapshot columns are snake_case (net_worth,
+// savings_rate, total_debt); there is no cash-flow column so that chart is
+// omitted (vs the portal's 4-up grid).
+function _advTrendsSnapshot(){
+  var snaps=(APP._supabaseSnapshots||[]).slice();
+  if(snaps.length<2)return '';
+  function nw(s){return parseFloat(s.net_worth)||0;}
+  function sr(s){return parseFloat(s.savings_rate)||0;}
+  function dbt(s){return parseFloat(s.total_debt)||0;}
+  var h='<div class="info-card" style="padding:14px;margin-bottom:18px">';
+  h+='<div class="info-card-title" style="margin-bottom:10px">📊 Financial Trends ('+snaps.length+' months)</div>';
+  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">';
+  h+='<div style="padding:8px;background:rgba(0,68,191,.04);border:1px solid var(--bd);border-radius:4px">'+_cSvgLine(snaps.map(function(s){return{v:nw(s)};}),260,80,'#5B9BFF','NET WORTH')+'</div>';
+  h+='<div style="padding:8px;background:rgba(0,68,191,.04);border:1px solid var(--bd);border-radius:4px">'+_cSvgLine(snaps.map(function(s){return{v:sr(s)};}),260,80,'#22C55E','SAVINGS RATE %')+'</div>';
+  if(dbt(snaps[0])>0||dbt(snaps[snaps.length-1])>0){
+    h+='<div style="padding:8px;background:rgba(0,68,191,.04);border:1px solid var(--bd);border-radius:4px">'+_cSvgLine(snaps.map(function(s){return{v:dbt(s)};}),260,80,'#EF4444','TOTAL DEBT')+'</div>';
+  }
+  h+='</div>';
+  // Month-over-month change strip
+  var prev=snaps[snaps.length-2],curr=snaps[snaps.length-1];
+  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:8px">';
+  [{l:'Net Worth',o:nw(prev),n:nw(curr),up:true},{l:'Savings %',o:sr(prev),n:sr(curr),up:true,pct:true},{l:'Debt',o:dbt(prev),n:dbt(curr),up:false}].forEach(function(ch){
+    var diff=ch.n-ch.o,good=ch.up?(diff>=0):(diff<=0),arrow=diff>0?'↑':diff<0?'↓':'→';
+    h+='<div style="padding:5px;background:rgba(0,0,0,.15);border-radius:3px;text-align:center"><div style="font-size:9px;color:var(--mu)">'+ch.l+'</div><div style="font-size:12px;font-weight:700;color:'+(good?'var(--gr)':'var(--rd)')+'">'+arrow+' '+(ch.pct?diff.toFixed(1)+'%':fmtK(Math.abs(diff)))+'</div></div>';
+  });
+  h+='</div></div>';
+  return h;
+}
 async function renderAdvisorTracking(){
   var el=document.getElementById('advisorTrackingContent');if(!el)return;
   _advEnsurePlan();
@@ -27423,6 +27479,7 @@ async function renderAdvisorTracking(){
   // YTD
   var ytdPlanned=0,ytdActual=0;funded.forEach(function(a){var i=CPLAN.allocations.indexOf(a);var ytd=_advTrackGetYTD(i);ytdPlanned+=ytd.planned;ytdActual+=ytd.actual;});
   // Mode badge
+  h+=_advTrendsSnapshot();
   h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:16px"><span style="font-size:9px;padding:4px 10px;border-radius:2px;font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase;background:'+(isPortal?'rgba(168,85,247,.1)':'rgba(91,155,255,.1)')+';border:1px solid '+(isPortal?'rgba(168,85,247,.25)':'rgba(91,155,255,.25)')+';color:'+(isPortal?'#A855F7':'#5B9BFF')+'">'+(isPortal?'CLIENT-TRACKED':'ADVISOR-TRACKED')+'</span></div>';
   // Header ring
   h+='<div style="display:grid;grid-template-columns:auto 1fr;gap:20px;margin-bottom:20px;align-items:center"><div style="position:relative;width:100px;height:100px">'+_advRing(120,pct,100,pct>=100?'var(--gr)':'#5B9BFF',8);
