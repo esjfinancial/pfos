@@ -7027,11 +7027,74 @@ function _cpExtractFlags(){
   var incSources=rawS2.incomeSources||[];
   if(incSources.length===1&&d.income>0)
     flags.push({icon:'📌',title:'Single income source',desc:'Diversification reduces risk — consider side income, rental, or dividends as plan grows.',type:'info',action:'diversify'});
-  // ── No umbrella policy ──
-  var hasUmbrella=(d.policies||[]).some(function(p){return(p.type||'').toLowerCase().indexOf('umbrella')>=0;});
-  if(!hasUmbrella&&d.income>3000)
-    flags.push({icon:'☂️',title:'No umbrella policy detected',desc:'Additional liability coverage beyond auto and home — typically $150-$300/yr for $1M coverage.',type:'opp',action:'protection'});
+  // ── Spouse flags (JOINT households only) ──
+  // In a joint household both spouses live in the one shared S, split by an
+  // `owner` field. The checks above only cover the primary person; run a
+  // spouse-scoped pass over the spouse-owned slice so the spouse's per-person
+  // gaps surface too. Household-level items (estate, will, POA, beneficiaries,
+  // umbrella) are shared and NOT duplicated here. Each spouse flag carries
+  // owner:'spouse', a "[spouse]" title tag, and a distinct `action` suffixed
+  // with '_spouse' so it doesn't get deduped against the self version.
+  if(CPLAN._householdType==='joint'){
+    try{ _cpAppendSpouseFlags(flags, rawS2, d); }catch(_sf){console.warn('Spouse flags:',_sf); }
+  }
   return flags;
+}
+// Build spouse-scoped flags for a joint household from the spouse-owned slice
+// of the shared state. Mirrors the per-person checks in _cpExtractFlags but
+// reads owner==='spouse' data. Pushes onto the passed-in flags array.
+function _cpAppendSpouseFlags(flags, rawS2, d){
+  if(!rawS2)return;
+  var spName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
+  function _sp(arr,field){return (arr||[]).filter(function(x){return x&&(x[field||'owner']||'personal')==='spouse';});}
+  // Spouse income (sum of spouse-owned income sources)
+  var spIncSrcs=_sp(rawS2.incomeSources);
+  var spInc=spIncSrcs.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0);
+  var spRetAccts=_sp(rawS2.retAccounts);
+  var spPolicies=_sp(rawS2.policies&&rawS2.policies.length?rawS2.policies:rawS2.insurancePolicies);
+  var spAge=(CPLAN._partner&&CPLAN._partner.age)||parseInt(rawS2.profile&&rawS2.profile.spCurrentAge)||0;
+  var tag=' ['+spName+']';
+  // Helper: does the plan already have a spouse-owned allocation of these types with money?
+  function _spHasAlloc(types){
+    return CPLAN.allocations.some(function(a){return a&&a.owner==='spouse'&&types.indexOf(a.type)>=0&&(parseFloat(a.amount)||0)>0;});
+  }
+  // ── No retirement savings (spouse) ──
+  var _retTypesDetect=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
+  if(!_spHasAlloc(_retTypesDetect)&&spAge>=25&&spInc>0)
+    flags.push({icon:'🕒',title:'No retirement savings active'+tag,desc:spName+' has no active retirement contribution. Starting now compounds significantly.',type:'warn',action:'retirement_spouse',owner:'spouse'});
+  // ── Old/orphaned retirement accounts (spouse) ──
+  var spOld=spRetAccts.filter(function(ra){return ra.type&&ra.type.indexOf('_old')>=0&&(parseFloat(ra.balance)||0)>0;});
+  if(spOld.length>0){
+    var spOldBal=spOld.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+    flags.push({icon:'🔄',title:'Old retirement account'+(spOld.length>1?'s':'')+tag+': '+fmtK(spOldBal),desc:spOld.length+' orphaned account'+(spOld.length>1?'s':'')+' for '+spName+'. Consider rolling into a current IRA/401(k) or a Roth conversion.',type:'warn',action:'rollover_spouse',owner:'spouse'});
+  }
+  // ── HSA eligibility (spouse) — HDHP detection from shared expData/profile ──
+  var spHDHP=false;
+  if(rawS2.profile&&rawS2.profile.spHasHDHP)spHDHP=true;
+  if(spHDHP&&!_spHasAlloc(['hsa']))
+    flags.push({icon:'💊',title:'HSA eligible'+tag+' — triple tax advantage',desc:spName+'\'s HDHP unlocks the only triple-tax-advantaged account: tax-free in, growth, and medical withdrawals.',type:'opp',action:'hsa_spouse',owner:'spouse'});
+  // ── Life insurance gap (spouse) ──
+  var spHasLife=spPolicies.some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('life')>=0||t.indexOf('term')>=0||t.indexOf('whole')>=0||t.indexOf('iul')>=0;});
+  if(!spHasLife&&spInc>0&&((d.children&&d.children.length>0)||d.marital==='Married'))
+    flags.push({icon:'🛡️',title:'No life insurance detected'+tag,desc:'With dependents, a coverage gap on '+spName+' puts the household at financial risk.',type:'warn',action:'protection_spouse',owner:'spouse'});
+  // ── Disability coverage (spouse) ──
+  var spHasDisab=spPolicies.some(function(p){return(p.type||'').toLowerCase().indexOf('disab')>=0;});
+  if(!spHasDisab&&spInc>0)
+    flags.push({icon:'🩺',title:'No disability coverage detected'+tag,desc:spName+'\'s income isn\'t protected against disability — the most common cause of lost earning years.',type:'warn',action:'protection_spouse',owner:'spouse'});
+  // ── Existing IBC / WL / IUL policies (spouse) not in plan ──
+  var spIBC=spPolicies.filter(function(p){return p.ibcFlag==='yes';});
+  if(spIBC.length>0&&!_spHasAlloc(['ibc']))
+    flags.push({icon:'🏛️',title:'IBC policy not in plan'+tag,desc:spIBC.length+' policy marked for Infinite Banking on '+spName+' — incorporate for debt recapture, major purchases, retirement supplement.',type:'opp',action:'ibc_spouse',owner:'spouse'});
+  var spRetPol=spPolicies.filter(function(p){var t=(p.type||'').toLowerCase();return(t.indexOf('whole')>=0||t.indexOf('iul')>=0)&&p.ibcFlag!=='yes'&&(parseFloat(p.premium)||0)>0;});
+  if(spRetPol.length>0&&!_spHasAlloc(['iul','wl']))
+    flags.push({icon:'📋',title:'Existing '+spRetPol[0].type+' not in plan'+tag,desc:spName+'\'s cash value could supplement retirement — consider incorporating.',type:'opp',action:'existing_policy_spouse',owner:'spouse'});
+  // ── Single income source (spouse) ──
+  if(spIncSrcs.length===1&&spInc>0)
+    flags.push({icon:'📌',title:'Single income source'+tag,desc:'Diversification reduces risk for '+spName+' — consider side income, rental, or dividends as the plan grows.',type:'info',action:'diversify_spouse',owner:'spouse'});
+  // ── Long-term care planning (spouse, age 50-65) ──
+  var spHasLTC=spPolicies.some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('long-term care')>=0||t.indexOf('ltc')>=0||t.indexOf('long term care')>=0;});
+  if(!spHasLTC&&spAge>=50&&spAge<=65&&spInc>0)
+    flags.push({icon:'🏥',title:'No long-term care planning'+tag,desc:'Premiums for '+spName+' are best locked 50-60 — nearly double after 65. Consider hybrid life/LTC.',type:'opp',action:'protection_spouse',owner:'spouse'});
 }
 function _cpCalcHealthScore(){
   var s=0,d=CPLAN;if(d.income<=0)return 0;
@@ -16703,36 +16766,46 @@ function _cpSyncFlagsToUnassigned(){
   flags.forEach(function(f){
     var act=f.action;
     if(!act)return;
-    if(CPLAN._dismissedFlags[act])return;
+    // Spouse flags (joint households) use '<action>_spouse' so they don't collide
+    // with the self version. Normalize to the base action so the maps below work,
+    // and remember this is a spouse-owned flag so dedup and the card owner are
+    // scoped to the spouse rather than the household/self.
+    var _flagOwner=(f.owner==='spouse')?'spouse':'self';
+    var _isSpouseFlag=(_flagOwner==='spouse');
+    if(_isSpouseFlag&&/_spouse$/.test(act))act=act.replace(/_spouse$/,'');
+    // Owner-aware allocation match: for a spouse flag, only spouse-owned
+    // allocations count as "already represented"; for a self flag, self/joint.
+    function _ownerAllocSome(pred){
+      return CPLAN.allocations.some(function(a){
+        if(!a)return false;
+        var ao=a.owner||'self';
+        if(_isSpouseFlag){if(ao!=='spouse')return false;}
+        else{if(ao==='spouse')return false;}
+        return pred(a);
+      });
+    }
+    if(CPLAN._dismissedFlags[f.action])return;
     // Already represented?
     var alreadyIn=false;
     if(chooserActions[act]){
-      if(act==='retirement') alreadyIn=CPLAN.allocations.some(function(a){return retTypes.indexOf(a.type)>=0&&a.amount>0;});
-      else if(act==='edu') alreadyIn=CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;});
-      else if(act==='rollover') alreadyIn=CPLAN.allocations.some(function(a){return rolloverDestTypes.indexOf(a.type)>=0;});
-      else if(act==='growth') alreadyIn=CPLAN.allocations.some(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
-      // Also count an existing placeholder for this same chooser action as "represented"
-      // so the placeholder doesn't multiply on re-renders.
-      if(!alreadyIn) alreadyIn=CPLAN.allocations.some(function(a){return a._chooserAction===act;});
+      if(act==='retirement') alreadyIn=_ownerAllocSome(function(a){return retTypes.indexOf(a.type)>=0&&a.amount>0;});
+      else if(act==='edu') alreadyIn=_ownerAllocSome(function(a){return a.type==='edu'&&a.amount>0;});
+      else if(act==='rollover') alreadyIn=_ownerAllocSome(function(a){return rolloverDestTypes.indexOf(a.type)>=0;});
+      else if(act==='growth') alreadyIn=_ownerAllocSome(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
+      // Also count an existing placeholder for this same chooser action+owner.
+      if(!alreadyIn) alreadyIn=CPLAN.allocations.some(function(a){return a._chooserAction===act&&((a.owner||'self')==='spouse')===_isSpouseFlag;});
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t=actionOnlyMap[act];
-      if(t==null) return; // 'expenses' has no allocation type — handled separately if we add a card later
-      // For 'protection' specifically, multiple flags can fire (life + disability +
-      // LTC + underinsured-life + disability-gap) and each deserves its own card —
-      // the AI version of the plan emits separate "Term Life Insurance Review" and
-      // "Disability Insurance Review" cards, and the DIY mode should match. Dedup
-      // on flagTitle so different protection flags don't collapse into one card.
-      // Other action-only types (umbrella, estate, diversify) keep the type-level
-      // dedup since they don't have multiple sub-flavors.
+      if(t==null) return;
       if(act==='protection'){
-        alreadyIn=CPLAN.allocations.some(function(a){return a.type===t&&a.flagTitle===f.title;});
+        alreadyIn=_ownerAllocSome(function(a){return a.type===t&&a.flagTitle===f.title;});
       } else {
-        alreadyIn=CPLAN.allocations.some(function(a){return a.type===t;});
+        alreadyIn=_ownerAllocSome(function(a){return a.type===t;});
       }
     } else if(directMap[act]){
-      alreadyIn=CPLAN.allocations.some(function(a){return a.type===directMap[act];});
+      alreadyIn=_ownerAllocSome(function(a){return a.type===directMap[act];});
     } else if(act==='401k'){
-      alreadyIn=CPLAN.allocations.some(function(a){return a.type==='401k';});
+      alreadyIn=_ownerAllocSome(function(a){return a.type==='401k';});
     }
     // Extended dedup: also treat a partner-shared card of a whitelisted type
     // as "already represented" so this sync doesn't recreate a duplicate every
@@ -16758,8 +16831,9 @@ function _cpSyncFlagsToUnassigned(){
       'Disability coverage gap':'Disability Coverage Gap Review',
       'No long-term care planning':'Long-Term Care Review'
     };
-    // Stage a new card with flag context + appropriate type/markers
-    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:'self',reason:f.desc||''};
+    // Stage a new card with flag context + appropriate type/markers.
+    // owner follows the flag (spouse flags → spouse-owned card).
+    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:_flagOwner,reason:f.desc||''};
     // Allow disability-gap title which is dynamic ('Disability coverage gap: $X/mo')
     if(act==='protection'){
       var _customNm=_protectionTitleMap[f.title];
@@ -20205,9 +20279,15 @@ function _cpExtractRedFlags(){
     }
   }
 
+  // ── Spouse flags (JOINT only) — see _cpAppendSpouseFlags. This is the flag
+  // function that feeds the unassigned CARDS, so the spouse pass must run here
+  // too (not only in _cpExtractFlags, which feeds the fork-screen issue list).
+  if(CPLAN._householdType==='joint'){
+    try{ _cpAppendSpouseFlags(flags, rawS2, d); }catch(_sf){console.warn('Spouse flags (cards):',_sf); }
+  }
+
   return flags;
 }
-
 
 function _cpRenderRedFlags(){
   // The standalone "Issues & Recommended Actions" panel has been retired.
