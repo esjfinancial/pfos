@@ -7128,7 +7128,23 @@ function _cpIRSMax(type,allocOrOwner){
   // Solo 401k overall (415c): $72,000 base, $80,000 at 50+, $83,250 at 60-63
   // SEP IRA: 25% of compensation, max $72,000 (self-employed)
   // Coverdell ESA: $2,000
-  var hsaFamily=(CPLAN.hsaCoverage==='family'||CPLAN.hdhpCoverage==='family');
+  // Resolve HSA coverage. Priority: the LINKED HSA INVESTMENT's hsaCoverage
+  // (per-account source of truth) → the linked income source's hsaCoverage
+  // (mirrors investment via bidirectional sync in pfos-main) → CPLAN-level
+  // fields (rarely populated; kept for back-compat). Pulling from the
+  // investment first makes the plan card respect the user's Self-Only /
+  // Family selection on the Investments card.
+  var hsaFamily=false;
+  if(alloc&&alloc._investmentId){
+    var rawS_hsa=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+    var ivHsa=(rawS_hsa.investments||[]).find(function(iv){return iv&&iv.id===alloc._investmentId;});
+    if(ivHsa&&ivHsa.hsaCoverage==='family')hsaFamily=true;
+    else if(ivHsa&&ivHsa._linkedIncomeSourceId){
+      var srcHsa=(rawS_hsa.incomeSources||[]).find(function(s){return s&&s.id===ivHsa._linkedIncomeSourceId;});
+      if(srcHsa&&srcHsa.hsaCoverage==='family')hsaFamily=true;
+    }
+  }
+  if(!hsaFamily)hsaFamily=(CPLAN.hsaCoverage==='family'||CPLAN.hdhpCoverage==='family');
   var hsaAnnual=(hsaFamily?8750:4400)+(o55?1000:0);
   // Phase 4: HSA Medicare cutoff. Anyone enrolled in Medicare cannot contribute to HSA
   // (still allowed to spend/grow). Default Medicare enrollment is age 65; some delay if
@@ -18091,7 +18107,13 @@ function _cpBuildCard(a,idx,isUnassigned){
   // though the user's effective contribution is higher. Compute the boost-
   // adjusted max by including the same boosts we added into _sliderEffective.
   var _cascadeBoostHere=Math.max(0,_sliderEffective-(parseInt(a.amount)||0));
-  var _sliderTotalMax=_slMax+_curContribSlide+_cascadeBoostHere;
+  // Slider max is the IRS contribution limit itself (which is a TOTAL annual
+  // cap, not an extras-on-top cap). Adding _curContribSlide to it would let
+  // users plan beyond the IRS cap (e.g. current $728 + IRS-cap-as-extras $367
+  // = $1,095 total, over a $4,404/yr self-only cap). Floor at current+boost
+  // so users already over the cap can keep their existing position without
+  // the slider forcing them down, while users under the cap stop at the cap.
+  var _sliderTotalMax=Math.max(_slMax,_curContribSlide+_cascadeBoostHere);
   // Slider lower bound: for cards backed by an existing account or policy,
   // allow the user to drag all the way down to $0 (planning a reduction).
   // For unlinked planning cards, the floor stays at currentContrib (which is
