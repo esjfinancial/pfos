@@ -7434,14 +7434,24 @@ function _syncHsaInvAcctFromIncomeSource(srcIdx){
     existingIdx=S.investments.findIndex(function(iv){return iv.id===src._linkedHsaInvId;});
   }
   if(existingIdx>=0){
-    // Update existing linked HSA: refresh contribution to match paycheck
+    // Update existing linked HSA: refresh contribution to match paycheck.
+    // Coverage stays as user-set on the investment (or paycheck — synced
+    // bidirectionally via updIncome / updInvAccount).
     var existing=S.investments[existingIdx];
     existing.monthlyContrib=monthlyHsa;
+    // Inherit hsaCoverage from paycheck if set; otherwise keep investment's.
+    if(src.hsaCoverage && existing.hsaCoverage !== src.hsaCoverage){
+      existing.hsaCoverage = src.hsaCoverage;
+    }
     S._touched.investments=true;
     if(typeof renderInvAccounts==='function')renderInvAccounts();
     _showAutoSyncBanner('updated',null,'hsa');
   } else {
-    // Create new linked HSA entry
+    // Create new linked HSA entry. Coverage defaults to paycheck's (if set)
+    // or 'self' otherwise. Paycheck hsaFsaType defaults to 'hsa' so the
+    // paycheck cap warning agrees with the investment's HSA limit.
+    if(!src.hsaFsaType) src.hsaFsaType = 'hsa';
+    if(!src.hsaCoverage) src.hsaCoverage = 'self';
     var newHsa={
       id:++invAcctIdCtr,
       type:'hsa',
@@ -7450,7 +7460,7 @@ function _syncHsaInvAcctFromIncomeSource(srcIdx){
       balance:0,
       monthlyContrib:monthlyHsa,
       owner:src.owner||'personal',
-      hsaCoverage:'self',// user can change to 'family' in the row
+      hsaCoverage:src.hsaCoverage,// mirrors paycheck
       grossReturn:7,fundFee:0.5,advFee:0,returnPct:6.5,
       _source:'manual',_plaidAccountId:null,_lastSynced:null,
       _planLinked:false,_planAllocType:'',_planAllocName:'',
@@ -7950,6 +7960,29 @@ function updInvAccount(i,field,val){
   if(a && a.type==='hsa' && (field==='monthlyContrib'||field==='hsaCoverage')){
     var warnEl=document.getElementById('hsaCapWarn_'+i);
     if(warnEl) warnEl.innerHTML=_hsaCapWarnHtml(a);
+  }
+  // ── Single-source-of-truth sync: linked paycheck income source ──────────
+  // When the HSA investment was auto-created from a paycheck, mirror the
+  // user's Coverage choice back to the income source so the paycheck cap
+  // warning uses the same Family/Self limit. Also force hsaFsaType to 'hsa'
+  // on the income source so it stops being treated as FSA — if user wants
+  // it as FSA, they'd toggle that on the paycheck side which detaches this
+  // investment (see updIncome's matching block).
+  if(a && a.type==='hsa' && field==='hsaCoverage' && a._linkedIncomeSourceId && S.incomeSources){
+    var _srcIdx = S.incomeSources.findIndex(function(s){return s && s.id===a._linkedIncomeSourceId;});
+    if(_srcIdx >= 0){
+      var _src = S.incomeSources[_srcIdx];
+      var _changed = false;
+      if(_src.hsaCoverage !== val){ _src.hsaCoverage = val; _changed = true; }
+      if(_src.hsaFsaType === 'fsa'){ _src.hsaFsaType = 'hsa'; _changed = true; }
+      if(!_src.hsaFsaType){ _src.hsaFsaType = 'hsa'; _changed = true; }
+      if(_changed){
+        S._touched.incomeSources = true;
+        // Refresh the paycheck-row warning without re-rendering (preserves focus)
+        var _payWarnEl = document.getElementById('incHsaFsaWarn_' + _srcIdx);
+        if(_payWarnEl) _payWarnEl.innerHTML = _hsaFsaPaycheckWarnHtml(_src);
+      }
+    }
   }
   calc();
 }
@@ -8760,6 +8793,40 @@ function updIncome(i,key,val){
       // Simplest: trigger a row re-render so the markup matches the new toggle state.
       // The re-render will call _hsaFsaPaycheckWarnHtml again with the new data.
       if(typeof renderIncomeRow==='function') renderIncomeRow();
+    }
+  }
+  // ── Single-source-of-truth sync: linked HSA investment ──────────────────
+  // When the paycheck has _linkedHsaInvId (auto-synced HSA exists), keep the
+  // classification aligned between the two screens so the cap warnings agree.
+  //   hsaCoverage change → write to linked investment.hsaCoverage
+  //   hsaFsaType change to 'fsa' → detach the linked HSA investment (FSA isn't
+  //     an investment; the auto-synced entry shouldn't exist anymore)
+  //   hsaFsaType change to 'hsa' / 'both' → re-create the investment via the
+  //     existing auto-sync on next deduction_hsa edit (handled there)
+  var srcAfter = S.incomeSources[i];
+  if(srcAfter && srcAfter._linkedHsaInvId && S.investments){
+    var _ivIdx = S.investments.findIndex(function(iv){return iv && iv.id===srcAfter._linkedHsaInvId;});
+    if(_ivIdx >= 0){
+      if(key === 'hsaCoverage'){
+        var _iv = S.investments[_ivIdx];
+        if(_iv.hsaCoverage !== val){
+          _iv.hsaCoverage = val;
+          S._touched.investments = true;
+          if(typeof renderInvAccounts==='function') renderInvAccounts();
+        }
+      } else if(key === 'hsaFsaType' && val === 'fsa'){
+        // FSA isn't an investment account — drop the auto-synced HSA entry.
+        // User retains the paycheck deduction (now classified as FSA) without
+        // a phantom HSA investment.
+        S.investments.splice(_ivIdx, 1);
+        delete srcAfter._linkedHsaInvId;
+        S._touched.investments = true;
+        S._touched.incomeSources = true;
+        if(typeof renderInvAccounts==='function') renderInvAccounts();
+        if(typeof toast==='function'){
+          toast('Auto-synced HSA removed — FSA can\'t be invested.', 'info');
+        }
+      }
     }
   }
 }
