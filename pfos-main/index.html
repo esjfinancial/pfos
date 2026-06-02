@@ -6058,7 +6058,7 @@ function editPaySchedule(idx){
   h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--yl);margin:12px 0 8px">Pre-Tax Deductions (per paycheck) — for reference &amp; cross-validation</div>';
   h+='<div class="row"><div class="fi"><label class="lb">401k Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ps401k" value="'+(ps.deduction_401k||'')+'" placeholder="0" oninput="psCalcGross()" style="padding-left:22px"></div></div>';
   h+='<div class="fi"><label class="lb">Health / Dental / Vision Insurance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psHealth" value="'+(ps.deduction_health||'')+'" placeholder="0" oninput="psCalcGross()" style="padding-left:22px"></div></div></div>';
-  h+='<div class="row"><div class="fi"><label class="lb">HSA / FSA Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psOther" value="'+(ps.deduction_other||'')+'" placeholder="0" oninput="psCalcGross()" style="padding-left:22px"></div></div>';
+  h+='<div class="row"><div class="fi"><label class="lb">HSA / FSA Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psOther" value="'+(ps.deduction_other||'')+'" placeholder="0" oninput="psCalcGross();_psCheckHsaCap()" style="padding-left:22px"></div><div id="psHsaWarn" style="font-size:10px;color:var(--mu);margin-top:3px">Tip: HSA cap is $4,400/yr self-only / $8,750/yr family (2026). FSA cap is $3,300/yr.</div></div>';
   h+='<div class="fi"><label class="lb">Other Pre-Tax</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="psOtherMisc" value="'+(ps.deduction_misc||'')+'" placeholder="Life ins, transit, etc." oninput="psCalcGross()" style="padding-left:22px"></div></div></div>';
   // Calculated gross display
   h+='<div id="psGrossDisplay" style="margin-top:10px;padding:10px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.15);border-radius:2px;display:flex;justify-content:space-between;align-items:center"><span style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF">Gross Per Check (take-home + deductions)</span><span id="psGrossVal" style="font-family:var(--fd);font-size:20px;color:#5B9BFF">$0</span></div>';
@@ -6097,6 +6097,7 @@ function psFreqChange(){
     }
   }
   psCalcGross();
+  if(typeof _psCheckHsaCap==='function') _psCheckHsaCap();
 }
 function psCalcGross(){
   var _psN=function(id){return parseFloat(((document.getElementById(id)||{}).value||'').replace(/[,\s]/g,''))||0;};
@@ -6110,6 +6111,40 @@ function psCalcGross(){
   if(grossEl) grossEl.textContent='$'+Math.round(gross).toLocaleString();
   var hiddenGross=document.getElementById('psGross');
   if(hiddenGross) hiddenGross.value=gross;
+}
+// Lightweight HSA cap warning for the Quick Paycheck Simulator. No HSA/FSA toggle
+// in this simulator — we surface BOTH thresholds so the user can self-check, and
+// flag clearly when the entered amount exceeds whichever they're contributing to.
+function _psCheckHsaCap(){
+  var warnEl=document.getElementById('psHsaWarn');
+  if(!warnEl) return;
+  var psOtherEl=document.getElementById('psOther');
+  var perCheck=parseFloat((psOtherEl&&psOtherEl.value||'').replace(/[,\s]/g,''))||0;
+  if(perCheck<=0){
+    warnEl.innerHTML='Tip: HSA cap is $4,400/yr self-only / $8,750/yr family (2026). FSA cap is $3,300/yr.';
+    warnEl.style.color='var(--mu)';
+    return;
+  }
+  var freq=(document.getElementById('psFreq')||{}).value||'biweekly';
+  var checksPerYear=({weekly:52,biweekly:26,semimonthly:24,monthly:12,irregular:12})[freq]||26;
+  var annual=perCheck*checksPerYear;
+  var age=parseInt(S.currentAge)||0;
+  var hsaSelf=_hsaAnnualLimit('self',age);
+  var hsaFamily=_hsaAnnualLimit('family',age);
+  var fsa=_fsaAnnualLimit();
+  if(annual>hsaFamily){
+    warnEl.innerHTML='🚫 <strong style="color:var(--rd)">'+fmt(annual)+'/yr exceeds every limit.</strong> HSA self-only '+fmt(hsaSelf)+', family '+fmt(hsaFamily)+', FSA '+fmt(fsa)+'.';
+    warnEl.style.color='var(--rd)';
+  } else if(annual>hsaSelf){
+    warnEl.innerHTML='⚠ <strong style="color:var(--or)">'+fmt(annual)+'/yr</strong> is over HSA self-only ('+fmt(hsaSelf)+') and FSA ('+fmt(fsa)+'). Only valid if HSA family coverage.';
+    warnEl.style.color='var(--or)';
+  } else if(annual>fsa){
+    warnEl.innerHTML='⚠ <strong style="color:var(--or)">'+fmt(annual)+'/yr</strong> is over FSA cap ('+fmt(fsa)+'). Only valid if HSA.';
+    warnEl.style.color='var(--or)';
+  } else {
+    warnEl.innerHTML='✓ '+fmt(annual)+'/yr is within all caps. HSA self '+fmt(hsaSelf)+' / family '+fmt(hsaFamily)+' / FSA '+fmt(fsa)+'.';
+    warnEl.style.color='var(--gr)';
+  }
 }
 function psIncomeSelect(){
   var sel=document.getElementById('psIncSrc');
@@ -7909,6 +7944,13 @@ function updInvAccount(i,field,val){
   S._touched.investments=true;
   S.investments[i][field]=['balance','monthlyContrib'].indexOf(field)!==-1?stripComma(val):val;
   updateInvTotals();
+  // Live-refresh the HSA cap warning when contribution or coverage type changes,
+  // without re-rendering the row (which would lose input focus mid-typing).
+  var a=S.investments[i];
+  if(a && a.type==='hsa' && (field==='monthlyContrib'||field==='hsaCoverage')){
+    var warnEl=document.getElementById('hsaCapWarn_'+i);
+    if(warnEl) warnEl.innerHTML=_hsaCapWarnHtml(a);
+  }
   calc();
 }
 function delInvAccount(i){
@@ -7949,6 +7991,83 @@ function updateInvTotals(){
   var totalCount = personalCount + jointCount;
   el.innerHTML='<span style="color:var(--wh);font-family:var(--fh);font-weight:700">'+(totBal>=1000?'$'+Math.round(totBal).toLocaleString():fmtK(totBal))+'</span> total · <span style="color:var(--gr)">'+fmt(totContrib)+'/mo</span> contributions · <span style="color:var(--mu)">'+totalCount+' account'+(totalCount!==1?'s':'')+'</span>';
 }
+// ── HSA contribution limit helper ──
+// 2026 IRS limits per Rev. Proc. 2025-19: $4,400 self-only / $8,750 family.
+// Catch-up of +$1,000 applies at age 55 and up.
+// Coverage: 'self' (default) or 'family'. Returns annual cap in dollars.
+function _hsaAnnualLimit(coverage, age){
+  var base = (coverage === 'family') ? 8750 : 4400;
+  var catchUp = ((parseInt(age)||0) >= 55) ? 1000 : 0;
+  return base + catchUp;
+}
+// 2026 FSA limit per IRS Rev. Proc. 2025-32: $3,300 health FSA. No catch-up.
+function _fsaAnnualLimit(){
+  return 3300;
+}
+// Combined cap helper for paycheck "HSA / FSA" field, where the user can flag the
+// deduction as HSA, FSA, or BOTH. When 'both', the combined cap is HSA + FSA
+// (typical Limited-Purpose FSA pairing).
+function _hsaFsaAnnualLimit(kind, hsaCoverage, age){
+  if(kind === 'fsa') return _fsaAnnualLimit();
+  if(kind === 'both') return _hsaAnnualLimit(hsaCoverage, age) + _fsaAnnualLimit();
+  return _hsaAnnualLimit(hsaCoverage, age);// default HSA
+}
+// Build the HSA cap warning HTML for an Investments-card HSA account.
+// Returns '' when there's nothing to warn about (no contribution yet, or well below cap).
+// Red when at/over the cap; blue when within $1k.
+function _hsaCapWarnHtml(a){
+  var coverage = (a && a.hsaCoverage) || 'self';
+  var age = parseInt(S.currentAge) || 0;
+  var maxAnnual = _hsaAnnualLimit(coverage, age);
+  var monthly = parseFloat(a && a.monthlyContrib) || 0;
+  var annual = monthly * 12;
+  if(annual <= 0) return '';
+  if(annual > maxAnnual){
+    var overBy = annual - maxAnnual;
+    var maxMonthly = Math.floor(maxAnnual / 12);
+    return '<div style="margin-top:6px;padding:8px 10px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.22);border-radius:3px;font-size:11px;color:var(--rd);line-height:1.5">'
+      +'🚫 <strong>Over IRS HSA limit by '+fmt(overBy)+'/yr.</strong> '+coverage.charAt(0).toUpperCase()+coverage.slice(1)+' coverage'+(age>=55?' + 55+ catch-up':'')+' cap is '+fmt(maxAnnual)+'/yr (~'+fmt(maxMonthly)+'/mo). Excess contributions face a 6% excise tax until withdrawn.'
+      +'</div>';
+  }
+  var remaining = maxAnnual - annual;
+  if(remaining > 0 && remaining < 1000){
+    return '<div style="margin-top:6px;padding:8px 10px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:3px;font-size:11px;color:#5B9BFF;line-height:1.5">'
+      +'ℹ <strong>'+fmt(remaining)+' remaining</strong> before hitting the '+fmt(maxAnnual)+'/yr IRS HSA cap ('+coverage+' coverage'+(age>=55?' + 55+ catch-up':'')+').'
+      +'</div>';
+  }
+  return '';
+}
+// Paycheck-level HSA/FSA cap warning. Caller provides the income source `src` and
+// computes annual = deduction_hsa per check × checks/year. The kind toggle on src
+// (`src.hsaFsaType`) determines which IRS limit applies. Returns '' when below cap.
+function _hsaFsaPaycheckWarnHtml(src){
+  if(!src) return '';
+  var perCheck = parseFloat(src.deduction_hsa) || 0;
+  if(perCheck <= 0) return '';
+  var checksPerYear = _checksPerMonth(src.pay_frequency) * 12;
+  var annual = perCheck * checksPerYear;
+  var kind = src.hsaFsaType || 'hsa';
+  var hsaCoverage = src.hsaCoverage || 'self';
+  var age = parseInt(S.currentAge) || 0;
+  var maxAnnual = _hsaFsaAnnualLimit(kind, hsaCoverage, age);
+  var kindLabel = kind === 'fsa' ? 'FSA' : kind === 'both' ? 'HSA + FSA combined' : 'HSA';
+  if(annual > maxAnnual){
+    var overBy = annual - maxAnnual;
+    return '<div style="margin-top:6px;padding:8px 10px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.22);border-radius:3px;font-size:11px;color:var(--rd);line-height:1.5">'
+      +'🚫 <strong>Over IRS '+kindLabel+' limit by '+fmt(overBy)+'/yr.</strong> '
+      +'2026 cap: '+fmt(maxAnnual)+'/yr'
+      +(kind!=='fsa'?' ('+hsaCoverage+' coverage'+(age>=55?' + 55+ catch-up':'')+')':'')+'. '
+      +'You\'re contributing '+fmt(annual)+'/yr across '+Math.round(checksPerYear)+' checks. Excess HSA contributions face a 6% excise tax; FSA excess is forfeited at year end.'
+      +'</div>';
+  }
+  var remaining = maxAnnual - annual;
+  if(remaining > 0 && remaining < 1000){
+    return '<div style="margin-top:6px;padding:8px 10px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:3px;font-size:11px;color:#5B9BFF;line-height:1.5">'
+      +'ℹ <strong>'+fmt(remaining)+' remaining</strong> before hitting the '+fmt(maxAnnual)+'/yr IRS '+kindLabel+' cap.'
+      +'</div>';
+  }
+  return '';
+}
 function _invAccountRowHtml(a,i){
   if(!a)return'';
   var rt=INV_TYPES.find(function(t){return t.val===a.type;})||INV_TYPES[0];
@@ -7972,6 +8091,7 @@ function _invAccountRowHtml(a,i){
   // HSA-specific: coverage type field (affects IRS contribution limit)
   if(rt.hsa){
     h+='<div class="row"><div class="fi"><label class="lb">HSA Coverage Type</label><select class="sel" onchange="updInvAccount('+i+',\'hsaCoverage\',this.value)"><option value="self"'+(a.hsaCoverage==='self'?' selected':'')+'>Self-Only ($4,400/yr cap)</option><option value="family"'+(a.hsaCoverage==='family'?' selected':'')+'>Family ($8,750/yr cap)</option></select></div><div class="fi"></div></div>'
+      +'<div id="hsaCapWarn_'+i+'">'+_hsaCapWarnHtml(a)+'</div>'
       +'<div style="padding:8px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.12);border-radius:3px;font-size:10px;color:var(--mu);line-height:1.5;margin-top:4px">💡 HSA is the only triple-tax-advantaged account: tax-deductible contributions, tax-free growth, tax-free withdrawals for qualified medical expenses. After 65, withdrawals for any purpose are taxed at ordinary income (no penalty) — making HSA function like a Traditional IRA with extra tax-free medical use.</div>';
   }
   // Return assumption sliders (collapsed by default — reuse retirement's net-return display)
@@ -8080,6 +8200,10 @@ function addIncome(owner){
     src.employer_match_pct=0;
     src.employer_match_cap=0;
     src.next_pay_date='';
+    // HSA/FSA toggle for the cap warning — defaults to HSA self-only.
+    // User can switch to FSA-only or HSA+FSA combined from the row UI.
+    src.hsaFsaType='hsa';
+    src.hsaCoverage='self';
   }
   S.incomeSources.push(src);
   S._touched.incomeSources=true;
@@ -8412,7 +8536,7 @@ function _incomeRowDetailedHtml(src,i){
       +'<div class="fi"><label class="lb">Health / Dental / Vision</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="incDedHealth_'+i+'" type="number" placeholder="0" value="'+(src.deduction_health||'')+'" oninput="updIncome('+i+',\'deduction_health\',this.value)" style="padding-left:22px"></div></div>'
     +'</div>'
     +'<div class="row">'
-      +'<div class="fi"><label class="lb">HSA / FSA</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="incDedHsa_'+i+'" type="number" placeholder="0" value="'+(src.deduction_hsa||'')+'" oninput="updIncome('+i+',\'deduction_hsa\',this.value)" style="padding-left:22px"></div></div>'
+      +'<div class="fi"><label class="lb">HSA / FSA</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="incDedHsa_'+i+'" type="number" placeholder="0" value="'+(src.deduction_hsa||'')+'" oninput="updIncome('+i+',\'deduction_hsa\',this.value)" style="padding-left:22px"></div><div style="display:flex;align-items:center;gap:6px;margin-top:4px"><span style="font-size:10px;color:var(--mu);font-family:var(--fh);letter-spacing:.05em">Type:</span><select class="sel" id="incHsaFsaType_'+i+'" style="flex:1;min-height:28px;font-size:11px;padding:2px 24px 2px 6px" onchange="updIncome('+i+',\'hsaFsaType\',this.value)"><option value="hsa"'+((src.hsaFsaType||'hsa')==='hsa'?' selected':'')+'>HSA only</option><option value="fsa"'+(src.hsaFsaType==='fsa'?' selected':'')+'>FSA only</option><option value="both"'+(src.hsaFsaType==='both'?' selected':'')+'>Both (HSA + Limited-Purpose FSA)</option></select>'+((src.hsaFsaType||'hsa')!=='fsa'?'<select class="sel" id="incHsaCov_'+i+'" style="flex:1;min-height:28px;font-size:11px;padding:2px 24px 2px 6px" onchange="updIncome('+i+',\'hsaCoverage\',this.value)"><option value="self"'+((src.hsaCoverage||'self')==='self'?' selected':'')+'>Self-Only</option><option value="family"'+(src.hsaCoverage==='family'?' selected':'')+'>Family</option></select>':'')+'</div><div id="incHsaFsaWarn_'+i+'">'+_hsaFsaPaycheckWarnHtml(src)+'</div></div>'
       +'<div class="fi"><label class="lb">Other Pre-Tax</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="incDedOther_'+i+'" type="number" placeholder="0" value="'+(src.deduction_other||'')+'" oninput="updIncome('+i+',\'deduction_other\',this.value)" style="padding-left:22px"></div></div>'
     +'</div>'
     +'<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--gr);margin:8px 0 6px">Employer 401k Match</div>'
@@ -8623,6 +8747,20 @@ function updIncome(i,key,val){
   if(_incSrcMode(S.incomeSources[i])==='detailed'&&(key==='deduction_hsa'||key==='pay_frequency')){
     clearTimeout(S._hsaInvSyncTimer);
     S._hsaInvSyncTimer=setTimeout(function(){_syncHsaInvAcctFromIncomeSource(i);},1500);
+  }
+  // Live-refresh the HSA/FSA cap warning on the paycheck row when relevant fields change.
+  // The toggle (hsaFsaType / hsaCoverage) flips which IRS limit applies; deduction_hsa
+  // and pay_frequency change the annual total being compared.
+  if(_incSrcMode(S.incomeSources[i])==='detailed'&&
+     (key==='deduction_hsa'||key==='pay_frequency'||key==='hsaFsaType'||key==='hsaCoverage')){
+    var warnEl=document.getElementById('incHsaFsaWarn_'+i);
+    if(warnEl) warnEl.innerHTML=_hsaFsaPaycheckWarnHtml(S.incomeSources[i]);
+    // Hide/show the HSA Coverage sub-select when toggle changes (FSA-only doesn't need it)
+    if(key==='hsaFsaType'){
+      // Simplest: trigger a row re-render so the markup matches the new toggle state.
+      // The re-render will call _hsaFsaPaycheckWarnHtml again with the new data.
+      if(typeof renderIncomeRow==='function') renderIncomeRow();
+    }
   }
 }
 function delIncome(i){ if(!S.incomeSources||S.incomeSources.length<=1) return; S._touched.incomeSources=true; S.incomeSources.splice(i,1); renderIncomeRow(); calc(); }
@@ -18336,7 +18474,7 @@ function renderTaxEstimateModal(){
   h+='<div class="row"><div class="fi"><label class="lb">Filing Status</label><select class="sel" id="te_filing" onchange="calcTaxEstimate()" style="min-height:36px"><option value="single"'+(filing==='single'?' selected':'')+'>Single</option><option value="married"'+(filing==='married'?' selected':'')+'>Married Filing Jointly</option><option value="hoh">Head of Household</option></select></div>';
   h+='<div class="fi"><label class="lb">Dependents</label><input class="inp" type="number" id="te_dep" value="0" min="0" oninput="calcTaxEstimate()" style="min-height:36px"></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">401k / Traditional IRA (annual)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="te_401k" value="'+Math.round(retContr)+'" oninput="calcTaxEstimate()" style="padding-left:22px;min-height:36px"></div></div>';
-  h+='<div class="fi"><label class="lb">HSA Contributions (annual)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="te_hsa" value="0" oninput="calcTaxEstimate()" style="padding-left:22px;min-height:36px"></div></div></div>';
+  h+='<div class="fi"><label class="lb">HSA Contributions (annual)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="te_hsa" value="0" oninput="calcTaxEstimate()" style="padding-left:22px;min-height:36px"></div><div id="te_hsaWarn" style="font-size:10px;color:var(--mu);margin-top:3px">Self-only coverage assumed. Verify on the Investments card if family.</div></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">Itemized Deductions (if > standard)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="te_itemized" value="0" oninput="calcTaxEstimate()" style="padding-left:22px;min-height:36px"></div></div>';
   h+='<div class="fi"><label class="lb">Taxes Already Withheld</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="te_withheld" value="0" oninput="calcTaxEstimate()" style="padding-left:22px;min-height:36px"></div></div></div>';
 
@@ -18351,6 +18489,24 @@ function calcTaxEstimate(){
   var k401=pf(gv('te_401k'))||0;var hsa=pf(gv('te_hsa'))||0;
   var itemized=pf(gv('te_itemized'))||0;var withheld=pf(gv('te_withheld'))||0;
   var el=document.getElementById('te_results');if(!el)return;
+
+  // HSA cap warning — Tax Estimator assumes self-only coverage since there's no toggle here.
+  // Users with family coverage should reference the Investments card where the full cap applies.
+  var teHsaWarnEl=document.getElementById('te_hsaWarn');
+  if(teHsaWarnEl){
+    var teAge=parseInt(S.currentAge)||0;
+    var teMax=_hsaAnnualLimit('self',teAge);
+    if(hsa>teMax){
+      teHsaWarnEl.innerHTML='🚫 <strong style="color:var(--rd)">Over IRS HSA limit by '+fmt(hsa-teMax)+'.</strong> Self-only cap '+(teAge>=55?'(55+ catch-up) ':'')+'is '+fmt(teMax)+'/yr. Family coverage would be '+fmt(_hsaAnnualLimit('family',teAge))+'/yr.';
+      teHsaWarnEl.style.color='var(--rd)';
+    } else if(hsa>0 && teMax-hsa<1000){
+      teHsaWarnEl.innerHTML='ℹ <strong style="color:#5B9BFF">'+fmt(teMax-hsa)+' remaining</strong> before the '+fmt(teMax)+'/yr self-only cap.';
+      teHsaWarnEl.style.color='#5B9BFF';
+    } else {
+      teHsaWarnEl.innerHTML='Self-only coverage assumed. Verify on the Investments card if family.';
+      teHsaWarnEl.style.color='var(--mu)';
+    }
+  }
 
   var gross=w2+se+stcg;// ordinary income (LTCG taxed separately)
   var stdDed=filing==='married'?32200:filing==='hoh'?24150:16100;
@@ -22133,7 +22289,7 @@ function renderHSACalc(){
 
   // ── Inputs ──
   h+='<div class="row"><div class="fi"><label class="lb">Current HSA Balance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="hsa_bal" value="5000" oninput="calcHSA()" style="padding-left:22px;min-height:36px"></div></div>';
-  h+='<div class="fi"><label class="lb">Annual Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="hsa_contr" value="3000" oninput="calcHSA()" style="padding-left:22px;min-height:36px"></div></div></div>';
+  h+='<div class="fi"><label class="lb">Annual Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="hsa_contr" value="3000" oninput="calcHSA()" style="padding-left:22px;min-height:36px"></div><div id="hsa_capWarn" style="font-size:10px;color:var(--mu);margin-top:3px"></div></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">Coverage Type</label><select class="sel" id="hsa_type" onchange="calcHSA()" style="min-height:36px"><option value="self">Self Only</option><option value="family" selected>Family</option></select></div>';
   h+='<div class="fi"><label class="lb">Tax Bracket %</label><input class="inp" type="number" id="hsa_bracket" value="22" oninput="calcHSA()" style="min-height:36px"></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">Annual Medical Expenses</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="hsa_medical" value="3000" oninput="calcHSA()" style="padding-left:22px;min-height:36px"></div></div>';
@@ -22162,6 +22318,20 @@ function calcHSA(){
   var catchUp=age>=55?1000:0;
   // 2026 HSA limits per IRS Rev. Proc. 2025-19: $4,400 self-only / $8,750 family + $1,000 catch-up at 55+
   var maxContr=(type==='self'?4400:8750)+catchUp;
+  // Update the inline cap warning under the Annual Contribution field
+  var hsaCapWarnEl=document.getElementById('hsa_capWarn');
+  if(hsaCapWarnEl){
+    if(contr>maxContr){
+      hsaCapWarnEl.innerHTML='🚫 <strong style="color:var(--rd)">Over IRS HSA limit by '+fmt(contr-maxContr)+'.</strong> '+(type==='self'?'Self-only':'Family')+' cap'+(age>=55?' (incl. 55+ catch-up)':'')+' is '+fmt(maxContr)+'/yr.';
+      hsaCapWarnEl.style.color='var(--rd)';
+    } else if(contr>0 && maxContr-contr<1000){
+      hsaCapWarnEl.innerHTML='ℹ <strong style="color:#5B9BFF">'+fmt(maxContr-contr)+' remaining</strong> before the '+fmt(maxContr)+'/yr cap.';
+      hsaCapWarnEl.style.color='#5B9BFF';
+    } else {
+      hsaCapWarnEl.innerHTML='2026 cap: '+fmt(maxContr)+'/yr ('+(type==='self'?'self-only':'family')+(age>=55?' + 55+ catch-up':'')+')';
+      hsaCapWarnEl.style.color='var(--mu)';
+    }
+  }
   var gap=Math.max(0,maxContr-contr);
   var taxSavedNow=Math.round(contr*bracket);// going in
   var maxTaxSaved=Math.round(maxContr*bracket);
