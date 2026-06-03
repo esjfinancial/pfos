@@ -1075,6 +1075,12 @@ const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBh
 var PFOS_ORIGIN='https://pfos.esjfinancial.com';
 var APP_COUPLES=[],APP_RECS=[],APP_ADVISORY_FILTER='all',APP_PRODUCT_FILTER='all';
 var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=false,_firstSaveGuardPassed=false;
+// Frame-readiness gate. The PFOS iframe (pfos-main) signals PFOS_READY once it can
+// receive messages. Posting PFOS_LOAD before that (e.g. right after a profile
+// switch, or before the frame finished re-initializing) silently drops the
+// message and leaves the view stale until a manual refresh. We track readiness
+// and queue the most recent critical message, flushing it when the frame is ready.
+var _pfosFrameReady=false,_pfosPendingPost=null,_pfosExpectedClientId=null;
 var _sessionStart=null,_sessionClientId=null;
 var _sessionTimer=null,_sessionWarnTimer=null;
 var SESSION_WARN_MS=25*60*1000,SESSION_IDLE_MS=30*60*1000,_lastReset=0;
@@ -2265,6 +2271,7 @@ function getPartnerClientId(coupleLink, myClientId){
 function loadPFOSTool(containerId){
   var el = document.getElementById(containerId);
   if(!el) return;
+  _pfosFrameReady=false;// new frame — not ready until it signals PFOS_READY
   var iframe = document.createElement('iframe');
   iframe.id = 'pfosFrame';
   iframe.src = 'https://pfos.esjfinancial.com/pfos-main';
@@ -2279,6 +2286,13 @@ function loadPFOSTool(containerId){
 }
 function pfosPost(msg){
   var frame = getPFOSFrame();
+  // If the frame isn't ready yet, queue the critical load message so it isn't
+  // lost — it will be flushed when PFOS_READY arrives. Other message types are
+  // best-effort (they recur or aren't load-critical).
+  if(!_pfosFrameReady && msg && msg.type==='PFOS_LOAD'){
+    _pfosPendingPost = msg;
+    return;
+  }
   if(frame && frame.contentWindow) frame.contentWindow.postMessage(msg, PFOS_ORIGIN);
 }
 function getPFOSFrame(){
@@ -2391,14 +2405,23 @@ async function loadClientDataIntoPFOS(clientId){
   var seedCalcs = (stateData && stateData.calcs) || {};
   _lastPfosState = { state: stateData || {}, calcs: seedCalcs };
   APP.currentClientCalcs = seedCalcs;
+  // Record which client the iframe is being loaded with, so we can reject any
+  // PFOS_DATA_CHANGE that arrives from a PREVIOUSLY-loaded client. On a profile
+  // switch the old iframe may still flush a debounced save tagged with the old
+  // client; without this check it would be written under the new client.
+  _pfosExpectedClientId = clientId;
+  // Block saves until the iframe confirms it loaded THIS client (echoed clientId
+  // in PFOS_DATA_CHANGE). Prevents a stale in-flight save from the prior client
+  // passing the guard mid-switch.
+  _pfosDataLoaded=false;
 
   var _ci=APP.currentClient?{name:APP.currentClient.name||'',email:APP.currentClient.email||'',phone:APP.currentClient.phone||'',marital:APP.currentClient.marital_status||'',spouse:APP.currentClient.spouse_name||'',householdType:APP.currentClient.household_type||''}:null;
   pfosPost({ type:'PFOS_LOAD', state: stateData, clientInfo: _ci, mode: mode, tier: pfosTier,
+    clientId: clientId,
     trialStart: APP.currentClient ? (APP.currentClient.trial_start_date||null) : null,
     clientType: APP.currentClient ? (APP.currentClient.client_type||'product') : 'product',
     assignedAdvisorId: (APP.currentClient && APP.currentClient.client_type !== 'product') ? (APP.currentClient.user_id || null) : null,
     coupleData: coupleData });
-  _pfosDataLoaded=true;
   // Sync advisor's plan to iframe so Progress section shows plan tracking
   setTimeout(function(){_syncPlanToMain();},500);
 }
@@ -5823,7 +5846,10 @@ window.addEventListener('message', async function(e){
   if(msg.type === 'PFOS_READY'){
     _pfosDataLoaded=false;
     _firstSaveGuardPassed=false;
+    _pfosFrameReady=true;// frame can now receive messages
     pfosPost({ type:'PFOS_AUTH' });
+    // Flush any load message that was queued before the frame was ready.
+    if(_pfosPendingPost){ var _pend=_pfosPendingPost; _pfosPendingPost=null; pfosPost(_pend); }
     if(APP.currentClientId) loadClientDataIntoPFOS(APP.currentClientId);
     return;
   }
@@ -5961,7 +5987,21 @@ window.addEventListener('message', async function(e){
   }
   if(msg.type === 'PFOS_DATA_CHANGE'){
     console.log('[PFOS-CP] PFOS_DATA_CHANGE received. calcs.inc:', msg.state&&msg.state.calcs?msg.state.calcs.inc:'NO CALCS');
-    if(!_pfosDataLoaded){console.log('[PFOS-CP] Skipping save — data not loaded yet');return;}
+    // Reject data-change messages from a client other than the one we loaded.
+    // On a profile switch the old iframe may flush a debounced save tagged with
+    // the previous client; writing that under the new client would corrupt data.
+    // Agent-finances mode has no expected client id, so it skips this check.
+    if(!(pfosClientContext && pfosClientContext.isAgentProfile)
+       && _pfosExpectedClientId && msg.clientId && msg.clientId!==_pfosExpectedClientId){
+      console.log('[PFOS-CP] Ignoring stale PFOS_DATA_CHANGE for '+msg.clientId+' (expected '+_pfosExpectedClientId+')');
+      return;
+    }
+    // First matching data-change confirms the iframe loaded THIS client → allow saves.
+    // Agent-finances mode is exempt (no client id); it manages its own load below.
+    if(!(pfosClientContext && pfosClientContext.isAgentProfile) && !_pfosDataLoaded){
+      if(_pfosExpectedClientId && msg.clientId && msg.clientId===_pfosExpectedClientId){ _pfosDataLoaded=true; }
+      else { console.log('[PFOS-CP] Skipping save — data not loaded yet'); return; }
+    }
     var clientId = APP.currentClientId;
     // Phase 10: If in agent finances mode, save to agent_profiles instead
     if(pfosClientContext && pfosClientContext.isAgentProfile){
