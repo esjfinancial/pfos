@@ -7042,7 +7042,7 @@ function _cpExtractFlags(){
   var hasHDHP=false;
   // Self-owned income source with an HSA payroll deduction or HDHP coverage flag.
   var _selfSrcs=(rawS2.incomeSources||[]).filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';});
-  if(_selfSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0||(s.hsaCoverage&&s.hsaCoverage!=='none');}))hasHDHP=true;
+  if(_selfSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0;}))hasHDHP=true;
   // Self HDHP flag on profile is not owner-tagged. Only trust it for the primary
   // when there's no spouse in the household (otherwise it may be the spouse's).
   var _hasSpouseData=!!(rawS2&&rawS2.incomeSources&&rawS2.incomeSources.some(function(s){return (s&&s.owner)==='spouse';}));
@@ -7149,7 +7149,7 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
   var spHDHP=false;
   if(rawS2.profile&&rawS2.profile.spHasHDHP)spHDHP=true;
   var _spSrcs=(rawS2.incomeSources||[]).filter(function(s){return (s&&s.owner)==='spouse';});
-  if(_spSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0||(s.hsaCoverage&&s.hsaCoverage!=='none');}))spHDHP=true;
+  if(_spSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0;}))spHDHP=true;
   if(spHDHP&&!_spHasAlloc(['hsa']))
     flags.push({icon:'💊',title:'HSA eligible'+tag+' — triple tax advantage',desc:spName+'\'s HDHP unlocks the only triple-tax-advantaged account: tax-free in, growth, and medical withdrawals.',type:'opp',action:'hsa_spouse',owner:'spouse'});
   // ── Life insurance gap (spouse) — detailed, calculated copy (mirrors primary) ──
@@ -15351,6 +15351,12 @@ function _cpMatchExisting(a, opts){
     incomeSources.forEach(function(src){
       if(!src)return;
       if(src.id&&_linkedSourceIds[src.id])return;// already counted via investments
+      // Owner filter: a self/personal HSA card must not count the spouse's
+      // paycheck HSA deduction, and vice-versa. Without this both spouses' cards
+      // summed the whole household HSA deduction.
+      var _srcOwner=(src.owner||'personal');
+      if(owner==='spouse'){ if(_srcOwner!=='spouse')return; }
+      else { if(_srcOwner==='spouse')return; }
       var perCheck=parseFloat(src.deduction_hsa)||0;
       if(perCheck<=0)return;
       var checks=(typeof _checksPerMonth==='function')?_checksPerMonth(src.pay_frequency):2.1667;
@@ -17899,7 +17905,7 @@ function _cpOwnerBadge(a){
   var _ix=CPLAN.allocations.indexOf(a);
   var _selfNm=(typeof esc==='function')?esc(_cpOwnerFirstName('self')):_cpOwnerFirstName('self');
   var _spNm=(typeof esc==='function')?esc(_cpOwnerFirstName('spouse')):_cpOwnerFirstName('spouse');
-  var _sel='<select title="'+safeTitle+'" onchange="_cpSetCardOwner('+_ix+',this.value)" onclick="event.stopPropagation()" style="margin-left:8px;padding:2px 6px;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.06em;color:'+color+';background:'+bg+';border:1px solid '+brd+';border-radius:2px;text-transform:uppercase;white-space:nowrap;cursor:pointer;-webkit-appearance:none;appearance:none">';
+  var _sel='<select title="'+safeTitle+'" onchange="_cpSetCardOwner('+_ix+',this.value)" onclick="event.stopPropagation()" style="margin-left:8px;padding:2px 6px;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.06em;color:'+color+';background:'+bg+';border:1px solid '+brd+';border-radius:2px;text-transform:uppercase;white-space:nowrap;cursor:pointer;-webkit-appearance:none;appearance:none;padding-right:18px;background-image:url(\'data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%228%22 height=%228%22 viewBox=%220 0 8 8%22><path d=%22M1 2.5L4 5.5L7 2.5%22 stroke=%22%23999%22 stroke-width=%221.2%22 fill=%22none%22 stroke-linecap=%22round%22/></svg>\');background-repeat:no-repeat;background-position:right 5px center">';
   _sel+='<option value="self"'+(owner==='self'?' selected':'')+'>'+_selfNm+'</option>';
   _sel+='<option value="spouse"'+(owner==='spouse'?' selected':'')+'>'+_spNm+'</option>';
   _sel+='<option value="joint"'+(owner==='joint'?' selected':'')+'>Shared</option>';
@@ -18579,6 +18585,8 @@ function _cpBuildCard(a,idx,isUnassigned){
     } else {
       var _mr=_nRate/100;var _cf2=_cpGetCF(a);
       var _totMonthly=(typeof _curContribCard==='number'?_curContribCard:0)+(parseFloat(a.amount)||0);
+      var _startBal2=parseFloat(_matchBuildCard&&_matchBuildCard.currentBalance)||0;
+      _yr5=_startBal2;_yr10=_startBal2;_yr20=_startBal2;
       for(var _yp=1;_yp<=20;_yp++){
         var _c=_totMonthly*12*_cf2;
         _yr5=_yp<=5?(_yr5+_c)*(1+_mr):_yr5;
@@ -19536,7 +19544,9 @@ function _cpBuildCard(a,idx,isUnassigned){
   // the card's slider uses). Previously gated on a.amount>0 alone, which hid the
   // assumptions on accounts that already have contributions but no planned change
   // (e.g. a 401k at $542/mo with "no change planned").
-  var _rfCurContrib=(typeof _cpMatchExisting==='function')?(parseInt((_cpMatchExisting(a)||{}).currentContrib)||0):0;
+  var _rfMatch=(typeof _cpMatchExisting==='function')?(_cpMatchExisting(a)||{}):{};
+  var _rfCurContrib=parseInt(_rfMatch.currentContrib)||0;
+  var _rfCurBalance=parseFloat(_rfMatch.currentBalance)||0;
   var _rfHasMoney=((parseFloat(a.amount)||0)>0)||(_rfCurContrib>0);
   if(isD&&_cpTierHas('return_fee')&&['roth','401k','roth401k','invest','iul','wl','edu','trad_ira','solo401k','sep_ira'].indexOf(a.type)>=0&&_rfHasMoney){
     var _isInsDetailed=a.type==='iul'||a.type==='wl'||a.type==='ibc'||(a.type==='edu'&&(a.eduVehicle==='wl'||a.eduVehicle==='iul'));
@@ -19558,7 +19568,11 @@ function _cpBuildCard(a,idx,isUnassigned){
     // just a.amount (the planned change). a.amount can be 0 on a card that's
     // already funded with "no change planned" — using it alone projected $0.
     var _monthlyContribProj=(_rfCurContrib||0)+(parseFloat(a.amount)||0);
-    var rate2=_cpGetNetRate(a);var cf2=_cpGetCF(a);var b5=0,b10=0,b20=0;for(var yp=1;yp<=20;yp++){var cp2=_monthlyContribProj*12*cf2;b5=yp<=5?(b5+cp2)*(1+rate2):b5;b10=yp<=10?(b10+cp2)*(1+rate2):b10;b20=(b20+cp2)*(1+rate2);}
+    // Seed each horizon with the EXISTING account balance so it compounds too —
+    // a $157K balance growing at the net rate is most of the 20yr number. Without
+    // this the projection only counted new contributions and understated the total.
+    var _startBal=_rfCurBalance||0;
+    var rate2=_cpGetNetRate(a);var cf2=_cpGetCF(a);var b5=_startBal,b10=_startBal,b20=_startBal;for(var yp=1;yp<=20;yp++){var cp2=_monthlyContribProj*12*cf2;b5=yp<=5?(b5+cp2)*(1+rate2):b5;b10=yp<=10?(b10+cp2)*(1+rate2):b10;b20=(b20+cp2)*(1+rate2);}
     h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:6px">';
     [{y:'5yr',v:b5},{y:'10yr',v:b10},{y:'20yr',v:b20}].forEach(function(yp2){h+='<div style="text-align:center;padding:6px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:10px;color:var(--mu)">'+yp2.y+'</div><div style="font-family:var(--fd);font-size:14px;color:var(--gr)">'+fmtK(Math.round(yp2.v))+'</div></div>';});
     h+='</div>';
@@ -20257,7 +20271,7 @@ function _cpExtractRedFlags(){
   // not owner-tagged, so detect from self-owned income sources instead).
   var hasHDHP=false;
   var _selfSrcsRF=(rawS2.incomeSources||[]).filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';});
-  if(_selfSrcsRF.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0||(s.hsaCoverage&&s.hsaCoverage!=='none');}))hasHDHP=true;
+  if(_selfSrcsRF.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0;}))hasHDHP=true;
   var _hasSpouseDataRF=!!(rawS2&&rawS2.incomeSources&&rawS2.incomeSources.some(function(s){return (s&&s.owner)==='spouse';}));
   if(rawS2.profile&&rawS2.profile.hasHDHP&&!_hasSpouseDataRF)hasHDHP=true;
   if(rawS2.profile&&rawS2.profile.selfHasHDHP)hasHDHP=true;
