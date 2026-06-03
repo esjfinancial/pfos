@@ -7035,15 +7035,19 @@ function _cpExtractFlags(){
       flags.push({icon:'🛡️',title:'Consider a guaranteed vehicle for '+fmtK(oldBal),desc:annuityRec+'. Surrender charges lock funds 7-12 years; compare against simple target-date fund before committing.',type:'opp',action:'annuity_research'});
     }
   }
-  // ── HSA eligibility (HDHP detection) ──
+  // ── HSA eligibility (HDHP detection) — must be SELF's coverage, not the
+  //    spouse's. In a joint/hybrid household the shared expData/profile can
+  //    carry the spouse's HDHP; attributing it to the primary wrongly shows an
+  //    HSA card for someone who has no HDHP. Check self-owned signals only.
   var hasHDHP=false;
-  if(rawS2.expData){
-    Object.keys(rawS2.expData).forEach(function(k){
-      var exp=rawS2.expData[k];
-      if(exp&&exp.name&&(exp.name.toLowerCase().indexOf('hdhp')>=0||exp.name.toLowerCase().indexOf('high deductible')>=0))hasHDHP=true;
-    });
-  }
-  if(rawS2.profile&&rawS2.profile.hasHDHP)hasHDHP=true;
+  // Self-owned income source with an HSA payroll deduction or HDHP coverage flag.
+  var _selfSrcs=(rawS2.incomeSources||[]).filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';});
+  if(_selfSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0||(s.hsaCoverage&&s.hsaCoverage!=='none');}))hasHDHP=true;
+  // Self HDHP flag on profile is not owner-tagged. Only trust it for the primary
+  // when there's no spouse in the household (otherwise it may be the spouse's).
+  var _hasSpouseData=!!(rawS2&&rawS2.incomeSources&&rawS2.incomeSources.some(function(s){return (s&&s.owner)==='spouse';}));
+  if(rawS2.profile&&rawS2.profile.hasHDHP&&!_hasSpouseData)hasHDHP=true;
+  if(rawS2.profile&&rawS2.profile.selfHasHDHP)hasHDHP=true;
   if(hasHDHP&&!CPLAN.allocations.some(function(a){return a.type==='hsa'&&a.amount>0;}))
     flags.push({icon:'💊',title:'HSA eligible — triple tax advantage',desc:'HDHP unlocks the only triple-tax-advantaged account: tax-free contributions, growth, and withdrawals for medical. After 65, functions like a Traditional IRA.',type:'opp',action:'hsa'});
   // ── Existing IBC policies not in plan ──
@@ -7140,9 +7144,12 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
     var spOldBal=spOld.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
     flags.push({icon:'🔄',title:'Old retirement account'+(spOld.length>1?'s':'')+tag+': '+fmtK(spOldBal),desc:spOld.length+' orphaned account'+(spOld.length>1?'s':'')+' for '+spName+'. Consider rolling into a current IRA/401(k) or a Roth conversion.',type:'warn',action:'rollover_spouse',owner:'spouse'});
   }
-  // ── HSA eligibility (spouse) — HDHP detection from shared expData/profile ──
+  // ── HSA eligibility (spouse) — detect from the spouse's own income sources
+  //    (HSA payroll deduction / HDHP coverage) and the spouse profile flag. ──
   var spHDHP=false;
   if(rawS2.profile&&rawS2.profile.spHasHDHP)spHDHP=true;
+  var _spSrcs=(rawS2.incomeSources||[]).filter(function(s){return (s&&s.owner)==='spouse';});
+  if(_spSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0||(s.hsaCoverage&&s.hsaCoverage!=='none');}))spHDHP=true;
   if(spHDHP&&!_spHasAlloc(['hsa']))
     flags.push({icon:'💊',title:'HSA eligible'+tag+' — triple tax advantage',desc:spName+'\'s HDHP unlocks the only triple-tax-advantaged account: tax-free in, growth, and medical withdrawals.',type:'opp',action:'hsa_spouse',owner:'spouse'});
   // ── Life insurance gap (spouse) — detailed, calculated copy (mirrors primary) ──
@@ -17889,7 +17896,15 @@ function _cpOwnerBadge(a){
   var title = owner === 'joint' ? 'Joint allocation (both spouses contribute)' : (owner === 'spouse' ? 'Your spouse\'s allocation' : 'Your allocation');
   var safeLabel = (typeof esc === 'function') ? esc(label) : String(label).replace(/[<>&"]/g, '');
   var safeTitle = (typeof esc === 'function') ? esc(title) : title;
-  return '<span title="'+safeTitle+'" style="margin-left:8px;padding:2px 7px;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.06em;color:'+color+';background:'+bg+';border:1px solid '+brd+';border-radius:2px;text-transform:uppercase;white-space:nowrap">'+safeLabel+'</span>';
+  var _ix=CPLAN.allocations.indexOf(a);
+  var _selfNm=(typeof esc==='function')?esc(_cpOwnerFirstName('self')):_cpOwnerFirstName('self');
+  var _spNm=(typeof esc==='function')?esc(_cpOwnerFirstName('spouse')):_cpOwnerFirstName('spouse');
+  var _sel='<select title="'+safeTitle+'" onchange="_cpSetCardOwner('+_ix+',this.value)" onclick="event.stopPropagation()" style="margin-left:8px;padding:2px 6px;font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.06em;color:'+color+';background:'+bg+';border:1px solid '+brd+';border-radius:2px;text-transform:uppercase;white-space:nowrap;cursor:pointer;-webkit-appearance:none;appearance:none">';
+  _sel+='<option value="self"'+(owner==='self'?' selected':'')+'>'+_selfNm+'</option>';
+  _sel+='<option value="spouse"'+(owner==='spouse'?' selected':'')+'>'+_spNm+'</option>';
+  _sel+='<option value="joint"'+(owner==='joint'?' selected':'')+'>Shared</option>';
+  _sel+='</select>';
+  return _sel;
 }
 
 
@@ -18563,8 +18578,9 @@ function _cpBuildCard(a,idx,isUnassigned){
       _yr20=(_r20&&_r20.data&&_r20.data.length)?_r20.data[_r20.data.length-1].cv:0;
     } else {
       var _mr=_nRate/100;var _cf2=_cpGetCF(a);
+      var _totMonthly=(typeof _curContribCard==='number'?_curContribCard:0)+(parseFloat(a.amount)||0);
       for(var _yp=1;_yp<=20;_yp++){
-        var _c=a.amount*12*_cf2;
+        var _c=_totMonthly*12*_cf2;
         _yr5=_yp<=5?(_yr5+_c)*(1+_mr):_yr5;
         _yr10=_yp<=10?(_yr10+_c)*(1+_mr):_yr10;
         _yr20=(_yr20+_c)*(1+_mr);
@@ -19538,7 +19554,11 @@ function _cpBuildCard(a,idx,isUnassigned){
     }
     h+='</div>';
     // Year projections inline
-    var rate2=_cpGetNetRate(a);var cf2=_cpGetCF(a);var b5=0,b10=0,b20=0;for(var yp=1;yp<=20;yp++){var cp2=a.amount*12*cf2;b5=yp<=5?(b5+cp2)*(1+rate2):b5;b10=yp<=10?(b10+cp2)*(1+rate2):b10;b20=(b20+cp2)*(1+rate2);}
+    // Project on the TOTAL monthly contribution (what's actually going in), not
+    // just a.amount (the planned change). a.amount can be 0 on a card that's
+    // already funded with "no change planned" — using it alone projected $0.
+    var _monthlyContribProj=(_rfCurContrib||0)+(parseFloat(a.amount)||0);
+    var rate2=_cpGetNetRate(a);var cf2=_cpGetCF(a);var b5=0,b10=0,b20=0;for(var yp=1;yp<=20;yp++){var cp2=_monthlyContribProj*12*cf2;b5=yp<=5?(b5+cp2)*(1+rate2):b5;b10=yp<=10?(b10+cp2)*(1+rate2):b10;b20=(b20+cp2)*(1+rate2);}
     h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;margin-top:6px">';
     [{y:'5yr',v:b5},{y:'10yr',v:b10},{y:'20yr',v:b20}].forEach(function(yp2){h+='<div style="text-align:center;padding:6px;background:rgba(0,68,191,.03);border-radius:2px"><div style="font-size:10px;color:var(--mu)">'+yp2.y+'</div><div style="font-family:var(--fd);font-size:14px;color:var(--gr)">'+fmtK(Math.round(yp2.v))+'</div></div>';});
     h+='</div>';
@@ -20233,10 +20253,14 @@ function _cpExtractRedFlags(){
       flags.push({type:'opp',icon:'🛡️',title:'Consider a guaranteed vehicle for '+fmtK(oldBal),desc:annuityRec+' <strong style="color:var(--gr)">Pros:</strong> '+annuityPros+'. <strong style="color:var(--or)">Cons:</strong> '+annuityCons+' Use the Policy Audit tool to analyze a specific product before committing.',action:'annuity_research'});
     }
   }
-  // HSA eligibility (conditional on HDHP)
+  // HSA eligibility — must be SELF's HDHP, not the spouse's (shared expData is
+  // not owner-tagged, so detect from self-owned income sources instead).
   var hasHDHP=false;
-  if(rawS2.expData){Object.keys(rawS2.expData).forEach(function(k){var exp=rawS2.expData[k];if(exp&&exp.name&&(exp.name.toLowerCase().indexOf('hdhp')>=0||exp.name.toLowerCase().indexOf('high deductible')>=0))hasHDHP=true;});}
-  if(rawS2.profile&&rawS2.profile.hasHDHP)hasHDHP=true;
+  var _selfSrcsRF=(rawS2.incomeSources||[]).filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';});
+  if(_selfSrcsRF.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0||(s.hsaCoverage&&s.hsaCoverage!=='none');}))hasHDHP=true;
+  var _hasSpouseDataRF=!!(rawS2&&rawS2.incomeSources&&rawS2.incomeSources.some(function(s){return (s&&s.owner)==='spouse';}));
+  if(rawS2.profile&&rawS2.profile.hasHDHP&&!_hasSpouseDataRF)hasHDHP=true;
+  if(rawS2.profile&&rawS2.profile.selfHasHDHP)hasHDHP=true;
   if(hasHDHP&&!CPLAN.allocations.some(function(a){return a.type==='hsa'&&a.amount>0;}))
     flags.push({type:'opp',icon:'💊',title:'HSA eligible — triple tax advantage',desc:'Your high-deductible health plan unlocks the only triple-tax-advantaged account: tax-free contributions, growth, and withdrawals for medical. After 65, functions like a Traditional IRA for any purpose.',action:'hsa'});
   // Existing IUL/WL not in plan (IBC or retirement supplement)
@@ -21896,6 +21920,21 @@ async function _cpRevertFromJoint(i){
 }
 
 function _cpSetName(i,v){CPLAN.allocations[i].customName=v;}
+function _cpSetCardOwner(i,owner){
+  var a=CPLAN.allocations[i];if(!a)return;
+  if(['self','spouse','joint'].indexOf(owner)<0)owner='self';
+  a.owner=owner;
+  // Joint cards use per-spouse split fields; seed/clear them so the split slider
+  // renders correctly. When moving OFF joint, drop the split so the single slider
+  // controls the whole amount again.
+  if(owner==='joint'){
+    if(a.amountSelf==null&&a.amountSpouse==null){var _h=(parseFloat(a.amount)||0)/2;a.amountSelf=Math.round(_h);a.amountSpouse=Math.round((parseFloat(a.amount)||0)-_h);}
+  } else { delete a.amountSelf; delete a.amountSpouse; }
+  CPLAN.modified=true; if(typeof _cpMarkModified==='function')_cpMarkModified();
+  if(typeof cplanSave==='function'){try{cplanSave();}catch(e){}}
+  _cpRenderPlanFull();
+  if(typeof _cpToast==='function'){var nm=owner==='joint'?'Shared':(owner==='spouse'?_cpOwnerFirstName('spouse'):_cpOwnerFirstName('self'));_cpToast('Allocation owner set to '+nm);}
+}
 
 function _cpSetEFMonthsTarget(mo){
   var _mo=parseInt(mo)||3;
@@ -23272,7 +23311,6 @@ function _cpRenderPlanFull(){
       h+='</div>';
     }
     _p1Items.forEach(function(a){var idx=CPLAN.allocations.indexOf(a);
-      if(_cpPlanView==='ours')h+='<div style="font-size:10px;font-family:var(--fh);font-weight:700;color:#5B9BFF;letter-spacing:.06em;margin-bottom:-4px;margin-top:4px">YOU</div>';
       h+=_cpBuildCard(a,idx,false);
     });
     h+='<div style="text-align:center;margin-top:8px"><button onclick="_cpShowAddMenu(1)" style="padding:6px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px dashed '+p.border+';color:'+p.color+';cursor:pointer;border-radius:2px;min-height:32px">+ Add to Phase 1</button></div>';
