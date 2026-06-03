@@ -4891,7 +4891,26 @@ function renderProfileSnapshot(fd, scores){
   var nw=c.netWorth||(assets-debt);
   var exp=c.baseExp||0;if(!exp&&rawS.expData){Object.keys(rawS.expData).forEach(function(k){exp+=(parseFloat((rawS.expData[k]||{}).amount)||0);});}
   var ncf=c.netCF||(inc-exp);
-  var sr=c.savingsRate||(inc>0?Math.round((inc-exp)/inc*100*10)/10:0);
+  // ── Household total for coupled clients ──
+  // A couple is the same people with ONE financial picture: the snapshot shows the
+  // HOUSEHOLD total regardless of which partner is loaded or the household type.
+  // CPLAN._partner is populated for couples (joint/hybrid/separate) by the plan
+  // load. We add the partner's figures so the numbers don't change on switch.
+  try{
+    if(typeof CPLAN!=='undefined' && CPLAN._partner){
+      var _p=CPLAN._partner;
+      var _pInc=parseFloat(_p.income)||0;
+      var _pExp=parseFloat(_p.expenses)||0;
+      var _pDebt=(Array.isArray(_p.debts)?_p.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0):0);
+      var _pNW=(parseFloat(_p.efBal)||0)-_pDebt; // partner net worth approximation from available fields
+      inc = inc + _pInc;
+      exp = exp + _pExp;
+      ncf = inc - exp;
+      debt = debt + _pDebt;
+      nw = nw + _pNW;
+    }
+  }catch(e){console.warn('[snapshot] household combine (profile) failed:',e&&e.message);}
+  var sr=inc>0?Math.round((inc-exp)/inc*100*10)/10:(c.savingsRate||0);
   var hasData=inc>0||debt>0||assets>0||Object.keys(c).length>0;
   var snap = hasData
     ? kv('Monthly Income',fmt(inc),inc>0?'var(--gr)':'var(--wh)')+kv('Net Cash Flow',fmt(ncf),ncf>=0?'var(--gr)':'var(--rd)')+kv('Net Worth',fmtK(nw),nw>=0?'var(--gr)':'var(--rd)')+kv('Total Debt',fmtK(debt),'var(--or)')+kv('Savings Rate',sr.toFixed(1)+'%')
@@ -7033,6 +7052,15 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
       }
     }
   }catch(e){console.warn('Couple link load failed:',e);}
+  // Partner is now loaded (or confirmed absent). Re-render the profile snapshot so
+  // it shows the HOUSEHOLD total — the initial render in openClientProfile ran
+  // before CPLAN._partner was populated, so it would have shown only this
+  // profile's own (possibly near-empty) figures.
+  try{
+    if(CPLAN._partner && APP._clientProfile && APP._clientProfile.financial_data){
+      renderProfileSnapshot(APP._clientProfile.financial_data, APP._clientProfile.scores||{});
+    }
+  }catch(e){console.warn('[snapshot] post-partner re-render failed:',e&&e.message);}
   // Phase 1: scale loaded plans if they exceed available budget (sets _scaledOnLoad notice flag)
   _cpEnforce();
   _cpRenderPlan();
