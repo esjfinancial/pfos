@@ -6947,12 +6947,35 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             retAccounts:pRetAccounts,
             policies:pPolicies,
             currentAllocations:pAllocs,
-            previousPlan:pPlan
+            previousPlan:pPlan,
+            // Part 2 (hybrid 4-tab): partner's chosen % of their surplus toward the
+            // combined plan (set at Mark Profile Complete). Default 100 if unset.
+            combinedAllocPct:(typeof pRawS.combinedAllocPct==='number')?pRawS.combinedAllocPct:100
           };
           if(CPLAN._householdType==='joint'){
             CPLAN._jointSurplus=CPLAN.surplus+CPLAN._partner.surplus;
             CPLAN._jointIncome=CPLAN.income+CPLAN._partner.income;
             CPLAN._jointExpenses=CPLAN.expenses+CPLAN._partner.expenses;
+          }
+          // ── Part 2 (hybrid 4-tab): split each spouse's surplus into a combined
+          //    pool and a personal pool, based on the % each chose at Mark Profile
+          //    Complete. Combined pool funds the Combined tab; each personal pool
+          //    funds that spouse's His/Hers tab. Defaults to 100% combined if unset.
+          if(CPLAN._householdType==='hybrid'){
+            var _selfPct=(typeof rawS.combinedAllocPct==='number')?rawS.combinedAllocPct:100;
+            var _partnerPct=(CPLAN._partner&&typeof CPLAN._partner.combinedAllocPct==='number')?CPLAN._partner.combinedAllocPct:100;
+            var _selfSurplus=Math.max(0,CPLAN.surplus||0);
+            var _partnerSurplus=Math.max(0,(CPLAN._partner&&CPLAN._partner.surplus)||0);
+            CPLAN._selfCombinedPct=_selfPct;
+            CPLAN._partnerCombinedPct=_partnerPct;
+            // Personal (non-combined) pools, keyed by self vs partner. "self" is the
+            // spouse this advisor view is centered on; Part 3 maps these to the
+            // His/Hers tabs by actual first name, not by a fixed gender.
+            CPLAN._selfPersonalSurplus=Math.round(_selfSurplus*(100-_selfPct)/100);
+            CPLAN._partnerPersonalSurplus=Math.round(_partnerSurplus*(100-_partnerPct)/100);
+            CPLAN._combinedSurplus=Math.round(_selfSurplus*_selfPct/100 + _partnerSurplus*_partnerPct/100);
+          } else {
+            CPLAN._combinedSurplus=null;CPLAN._selfPersonalSurplus=null;CPLAN._partnerPersonalSurplus=null;
           }
           // Tag any existing allocations without owner — assume self
           (CPLAN.allocations||[]).forEach(function(a){if(!a.owner)a.owner='self';});
@@ -17924,6 +17947,28 @@ function _cpOwnerBadge(a){
   return _sel;
 }
 
+// Hybrid-only: a "Tab:" dropdown letting the advisor place a card into one of the
+// four tabs (Combined / self / partner / Joint), independent of who owns it.
+// Sets a._tab via _cpSetCardTab. Empty for non-hybrid households.
+function _cpTabBadge(a){
+  if(!a)return'';
+  var hh=CPLAN._householdType||'individual';
+  if(hh!=='hybrid')return'';
+  var _ix=CPLAN.allocations.indexOf(a);
+  // Current tab: explicit _tab, else derived from owner (matches _cpTabOf).
+  var cur=a._tab;
+  if(['combined','self','partner','joint'].indexOf(cur)<0){
+    var o=a.owner||'self';cur=(o==='joint')?'joint':(o==='spouse')?'partner':'self';
+  }
+  var selfNm=(typeof esc==='function')?esc(_cpOwnerFirstName('self')):_cpOwnerFirstName('self');
+  var spNm=(typeof esc==='function')?esc(_cpOwnerFirstName('spouse')):_cpOwnerFirstName('spouse');
+  var opts=[['combined','Combined'],['self',selfNm],['partner',spNm],['joint','Joint']];
+  var s='<select title="Which tab / surplus pool funds this card" onchange="_cpSetCardTab('+_ix+',this.value)" onclick="event.stopPropagation()" style="margin-left:6px;padding:2px 18px 2px 6px;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.04em;color:var(--mu);background:rgba(100,116,139,.12);border:1px solid var(--bd);border-radius:2px;cursor:pointer;-webkit-appearance:none;appearance:none;background-image:url(\'data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%228%22 height=%228%22 viewBox=%220 0 8 8%22><path d=%22M1 2.5L4 5.5L7 2.5%22 stroke=%22%23999%22 stroke-width=%221.2%22 fill=%22none%22 stroke-linecap=%22round%22/></svg>\');background-repeat:no-repeat;background-position:right 5px center">';
+  opts.forEach(function(o){s+='<option value="'+o[0]+'"'+(cur===o[0]?' selected':'')+'>'+o[1]+'</option>';});
+  s+='</select>';
+  return s;
+}
+
 
 function _cpBuildCard(a,idx,isUnassigned){
   // ── Chooser-placeholder card (multi-select trigger for retirement/edu/rollover) ──
@@ -18063,7 +18108,8 @@ function _cpBuildCard(a,idx,isUnassigned){
   if(a.type==='custom'){
     // Phase 7 — owner badge sits beside the editable name input
     var _customOwnerBadge=(typeof _cpOwnerBadge==='function')?_cpOwnerBadge(a):'';
-    h+='<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><input type="text" value="'+esc(name)+'" onchange="_cpSetName('+idx+',this.value)" style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);background:transparent;border:none;border-bottom:1px dashed var(--bd);flex:1;min-width:140px;padding:2px 0;min-height:28px">'+_customOwnerBadge+'</div>';
+    var _customTabBadge=(typeof _cpTabBadge==='function')?_cpTabBadge(a):'';
+    h+='<div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap"><input type="text" value="'+esc(name)+'" onchange="_cpSetName('+idx+',this.value)" style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);background:transparent;border:none;border-bottom:1px dashed var(--bd);flex:1;min-width:140px;padding:2px 0;min-height:28px">'+_customOwnerBadge+_customTabBadge+'</div>';
   }
   else {
     var _cardSlug=(typeof _cpLearnSlugFor==='function')?_cpLearnSlugFor(a.type,a.eduVehicle):'';
@@ -18075,7 +18121,8 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _newBadge=a._overflowAbsorber===true?'<span style="margin-left:8px;padding:2px 6px;font-size:11px;font-weight:700;letter-spacing:.06em;color:var(--yl);background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);border-radius:2px;text-transform:uppercase">NEW</span>':'';
     // Phase 7 — owner badge (Joint/Hybrid only; empty for Individual/Separate)
     var _ownerBadge=(typeof _cpOwnerBadge==='function')?_cpOwnerBadge(a):'';
-    h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);display:flex;align-items:center;flex-wrap:wrap">'+name+_cardInfo+_newBadge+_ownerBadge+'</div>';
+    var _tabBadge=(typeof _cpTabBadge==='function')?_cpTabBadge(a):'';
+    h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh);display:flex;align-items:center;flex-wrap:wrap">'+name+_cardInfo+_newBadge+_ownerBadge+_tabBadge+'</div>';
   }
   // "Why this" in guided or AI reasoning. Interpolate {{AMOUNT}} placeholders
   // with the live a.amount so the prose always matches the slider — see
@@ -21962,6 +22009,29 @@ function _cpSetCardOwner(i,owner){
   if(typeof _cpToast==='function'){var nm=owner==='joint'?'Shared':(owner==='spouse'?_cpOwnerFirstName('spouse'):_cpOwnerFirstName('self'));_cpToast('Allocation owner set to '+nm);}
 }
 
+// Hybrid: move a card to a tab (combined/self/partner/joint) by setting a._tab.
+// Independent of owner — the advisor decides placement (a his-owned card can sit
+// in Combined). Switches the active tab to follow the card.
+function _cpSetCardTab(i,tab){
+  var a=CPLAN.allocations[i];if(!a)return;
+  if(['combined','self','partner','joint'].indexOf(tab)<0)tab='combined';
+  a._tab=tab;
+  // A card placed in Combined or Joint is funded from the shared pool and uses the
+  // joint split mechanic — seed split fields if missing. Otherwise drop them.
+  if(tab==='joint'){
+    if(a.amountSelf==null&&a.amountSpouse==null){var _h=(parseFloat(a.amount)||0)/2;a.amountSelf=Math.round(_h);a.amountSpouse=Math.round((parseFloat(a.amount)||0)-_h);}
+  }
+  CPLAN._hybridTab=tab;// follow the card to its new tab
+  CPLAN.modified=true; if(typeof _cpMarkModified==='function')_cpMarkModified();
+  if(typeof cplanSave==='function'){try{cplanSave();}catch(e){}}
+  if(tab==='combined'){CPLAN._coupleView='ours';_cpLoadCouplePlan();}
+  else _cpRenderPlanFull();
+  if(typeof _cpToast==='function'){
+    var lbl=tab==='combined'?'Combined':tab==='joint'?'Joint':tab==='partner'?_cpOwnerFirstName('spouse'):_cpOwnerFirstName('self');
+    _cpToast('Card moved to '+lbl+' tab');
+  }
+}
+
 function _cpSetEFMonthsTarget(mo){
   var _mo=parseInt(mo)||3;
   if(_mo<1)_mo=1;if(_mo>24)_mo=24;
@@ -22724,11 +22794,49 @@ function _cpRenderPlanFull(){
   var unalloc=Math.max(0,CPLAN.surplus-allocated-staticPremTotal);
   var allocPct=CPLAN.surplus>0?Math.round(allocated/CPLAN.surplus*100):0;
   var brPct=CPLAN._breathingPct||15;// Default 15% breathing room
+  // ── Hybrid: scope the budget to the ACTIVE TAB's surplus pool ──
+  // Each tab spends from its own pool: Combined + Joint draw from the combined
+  // surplus pool; the self/partner tabs draw from that spouse's personal pool.
+  // We recompute surplus / allocated / unalloc / allocPct for the active tab so
+  // the deployment line and "available to allocate" reflect the right money.
+  var _tabSurplus=CPLAN.surplus, _tabAllocated=allocated, _tabUnalloc=unalloc, _tabAllocPct=allocPct;
+  if(_cpHouseholdType==='hybrid'){
+    var _ht3=CPLAN._hybridTab||'combined';
+    if(_ht3==='combined'||_ht3==='joint')_tabSurplus=Math.max(0,CPLAN._combinedSurplus||0);
+    else if(_ht3==='self')_tabSurplus=Math.max(0,CPLAN._selfPersonalSurplus||0);
+    else if(_ht3==='partner')_tabSurplus=Math.max(0,CPLAN._partnerPersonalSurplus||0);
+    // Allocated within this tab only (cards that pass the tab filter).
+    _tabAllocated=CPLAN.allocations.reduce(function(t,a){
+      if(!_cpAllocInTab(a))return t;
+      if(a._completed&&(a._policyId||a._retAccountId||a._investmentId||a.type==='term_life'||a.type==='disability'))return t;
+      if(a._linkedPolicyId&&a._ibcState==='active')return t;
+      if(a.owner==='joint'){var sp=parseFloat(a.amountSelf);if(isNaN(sp)||sp===0)sp=(parseFloat(a.amount)||0)/2;return t+sp;}
+      return t+(parseFloat(a.amount)||0);
+    },0);
+    _tabUnalloc=Math.max(0,_tabSurplus-_tabAllocated);
+    _tabAllocPct=_tabSurplus>0?Math.round(_tabAllocated/_tabSurplus*100):0;
+  }
   // Header bar
   h+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px">';
   // Couple detection
   var _cpCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
   var _cpHouseholdType=_cpCouple?_cpCouple.household_type:'individual';
+  // ── Hybrid 4-tab filter helpers ──
+  // Which tab an allocation belongs to. Explicit a._tab wins; else derive from
+  // owner so existing cards (no _tab yet) land sensibly: joint→joint,
+  // spouse→partner, else→self. Combined shows cards explicitly placed there.
+  function _cpTabOf(a){
+    if(a&&a._tab&&['combined','self','partner','joint'].indexOf(a._tab)>=0)return a._tab;
+    var o=(a&&a.owner)||'self';
+    if(o==='joint')return'joint';
+    if(o==='spouse')return'partner';
+    return'self';
+  }
+  // Only filter for hybrid; every other household type shows all its cards.
+  function _cpAllocInTab(a){
+    if(_cpHouseholdType!=='hybrid')return true;
+    return _cpTabOf(a)===(CPLAN._hybridTab||'combined');
+  }
   var _cpPlanView=CPLAN._coupleView||'mine';// 'mine' or 'ours'
 
   h+='<div><div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap"><span style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh)">Client Financial Plan</span><span style="display:inline-flex;align-items:center;padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.2);border-radius:2px;letter-spacing:.08em">DETAILED VIEW</span>';
@@ -22749,7 +22857,33 @@ function _cpRenderPlanFull(){
       if(_cpHouseholdType==='hybrid'&&!CPLAN._partnerCalcs){_cpLoadCouplePlan();return;}
     }
     // Only render the toggle when the client actually has a choice (hybrid).
-    if(_showMine&&_showOurs){
+    if(_cpHouseholdType==='hybrid'){
+      // ── Hybrid 4-tab bar: Combined / <self> / <partner> / Joint ──
+      // Combined = shared plan funded by the combined surplus pool (built joint-style).
+      // <self>/<partner> = each spouse's personal plan funded by their personal pool.
+      // Joint = joint-owned cards only. Tab state lives on CPLAN._hybridTab.
+      var _ht=CPLAN._hybridTab||'combined';
+      var _selfNmTab=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('self'):'You';
+      var _partnerNmTab=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('spouse'):'Spouse';
+      // Combined needs the partner plan loaded (same as the old "ours" view).
+      if(_ht==='combined'){CPLAN._coupleView='ours';if(!CPLAN._partnerCalcs){_cpLoadCouplePlan();return;}}
+      else{CPLAN._coupleView='mine';}
+      var _tabs=[
+        {k:'combined',lbl:'Combined',clr:'#22C55E',bg:'rgba(34,197,94,.15)'},
+        {k:'self',lbl:_selfNmTab,clr:'#5B9BFF',bg:'rgba(91,155,255,.15)'},
+        {k:'partner',lbl:_partnerNmTab,clr:'#F97316',bg:'rgba(249,115,22,.15)'},
+        {k:'joint',lbl:'Joint',clr:'#A855F7',bg:'rgba(168,85,247,.15)'}
+      ];
+      h+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
+      _tabs.forEach(function(t){
+        var on=(_ht===t.k);
+        h+='<button onclick="CPLAN._hybridTab=\''+t.k+'\';_cpRenderPlanFull()" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(on?t.bg:'transparent')+';color:'+(on?t.clr:'var(--mu)')+'">'+esc(t.lbl)+'</button>';
+      });
+      h+='</div>';
+      // Pool indicator: which surplus pool the active tab spends from + its size.
+      var _poolLbl=(_ht==='combined')?'Combined pool':(_ht==='joint')?'Combined pool (joint cards)':(_ht==='self')?_selfNmTab+'\u2019s personal pool':_partnerNmTab+'\u2019s personal pool';
+      h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;width:100%">'+esc(_poolLbl)+': <strong style="color:var(--gr)">'+fmt(_tabSurplus)+'</strong>/mo available</div>';
+    } else if(_showMine&&_showOurs){
       h+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
       h+='<button onclick="CPLAN._coupleView=\'mine\';_cpRenderPlanFull()" style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:24px;background:'+(_cpPlanView==='mine'?'rgba(91,155,255,.15)':'transparent')+';color:'+(_cpPlanView==='mine'?'#5B9BFF':'var(--mu)')+'">My Plan</button>';
       h+='<button onclick="CPLAN._coupleView=\'ours\';_cpLoadCouplePlan()" style="padding:4px 10px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:24px;background:'+(_cpPlanView==='ours'?'rgba(168,85,247,.15)':'transparent')+';color:'+(_cpPlanView==='ours'?'#A855F7':'var(--mu)')+'">Our Plan</button>';
@@ -22760,9 +22894,9 @@ function _cpRenderPlanFull(){
   // Compute the breathing room reserve (the dollars set aside per the breathing %) vs
   // available-to-allocate (the rest of unspent surplus that could be allocated but isn't).
   // These are two different numbers — we display them separately so users aren't confused.
-  var _brReserveTop=Math.round((CPLAN.surplus||0)*(brPct/100));
-  var _availTop=Math.max(0,unalloc-_brReserveTop);
-  h+='<div style="font-size:13px;color:var(--mu)"><span id="cpSurplusLine">Deploying <strong style="color:var(--gr)">'+fmt(allocated)+'</strong>/mo ('+allocPct+'% of surplus)'+(_brReserveTop>0?' · <span style="color:var(--gr)">'+fmt(_brReserveTop)+' breathing room</span>':'')+(_availTop>0?' · <span style="color:#5B9BFF">'+fmt(_availTop)+' available to allocate</span>':'')+'</span></div></div>';
+  var _brReserveTop=Math.round((_tabSurplus||0)*(brPct/100));
+  var _availTop=Math.max(0,_tabUnalloc-_brReserveTop);
+  h+='<div style="font-size:13px;color:var(--mu)"><span id="cpSurplusLine">Deploying <strong style="color:var(--gr)">'+fmt(_tabAllocated)+'</strong>/mo ('+_tabAllocPct+'% of '+(_cpHouseholdType==='hybrid'?'this pool':'surplus')+')'+(_brReserveTop>0?' · <span style="color:var(--gr)">'+fmt(_brReserveTop)+' breathing room</span>':'')+(_availTop>0?' · <span style="color:#5B9BFF">'+fmt(_availTop)+' available to allocate</span>':'')+'</span></div></div>';
   h+='<div style="display:flex;gap:6px;align-items:center">';
   // Mode is always Detailed (Guided/Detailed toggle removed per spec). Force the
   // mode here so every render uses the detailed view regardless of the CPLAN
@@ -23055,7 +23189,7 @@ function _cpRenderPlanFull(){
       });
     }catch(_gsErr){console.warn('Goal seed in render:',_gsErr);}
   }
-  var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0;});
+  var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&_cpAllocInTab(a);});
   if(unassigned.length){
     // Detailed instructional panel — default collapsed. Sits just above the unassigned
     // items so the user can read about how everything works right next to the thing
@@ -23084,7 +23218,7 @@ function _cpRenderPlanFull(){
   var _allocPhases={};CPLAN.allocations.forEach(function(a){if(a.phase>0)_allocPhases[a.phase]=true;});
   // Check if phase has MEANINGFUL items (funded or genuinely new, not just $0 action items)
   function _phaseHasContent(pn){
-    var items=CPLAN.allocations.filter(function(a){return a.phase===pn;});
+    var items=CPLAN.allocations.filter(function(a){return a.phase===pn&&_cpAllocInTab(a);});
     if(!items.length)return false;
     return items.some(function(a){return a.amount>0||a.type!=='protection';});
   }
@@ -23128,7 +23262,7 @@ function _cpRenderPlanFull(){
   _availablePhases.forEach(function(pn){
     var p=CP_PHASE[pn]||{name:'Phase '+pn,color:'#94A3B8',icon:'📌'};
     var isActive=pn===_activeTab;
-    var phaseItems=CPLAN.allocations.filter(function(a){return a.phase===pn;});
+    var phaseItems=CPLAN.allocations.filter(function(a){return a.phase===pn&&_cpAllocInTab(a);});
     var doneCnt=phaseItems.filter(function(a){return a._completed;}).length;
     var pPct=phaseItems.length>0?Math.round(doneCnt/phaseItems.length*100):0;
     // Any phase with all items completed = grayed (was: only Phase 1)
@@ -23322,8 +23456,8 @@ function _cpRenderPlanFull(){
   }
 
   // ── Phase Content — active tab only ──
-  var _p1Items=CPLAN.allocations.filter(function(a){return a.phase===1;});
-  var _activeItems=CPLAN.allocations.filter(function(a){return a.phase===_activeTab;});
+  var _p1Items=CPLAN.allocations.filter(function(a){return a.phase===1&&_cpAllocInTab(a);});
+  var _activeItems=CPLAN.allocations.filter(function(a){return a.phase===_activeTab&&_cpAllocInTab(a);});
 
   if(_activeTab===1){
     // Phase 1: render normally (current behavior)
