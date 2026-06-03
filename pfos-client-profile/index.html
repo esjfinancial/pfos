@@ -4891,26 +4891,7 @@ function renderProfileSnapshot(fd, scores){
   var nw=c.netWorth||(assets-debt);
   var exp=c.baseExp||0;if(!exp&&rawS.expData){Object.keys(rawS.expData).forEach(function(k){exp+=(parseFloat((rawS.expData[k]||{}).amount)||0);});}
   var ncf=c.netCF||(inc-exp);
-  // ── Household total for coupled clients ──
-  // A couple is the same people with ONE financial picture: the snapshot shows the
-  // HOUSEHOLD total regardless of which partner is loaded or the household type.
-  // CPLAN._partner is populated for couples (joint/hybrid/separate) by the plan
-  // load. We add the partner's figures so the numbers don't change on switch.
-  try{
-    if(typeof CPLAN!=='undefined' && CPLAN._partner){
-      var _p=CPLAN._partner;
-      var _pInc=parseFloat(_p.income)||0;
-      var _pExp=parseFloat(_p.expenses)||0;
-      var _pDebt=(Array.isArray(_p.debts)?_p.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0):0);
-      var _pNW=(parseFloat(_p.efBal)||0)-_pDebt; // partner net worth approximation from available fields
-      inc = inc + _pInc;
-      exp = exp + _pExp;
-      ncf = inc - exp;
-      debt = debt + _pDebt;
-      nw = nw + _pNW;
-    }
-  }catch(e){console.warn('[snapshot] household combine (profile) failed:',e&&e.message);}
-  var sr=inc>0?Math.round((inc-exp)/inc*100*10)/10:(c.savingsRate||0);
+  var sr=c.savingsRate||(inc>0?Math.round((inc-exp)/inc*100*10)/10:0);
   var hasData=inc>0||debt>0||assets>0||Object.keys(c).length>0;
   var snap = hasData
     ? kv('Monthly Income',fmt(inc),inc>0?'var(--gr)':'var(--wh)')+kv('Net Cash Flow',fmt(ncf),ncf>=0?'var(--gr)':'var(--rd)')+kv('Net Worth',fmtK(nw),nw>=0?'var(--gr)':'var(--rd)')+kv('Total Debt',fmtK(debt),'var(--or)')+kv('Savings Rate',sr.toFixed(1)+'%')
@@ -6110,6 +6091,21 @@ window.addEventListener('message', async function(e){
       try{sessionStorage.setItem('pfos_cached_'+saveToId,JSON.stringify({calcs:calcs,S:state,scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},ts:Date.now()}));}catch(e){}
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
 
+      // ══ ADVISOR VIEW IS READ-ONLY ══
+      // When an advisor (or admin/agent) is viewing a client, the embedded PFOS
+      // recomputes calc() for DISPLAY, but we must NOT write it back to the
+      // client's stored data. Re-saving load-timing-dependent calcs on every
+      // advisor visit is what made the snapshot drift ($49,404 / $0 / $24,702).
+      // The snapshot still renders below from main's authoritative calc — it
+      // EXTRACTS from main rather than persisting its own derivation.
+      if(APP.role !== 'client'){
+        var _advFD={S:state,calcs:calcs,riskProfile:state.riskProfile||state.risk_profile||'moderate'};
+        var _advScores={cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
+        renderProfileSnapshot(_advFD, _advScores);
+        renderProfileRedFlags(_advFD);
+        renderProfileSavingsGoals(_advFD);
+        return;
+      }
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
       var ex = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2,data_version').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       var mergedState = JSON.parse(JSON.stringify(state));
@@ -7052,15 +7048,6 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
       }
     }
   }catch(e){console.warn('Couple link load failed:',e);}
-  // Partner is now loaded (or confirmed absent). Re-render the profile snapshot so
-  // it shows the HOUSEHOLD total — the initial render in openClientProfile ran
-  // before CPLAN._partner was populated, so it would have shown only this
-  // profile's own (possibly near-empty) figures.
-  try{
-    if(CPLAN._partner && APP._clientProfile && APP._clientProfile.financial_data){
-      renderProfileSnapshot(APP._clientProfile.financial_data, APP._clientProfile.scores||{});
-    }
-  }catch(e){console.warn('[snapshot] post-partner re-render failed:',e&&e.message);}
   // Phase 1: scale loaded plans if they exceed available budget (sets _scaledOnLoad notice flag)
   _cpEnforce();
   _cpRenderPlan();
