@@ -3659,7 +3659,16 @@ function _showJointDataToast(text){
   }catch(e){ console.warn('[joint-rt] toast failed:', e); }
 }
 
-function markProfileComplete(){
+async function markProfileComplete(){
+  // Hybrid households: before completing, ask how much of this person's surplus
+  // should go to the COMBINED plan. The advisor's 4-tab hybrid plan splits surplus
+  // into combined / his / hers pools based on each spouse's answer.
+  var _hh=S.householdType||'individual';
+  if(_hh==='hybrid'){
+    var pct=await _pmSurplusAllocModal();
+    if(pct===null)return;// user cancelled — don't complete
+    S.combinedAllocPct=pct;// 0–100; percent of this person's surplus into combined plan
+  }
   S.profileCompleted=true;
   S.profileCompletedAt=new Date().toISOString();
   if(typeof _doSync==='function')_doSync();
@@ -3672,6 +3681,66 @@ function markProfileComplete(){
   // gracefully — if the notification type isn't deployed yet or partner
   // email is missing, we just skip the notification silently.
   try{notifyPartnerOfCompletion();}catch(e){console.warn('[completion] notify failed:',e);}
+}
+
+// Hybrid-only modal asked at profile completion: how much of this person's
+// surplus goes to the COMBINED plan. Returns a percentage 0–100, or null if the
+// user cancelled. "Yes, all of it" → 100. "No" → user picks a percentage.
+function _pmSurplusAllocModal(){
+  return new Promise(function(resolve){
+    var existing=document.getElementById('pmSurplusOverlay');if(existing)existing.remove();
+    var prev=(typeof S.combinedAllocPct==='number')?S.combinedAllocPct:100;
+    var ov=document.createElement('div');
+    ov.id='pmSurplusOverlay';
+    ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:10002;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);font-family:var(--fb,sans-serif)';
+    var resolved=false;
+    var done=function(v){if(resolved)return;resolved=true;try{ov.remove();}catch(e){}resolve(v);};
+    var h='<div style="background:var(--bg-card,#0F172A);border:1px solid var(--bd,#1E293B);border-radius:8px;max-width:500px;width:100%;color:var(--wh,#F0F6FF)">';
+    h+='<div style="padding:16px 18px;border-bottom:1px solid var(--bd,#1E293B);display:flex;align-items:center;gap:10px">';
+    h+='<div style="font-size:20px">🤝</div><div style="font-family:var(--fh,sans-serif);font-size:14px;font-weight:700">Allocating your surplus</div></div>';
+    h+='<div style="padding:18px;display:flex;flex-direction:column;gap:16px">';
+    h+='<div style="font-size:13px;color:var(--mu,#94A3B8);line-height:1.6">In a hybrid household, your monthly surplus can go toward your <strong style="color:var(--wh)">combined household plan</strong>, stay as <strong style="color:var(--wh)">your own personal plan</strong>, or a mix of both. How much of your surplus would you like to put toward the combined plan?</div>';
+    // Yes / No choice
+    h+='<div style="display:flex;gap:8px">';
+    h+='<button id="psaAll" style="flex:1;padding:12px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;background:rgba(34,197,94,.15);border:1px solid rgba(34,197,94,.4);color:var(--gr,#22C55E)">All of it (100%)</button>';
+    h+='<button id="psaSome" style="flex:1;padding:12px;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.3);color:#5B9BFF">A percentage</button>';
+    h+='</div>';
+    // Percentage picker (hidden until "A percentage")
+    h+='<div id="psaPctWrap" style="display:none;flex-direction:column;gap:10px;padding:14px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:6px">';
+    h+='<div style="font-size:12px;color:var(--mu)">Percentage of your surplus toward the combined plan:</div>';
+    h+='<div style="display:flex;align-items:center;gap:10px">';
+    h+='<input type="range" id="psaRange" min="0" max="100" step="5" value="'+(prev<100?prev:50)+'" style="flex:1;accent-color:#5B9BFF">';
+    h+='<div style="display:flex;align-items:center;gap:2px"><input type="number" id="psaNum" min="0" max="100" step="5" value="'+(prev<100?prev:50)+'" style="width:56px;padding:6px;background:var(--bg-in,#0B1220);border:1px solid var(--bd);border-radius:3px;color:var(--wh);font-size:13px;text-align:right"><span style="font-size:13px;color:var(--mu)">%</span></div>';
+    h+='</div>';
+    h+='<div style="font-size:11px;color:var(--mu)" id="psaSplit"></div>';
+    h+='</div>';
+    h+='<div style="display:flex;gap:8px;justify-content:flex-end">';
+    h+='<button id="psaCancel" style="padding:10px 18px;font-size:13px;background:transparent;border:1px solid var(--bd);color:var(--mu);border-radius:4px;cursor:pointer">Cancel</button>';
+    h+='<button id="psaConfirm" style="padding:10px 18px;font-size:13px;font-weight:700;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.5);color:#5B9BFF;border-radius:4px;cursor:pointer">Confirm &amp; complete</button>';
+    h+='</div></div></div>';
+    ov.innerHTML=h;
+    document.body.appendChild(ov);
+    var mode='all';// default
+    var pctWrap=ov.querySelector('#psaPctWrap');
+    var rng=ov.querySelector('#psaRange');var num=ov.querySelector('#psaNum');var split=ov.querySelector('#psaSplit');
+    var allBtn=ov.querySelector('#psaAll');var someBtn=ov.querySelector('#psaSome');
+    function updSplit(){var p=parseInt(num.value)||0;split.textContent='Combined: '+p+'%  ·  Your personal plan: '+(100-p)+'%';}
+    function setMode(m){
+      mode=m;
+      if(m==='all'){allBtn.style.opacity='1';allBtn.style.outline='2px solid rgba(34,197,94,.5)';someBtn.style.opacity='.6';someBtn.style.outline='none';pctWrap.style.display='none';}
+      else{someBtn.style.opacity='1';someBtn.style.outline='2px solid rgba(91,155,255,.5)';allBtn.style.opacity='.6';allBtn.style.outline='none';pctWrap.style.display='flex';updSplit();}
+    }
+    allBtn.onclick=function(){setMode('all');};
+    someBtn.onclick=function(){setMode('some');};
+    rng.oninput=function(){num.value=rng.value;updSplit();};
+    num.oninput=function(){var v=Math.max(0,Math.min(100,parseInt(num.value)||0));rng.value=v;updSplit();};
+    ov.querySelector('#psaCancel').onclick=function(){done(null);};
+    ov.querySelector('#psaConfirm').onclick=function(){
+      if(mode==='all')done(100);
+      else done(Math.max(0,Math.min(100,parseInt(num.value)||0)));
+    };
+    setMode('all');
+  });
 }
 
 async function unmarkProfileComplete(){
@@ -9903,8 +9972,20 @@ function _doSync(){
   // For Hybrid and Separate, each spouse has their own client_profiles row
   // and entering spouse data on the other's profile would create stale
   // duplicates that get overwritten by the partner's actual edits.
-  var _ht_sync = S.householdType || 'individual';
-  var _includeSpouse = (_ht_sync === 'joint');
+  // Preserve spouse profile fields regardless of household type. Changing the
+  // household type hides/clears the spouse DOM inputs, but the underlying data
+  // must NOT change — a profile's own numbers stay the same across joint/hybrid/
+  // separate. So: use the DOM value when present, else keep the stored value.
+  var _prevProfile=(S.profile||{});
+  function _spKeep(id){
+    var el=document.getElementById(id);
+    var domVal=el?String(el.value||'').trim():'';
+    if(domVal!=='')return domVal;
+    // DOM empty (field hidden by current household type or genuinely blank):
+    // fall back to the stored value so a type switch never erases it.
+    var prev=_prevProfile[id];
+    return (prev!=null)?prev:'';
+  }
   S.profile={
     firstName:gv('cpFirstName'),lastName:gv('cpLastName'),email:gv('cpEmail'),phone:gv('cpPhone'),dob:gv('cpDOB'),
     marital:gv('cpMarital'),spouse:gv('cpSpouse'),children:S.children?S.children.length:0,occupation:gv('cpOccupation'),
@@ -9913,15 +9994,15 @@ function _doSync(){
     state:gv('cpState'),healthStatus:gv('cpHealthStatus'),selectedGoals:S.selectedGoals||[],
     currentAge:gv('currentAge'),hhSize:gv('hhSize'),creditScore:gv('creditScore'),
     taxFilingStatus:gv('taxFilingStatus'),
-    spFirstName: _includeSpouse ? gv('spFirstName') : '',
-    spLastName:  _includeSpouse ? gv('spLastName')  : '',
-    spEmail:     _includeSpouse ? gv('spEmail')     : '',
-    spOccupation:_includeSpouse ? gv('spOccupation'): '',
-    spDOB:       _includeSpouse ? gv('spDOB')       : '',
-    spCurrentAge:_includeSpouse ? gv('spCurrentAge'): '',
-    spRetAge:    _includeSpouse ? gv('spRetAge')    : '',
-    spSsBenefit: _includeSpouse ? gv('spSsBenefit') : '',
-    spRetIncome: _includeSpouse ? gv('spRetIncome') : '',
+    spFirstName: _spKeep('spFirstName'),
+    spLastName:  _spKeep('spLastName'),
+    spEmail:     _spKeep('spEmail'),
+    spOccupation:_spKeep('spOccupation'),
+    spDOB:       _spKeep('spDOB'),
+    spCurrentAge:_spKeep('spCurrentAge'),
+    spRetAge:    _spKeep('spRetAge'),
+    spSsBenefit: _spKeep('spSsBenefit'),
+    spRetIncome: _spKeep('spRetIncome'),
     retAge:gv('retAge'),retIncome:gv('retIncome'),retLifeExp:gv('retLifeExp'),ssBenefit:gv('ssBenefit'),retInflation:gv('retInflation'),
     retTaxBracket:gv('retTaxBracket'),retCapGainsBracket:gv('retCapGainsBracket'),
     liAnnualIncome:gv('liAnnualIncome'),liYearsReplace:gv('liYearsReplace'),liSpouseYears:gv('liSpouseYears'),
