@@ -6687,21 +6687,29 @@ window.addEventListener('message', async function(e){
           var _ccId = saveToId;
           var _incComplete = (state.profileCompleted === true);
           var _incCompleteAt = state.profileCompletedAt || null;
+          // combinedAllocPct: set by _pmSurplusAllocModal in the iframe when marking
+          // complete for a hybrid household. It rides along in state; persist it with
+          // the flag so the advisor's chosen split isn't dropped (which left it null →
+          // defaulting to 100% combined in the plan pools).
+          var _incPct = (typeof state.combinedAllocPct === 'number') ? state.combinedAllocPct : null;
           var _ccEx = await db.from('client_profiles')
             .select('id,financial_data')
             .eq('client_id',_ccId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
           if(_ccEx && _ccEx.data && _ccEx.data.financial_data && _ccEx.data.financial_data.S){
             var _ccFD = _ccEx.data.financial_data;
             var _wasComplete = (_ccFD.S.profileCompleted === true);
+            var _wasPct = (typeof _ccFD.S.combinedAllocPct === 'number') ? _ccFD.S.combinedAllocPct : null;
             if(_wasComplete !== _incComplete ||
-               (_ccFD.S.profileCompletedAt||null) !== _incCompleteAt){
+               (_ccFD.S.profileCompletedAt||null) !== _incCompleteAt ||
+               (_incPct !== null && _incPct !== _wasPct)){
               _ccFD.S.profileCompleted = _incComplete;
               _ccFD.S.profileCompletedAt = _incCompleteAt;
+              if(_incPct !== null) _ccFD.S.combinedAllocPct = _incPct;
               var _ccR = await db.from('client_profiles')
                 .update({financial_data:_ccFD, updated_at:new Date().toISOString()})
                 .eq('id',_ccEx.data.id);
               if(_ccR.error) console.warn('[PFOS-CP] completion-flag save failed:',_ccR.error.message);
-              else console.log('[PFOS-CP] profile completion flag persisted ('+_incComplete+') for',_ccId);
+              else console.log('[PFOS-CP] profile completion persisted (complete='+_incComplete+', combinedAllocPct='+_incPct+') for',_ccId);
             }
           }
         }catch(_ccErr){ console.warn('[PFOS-CP] completion-flag save exception:',_ccErr&&_ccErr.message); }
@@ -7645,6 +7653,7 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
           // Phase D follow-up: enrich partner with retirement accounts, policies, employment, health
           var pProfile=(pRawS.profile||{});
           var pRetAccounts=pRawS.retAccounts||pFd.retAccounts||[];
+          var pInvestments=pRawS.investments||pFd.investments||[];
           var pPolicies=pRawS.policies||pRawS.insurancePolicies||[];
           CPLAN._partner={
             clientId:partnerId,
@@ -7669,6 +7678,9 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             creditScore:pProfile.creditScore||null,
             taxFilingStatus:pProfile.taxFilingStatus||'',
             retAccounts:pRetAccounts,
+            investments:pInvestments,
+            incomeSources:(pRawS.incomeSources||[]),
+            _rawProfile:pProfile,
             policies:pPolicies,
             currentAllocations:pAllocs,
             previousPlan:pPlan,
@@ -7848,7 +7860,7 @@ function _cpExtractFlags(){
   // umbrella) are shared and NOT duplicated here. Each spouse flag carries
   // owner:'spouse', a "[spouse]" title tag, and a distinct `action` suffixed
   // with '_spouse' so it doesn't get deduped against the self version.
-  if(CPLAN._householdType==='joint'){
+  if(CPLAN._householdType==='joint'||CPLAN._householdType==='hybrid'){
     try{ _cpAppendSpouseFlags(flags, rawS2, d); }catch(_sf){console.warn('Spouse flags:',_sf); }
   }
   return flags;
@@ -7860,11 +7872,24 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
   if(!rawS2)return;
   var spName=(CPLAN._partner&&CPLAN._partner.firstName)||'Spouse';
   function _sp(arr,field){return (arr||[]).filter(function(x){return x&&(x[field||'owner']||'personal')==='spouse';});}
-  // Spouse income (sum of spouse-owned income sources)
-  var spIncSrcs=_sp(rawS2.incomeSources);
-  var spInc=spIncSrcs.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0);
-  var spRetAccts=_sp(rawS2.retAccounts);
-  var spPolicies=_sp(rawS2.policies&&rawS2.policies.length?rawS2.policies:rawS2.insurancePolicies);
+  // Data sourcing differs by household model:
+  //  • JOINT: both spouses share ONE row; spouse items are owner==='spouse' in rawS2.
+  //  • HYBRID: each spouse has their OWN row; the partner's data is on CPLAN._partner
+  //    (a separate profile), where their accounts are owner 'self'/'personal' on THEIR
+  //    row. So for hybrid we read straight from CPLAN._partner rather than filtering rawS2.
+  var _isHybridSp=(CPLAN._householdType==='hybrid' && CPLAN._partner);
+  var spIncSrcs, spInc, spRetAccts, spPolicies;
+  if(_isHybridSp){
+    spInc=Math.max(0, CPLAN._partner.income||0);
+    spRetAccts=CPLAN._partner.retAccounts||[];
+    spPolicies=CPLAN._partner.policies||[];
+  } else {
+    // Spouse income (sum of spouse-owned income sources)
+    spIncSrcs=_sp(rawS2.incomeSources);
+    spInc=spIncSrcs.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0);
+    spRetAccts=_sp(rawS2.retAccounts);
+    spPolicies=_sp(rawS2.policies&&rawS2.policies.length?rawS2.policies:rawS2.insurancePolicies);
+  }
   var spAge=(CPLAN._partner&&CPLAN._partner.age)||parseInt(rawS2.profile&&rawS2.profile.spCurrentAge)||0;
   var tag=' ['+spName+']';
   // Helper: does the plan already have a spouse-owned allocation of these types with money?
@@ -7894,9 +7919,17 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
   // ── HSA eligibility (spouse) — detect from the spouse's own income sources
   //    (HSA payroll deduction / HDHP coverage) and the spouse profile flag. ──
   var spHDHP=false;
-  if(rawS2.profile&&rawS2.profile.spHasHDHP)spHDHP=true;
-  var _spSrcs=(rawS2.incomeSources||[]).filter(function(s){return (s&&s.owner)==='spouse';});
-  if(_spSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0;}))spHDHP=true;
+  if(_isHybridSp){
+    // Hybrid: read the partner's own profile/income sources.
+    var _pPR=(CPLAN._partner&&CPLAN._partner._rawProfile)||null;
+    if(_pPR&&_pPR.spHasHDHP)spHDHP=true; // (partner's own HDHP flag if captured)
+    var _pSrcsH=(CPLAN._partner&&CPLAN._partner.incomeSources)||[];
+    if(_pSrcsH.some(function(s){return (parseFloat(s&&s.deduction_hsa)||0)>0;}))spHDHP=true;
+  } else {
+    if(rawS2.profile&&rawS2.profile.spHasHDHP)spHDHP=true;
+    var _spSrcs=(rawS2.incomeSources||[]).filter(function(s){return (s&&s.owner)==='spouse';});
+    if(_spSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0;}))spHDHP=true;
+  }
   if(spHDHP&&!_spHasAlloc(['hsa']))
     flags.push({icon:'💊',title:'HSA eligible'+tag+' — triple tax advantage',desc:spName+'\'s HDHP unlocks the only triple-tax-advantaged account: tax-free in, growth, and medical withdrawals.',type:'opp',action:'hsa_spouse',owner:'spouse'});
   // ── Life insurance gap (spouse) — detailed, calculated copy (mirrors primary) ──
@@ -11242,6 +11275,30 @@ function _cpStartSelf(){
       reason: 'Existing brokerage account detected. Slider shows your current monthly contribution; drag to plan changes.'
     }));
   });
+  // ── HYBRID: seed the PARTNER's existing accounts as spouse-owned cards ──
+  // For hybrid households each spouse has their own client_profiles row, so the
+  // partner's retirement/investment accounts live on CPLAN._partner (loaded in
+  // _cpInitPlan), NOT in rawS_seed (the centered spouse's row). Without this the
+  // partner's 401k never appears in the plan. Reuse the shared builders and force
+  // owner:'spouse' so they land on the partner pool / His-Hers tab. Dedup by id.
+  if(CPLAN._householdType==='hybrid' && CPLAN._partner){
+    try{
+      (CPLAN._partner.retAccounts||[]).forEach(function(r){
+        if(!r||!r.id)return;
+        if(CPLAN.allocations.some(function(a){return a&&a._retAccountId===r.id&&(a.owner==='spouse');}))return;
+        if(typeof _cpBuildRetAllocFromAccount!=='function')return;
+        var pa=_cpBuildRetAllocFromAccount(r);
+        if(pa){ pa.owner='spouse'; if((pa.customName||'').indexOf('[spouse]')<0) pa.customName=(pa.customName||'')+' [spouse]'; CPLAN.allocations.push(pa); }
+      });
+      ((CPLAN._partner.investments)||[]).forEach(function(iv){
+        if(!iv||!iv.id)return;
+        if(CPLAN.allocations.some(function(a){return a&&a._investmentId===iv.id&&(a.owner==='spouse');}))return;
+        if(typeof _cpBuildInvestAllocFromAccount!=='function')return;
+        var pia=_cpBuildInvestAllocFromAccount(iv);
+        if(pia){ pia.owner='spouse'; if((pia.customName||'').indexOf('[spouse]')<0) pia.customName=(pia.customName||'')+' [spouse]'; CPLAN.allocations.push(pia); }
+      });
+    }catch(_psErr){console.warn('[hybrid] partner account seed failed:',_psErr&&_psErr.message);}
+  }
   // ── RED FLAGS → phase 0 (UNASSIGNED) ──
   // Multi-option categories (retirement, education) are intentionally OMITTED.
   // Those appear in the red-flag panel with a "Choose…" button.
