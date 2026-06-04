@@ -2449,7 +2449,10 @@ async function _advBackfillJointCouple(couple, opts){
   // VERIFIED WRITE 1: B row (create or update), backup rotation if updating.
   var wB;
   if(rowB && rowB.id){
-    var ppB = { financial_data:fdB, updated_at:new Date().toISOString() };
+    // allow_data_downgrade: under last-write-wins, an existing (drifted) B row is
+    // rebuilt fresh from A's spouse-data, which is typically lighter. This write is
+    // intentional, so bypass the destructive-overwrite trigger for this one update.
+    var ppB = { financial_data:fdB, updated_at:new Date().toISOString(), allow_data_downgrade:true };
     if(rowB.financial_data){ ppB.previous_financial_data=rowB.financial_data;
       if(rowB.previous_financial_data) ppB.previous_financial_data_2=rowB.previous_financial_data;
       if(rowB.previous_financial_data_2) ppB.previous_financial_data_3=rowB.previous_financial_data_2; }
@@ -5786,8 +5789,14 @@ async function saveClientData(){
     var stateData = _lastPfosState.state || {};
     var calcs     = _lastPfosState.calcs || {};
     var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
-    const { data:ex } = await db.from('client_profiles').select('id').eq('client_id',pfosClientContext.clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    var pp={client_id:pfosClientContext.clientId,financial_data:{S:stateData,calcs},scores,updated_at:new Date().toISOString()};
+    // ── V2 joint: save target is client_a; de-merge so B's items go to B's row. ──
+    var _scCouple=(typeof getCoupleForClient==='function')?getCoupleForClient(pfosClientContext.clientId):null;
+    var _scSaveId=(_scCouple&&_scCouple.household_type==='joint')?_scCouple.client_a_id:pfosClientContext.clientId;
+    var _scIsV2=!!(_scCouple&&_scCouple.household_type==='joint'&&_isJointModelV2(_scCouple));
+    if(_scIsV2){ stateData = await _jmDemergeWriteB(_scCouple, stateData); }
+    const { data:ex } = await db.from('client_profiles').select('id').eq('client_id',_scSaveId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    var pp={client_id:_scSaveId,financial_data:{S:stateData,calcs},scores,updated_at:new Date().toISOString()};
+    if(_scIsV2) pp.allow_data_downgrade=true;
     if(ex){ await db.from('client_profiles').update(pp).eq('id',ex.id); } else { await db.from('client_profiles').insert(pp); }
     await db.from('clients').update({last_review_date:new Date().toISOString().split('T')[0]}).eq('id',pfosClientContext.clientId);
     // Auto-save daily snapshot for trend tracking (Phase 4)
@@ -5816,8 +5825,14 @@ async function generateAndSaveReport(){
     if(reportPayload.clientState && pfosClientContext.clientId){
       var cs = reportPayload.clientState;
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
-      var ex = await db.from('client_profiles').select('id').eq('client_id',pfosClientContext.clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-      var pp = { client_id:pfosClientContext.clientId, financial_data:{S:cs, calcs}, scores, updated_at:new Date().toISOString() };
+      // ── V2 joint: save target is client_a; de-merge so B's items go to B's row. ──
+      var _grCouple=(typeof getCoupleForClient==='function')?getCoupleForClient(pfosClientContext.clientId):null;
+      var _grSaveId=(_grCouple&&_grCouple.household_type==='joint')?_grCouple.client_a_id:pfosClientContext.clientId;
+      var _grIsV2=!!(_grCouple&&_grCouple.household_type==='joint'&&_isJointModelV2(_grCouple));
+      if(_grIsV2){ cs = await _jmDemergeWriteB(_grCouple, cs); }
+      var ex = await db.from('client_profiles').select('id').eq('client_id',_grSaveId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var pp = { client_id:_grSaveId, financial_data:{S:cs, calcs}, scores, updated_at:new Date().toISOString() };
+      if(_grIsV2) pp.allow_data_downgrade=true;
       if(ex.data){ await db.from('client_profiles').update(pp).eq('id',ex.data.id); }
       else { await db.from('client_profiles').insert(pp); }
     }
