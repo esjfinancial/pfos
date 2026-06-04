@@ -2396,6 +2396,52 @@ function _jmRowHasData(row){
   return _JOINT_MERGE_ARRAYS.some(function(a){ return Array.isArray(S[a]) && S[a].length>0; });
 }
 
+// ── Identity routing (replaces the old "client_a is always the self/primary"
+// assumption) ──
+// The joint profile was entered with ONE person as the self/primary (profile.email
+// + profile.firstName) and the other as the spouse (profile.spEmail + spFirstName).
+// That self-person is NOT necessarily client_a — whoever filled the form may have
+// put their partner as primary. This resolver decides which client (a|b) the
+// profile's SELF data actually belongs to, so each person's data lands on THEIR own
+// row regardless of A/B ordering.
+//   Ladder: exact email match → exact name match → 'ambiguous' (caller must STOP).
+// Returns 'a' (self belongs to client_a — no swap), 'b' (self belongs to client_b —
+// swap the split), or 'ambiguous' (cannot tell — needs_review).
+function _jmNorm(s){ return (s==null?'':String(s)).trim().toLowerCase(); }
+function _jmResolveSelfOwner(profileS, clientA, clientB){
+  var prof = (profileS && profileS.profile) ? profileS.profile : {};
+  var selfEmail = _jmNorm(prof.email);
+  var selfName  = _jmNorm(prof.firstName);
+  var aEmail = _jmNorm(clientA && clientA.email);
+  var bEmail = _jmNorm(clientB && clientB.email);
+  var aName  = _jmNorm(clientA && clientA.name);
+  var bName  = _jmNorm(clientB && clientB.name);
+  // helper: does a client name contain/equal the profile first name?
+  function nameMatches(profFirst, clientName){
+    if(!profFirst || !clientName) return false;
+    if(profFirst === clientName) return true;
+    // clientName is often "First Last" — match on the leading token or containment
+    var first = clientName.split(/\s+/)[0];
+    return profFirst === first || clientName.indexOf(profFirst) === 0;
+  }
+  // 1) EMAIL (exact, reliable). Only decisive if the two clients have DIFFERENT
+  //    emails AND the profile email matches exactly one of them.
+  if(selfEmail && aEmail && bEmail && aEmail !== bEmail){
+    if(selfEmail === aEmail && selfEmail !== bEmail) return 'a';
+    if(selfEmail === bEmail && selfEmail !== aEmail) return 'b';
+  }
+  // 2) NAME fallback (only when emails couldn't decide). Decisive only if the
+  //    profile first name matches exactly one client and not the other.
+  if(selfName && aName !== bName){
+    var mA = nameMatches(selfName, aName);
+    var mB = nameMatches(selfName, bName);
+    if(mA && !mB) return 'a';
+    if(mB && !mA) return 'b';
+  }
+  // 3) Could not confidently determine.
+  return 'ambiguous';
+}
+
 // ONE-TIME BACKFILL: split a legacy single-row joint couple into two rows.
 // opts.dryRun=true returns the planned rows without writing.
 // Returns {status, ...}: status in {skipped, needs_review, dryrun, ok, error}.
@@ -2433,6 +2479,31 @@ async function _advBackfillJointCouple(couple, opts){
   var _baseB = (_bWasOverwritten) ? null : ((rowB && rowB.financial_data && rowB.financial_data.S) ? rowB.financial_data.S : null);
   var split = _demergeJointState(rowA.financial_data.S, _baseB);
   var newA_S = split.aS, newB_S = split.bS;
+
+  // ── IDENTITY ROUTING (no privileged "primary") ──
+  // _demergeJointState put the profile's SELF data on newA_S and the SPOUSE data on
+  // newB_S — but the self-person may actually be client_b (whoever filled the joint
+  // form entered their partner as primary). Resolve whose data 'self' really is and,
+  // if it belongs to client_b, swap so each person's data lands on their OWN row.
+  // If we cannot tell confidently, STOP (needs_review) rather than risk inverting.
+  try{
+    var _cliRes = await db.from('clients').select('id,name,email').in('id',[aId,bId]);
+    var _clients = (_cliRes && _cliRes.data) ? _cliRes.data : [];
+    var _clA = _clients.find(function(c){ return c.id===aId; }) || null;
+    var _clB = _clients.find(function(c){ return c.id===bId; }) || null;
+    var _selfOwner = _jmResolveSelfOwner(rowA.financial_data.S, _clA, _clB);
+    if(_selfOwner === 'ambiguous'){
+      return {status:'needs_review', reason:'cannot determine whose data is whose (email/name ambiguous) — manual review required', aId:aId, bId:bId};
+    }
+    if(_selfOwner === 'b'){
+      // The profile's self-person is client_b. Swap so self→B, spouse→A.
+      var _tmp = newA_S; newA_S = newB_S; newB_S = _tmp;
+      console.log('[jm-backfill] identity routing: self-person is client_b — swapped split so each row gets its own person.');
+    }
+  }catch(_eId){
+    return {status:'error', error:'identity resolution failed: '+(_eId&&_eId.message)};
+  }
+
   // Stamp pfos-main's migration flags on both rows so _pfosRunMigration sees the
   // couple as already-migrated for the current (joint) type and never fires its
   // own sweep against the merged V2 state. Defense-in-depth: keeps the two
