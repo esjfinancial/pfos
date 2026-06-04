@@ -6667,6 +6667,35 @@ window.addEventListener('message', async function(e){
         renderProfileSnapshot(_advFD, _advScores);
         renderProfileRedFlags(_advFD);
         renderProfileSavingsGoals(_advFD);
+        // ── Narrow exception to read-only: persist the profile-completion flag ──
+        // "Mark Profile Complete" flows through this same PFOS_DATA_CHANGE path, so
+        // without this the advisor's completion is rendered then discarded by the
+        // return below — it clears on reload because it was never saved. We write
+        // ONLY profileCompleted/profileCompletedAt (not the rest of the recomputed
+        // state, which stays read-only) to the current spouse's own row (saveToId;
+        // for hybrid that's this client). Fire only when the flag actually changed.
+        try{
+          var _ccId = saveToId;
+          var _incComplete = (state.profileCompleted === true);
+          var _incCompleteAt = state.profileCompletedAt || null;
+          var _ccEx = await db.from('client_profiles')
+            .select('id,financial_data')
+            .eq('client_id',_ccId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+          if(_ccEx && _ccEx.data && _ccEx.data.financial_data && _ccEx.data.financial_data.S){
+            var _ccFD = _ccEx.data.financial_data;
+            var _wasComplete = (_ccFD.S.profileCompleted === true);
+            if(_wasComplete !== _incComplete ||
+               (_ccFD.S.profileCompletedAt||null) !== _incCompleteAt){
+              _ccFD.S.profileCompleted = _incComplete;
+              _ccFD.S.profileCompletedAt = _incCompleteAt;
+              var _ccR = await db.from('client_profiles')
+                .update({financial_data:_ccFD, updated_at:new Date().toISOString()})
+                .eq('id',_ccEx.data.id);
+              if(_ccR.error) console.warn('[PFOS-CP] completion-flag save failed:',_ccR.error.message);
+              else console.log('[PFOS-CP] profile completion flag persisted ('+_incComplete+') for',_ccId);
+            }
+          }
+        }catch(_ccErr){ console.warn('[PFOS-CP] completion-flag save exception:',_ccErr&&_ccErr.message); }
         return;
       }
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
