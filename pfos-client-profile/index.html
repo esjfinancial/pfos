@@ -1234,6 +1234,8 @@ async function initAuth(){
         localStorage.removeItem('pfos_tracking');
         localStorage.removeItem('pfos_plan_calendar');
         localStorage.removeItem('pfos_plan_backup');
+        // Also clear all per-client scoped plan backups (pfos_plan_backup_<id>).
+        try{ Object.keys(localStorage).forEach(function(k){ if(k.indexOf('pfos_plan_backup_')===0) localStorage.removeItem(k); }); }catch(ex2){}
         localStorage.removeItem('pfos_ui_mode');
       }catch(ex){}
       _lastPfosState={state:{},calcs:{}};
@@ -21304,7 +21306,10 @@ function initClientPlan(){
   // Load plan: try Supabase data first, then localStorage backup
   var loadedPlan=fd.allocation_plan;
   if((!loadedPlan||!loadedPlan.allocations||!loadedPlan.allocations.length)){
-    try{var backup=localStorage.getItem('pfos_plan_backup');if(backup){var parsed=JSON.parse(backup);if(parsed&&parsed.allocations&&parsed.allocations.length)loadedPlan=parsed;}}catch(e){}
+    // Per-client backup only (see cplanSave). The legacy global 'pfos_plan_backup'
+    // key is intentionally NOT read here — it caused cross-client bleed of completion
+    // state in the advisor view.
+    try{var _bkId=APP.currentClientId||'anon';var backup=localStorage.getItem('pfos_plan_backup_'+_bkId);if(backup){var parsed=JSON.parse(backup);if(parsed&&parsed.allocations&&parsed.allocations.length)loadedPlan=parsed;}}catch(e){}
   }
   if(loadedPlan&&loadedPlan.allocations&&loadedPlan.allocations.length){
     if(typeof _cpMigrateAllocationsToExtras==='function')_cpMigrateAllocationsToExtras(loadedPlan);
@@ -23242,8 +23247,15 @@ function cplanSave(){
     // on load — see _cpMigrateAllocationsToExtras.
     _extrasSemantics:true
   };
-  // Always save to localStorage as backup
-  try{localStorage.setItem('pfos_plan_backup',JSON.stringify(plan));}catch(e){}
+  // Always save to localStorage as backup — KEYED PER CLIENT. In the advisor view
+  // one session switches across many clients, so a single global key would let one
+  // client's plan (and its _completed flags) bleed into another on load. Scope the
+  // key by client id; also drop any legacy global key so stale data can't resurface.
+  try{
+    var _bkId = APP.currentClientId || 'anon';
+    localStorage.setItem('pfos_plan_backup_'+_bkId, JSON.stringify(plan));
+    localStorage.removeItem('pfos_plan_backup'); // retire the old non-scoped key
+  }catch(e){}
   // Update in-memory portal data so same-session re-init works
   if(APP._currentClientFd)APP._currentClientFd.allocation_plan=plan;
   // Save to Supabase if client ID available
