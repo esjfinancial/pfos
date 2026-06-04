@@ -1913,6 +1913,39 @@ async function renderUnlinkRequestsPage(){
     listEl.innerHTML=html;
   }catch(e){ listEl.innerHTML='<div style="color:var(--rd);font-size:12px">Error: '+esc(e.message)+'</div>'; }
 }
+// ── Unlink cleanup (Section C, admin) ──
+// When an admin approves an unlink request, each person's own data stays in their
+// own row, but everything SPOUSE-related is stripped from each row: owner='spouse'
+// items and the sp* profile fields. Truly SHARED owner='joint' items are parked in
+// S._pendingJointCleanup so each CLIENT resolves keep/drop in their own portal at
+// next login (never the admin). Self-contained: no shared helpers needed here.
+var _JM_MERGE_ARRAYS_ADMIN = ['incomeSources','retAccounts','investments','debts','goals'];
+var _JM_SP_FIELDS_ADMIN = ['spFirstName','spLastName','spEmail','spOccupation','spouse','spAnnualIncome','spCoverage','spDiCoverage','spouse_employment_type','spouseEmploymentType'];
+async function _jmAdminUnlinkClean(clientId){
+  if(!clientId) return {ok:true, noop:true};
+  try{
+    var ex = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(!ex || !ex.data || !ex.data.financial_data || !ex.data.financial_data.S) return {ok:true, noop:true};
+    var S = JSON.parse(JSON.stringify(ex.data.financial_data.S));
+    _JM_MERGE_ARRAYS_ADMIN.forEach(function(arr){ if(Array.isArray(S[arr])) S[arr] = S[arr].filter(function(it){ return (it && it.owner)!=='spouse'; }); });
+    if(S.profile){ _JM_SP_FIELDS_ADMIN.forEach(function(k){ delete S.profile[k]; }); }
+    var pending = [];
+    _JM_MERGE_ARRAYS_ADMIN.forEach(function(arr){
+      if(!Array.isArray(S[arr])) return;
+      var kept = [];
+      S[arr].forEach(function(it){ if(it && it.owner==='joint'){ var c=Object.assign({},it); c._cleanupArr=arr; pending.push(c); } else kept.push(it); });
+      S[arr] = kept;
+    });
+    if(pending.length){ S._pendingJointCleanup = { items:pending, ts:new Date().toISOString() }; }
+    var fd = Object.assign({}, ex.data.financial_data, {S:S});
+    var pp = { financial_data:fd, updated_at:new Date().toISOString(), previous_financial_data:ex.data.financial_data };
+    if(ex.data.previous_financial_data) pp.previous_financial_data_2=ex.data.previous_financial_data;
+    if(ex.data.previous_financial_data_2) pp.previous_financial_data_3=ex.data.previous_financial_data_2;
+    var r = await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+    if(r.error) return {ok:false, error:r.error.message};
+    return {ok:true};
+  }catch(e){ return {ok:false, error:e.message}; }
+}
 async function approveUnlinkRequest(reqId, coupleLinkId, requestingClientId){
   if(!confirm('Approve this unlink request?\n\nThe couple link will be deleted and both clients will be notified.')) return;
   try{
@@ -1923,6 +1956,14 @@ async function approveUnlinkRequest(reqId, coupleLinkId, requestingClientId){
     // Get requesting client name for notification
     const { data: reqClient } = await db.from('clients').select('name').eq('id',requestingClientId).maybeSingle();
     var reqName = reqClient?(reqClient.name||'Your partner'):'Your partner';
+    // ── Section C: clean both rows BEFORE deleting the link. Strips spouse items
+    //    + sp* fields; parks joint items for each client to resolve at next login. ──
+    if(couple){
+      var _cca=await _jmAdminUnlinkClean(couple.client_a_id);
+      if(!_cca.ok){ alert('Unlink cleanup failed (A): '+_cca.error+'\nNot unlinked.'); return; }
+      var _ccb=await _jmAdminUnlinkClean(couple.client_b_id);
+      if(!_ccb.ok){ alert('Unlink cleanup failed (B): '+_ccb.error+'\nNot unlinked.'); return; }
+    }
     // 2. Delete the couple link
     await db.from('couple_links').delete().eq('id',coupleLinkId);
     // 3. Mark request approved
