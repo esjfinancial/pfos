@@ -4930,6 +4930,14 @@ async function loadClientPortalData(){
   if(profile && profile.financial_data){
     var fd = profile.financial_data, scores = profile.scores || {}, calcs = fd.calcs || {};
     APP._portalCalcs=calcs; APP._portalFd=fd;
+    // Section B hook: if this row carries parked joint items AND the client is now
+    // individual (no couple link), prompt keep/drop shortly after load. Fires once;
+    // the resolver clears _pendingJointCleanup and persists the result.
+    try{
+      if(fd.S && Array.isArray(fd.S._pendingJointCleanup) && fd.S._pendingJointCleanup.length && !_couple){
+        setTimeout(function(){ _cpResolveJointCleanup(APP.currentClientId, fd.S); }, 800);
+      }
+    }catch(e){}
     APP._lastDataVersion=profile.data_version||0;// Track for multi-tab conflict detection
     try{_replayPendingSaves();}catch(e){}// Replay any saves queued during offline
     // Initialize forward detection baseline
@@ -43616,6 +43624,49 @@ function _cpToast(msg){
 // Useful for spelling out consequences without cluttering the main message.
 //
 // Esc and backdrop click both resolve to false (cancel).
+// ── Section B: client-side joint-cleanup resolver ─────────────────────────
+// After an unlink, owner='joint' items were parked in S._pendingJointCleanup by
+// the admin/advisor cleanup. On the now-individual client's next login, prompt
+// keep/drop for each parked item: KEEP -> becomes a clean owner='personal' entry
+// back in its source array; DROP -> discarded. Then clear _pendingJointCleanup and
+// save (allow_data_downgrade:true, since resolving can reduce the row).
+async function _cpResolveJointCleanup(clientId, S){
+  try{
+    if(!clientId || !S || !Array.isArray(S._pendingJointCleanup) || !S._pendingJointCleanup.length) return;
+    var parked = S._pendingJointCleanup.slice();
+    for(var i=0;i<parked.length;i++){
+      var it = parked[i] || {};
+      var arr = it._cleanupArr || 'incomeSources';
+      var nm = it.name || it.label || it.source || 'Joint item';
+      var amt = (it.amount!=null) ? it.amount : (it.balance!=null ? it.balance : null);
+      var amtStr = (amt!=null && typeof fmt==='function') ? (' (' + fmt(amt) + ')') : '';
+      var keep = await _cpConfirmModal({
+        title: 'Keep this joint item?',
+        message: 'You\u2019re now an individual household. "' + nm + '"' + amtStr + ' was a joint item.',
+        detail: 'Keep it as your own, or drop it. You can change it later in your profile.',
+        confirmLabel: 'Keep as mine', cancelLabel: 'Drop it',
+        confirmStyle: 'primary', icon: '\ud83d\udd17'
+      });
+      if(keep){
+        if(!Array.isArray(S[arr])) S[arr] = [];
+        var clean = Object.assign({}, it);
+        delete clean._cleanupArr; delete clean._fromBRow; delete clean._migratedToV2; delete clean._migratedHouseholdType;
+        clean.owner = 'personal';
+        S[arr].push(clean);
+      }
+    }
+    delete S._pendingJointCleanup;
+    // Persist the resolved row to the client's own profile.
+    var ex = await db.from('client_profiles').select('id,financial_data').eq('client_id',clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(ex && ex.data){
+      var fdNew = Object.assign({}, ex.data.financial_data||{}, {S:S});
+      var pp = { financial_data:fdNew, allow_data_downgrade:true, updated_at:new Date().toISOString() };
+      if(ex.data.financial_data) pp.previous_financial_data = ex.data.financial_data;
+      await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+    }
+    try{ if(typeof _cpToast==='function') _cpToast('Joint items resolved.'); }catch(e){}
+  }catch(e){ console.warn('[joint-cleanup] resolve failed:', e && e.message); }
+}
 function _cpConfirmModal(opts){
   opts = opts || {};
   return new Promise(function(resolve){
