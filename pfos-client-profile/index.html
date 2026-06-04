@@ -2604,7 +2604,18 @@ async function _jmJointToJFD(couple){
     var existing = Array.isArray(newJFD[arr]) ? newJFD[arr] : [];
     newJFD[arr] = existing.concat(jointItems.map(function(it){ return _jmShapeForJFD(it, aId); }));
   });
-  if(!anyMoved) return {ok:true, noop:true};
+  if(!anyMoved){
+    // No owner='joint' items to move — but the V2 flag must still be guaranteed on
+    // couple_links (an earlier backfill may not have persisted it, or this is a
+    // no-joint-item couple switching type). If the flag is already set, true noop;
+    // otherwise write just the flag so V2 read/write paths activate.
+    if(curJFD && curJFD._jointModelV2 === true) return {ok:true, noop:true};
+    var flagOnly = Object.assign({}, curJFD, {_jointModelV2:true});
+    try{ var rjf = await db.from('couple_links').update({joint_financial_data:flagOnly}).eq('id',couple.id); if(rjf.error) return {ok:false, error:'V2 flag set: '+rjf.error.message}; }
+    catch(e){ return {ok:false, error:'V2 flag set ex: '+e.message}; }
+    couple.joint_financial_data = flagOnly;
+    return {ok:true, flagOnly:true};
+  }
   // Preserve the V2 flag on JFD.
   newJFD._jointModelV2 = true;
   // WRITE 1: JFD (backup prior under _backup).
@@ -6752,9 +6763,17 @@ window.addEventListener('message', async function(e){
   if(msg.type === 'JOINT_DATA_UPDATE' && msg.coupleLinkId && msg.jointData){
     // Save hybrid joint sections to couple_links.joint_financial_data
     try{
-      await db.from('couple_links').update({joint_financial_data: msg.jointData}).eq('id', msg.coupleLinkId);
-      var cl = APP_COUPLES.find(function(c){ return c.id===msg.coupleLinkId; });
-      if(cl) cl.joint_financial_data = msg.jointData;
+      // Preserve V2 markers (_jointModelV2, _backup) — never let a full-object
+      // overwrite from the iframe blow away the migration flag.
+      var _jduCl = APP_COUPLES.find(function(c){ return c.id===msg.coupleLinkId; });
+      var _jduCur = (_jduCl && _jduCl.joint_financial_data) ? _jduCl.joint_financial_data : null;
+      var _jduData = Object.assign({}, msg.jointData);
+      if(_jduCur){
+        if(_jduCur._jointModelV2 === true) _jduData._jointModelV2 = true;
+        if(_jduCur._backup !== undefined && _jduData._backup === undefined) _jduData._backup = _jduCur._backup;
+      }
+      await db.from('couple_links').update({joint_financial_data: _jduData}).eq('id', msg.coupleLinkId);
+      if(_jduCl) _jduCl.joint_financial_data = _jduData;
     } catch(err){ console.warn('Joint data save failed:', err); }
   }
   // ── SAVE_ADVISOR_RECS — persist Decision Engine recommendations to Supabase ──
