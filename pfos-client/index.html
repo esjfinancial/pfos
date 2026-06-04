@@ -3456,7 +3456,7 @@ async function _jmDemergeWriteB(couple, mergedState){
     var bEx = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',bId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
     var bBase = (bEx&&bEx.data&&bEx.data.financial_data&&bEx.data.financial_data.S) ? bEx.data.financial_data.S : null;
     var split = _demergeJointState(mergedState, bBase);
-    var ppB = { financial_data:{S:split.bS, calcs:(bEx&&bEx.data&&bEx.data.financial_data&&bEx.data.financial_data.calcs)||{}}, updated_at:new Date().toISOString(), allow_data_downgrade:true };
+    var ppB = { financial_data:{S:split.bS, calcs:(bEx&&bEx.data&&bEx.data.financial_data&&bEx.data.financial_data.calcs)||{}}, updated_at:new Date().toISOString() };
     if(bEx&&bEx.data){
       if(bEx.data.financial_data){ ppB.previous_financial_data=bEx.data.financial_data;
         if(bEx.data.previous_financial_data) ppB.previous_financial_data_2=bEx.data.previous_financial_data;
@@ -3767,7 +3767,6 @@ async function doLogout(){
           var _clState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _clState._touched;
           var _clWriteState=await _jmDemergeWriteB(couple,_clState);
           var pp={client_id:saveToId,financial_data:{S:_clWriteState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-          if(couple&&couple.household_type==='joint'&&_isJointModelV2(couple)) pp.allow_data_downgrade=true;
           var ex=await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
           if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
           console.log('[PFOS] logout: saved ('+_logoutTouched.length+' sections touched)');
@@ -4931,11 +4930,6 @@ async function loadClientPortalData(){
   if(profile && profile.financial_data){
     var fd = profile.financial_data, scores = profile.scores || {}, calcs = fd.calcs || {};
     APP._portalCalcs=calcs; APP._portalFd=fd;
-    // ── Section B: if this client has parked joint items from an unlink, prompt
-    //    keep/drop in their own session (deferred). !_couple = now individual. ──
-    if(fd && fd.S && fd.S._pendingJointCleanup && !_couple){
-      setTimeout(function(){ try{ _cpResolveJointCleanup(APP.currentClientId, fd.S); }catch(e){ console.warn('[jm] cleanup prompt failed:', e&&e.message); } }, 800);
-    }
     APP._lastDataVersion=profile.data_version||0;// Track for multi-tab conflict detection
     try{_replayPendingSaves();}catch(e){}// Replay any saves queued during offline
     // Initialize forward detection baseline
@@ -9624,10 +9618,12 @@ async function clientSaveOwnData(){
     var stateData = _lastPfosState.state || {};
     var calcs     = _lastPfosState.calcs || {};
     var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
-    // ── V2 joint: save target is client_a; de-merge so B's items go to B's row. ──
-    var _csCouple=(typeof getCoupleForClient==='function')?getCoupleForClient(APP.currentClientId):null;
-    var _csSaveId=(_csCouple&&_csCouple.household_type==='joint')?_csCouple.client_a_id:APP.currentClientId;
-    var _csIsV2=!!(_csCouple&&_csCouple.household_type==='joint'&&_isJointModelV2(_csCouple));
+    // V2 joint: route the save to client_a and de-merge spouse data to B's row.
+    // _jmDemergeWriteB returns stateData unchanged for non-V2/non-joint couples.
+    var _csClientId = APP.currentClientId;
+    var _csCouple = (typeof getCoupleForClient==='function') ? getCoupleForClient(_csClientId) : null;
+    var _csIsV2 = _csCouple && _csCouple.household_type==='joint' && _isJointModelV2(_csCouple);
+    var _csSaveId = _csIsV2 ? _csCouple.client_a_id : _csClientId;
     if(_csIsV2){ stateData = await _jmDemergeWriteB(_csCouple, stateData); }
     var exRes=await db.from('client_profiles').select('id').eq('client_id',_csSaveId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
     var pp={client_id:_csSaveId,financial_data:{S:stateData,calcs},scores,updated_at:new Date().toISOString()};
@@ -9636,7 +9632,7 @@ async function clientSaveOwnData(){
     if(exRes&&exRes.data){saveRes=await db.from('client_profiles').update(pp).eq('id',exRes.data.id);}else{saveRes=await db.from('client_profiles').insert(pp);}
     if(saveRes&&saveRes.error){throw new Error(saveRes.error.message);}
     // Auto-save daily snapshot for trend tracking (Phase 4)
-    try{autoSaveSnapshot(APP.currentClientId, calcs);}catch(e2){}
+    try{autoSaveSnapshot(_csClientId, calcs);}catch(e2){}
     if(siEl){siEl.className='save-indicator saved';siEl.textContent='✓ Saved';siEl.style.display='inline-flex';setTimeout(function(){siEl.className='save-indicator';siEl.style.display='none';},2500);}
   }catch(e){
     console.error('clientSaveOwnData error:',e);
@@ -9788,9 +9784,6 @@ window.addEventListener('message',async function(e){
             debts:         Array.isArray(existing.debts) ? existing.debts.slice() : [],
             _lastChange:   existing._lastChange || null
           };
-          // Preserve V2 markers — never drop the migration flag on write-back.
-          if(existing._jointModelV2 === true) merged._jointModelV2 = true;
-          if(existing._backup !== undefined) merged._backup = existing._backup;
           // Dedup helper: looks for an item with the same name (or label/source/type)
           // and approximately the same amount/balance. If found, skip the incoming
           // item (the partner already migrated the shared item from their side).
@@ -9806,6 +9799,11 @@ window.addEventListener('message',async function(e){
           (jp.retAccounts||[]).forEach(function(r){ if(!_dupMatch(merged.retAccounts, r)){ merged.retAccounts.push(r); addedCount++; } });
           (jp.investments||[]).forEach(function(i){ if(!_dupMatch(merged.investments, i)){ merged.investments.push(i); addedCount++; } });
           (jp.debts||[]).forEach(function(d){ if(!_dupMatch(merged.debts, d)){ merged.debts.push(d); addedCount++; } });
+          // PRESERVE V2 markers — the hand-picked `merged` shape above omits them,
+          // so carry _jointModelV2 / _backup forward or this write-back would drop
+          // the flag and disable merge-on-read.
+          if(existing._jointModelV2===true) merged._jointModelV2 = true;
+          if(existing._backup!==undefined) merged._backup = existing._backup;
           // Write back
           await db.from('couple_links').update({ joint_financial_data: merged }).eq('id', coupleLinkId);
           console.log('[migration-hybrid] joint items merged to couple_links — added:', addedCount, 'originator:', origId);
@@ -10436,14 +10434,13 @@ window.addEventListener('message',async function(e){
       // ── Joint two-row model (V2): de-merge before writing ──
       // Split combined view: B's items (owner=spouse) + sp* profile -> client_b row;
       // A keeps self+joint. Write B here (backup rotation), persist A below.
-      var _jmDidDemerge=false;
       if(_cpSave && _cpSave.household_type==='joint' && _isJointModelV2(_cpSave)){
         try{
           var _bIdWc=_cpSave.client_b_id;
           var _bExc=await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',_bIdWc).order('updated_at',{ascending:false}).limit(1).maybeSingle();
           var _bBasec=(_bExc&&_bExc.data&&_bExc.data.financial_data&&_bExc.data.financial_data.S)?_bExc.data.financial_data.S:null;
           var _splitc=_demergeJointState(mergedState,_bBasec);
-          var _ppBc={financial_data:{S:_splitc.bS,calcs:(_bExc&&_bExc.data&&_bExc.data.financial_data&&_bExc.data.financial_data.calcs)||{}},updated_at:new Date().toISOString(),allow_data_downgrade:true};
+          var _ppBc={financial_data:{S:_splitc.bS,calcs:(_bExc&&_bExc.data&&_bExc.data.financial_data&&_bExc.data.financial_data.calcs)||{}},updated_at:new Date().toISOString()};
           if(_bExc&&_bExc.data){
             if(_bExc.data.financial_data){_ppBc.previous_financial_data=_bExc.data.financial_data;
               if(_bExc.data.previous_financial_data)_ppBc.previous_financial_data_2=_bExc.data.previous_financial_data;
@@ -10455,14 +10452,9 @@ window.addEventListener('message',async function(e){
             if(_rB2c.error)console.error('[jm] B-row insert failed:',_rB2c.error.message);
           }
           mergedState=_splitc.aS;
-          _jmDidDemerge=true;
         }catch(_eJmc){console.warn('[jm] de-merge-on-write failed, writing combined to primary:',_eJmc&&_eJmc.message);}
       }
       var pp={client_id:_saveToId,financial_data:{S:mergedState,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
-      // V2 de-merge: A's written row excludes B's items (they live on B's row), so it
-      // is intentionally lighter than the merged view — allow the protective trigger
-      // to permit this one write. Legacy (non-V2) saves keep full protection.
-      if(_jmDidDemerge) pp.allow_data_downgrade=true;
 
       // ══ BACKUP: ALWAYS rotate 3 versions before overwriting ══
       if(ex&&ex.data&&ex.data.financial_data){
@@ -10633,21 +10625,7 @@ window.addEventListener('beforeunload',function(){
     try{
       var calcs=_lastPfosState.calcs||{};
       var _blState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _blState._touched;
-      // ── V2 joint: de-merge (sync, no B base read in unload context) and write B's
-      //    portion to client_b via a second keepalive PATCH; A keeps self+joint. ──
-      var _blDidDemerge=false;
-      try{
-        var _blCouple=(typeof getCoupleForClient==='function')?getCoupleForClient(APP.currentClientId):null;
-        if(_blCouple&&_blCouple.household_type==='joint'&&_isJointModelV2(_blCouple)){
-          var _blSplit=_demergeJointState(_blState,null);
-          _blState=_blSplit.aS;
-          _blDidDemerge=true;
-          var _blBUrl=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+_blCouple.client_b_id+'&order=updated_at.desc&limit=1';
-          fetch(_blBUrl,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify({financial_data:{S:_blSplit.bS,calcs:{}},updated_at:new Date().toISOString(),allow_data_downgrade:true}),keepalive:true}).catch(function(){});
-        }
-      }catch(_eBl){}
       var payload={financial_data:{S:_blState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-      if(_blDidDemerge) payload.allow_data_downgrade=true;
       var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+_lastSaveClientId+'&order=updated_at.desc&limit=1';
       fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
     }catch(e){}
@@ -43638,51 +43616,6 @@ function _cpToast(msg){
 // Useful for spelling out consequences without cluttering the main message.
 //
 // Esc and backdrop click both resolve to false (cancel).
-// ── Joint cleanup resolver (Section B) ──
-// When a couple unlinks to individual, the advisor/admin side strips spouse data
-// immediately but parks owner='joint' items in S._pendingJointCleanup. Only the
-// CLIENT (the data owner) may decide keep/drop, so this runs in the client's own
-// portal session at next login. Each kept item becomes owner='personal' on this
-// client's row; dropped items are discarded. Each client independently keeps or
-// drops their own copy. Saves to the client's own row with backup rotation.
-async function _cpResolveJointCleanup(clientId, S){
-  if(!S || !S._pendingJointCleanup || !Array.isArray(S._pendingJointCleanup.items) || !S._pendingJointCleanup.items.length){ return false; }
-  var items = S._pendingJointCleanup.items;
-  for(var i=0;i<items.length;i++){
-    var it = items[i];
-    var nm = it.name || it.label || it.source || it.institution || it.type || 'Shared item';
-    var magRaw = (it.amount!=null?it.amount:(it.balance!=null?it.balance:(it.monthly!=null?it.monthly:null)));
-    var meta = (magRaw!=null && typeof fmt==='function') ? fmt(magRaw) : (magRaw!=null ? ('$'+magRaw) : '');
-    var keep = await _cpConfirmModal({
-      title:'Keep this shared item?',
-      message:'You\u2019re now an individual household. \u201c'+nm+'\u201d'+(meta?(' ('+meta+')'):'')+' was a joint item.',
-      detail:'Keep it on your profile as your own, or drop it. ('+(i+1)+' of '+items.length+')',
-      confirmLabel:'Keep', cancelLabel:'Drop', confirmStyle:'primary', icon:'\ud83d\udd17'
-    });
-    if(keep){
-      var arr = it._cleanupArr || 'debts';
-      if(!Array.isArray(S[arr])) S[arr] = [];
-      var c = Object.assign({}, it); delete c._cleanupArr; c.owner='personal';
-      delete c.share_pct_a; delete c.share_pct_b; delete c._migratedFromClient; delete c._fromBRow;
-      S[arr].push(c);
-    }
-  }
-  delete S._pendingJointCleanup;
-  try{
-    var ex = await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(ex && ex.data){
-      var fd = Object.assign({}, ex.data.financial_data||{}, {S:S});
-      // allow_data_downgrade: resolving parked joint items may drop some (user choice),
-      // making the row lighter on purpose.
-      var pp = { financial_data:fd, updated_at:new Date().toISOString(), previous_financial_data:ex.data.financial_data, allow_data_downgrade:true };
-      if(ex.data.previous_financial_data) pp.previous_financial_data_2=ex.data.previous_financial_data;
-      if(ex.data.previous_financial_data_2) pp.previous_financial_data_3=ex.data.previous_financial_data_2;
-      await db.from('client_profiles').update(pp).eq('id',ex.data.id);
-    }
-  }catch(e){ console.warn('[jm] joint cleanup save failed:', e&&e.message); }
-  return true;
-}
-
 function _cpConfirmModal(opts){
   opts = opts || {};
   return new Promise(function(resolve){
