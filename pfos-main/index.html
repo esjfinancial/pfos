@@ -4009,6 +4009,20 @@ function _pfosRunMigration(){
   // Without this, every advisor visit re-saved the profile with freshly-computed
   // (and load-timing-dependent) numbers, making the snapshot drift each visit.
   if(S.mode === 'advisor') return;
+  // TWO-ROW (V2) GATE: when the parent (pfos-client / pfos-client-profile) manages
+  // this couple under the two-row model, it owns ALL data reshaping/relocation on
+  // type changes via its merge-on-read / de-merge-on-write + JFD engine. This
+  // iframe must NOT run its own legacy single-blob migration sweep, or the two
+  // engines fight (recombining what the parent split). The unambiguous signal is
+  // couple_links.joint_financial_data._jointModelV2 === true, delivered to the
+  // iframe as S.coupleData.jointFinancialData._jointModelV2. Render-only; no sweep.
+  try{
+    var _jfdV2 = S.coupleData && S.coupleData.jointFinancialData;
+    if(_jfdV2 && _jfdV2._jointModelV2 === true){
+      console.log('[migration] V2 two-row couple — parent owns reshaping; iframe sweep skipped');
+      return;
+    }
+  }catch(e){}
   var ht = S.householdType || 'individual';
   // Backward compat: legacy users have _migratedToV2=true but no
   // _migratedHouseholdType. Infer the latter from current ht so the
@@ -15361,6 +15375,14 @@ function submitAdvisorRequestFromModal(){
       S.selectedGoals=[];if(typeof initGoalsGrid==='function')initGoalsGrid();
       // ── Apply incoming state ──
       if(msg.state)Object.assign(S,msg.state);
+      // Object.assign MERGES — it leaves keys absent from msg.state at their prior
+      // value. For per-person flags that bleed across a partner switch, that's a bug:
+      // if the previously-loaded partner had profileCompleted=true and the incoming
+      // client's row has no such key, the stale true would persist and the box would
+      // wrongly show "You — Complete". Force these to the incoming client's actual
+      // stored value (false/null when absent).
+      S.profileCompleted = !!(msg.state && msg.state.profileCompleted === true);
+      S.profileCompletedAt = (msg.state && msg.state.profileCompletedAt) || null;
       // ── Phase 1A: Migrate existing data ──
       // Income sources without mode are pre-migration; treat as simple mode.
       // Profiles without employment_type default to W-2.
@@ -15430,6 +15452,11 @@ function submitAdvisorRequestFromModal(){
             clientId: msg.coupleData.partnerClientId || null
           };
           window._pfosPartnerCompletionCache = null; // force re-read on next render
+          // Re-render the completion box now that partner status has arrived.
+          // Without this, a box rendered earlier in load stays stuck on
+          // "Status loading…" because nothing refreshes it once the partner
+          // data lands from the parent.
+          try{ if(typeof renderProfileCompletionBox === 'function') renderProfileCompletionBox(); }catch(e){}
         }
         if(msg.coupleData.sharedGoals){
           S.sharedGoals=msg.coupleData.sharedGoals.map(function(g){
