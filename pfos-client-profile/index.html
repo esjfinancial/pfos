@@ -1081,6 +1081,29 @@ var pfosClientContext=null,_lastPfosState={state:{},calcs:{}},_pfosDataLoaded=fa
 // message and leaves the view stale until a manual refresh. We track readiness
 // and queue the most recent critical message, flushing it when the frame is ready.
 var _pfosFrameReady=false,_pfosPendingPost=null,_pfosExpectedClientId=null,_ocpInFlight=null;
+// Module-level data-weight function (mirrors _stateWeight in pfos-main). Used by both
+// the first-save guard and the recurring catastrophic-drop guard so they agree.
+function _cpStateWeight(s,c){
+  s=s||{};c=c||{};
+  var w=0;
+  w+=(s.incomeSources||[]).filter(function(x){return (typeof _incSrcMonthlyTakeHome==='function')?_incSrcMonthlyTakeHome(x)>0:(parseFloat(x&&x.amount)||0)>0;}).length*10;
+  w+=Object.keys(s.expData||{}).length;
+  w+=(s.debts||[]).filter(function(x){return(parseFloat(x.balance)||0)>0;}).length*10;
+  w+=(s.retAccounts||[]).length*10;
+  w+=(s.investments||[]).filter(function(iv){return (parseFloat(iv&&iv.balance)||0)>0||(parseFloat(iv&&iv.monthlyContrib)||0)>0;}).length*10;
+  w+=(s.children||[]).length*5;
+  w+=(s.goals||[]).length*5;
+  w+=(s.insurancePolicies||s.policies||[]).length*10;
+  if(s.profile){var p=s.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
+  if(s.assets){if(parseFloat(s.assets.checking)>0)w+=5;if(parseFloat(s.assets.savings)>0)w+=5;if(parseFloat(s.assets.invest)>0)w+=5;}
+  if(s.buckets&&s.buckets.length)w+=s.buckets.length*3;
+  if((c.inc||0)>0)w+=10;
+  return w;
+}
+// Per-client last-known-good weight, keyed by the client the weight belongs to.
+// Lets the recurring guard detect a catastrophic mid-session weight collapse
+// (data loss) without a DB round-trip on every save.
+var _cpLastGoodWeight={};
 var _sessionStart=null,_sessionClientId=null;
 var _sessionTimer=null,_sessionWarnTimer=null;
 var SESSION_WARN_MS=25*60*1000,SESSION_IDLE_MS=30*60*1000,_lastReset=0;
@@ -6602,30 +6625,56 @@ window.addEventListener('message', async function(e){
     }
     if(!clientId) return;
     try{
+      // ══ CROSS-WRITE ASSERTION (universal data-integrity guard) ══
+      // A save payload is built for ONE specific client (msg.clientId, echoed by the
+      // iframe from the client it loaded). It must only ever be written to THAT
+      // client's row. Three identities must agree: what the iframe says the payload
+      // is for (msg.clientId), what the parent last loaded (_pfosExpectedClientId),
+      // and the parent's current client (APP.currentClientId). If any disagree, a
+      // profile switch / race / shared-session has desynced them, and writing would
+      // corrupt the wrong spouse's profile (the root cause of the hybrid data loss:
+      // one spouse's partial state landing on the other's row). Refuse and log.
+      // Agent-finances mode is exempt (handled separately above, no client identity).
+      if(!(pfosClientContext && pfosClientContext.isAgentProfile)){
+        var _payloadFor = msg.clientId || null;
+        if(_payloadFor && _payloadFor !== clientId){
+          console.warn('[PFOS-CP] ⛔ CROSS-WRITE BLOCKED — payload for '+_payloadFor+' but current client is '+clientId+'. Refusing to write.');
+          return;
+        }
+        if(_pfosExpectedClientId && _payloadFor && _payloadFor !== _pfosExpectedClientId){
+          console.warn('[PFOS-CP] ⛔ CROSS-WRITE BLOCKED — payload for '+_payloadFor+' but loaded client is '+_pfosExpectedClientId+'. Refusing to write.');
+          return;
+        }
+      }
       var couple = getCoupleForClient(clientId);
-      var saveToId = (couple && couple.household_type==='joint') ? couple.client_a_id : clientId;
+      // Save target. Joint households share ONE row (client_a) by design; every other
+      // type (hybrid/separate/individual) writes the loaded client's OWN row. Read the
+      // type from the authoritative couple_links record (APP_COUPLES), never from a
+      // drift-prone in-memory S.householdType — a stale 'joint' here would redirect a
+      // hybrid spouse's save onto the partner's row.
+      var _authType = (couple && couple.household_type) || 'individual';
+      var saveToId = (_authType==='joint' && couple) ? couple.client_a_id : clientId;
       var state  = msg.state;
       var calcs  = state.calcs || {};
+      // ══ RECURRING CATASTROPHIC-DROP GUARD (every save, all clients) ══
+      // The first-save guard below only runs once per session. But data loss also
+      // happens mid-session: a save carrying near-empty state overwrites good stored
+      // data (the signature of the hybrid wipes — weight collapsing from ~130 to ~0
+      // on a later save). Compare incoming weight to the last-known-good weight for
+      // THIS client; if it collapses below 40% while the prior was substantial, refuse
+      // and let the user reload rather than persist the loss. Keyed per client so a
+      // profile switch doesn't compare across people. No DB round-trip (uses cache).
+      var _incWNow=_cpStateWeight(state,calcs);
+      var _prevGoodW=_cpLastGoodWeight[saveToId];
+      if(typeof _prevGoodW==='number' && _prevGoodW>=40 && _incWNow < _prevGoodW*0.4){
+        console.warn('[PFOS-CP] ⛔ CATASTROPHIC-DROP BLOCKED — incoming weight '+_incWNow+' vs last-good '+_prevGoodW+' for '+saveToId+'. Save refused (likely data loss).');
+        var _ind2=document.getElementById('saveIndicator');if(_ind2){_ind2.className='save-indicator';_ind2.textContent='⛔ Protected';_ind2.style.color='#EF4444';}
+        return;
+      }
       // ══ FIRST-SAVE DATA PROTECTION ══
       if(!_firstSaveGuardPassed){
         _firstSaveGuardPassed=true;
-        // Calculate incoming data weight (mirrors _stateWeight in pfos-main)
-        function _cpWeight(s,c){
-          var w=0;
-          w+=(s.incomeSources||[]).filter(function(x){return _incSrcMonthlyTakeHome(x)>0;}).length*10;
-          w+=Object.keys(s.expData||{}).length;
-          w+=(s.debts||[]).filter(function(x){return(parseFloat(x.balance)||0)>0;}).length*10;
-          w+=(s.retAccounts||[]).length*10;
-          w+=(s.children||[]).length*5;
-          w+=(s.goals||[]).length*5;
-          w+=(s.insurancePolicies||[]).length*10;
-          if(s.profile){var p=s.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
-          if(s.assets){if(parseFloat(s.assets.checking)>0)w+=5;if(parseFloat(s.assets.savings)>0)w+=5;if(parseFloat(s.assets.invest)>0)w+=5;}
-          if(s.buckets&&s.buckets.length)w+=s.buckets.length*3;
-          if((c.inc||0)>0)w+=10;
-          return w;
-        }
-        var _inW=_cpWeight(state,calcs);
+        var _inW=_cpStateWeight(state,calcs);
         // If incoming weight is low, compare against existing data
         if(_inW<20){
           try{
@@ -6633,7 +6682,7 @@ window.addEventListener('message', async function(e){
             if(_gEx&&_gEx.data&&_gEx.data.financial_data){
               var _exS=_gEx.data.financial_data.S||{};
               var _exC=_gEx.data.financial_data.calcs||{};
-              var _exW=_cpWeight(_exS,_exC);
+              var _exW=_cpStateWeight(_exS,_exC);
               if(_exW>10&&_inW<_exW*0.5){
                 console.warn('[PFOS-CP] ⛔ First save blocked — incoming weight '+_inW+' vs existing '+_exW+'. Data loss prevented.');
                 _firstSaveGuardPassed=false;
@@ -6659,6 +6708,8 @@ window.addEventListener('message', async function(e){
       }
       // Cache latest state so saveClientData/clientSaveOwnData can use it
       _lastPfosState = { state: state, calcs: calcs };
+      // Refresh the recurring-guard baseline for this client to the accepted weight.
+      _cpLastGoodWeight[saveToId]=_incWNow;
       // Also cache in sessionStorage so data survives page navigation
       try{sessionStorage.setItem('pfos_cached_'+saveToId,JSON.stringify({calcs:calcs,S:state,scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},ts:Date.now()}));}catch(e){}
       var scores = {cfScore:calcs.cfScore, protScore:calcs.protScore, growScore:calcs.growScore, effScore:calcs.effScore};
@@ -7994,8 +8045,9 @@ function _cpCalcHealthScore(){
       function _atY(arr,y){return arr[y]!=null?arr[y]:(arr[arr.length-1]||0);}
       var _myBal=_atY(_selfArr,_myYr)+_atY(_jtArr,_jtYr)*0.5;
       var _spBal=_atY(_spArr,_spYr)+_atY(_jtArr,_jtYr)*0.5;
-      var _myInc=_cpSustainableMonthly(_myBal,25,0.01);
-      var _spInc=_cpSustainableMonthly(_spBal,25,0.01);
+      var _lifeExpHS=parseInt((APP._currentClientFd&&APP._currentClientFd.S&&APP._currentClientFd.S.calcs&&APP._currentClientFd.S.calcs.retLifeExp))||90;
+      var _myInc=_cpSustainableMonthly(_myBal,Math.max(1,(_lifeExpHS-_myRetAge)||25),0.01);
+      var _spInc=_cpSustainableMonthly(_spBal,Math.max(1,(_lifeExpHS-_spRetAge)||25),0.01);
       var _myTgt=_cpRetIncomeTarget('self');
       var _spTgt=_cpRetIncomeTarget('spouse');
       var _myPct=_myTgt>0?Math.min(1,_myInc/_myTgt):0;
@@ -8641,9 +8693,14 @@ function _cpRenderIncomeReplacement(){
     var _myBal=_atYr(_selfArr,_myYr)+_atYr(_jtArr,_jtYr)*0.5;
     var _spBal=_atYr(_spArr,_spYr)+_atYr(_jtArr,_jtYr)*0.5;
     // Phase 2: monthly income each balance can sustain. Targets are user-stated, not derived.
-    // Years in retirement default to 25 (age 65 → 90); real return default 1%.
-    var _myInc=Math.round(_cpSustainableMonthly(_myBal,25,0.01));
-    var _spInc=Math.round(_cpSustainableMonthly(_spBal,25,0.01));
+    // Years in retirement are now per-spouse (life expectancy minus that spouse's own
+    // retirement age) rather than a flat 25, so an early retiree's balance is correctly
+    // stretched over more years. Falls back to 25 if ages are missing. Real return 1%.
+    var _lifeExp=parseInt((APP._currentClientFd&&APP._currentClientFd.S&&APP._currentClientFd.S.calcs&&APP._currentClientFd.S.calcs.retLifeExp))||90;
+    var _myRetYears=Math.max(1,(_lifeExp-_myRetAge)||25);
+    var _spRetYears=Math.max(1,(_lifeExp-_spRetAge)||25);
+    var _myInc=Math.round(_cpSustainableMonthly(_myBal,_myRetYears,0.01));
+    var _spInc=Math.round(_cpSustainableMonthly(_spBal,_spRetYears,0.01));
     var _myTarget=Math.round(_cpRetIncomeTarget('self'));
     var _spTarget=Math.round(_cpRetIncomeTarget('spouse'));
     var _myPct=_myTarget>0?Math.round(_myInc/_myTarget*100):0;
@@ -18979,20 +19036,31 @@ function _cpBuildCard(a,idx,isUnassigned){
   // changes in pfos-main propagate without needing a re-seed (#6).
   if(a.reason){
     var _liveReason=a.reason.replace(/\{\{AMOUNT\}\}/g,'$'+fmt(a.amount||0));
-    if(a._retAccountId){
-      try{
-        // Phase 3.2: when the card is partner-owned, look up the linked account
-        // in the partner's data (scope='spouse'), not current user's.
-        var _scopeR2=(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId)?'spouse':undefined;
-        var _rR2 = (typeof _cpFindRetAccountById==='function')?_cpFindRetAccountById(a._retAccountId,_scopeR2):null;
-        if(_rR2){
-          var _iR2 = _cpResolveMatchInfo(_rR2,_scopeR2);
-          _liveReason = _liveReason
-            .replace(/\{\{MATCH_PCT\}\}/g, (_iR2.matchPct||0) + '%')
-            .replace(/\{\{MATCH_CEILING\}\}/g, fmt(_iR2.matchCeiling||0))
-            .replace(/\{\{MONTHLY_WAGE\}\}/g, fmt(_iR2.monthlyWage||0));
-        }
-      }catch(_eR){}
+    // Substitute the match tokens from the linked retAccount. Try the most likely
+    // scope first, then the other, so a spouse-owned card whose _sharedOwnerClientId
+    // isn't set still resolves. CRITICAL: whatever happens, never let raw {{...}}
+    // tokens reach the UI — after the best-effort live substitution, strip any
+    // leftover tokens to a neutral value (Image 3 showed literal {{MATCH_PCT}} leaking).
+    if(/\{\{MATCH_PCT\}\}|\{\{MATCH_CEILING\}\}|\{\{MONTHLY_WAGE\}\}/.test(_liveReason)){
+      var _iR2=null;
+      if(a._retAccountId && typeof _cpFindRetAccountById==='function'){
+        try{
+          var _scopeGuess=(a.owner==='spouse'||(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId))?'spouse':undefined;
+          var _rR2=_cpFindRetAccountById(a._retAccountId,_scopeGuess);
+          if(!_rR2)_rR2=_cpFindRetAccountById(a._retAccountId,_scopeGuess?undefined:'spouse');
+          if(_rR2)_iR2=_cpResolveMatchInfo(_rR2,_scopeGuess);
+        }catch(_eR){}
+      }
+      if(_iR2){
+        _liveReason=_liveReason
+          .replace(/\{\{MATCH_PCT\}\}/g,(_iR2.matchPct||0)+'%')
+          .replace(/\{\{MATCH_CEILING\}\}/g,fmt(_iR2.matchCeiling||0))
+          .replace(/\{\{MONTHLY_WAGE\}\}/g,fmt(_iR2.monthlyWage||0));
+      } else {
+        // Account/match data unavailable — fall back to a clean generic explanation
+        // rather than leaving raw or half-filled template tokens in the sentence.
+        _liveReason='Capture your full employer 401(k) match first — it\u2019s an immediate guaranteed return. Use the top slider for the match, the bottom slider for additional contributions.';
+      }
     }
     h+='<div id="cpReason'+idx+'" style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+_liveReason+'</div>';
   }
