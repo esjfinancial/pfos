@@ -2012,6 +2012,22 @@ var HH_DESCS = {
 
 // ── SAVE GUARD — prevents empty state from overwriting good data on initial render ──
 var _saveGuardActive=false, _loadedWeight=0;
+// ── Mid-session array-wipe guard ──
+// Snapshot of the protected arrays as last loaded or successfully saved. Used by
+// _doSync to detect a populated→empty transition that the user never initiated
+// (the signature of a programmatic/stale-context wipe, e.g. the owner='spouse'
+// cleanup that once deleted a real HSA). Legitimate user deletes set S._touched.<key>,
+// which stands the guard down. Only these four high-value arrays are protected.
+var _PROTECTED_ARRAYS=['investments','retAccounts','debts','incomeSources'];
+var _lastGoodArrays=null;
+function _snapshotGoodArrays(){
+  try{
+    _lastGoodArrays={};
+    _PROTECTED_ARRAYS.forEach(function(k){
+      _lastGoodArrays[k]=Array.isArray(S[k])?JSON.parse(JSON.stringify(S[k])):[];
+    });
+  }catch(e){_lastGoodArrays=null;}
+}
 function _stateWeight(){
   var w=0;
   w+=(S.incomeSources||[]).filter(function(s){return s.amount>0;}).length*10;
@@ -10061,6 +10077,29 @@ function _doSync(){
     estWillNotes:gv('estWillNotes'),estTrustNotes:gv('estTrustNotes'),estPOANotes:gv('estPOANotes'),estHealthcareNotes:gv('estHealthcareNotes'),estBeneficiaryNotes:gv('estBeneficiaryNotes'),estGuardianNotes:gv('estGuardianNotes')
   };
   try{ var pl=JSON.parse(JSON.stringify(S));
+    // ── Mid-session array-wipe guard ──
+    // If a protected array is about to be saved EMPTY while our last-known-good
+    // snapshot had entries, and the user never touched that section this session
+    // (no S._touched flag), treat it as an unintended wipe: restore the array from
+    // the snapshot into BOTH the live S and this payload, and skip persisting the
+    // empty. A genuine user deletion sets S._touched.<key>, so this never blocks
+    // intentional clears. Per-array and surgical — the rest of the save proceeds.
+    if(_lastGoodArrays){
+      var _touched=S._touched||{};
+      _PROTECTED_ARRAYS.forEach(function(k){
+        var snap=_lastGoodArrays[k];
+        var cur=pl[k];
+        var hadData=Array.isArray(snap)&&snap.length>0;
+        var nowEmpty=!Array.isArray(cur)||cur.length===0;
+        if(hadData&&nowEmpty&&!_touched[k]){
+          console.warn('[PFOS _doSync] WIPE GUARD: '+k+' went '+snap.length+'\u21920 with no user edit \u2014 restoring from snapshot.');
+          try{
+            S[k]=JSON.parse(JSON.stringify(snap));
+            pl[k]=JSON.parse(JSON.stringify(snap));
+          }catch(e){}
+        }
+      });
+    }
     // Phase 4 — strip local-only joint items from save payload. _jointItems
     // is hydrated from couple_links.joint_financial_data on load and
     // mutated there during toggle operations; persisting it into
@@ -10083,7 +10122,9 @@ function _doSync(){
       'profile:',(S.profile&&S.profile.firstName?S.profile.firstName:'EMPTY'),
       'assets:',JSON.stringify(S.assets||{}),
       'weight:',_stateWeight());
-    window.parent.postMessage({type:'PFOS_DATA_CHANGE',state:pl,clientId:window._pfosLoadedClientId||null},'https://pfos.esjfinancial.com');window.postMessage({type:'PFOS_DATA_CHANGE',state:pl,clientId:window._pfosLoadedClientId||null},'*'); }catch(e){ console.error('[PFOS _doSync] postMessage failed:',e); }
+    window.parent.postMessage({type:'PFOS_DATA_CHANGE',state:pl,clientId:window._pfosLoadedClientId||null},'https://pfos.esjfinancial.com');window.postMessage({type:'PFOS_DATA_CHANGE',state:pl,clientId:window._pfosLoadedClientId||null},'*');
+    _snapshotGoodArrays();// refresh wipe-guard baseline to the just-saved good state
+    }catch(e){ console.error('[PFOS _doSync] postMessage failed:',e); }
   try{
     // Strip joint items from localStorage backup as well — same reason
     var lsState = JSON.parse(JSON.stringify(S));
@@ -10407,10 +10448,19 @@ function openSavingsGoalModal(editId){
   document.getElementById('gm-calDay').value=g?g.calendarDay||'15':'15';
   document.getElementById('gm-current').value=g?g.current||'':'';
   document.getElementById('gm-priority').value=g?g.priority||'1':'1';
-  // Ownership: hide for joint households, show for hybrid
+  // Ownership: hide for joint households, show for hybrid — but ONLY when this
+  // account is actually part of a couple. An individual account (no couple link)
+  // must not be able to create a joint/shared goal (that produced orphan shared
+  // goals with no couple to attach to). Force personal there and hide the selector.
   var ownerWrap=document.getElementById('gm-ownerWrap');
   var ownerSel=document.getElementById('gm-owner');
+  var _isCoupled=!!(S.coupleLinkId||(S.coupleData&&S.coupleData.coupleLinkId));
   if(S.householdType==='joint'){if(ownerWrap)ownerWrap.querySelector('.fi:first-child').style.display='none';if(ownerSel)ownerSel.value='joint';}
+  else if(!_isCoupled){
+    // Not part of a couple → personal only, no shared/joint option.
+    if(ownerWrap)ownerWrap.querySelector('.fi:first-child').style.display='none';
+    if(ownerSel)ownerSel.value='personal';
+  }
   else{if(ownerWrap)ownerWrap.querySelector('.fi:first-child').style.display='';if(ownerSel)ownerSel.value=g?g.owner||'personal':'personal';}
   openModal('goalModal');
 }
@@ -10430,7 +10480,14 @@ function saveSavingsGoal(){
     fixedMonthly:isFixed?pf(document.getElementById('gm-fixedAmt').value):0,
     calendarDay:isFixed?parseInt(document.getElementById('gm-calDay').value)||15:15,
     current:pf(document.getElementById('gm-current').value),
-    owner:S.householdType==='joint'?'joint':(document.getElementById('gm-owner').value||'personal'),
+    owner:(function(){
+      var _o=S.householdType==='joint'?'joint':(document.getElementById('gm-owner').value||'personal');
+      // Shared/joint ownership requires an actual couple link. On an individual
+      // account, coerce to personal so no orphan shared goal can be created.
+      var _coupled=!!(S.coupleLinkId||(S.coupleData&&S.coupleData.coupleLinkId));
+      if(_o==='joint'&&!_coupled)_o='personal';
+      return _o;
+    })(),
     priority:parseInt(document.getElementById('gm-priority').value)||1,
     allocationMode:'bottom_up',
     buckets:[],transactions:[],status:'active',_migrated:true
@@ -15401,6 +15458,42 @@ function submitAdvisorRequestFromModal(){
       (S.incomeSources||[]).forEach(function(s){if(!s.mode)s.mode='simple';});
       if(!S.profile)S.profile={};
       if(!S.profile.employment_type)S.profile.employment_type='w2';
+      // ── HSA investment reconcile (self-heal) ──
+      // The paycheck→investments HSA sync (_syncHsaInvAcctFromIncomeSource) only
+      // fires on EDIT. If a client's linked HSA investment is lost (e.g. S.investments
+      // was overwritten by a save that didn't carry it), the income source keeps a
+      // dangling _linkedHsaInvId pointing at nothing, and the HSA vanishes from the
+      // Investments list while the paycheck deduction remains. Re-create the linked
+      // entry on load when it's missing so it self-heals without a manual edit.
+      try{
+        if(!S.investments)S.investments=[];
+        // Keep the id counter ahead of any existing investment ids so re-created
+        // entries can't collide.
+        (S.investments||[]).forEach(function(iv){var n=parseInt(iv&&iv.id);if(!isNaN(n)&&n>invAcctIdCtr)invAcctIdCtr=n;});
+        (S.incomeSources||[]).forEach(function(src){
+          if(!src||(src.mode!=='detailed'))return;
+          var _mHsa=Math.round((parseFloat(src.deduction_hsa)||0)*_checksPerMonth(src.pay_frequency));
+          if(_mHsa<=0)return;
+          var _has=src._linkedHsaInvId && S.investments.some(function(iv){return iv&&iv.id===src._linkedHsaInvId;});
+          if(_has)return;// linked entry exists — nothing to heal
+          // Re-create the linked HSA investment (mirror of the sync's create branch).
+          if(!src.hsaFsaType)src.hsaFsaType='hsa';
+          if(!src.hsaCoverage)src.hsaCoverage='self';
+          var _reId=(src._linkedHsaInvId!=null&&src._linkedHsaInvId!=='')?src._linkedHsaInvId:(++invAcctIdCtr);
+          S.investments.push({
+            id:_reId,type:'hsa',provider:'',
+            accountLabel:'Employer HSA (auto-synced from paycheck)',
+            balance:0,monthlyContrib:_mHsa,owner:src.owner||'personal',
+            hsaCoverage:src.hsaCoverage,
+            grossReturn:7,fundFee:0.5,advFee:0,returnPct:6.5,
+            _source:'manual',_plaidAccountId:null,_lastSynced:null,
+            _planLinked:false,_planAllocType:'',_planAllocName:'',
+            _autoCreated:true,_linkedIncomeSourceId:src.id
+          });
+          src._linkedHsaInvId=_reId;
+          if(S._touched)S._touched.investments=true;
+        });
+      }catch(_hsaRec){console.warn('[PFOS LOAD] HSA reconcile failed:',_hsaRec);}
       console.log('[PFOS LOAD] State from Supabase →',
         'income:',(S.incomeSources||[]).length,'('+((S.incomeSources||[]).reduce(function(t,s){return t+(s.amount||0);},0))+'/mo)',
         'expData:',Object.keys(S.expData||{}).length,
@@ -15688,6 +15781,7 @@ function submitAdvisorRequestFromModal(){
       // ── Save guard: capture loaded data weight before renders trigger auto-save ──
       _loadedWeight=_stateWeight();
       _saveGuardActive=_recoveredFromLS?false:true; // don't block save if we recovered from localStorage
+      _snapshotGoodArrays();// baseline for the mid-session array-wipe guard
       console.log('[PFOS LOAD] Save guard '+ (_saveGuardActive?'armed':'DISABLED (localStorage recovery)')+'. Loaded weight:',_loadedWeight);
       // ── Render all panels ──
       renderIncomeRow();initExpData();renderExpenses();renderDebts();renderRetAccounts();calc();
