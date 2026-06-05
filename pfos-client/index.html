@@ -9707,6 +9707,27 @@ async function submitDeletionRequest(){
 
 var _pfosDataLoaded=false;
 var _firstSaveGuardPassed=false;
+// Module-level data-weight function (mirrors _stateWeight in pfos-main) used by both
+// the first-save guard and the recurring catastrophic-drop guard so they agree.
+function _cpStateWeight(s,c){
+  s=s||{};c=c||{};
+  var w=0;
+  w+=(s.incomeSources||[]).filter(function(x){return (typeof _incSrcMonthlyTakeHome==='function')?_incSrcMonthlyTakeHome(x)>0:(parseFloat(x&&x.amount)||0)>0;}).length*10;
+  w+=Object.keys(s.expData||{}).length;
+  w+=(s.debts||[]).filter(function(x){return(parseFloat(x.balance)||0)>0;}).length*10;
+  w+=(s.retAccounts||[]).length*10;
+  w+=(s.investments||[]).filter(function(iv){return (parseFloat(iv&&iv.balance)||0)>0||(parseFloat(iv&&iv.monthlyContrib)||0)>0;}).length*10;
+  w+=(s.children||[]).length*5;
+  w+=(s.goals||[]).length*5;
+  w+=(s.insurancePolicies||s.policies||[]).length*10;
+  if(s.profile){var p=s.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
+  if(s.assets){if(parseFloat(s.assets.checking)>0)w+=5;if(parseFloat(s.assets.savings)>0)w+=5;if(parseFloat(s.assets.invest)>0)w+=5;}
+  if(s.buckets&&s.buckets.length)w+=s.buckets.length*3;
+  if((c.inc||0)>0)w+=10;
+  return w;
+}
+// Per-client last-known-good weight for the recurring catastrophic-drop guard.
+var _cpLastGoodWeight={};
 window.addEventListener('message',async function(e){
   if(e.origin!==PFOS_ORIGIN) return;
   var msg=e.data; if(!msg||!msg.type) return;
@@ -10356,22 +10377,7 @@ window.addEventListener('message',async function(e){
       // ══ FIRST-SAVE DATA PROTECTION ══
       if(!_firstSaveGuardPassed){
         _firstSaveGuardPassed=true;
-        function _cpWeight(s,c){
-          var w=0;
-          w+=(s.incomeSources||[]).filter(function(x){return _incSrcMonthlyTakeHome(x)>0;}).length*10;
-          w+=Object.keys(s.expData||{}).length;
-          w+=(s.debts||[]).filter(function(x){return(parseFloat(x.balance)||0)>0;}).length*10;
-          w+=(s.retAccounts||[]).length*10;
-          w+=(s.children||[]).length*5;
-          w+=(s.goals||[]).length*5;
-          w+=(s.insurancePolicies||[]).length*10;
-          if(s.profile){var p=s.profile;if(p.firstName)w+=3;if(p.email)w+=3;if(p.retAge&&p.retAge!=='65')w+=3;}
-          if(s.assets){if(parseFloat(s.assets.checking)>0)w+=5;if(parseFloat(s.assets.savings)>0)w+=5;if(parseFloat(s.assets.invest)>0)w+=5;}
-          if(s.buckets&&s.buckets.length)w+=s.buckets.length*3;
-          if((c.inc||0)>0)w+=10;
-          return w;
-        }
-        var _inW=_cpWeight(state,calcs);
+        var _inW=_cpStateWeight(state,calcs);
         if(_inW<20){
           try{
             var _cpG=getCoupleForClient(APP.currentClientId);
@@ -10380,7 +10386,7 @@ window.addEventListener('message',async function(e){
             if(_gEx&&_gEx.data&&_gEx.data.financial_data){
               var _exS=_gEx.data.financial_data.S||{};
               var _exC=_gEx.data.financial_data.calcs||{};
-              var _exW=_cpWeight(_exS,_exC);
+              var _exW=_cpStateWeight(_exS,_exC);
               if(_exW>10&&_inW<_exW*0.5){
                 console.warn('[PFOS] ⛔ First save blocked — incoming weight '+_inW+' vs existing '+_exW+'. Data loss prevented.');
                 _firstSaveGuardPassed=false;
@@ -10404,10 +10410,32 @@ window.addEventListener('message',async function(e){
         console.warn('[PFOS] ⛔ NaN detected in calcs — skipping save');return;
       }
       _lastPfosState={state:state,calcs:calcs};
-      // For joint couples, save to primary (client_a)
+      // Save target. Joint households share ONE row (client_a) by design; every other
+      // type writes the loaded client's OWN row. Read type from the authoritative
+      // couple_links record (getCoupleForClient), never a drift-prone S.householdType.
       var _cpSave=getCoupleForClient(APP.currentClientId);
-      var _saveToId=(_cpSave&&_cpSave.household_type==='joint')?_cpSave.client_a_id:APP.currentClientId;
+      var _authType=(_cpSave&&_cpSave.household_type)||'individual';
+      var _saveToId=(_authType==='joint'&&_cpSave)?_cpSave.client_a_id:APP.currentClientId;
       _lastSaveClientId=_saveToId;
+      // ══ RECURRING CATASTROPHIC-DROP GUARD (every save) ══
+      // The first-save guard above runs once per session; data loss also happens
+      // mid-session when a save carries near-empty state over good stored data (the
+      // hybrid-wipe signature). Compare incoming weight to the last-known-good weight
+      // for THIS client; if it collapses below 40% while the prior was substantial,
+      // refuse and let the user reload rather than persist the loss. Keyed per client.
+      var _incWNow=_cpStateWeight(state,calcs);
+      var _prevGoodW=_cpLastGoodWeight[_saveToId];
+      if(typeof _prevGoodW==='number' && _prevGoodW>=40 && _incWNow < _prevGoodW*0.4){
+        console.warn('[PFOS] ⛔ CATASTROPHIC-DROP BLOCKED — incoming weight '+_incWNow+' vs last-good '+_prevGoodW+' for '+_saveToId+'. Save refused (likely data loss).');
+        var _pdb=document.getElementById('dataProtectionBanner');
+        if(!_pdb){
+          var _b2=document.createElement('div');_b2.id='dataProtectionBanner';
+          _b2.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9999;padding:14px 20px;background:linear-gradient(90deg,#EF4444,#DC2626);color:#fff;font-family:var(--fh);font-size:14px;font-weight:700;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 4px 20px rgba(0,0,0,.3)';
+          _b2.innerHTML='\u26d4 Data protection activated \u2014 a large drop in your data was detected and the save was blocked. <button onclick="window.location.reload()" style="padding:6px 16px;background:#fff;color:#EF4444;border:none;border-radius:3px;font-family:var(--fh);font-size:13px;font-weight:700;cursor:pointer">\ud83d\udd04 Refresh Page</button> <button onclick="this.parentElement.remove()" style="padding:6px 12px;background:transparent;color:rgba(255,255,255,.7);border:1px solid rgba(255,255,255,.3);border-radius:3px;font-family:var(--fh);font-size:13px;cursor:pointer">Dismiss</button>';
+          document.body.appendChild(_b2);
+        }
+        return;
+      }
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
 
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
@@ -10481,6 +10509,7 @@ window.addEventListener('message',async function(e){
       }
       else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error)console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); else console.log('[PFOS] Inserted new profile'); }
       _lastSaveDirty=false;
+      _cpLastGoodWeight[_saveToId]=_incWNow;// refresh recurring-guard baseline to accepted weight
       // Backup to localStorage for fast reload
       try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:state,calcs:calcs,ts:Date.now(),cid:_saveToId||APP.currentClientId}));}catch(e3){}
       // Update dashboard snapshot with fresh data — preserve allocation_plan
