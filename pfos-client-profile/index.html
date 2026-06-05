@@ -24232,7 +24232,6 @@ function _cpRenderPlanFull(){
     // plan load — by the time a render runs, the real plan state is settled.
     try{
       var _gRawS=(APP._currentClientFd&&APP._currentClientFd.S)||{};
-      var _isHybrid=(CPLAN._householdType==='hybrid');
       (_gRawS.goals||[]).forEach(function(g){
         if(!g||!g.name)return;
         if((g.status||'active')!=='active')return;
@@ -24241,29 +24240,42 @@ function _cpRenderPlanFull(){
             && ((g.id&&a.goalId===g.id)||(a.customName&&a.customName===g.name));
         });
         if(_gExists)return;
-        var _gOwner=g.owner||'personal';
-        var _gTarget=parseFloat(g.target)||0;
-        var _gCurrent=parseFloat(g.current||g.balance)||0;
-        // ── Stage 4: a JOINT-owned goal in a hybrid household is a thing the couple
-        // does TOGETHER — place it in the Combined tab so it draws from the combined
-        // pool and gets the his/her split slider (Stage 3). Personal/spouse goals
-        // fall through to owner-derived tab placement (self/partner) as before.
-        if(_isHybrid && _gOwner==='joint'){
-          CPLAN.allocations.push({
-            type:'savings_goal',amount:0,target:_gTarget,phase:0,cascade:'',
-            customName:g.name,goalId:g.id||null,goalCurrent:_gCurrent,
-            owner:'joint',_tab:'combined',
-            reason:'Shared household goal.'+(_gTarget>0?' Target '+fmt(_gTarget)+(_gCurrent>0?', '+fmt(_gCurrent)+' saved so far':'')+'.':'')+' Funded from the combined pool \u2014 split each spouse\u2019s contribution below.'
-          });
-        } else {
-          CPLAN.allocations.push({
-            type:'custom',amount:0,target:_gTarget,phase:0,cascade:'',
-            customName:g.name,goalId:g.id||null,
-            goalCurrent:_gCurrent,owner:_gOwner
-          });
-        }
+        // Personal/spouse goals only. Shared (couple) goals live in the shared_goals
+        // table now, NOT in S.goals — they're seeded separately below.
+        CPLAN.allocations.push({
+          type:'custom',amount:0,target:parseFloat(g.target)||0,phase:0,cascade:'',
+          customName:g.name,goalId:g.id||null,
+          goalCurrent:parseFloat(g.current||g.balance)||0,owner:g.owner||'personal'
+        });
       });
     }catch(_gsErr){console.warn('Goal seed in render:',_gsErr);}
+    // ── Stage 4: shared (couple) goals from the canonical shared_goals table ──
+    // Shared goals are first-class records keyed to the couple_link, loaded into
+    // APP._clientCoupleData.sharedGoals. For a hybrid household, seed each as a
+    // Combined-tab card drawing from the combined pool with the his/her split
+    // (Stage 3). Dedup by the shared-goal row id. Personal goals stay above.
+    if(CPLAN._householdType==='hybrid'){
+      try{
+        var _shg=(APP._clientCoupleData&&APP._clientCoupleData.sharedGoals)||[];
+        _shg.forEach(function(sg){
+          if(!sg||!sg.name)return;
+          var _sgId=sg.id||sg.source_goal_id||null;
+          var _exists=CPLAN.allocations.some(function(a){
+            return a && ((a._sharedGoalRowId && _sgId && a._sharedGoalRowId===_sgId)
+                       || (a.customName && a.customName===sg.name && _cpTabOfAlloc(a)==='combined'));
+          });
+          if(_exists)return;
+          var _sgTarget=parseFloat(sg.target)||0;
+          var _sgCurrent=parseFloat(sg.current)||0;
+          CPLAN.allocations.push({
+            type:'savings_goal',amount:0,target:_sgTarget,phase:0,cascade:'',
+            customName:sg.name,goalCurrent:_sgCurrent,
+            _sharedGoalRowId:_sgId,owner:'joint',_tab:'combined',
+            reason:'Shared household goal.'+(_sgTarget>0?' Target '+fmt(_sgTarget)+(_sgCurrent>0?', '+fmt(_sgCurrent)+' saved so far':'')+'.':'')+' Funded from the combined pool \u2014 split each spouse\u2019s contribution below.'
+          });
+        });
+      }catch(_sgErr){console.warn('Shared-goal seed in render:',_sgErr);}
+    }
   }
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&_cpAllocInTab(a);});
   if(unassigned.length){
@@ -28133,6 +28145,20 @@ async function _cpPublishPlan(){
       _breathingPct:CPLAN._breathingPct
     };
     await db.from('client_profiles').update({allocation_plan:planObj,plan_status:'published',plan_published_at:nowIso,updated_at:nowIso}).eq('id',ex.data.id);
+    // ── Stage 4 write-back: sync shared-goal planned contributions to shared_goals ──
+    // Each Combined-tab shared-goal card carries _sharedGoalRowId. Persist its planned
+    // monthly contribution (his + her split, or the single amount) to the canonical
+    // shared_goals row so the goals system reflects what the plan funds. Best-effort:
+    // a failure here must not block the publish itself.
+    try{
+      var _sgCards=(CPLAN.allocations||[]).filter(function(a){return a && a._sharedGoalRowId;});
+      for(var _i=0;_i<_sgCards.length;_i++){
+        var _c=_sgCards[_i];
+        var _planned=(parseFloat(_c.amountSelf)||0)+(parseFloat(_c.amountSpouse)||0);
+        if(_planned===0)_planned=parseFloat(_c.amount)||0;
+        await db.from('shared_goals').update({planned:_planned,updated_at:nowIso}).eq('id',_c._sharedGoalRowId);
+      }
+    }catch(_sgwbErr){console.warn('[plan publish] shared-goal write-back failed:',_sgwbErr);}
     CPLAN._planStatus='published';CPLAN._planPublishedAt=nowIso;CPLAN.modified=false;
     // Wave 5: snapshot the publish event
     if(typeof _cpCaptureSnapshot==='function'){
