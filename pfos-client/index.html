@@ -16805,144 +16805,20 @@ function calcIBCWLIUL(){
   }
 
   // Run debt-payoff IBC sim for one chassis. Returns per-year array + totals.
+  // CANONICAL: delegates to the engine's chassis-aware cascade. WL = guaranteed+dividend
+  // crediting at 90% LTV; IUL = cap/floor index credit, age-rising COI, premium counted
+  // ONCE (fixes the old 0%-credit + double-count bugs), 70->100% LTV ramp. Crediting +
+  // fee calibrations are credible-source-grounded. Returns the page-consumed shape.
   function _ibcChassisRun(chassisType){
-    var policyDefaults=_ibcPolicyDefaults(chassisType);
-    var ibcParams=Object.assign({},policyDefaults,{monthlyPremium:prem});
-    // Override defaults with user-supplied policy parameters from the form.
-    if(chassisType==='wl'){
-      // WL net effective rate ≈ guaranteed + dividend portion that lands as CV
-      // (dividends are not guaranteed, but for illustration use input rate).
-      ibcParams.netEffectiveRate=wlGuar+(wlDiv-wlGuar)*0.85;
-      ibcParams.guaranteedRate=wlGuar;
-      ibcParams.dividendRate=wlDiv-wlGuar;
-      ibcParams.loanRate=wlLoan;
-    }else{
-      ibcParams.capRate=iulCap;
-      ibcParams.floorRate=iulFloor;
-      ibcParams.assumedIndexReturn=iulIll;
-      ibcParams.loanRate=iulLoan;
-      // IUL net effective is approximately the lower of cap, illustrated; floor sets the downside.
-      ibcParams.netEffectiveRate=Math.max(iulFloor,Math.min(iulIll,iulCap));
-    }
-    var loanRate=ibcParams.loanRate;
-
-    // Debts sorted by interest rate (avalanche order — attack most expensive first)
-    var ds=userDebts.map(function(d,i){
-      return{
-        name:d.name||('Debt '+(i+1)),
-        bal:parseFloat(d.balance)||0,
-        rate:(parseFloat(d.rate)||0)/100/12,
-        annualRate:(parseFloat(d.rate)||0),
-        min:parseFloat(d.min)||0,
-        paid:false
-      };
-    });
-    ds.sort(function(a,b){return b.rate-a.rate;});
-
-    var lastAnnivCV=0,premiumSinceAnniv=0;
-    var totalLoanBalance=0,totalLoanFreedMins=0;
-    var totalDebtInt=0,totalLoanInt=0,totalFees=0,totalLoaned=0;
-    var origFreeMonth=null,month=0;
-    var yearSnaps=[];      // per-year arrays for the chart
-    var loanEventThisYear=false;
-
-    var maxMonths=years*12;
-    while(month<maxMonths){
-      month++;
-      // Step 1: premium flows in
-      premiumSinceAnniv+=prem;
-      var vehicle=lastAnnivCV+premiumSinceAnniv;
-
-      // Step 2: debts accrue interest + minimum payments
-      ds.forEach(function(d){
-        if(d.bal<0.01||d.paid)return;
-        var interest=d.bal*d.rate;
-        totalDebtInt+=interest;
-        d.bal+=interest;
-        var pmt=Math.min(d.min,d.bal);
-        d.bal-=pmt;
-        if(d.bal<0.01)d.bal=0;
-      });
-
-      // Step 3: if CV available, kill next-highest-rate debt with a policy loan
-      ds.forEach(function(d){
-        if(d.paid||d.bal<0.01)return;
-        var availableCV=vehicle-totalLoanBalance;
-        if(availableCV>=d.bal){
-          totalLoanBalance+=d.bal;
-          totalLoaned+=d.bal;
-          totalLoanFreedMins+=d.min;
-          d.bal=0;
-          d.paid=true;
-          loanEventThisYear=true;
-        }
-      });
-
-      // Step 4: freed-minimums pool repays the combined policy loan
-      if(totalLoanBalance>0){
-        var loanInterest=totalLoanBalance*loanRate/12;
-        totalLoanInt+=loanInterest;
-        totalLoanBalance+=loanInterest;
-        var loanPayment=Math.min(totalLoanFreedMins,totalLoanBalance);
-        totalLoanBalance-=loanPayment;
-        if(totalLoanBalance<0.01)totalLoanBalance=0;
-      }
-
-      // Step 5: anniversary crediting (every 12 months)
-      if(month%12===0){
-        var policyYear=month/12;
-        if(chassisType==='wl'){
-          var wlc=_ibcWLAnnualCredit(ibcParams,policyYear,lastAnnivCV,0);
-          var efficiency=_ibcYearFactor(ibcParams.cvEfficiencyYr,policyYear,1.0);
-          var stuckPremiumCV=premiumSinceAnniv*efficiency;
-          // Premium not "stuck" as CV is effectively a fee/load for the year
-          totalFees+=(premiumSinceAnniv-stuckPremiumCV);
-          lastAnnivCV=lastAnnivCV+stuckPremiumCV+wlc.breakdown.guaranteedGrowth+wlc.breakdown.dividend;
-        }else{
-          var iulc=_ibcIULAnnualCredit(ibcParams,policyYear,lastAnnivCV,0);
-          // IUL credit returns avDelta which already accounts for premium load and COI
-          // Apply premium load explicitly: premium minus load = net into account.
-          var iulLoadPct=_ibcYearFactor(ibcParams.premiumLoadYr,policyYear,0.04);
-          var loadOnPremium=premiumSinceAnniv*iulLoadPct;
-          totalFees+=loadOnPremium;
-          totalFees+=(iulc.breakdown.coiTotal||0);
-          lastAnnivCV=lastAnnivCV+(premiumSinceAnniv-loadOnPremium)+iulc.avDelta;
-        }
-        premiumSinceAnniv=0;
-        vehicle=lastAnnivCV;
-
-        // Snapshot at end of policy year
-        var cAge=age+policyYear;
-        var netCV=Math.max(0,Math.round(vehicle-totalLoanBalance));
-        var ltv=vehicle>0?Math.round(totalLoanBalance/vehicle*100):0;
-        yearSnaps.push({
-          yr:policyYear,
-          age:cAge,
-          cv:Math.round(vehicle),
-          net:netCV,
-          lb:Math.round(totalLoanBalance),
-          ltv:ltv,
-          le:loanEventThisYear
-        });
-        loanEventThisYear=false;
-      }
-
-      var origLeft=ds.some(function(d){return d.bal>0.01;});
-      if(!origLeft&&origFreeMonth===null)origFreeMonth=month;
-      // We stop the active phase when all debts AND policy loans cleared,
-      // but keep accumulating years (with no new debt activity) until reaching `years`
-      // so the chart has a full timeline.
-    }
-
-    return{
-      data:yearSnaps,
-      cv:lastAnnivCV,
-      months:origFreeMonth||month,
-      totalFees:Math.round(totalFees),
-      totalLoaned:Math.round(totalLoaned),
-      totalDebtInt:Math.round(totalDebtInt),
-      totalLoanInt:Math.round(totalLoanInt)
-    };
+    var EC=window.PFOSEngine&&window.PFOSEngine.ibcCascade;
+    var empty={data:[],cv:0,months:0,totalFees:0,totalLoaned:0,totalDebtInt:0,totalLoanInt:0};
+    if(!EC||!EC.simulateIBCDebtCascade)return empty;
+    var pp=(chassisType==='wl')
+      ?{guaranteedRate:wlGuar,dividendRate:wlDiv-wlGuar,netEffectiveRate:wlGuar+(wlDiv-wlGuar)*0.85,loanRate:wlLoan}
+      :{capRate:iulCap,floorRate:iulFloor,assumedIndexReturn:iulIll,loanRate:iulLoan};
+    var r=EC.simulateIBCDebtCascade(userDebts,prem,{chassis:chassisType,runFullHorizon:true,years:years,issueAge:age,loanAnnRate:(chassisType==='wl'?wlLoan:iulLoan),policyParams:pp});
+    if(!r)return empty;
+    return {data:r.yearSnaps,cv:r.vehicle,months:r.months,totalFees:r.totalFees,totalLoaned:r.totalLoaned,totalDebtInt:r.totalDebtInterest,totalLoanInt:r.totalLoanInterest};
   }
 
   // Run both chassis
@@ -46509,6 +46385,6 @@ function cas_toggleBiometricEnrollment(checkbox){
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v2.js" defer></script>
+<script src="/pfos-core.v3.js" defer></script>
 </body>
 </html>
