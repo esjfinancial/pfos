@@ -8372,63 +8372,37 @@ function calcGenWealth(){
   var prem=pf(gv('gw_prem'))||500;var growth=(pf(gv('gw_growth'))||5)/100;
   var gen2Inc=(pf(gv('gw_gen2'))||50)/100;var gen3Inc=(pf(gv('gw_gen3'))||100)/100;
   var age=parseInt(gv('gw_age'))||40;
-  var mr=growth/12;var el=document.getElementById('gw_results');if(!el)return;
-
-  var gens=[
-    {name:'Generation 1 (You)',premMult:1,col:'var(--gr)',icon:'👤',yrs:30},
-    {name:'Generation 2 (Children)',premMult:1+gen2Inc,col:'#5B9BFF',icon:'👶',yrs:30},
-    {name:'Generation 3 (Grandchildren)',premMult:1+gen3Inc,col:'var(--pu)',icon:'🧒',yrs:30}
-  ];
-
-  var cv=0;var totalPrem=0;var prevDB=0;var genData=[];
-
-  gens.forEach(function(g,i){
-    var genPrem=Math.round(prem*g.premMult);
-    if(i>0) cv+=prevDB;// inherit death benefit
-    var startCV=cv;
-    var yearMilestones=[];
-    // Anniversary-anchored crediting (no monthly compounding) — matches how WL
-    // policies actually credit dividends: once per anniversary, applied to year-end
-    // accumulated value. The annualized rate is mr*12 since mr was the monthly rate.
-    var annualGrowthRate = mr * 12;
-    var lastAnnivCV = cv;
-    var premiumSinceAnniv = 0;
-    for(var m=1; m<=g.yrs*12; m++){
-      premiumSinceAnniv += genPrem;
-      cv = lastAnnivCV + premiumSinceAnniv;
-      totalPrem += genPrem;
-      if(m % 12 === 0){
-        // Year-N efficiency: high-CV WL design, 55% yr1 → 100% yr5+
-        var policyYear = m / 12;
-        var efficiency = policyYear <= 1 ? 0.55 : policyYear <= 3 ? 0.75 : policyYear <= 5 ? 0.90 : 1.00;
-        var stuckPremiumCV = premiumSinceAnniv * efficiency;
-        var growthOnExisting = lastAnnivCV * annualGrowthRate;
-        lastAnnivCV = lastAnnivCV + stuckPremiumCV + growthOnExisting;
-        premiumSinceAnniv = 0;
-        cv = lastAnnivCV;
-      }
-      if(m % 120 === 0) yearMilestones.push({yr:m/12,cv:Math.round(cv)});
-    }
-    var db=Math.max(cv*2,cv+500000);prevDB=db;
-    genData.push({name:g.name,icon:g.icon,col:g.col,prem:genPrem,startCV:Math.round(startCV),cv:Math.round(cv),db:Math.round(db),totalPrem:Math.round(totalPrem),milestones:yearMilestones,inherited:i>0?Math.round(startCV):0});
-  });
-
-  // Traditional comparison: invest same amount at 7% in taxable account
-  var tradBal=0;var tradPrem=0;
-  for(var m=0;m<90*12;m++){
-    var yr=Math.floor(m/360);
-    var tPrem=prem*(yr===0?1:yr===1?(1+gen2Inc):(1+gen3Inc));
-    tradBal=tradBal*(1+0.07/12)+tPrem;tradPrem+=tPrem;
-  }
-  var tradAfterTax=Math.round(tradBal*0.75);// 25% cap gains on withdrawal
-  var ibcAdvantage=Math.round(cv+prevDB-tradAfterTax);
+  var el=document.getElementById('gw_results');if(!el)return;
+  // CLUSTER 4: cascade single-sourced -> window.PFOSEngine.calculators.genWealth. Death benefit tied
+  // to the user's UPLOADED illustration (S.insurancePolicies) — never simulated (plan section 5B).
+  var _pols=S.insurancePolicies||[];
+  var _wl=_pols.find(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('life')>=0||t.indexOf('whole')>=0||t.indexOf('iul')>=0||t.indexOf('universal')>=0;})||{};
+  var _illusDB=Math.round(_wl.coverage||_wl.death_benefit||0);
+  var _illusPrem=Math.round(_wl.premium||0);
+  var _illusCarrier=_wl.company||_wl.carrier||'your policy';
+  var _dbRatio=(_illusDB>0&&_illusPrem>0)?(_illusDB/_illusPrem):null;
+  var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
+  var _gw=_EC?_EC.genWealth({prem:prem,growth:growth,gen2Inc:gen2Inc,gen3Inc:gen3Inc,dbRatio:_dbRatio}):null;
+  if(!_gw)return;
+  var genData=_gw.genData,cv=_gw.cv,prevDB=_gw.prevDB,totalPrem=_gw.totalPrem,tradAfterTax=_gw.tradAfterTax,ibcAdvantage=_gw.ibcAdvantage,hasIllustration=_gw.hasIllustration;
 
   var h='';
 
-  // ── Story Hook ──
-  h+=calcStoryBox('🌳','Your <span style="color:var(--gr);font-weight:700">'+fmt(prem)+'/mo</span> premium today creates: <span style="color:var(--gr)">'+fmtK(genData[0].cv)+'</span> cash value for YOUR retirement + <span style="color:#5B9BFF">'+fmtK(genData[0].db)+'</span> tax-free death benefit to your children. If they continue the system, total family wealth by Gen 3: <span style="color:var(--pu);font-weight:700">'+fmtK(cv+prevDB)+'</span>.','var(--gr)');
+  // Illustration status banner
+  if(hasIllustration){
+    h+='<div style="padding:10px;background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.18);border-radius:4px;margin-bottom:10px;font-size:11px;color:var(--gr);line-height:1.6">✓ <strong>Death benefits from your uploaded illustration</strong> ('+_illusCarrier+': '+fmtK(_illusDB)+' DB at '+fmt(_illusPrem)+'/mo). Each generation\'s death benefit scales with its premium.</div>';
+  }else{
+    h+='<div style="padding:10px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.18);border-radius:4px;margin-bottom:10px;font-size:11px;color:var(--yl);line-height:1.6">⚠️ <strong>No policy illustration uploaded.</strong> Showing cash-value accumulation only — death benefits are not simulated. Upload a whole-life / IUL illustration in <strong>Policy Audit</strong> to project tax-free death-benefit transfer across generations.</div>';
+  }
 
-  // ── 3-Generation Cards ──
+  // Story Hook
+  if(hasIllustration){
+    h+=calcStoryBox('🌳','Your <span style="color:var(--gr);font-weight:700">'+fmt(prem)+'/mo</span> premium today creates: <span style="color:var(--gr)">'+fmtK(genData[0].cv)+'</span> cash value for YOUR retirement + <span style="color:#5B9BFF">'+fmtK(genData[0].db)+'</span> tax-free death benefit to your children. If they continue the system, total family wealth by Gen 3: <span style="color:var(--pu);font-weight:700">'+fmtK(cv+prevDB)+'</span>.','var(--gr)');
+  }else{
+    h+=calcStoryBox('🌳','Your <span style="color:var(--gr);font-weight:700">'+fmt(prem)+'/mo</span> premium builds <span style="color:var(--gr)">'+fmtK(genData[0].cv)+'</span> in cash value over 30 years. Upload your policy illustration to project the tax-free death-benefit transfer that makes this a true generational strategy.','var(--gr)');
+  }
+
+  // 3-Generation Cards
   genData.forEach(function(g,i){
     h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+g.col+';border-radius:4px;margin-bottom:8px">';
     h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
@@ -8436,46 +8410,46 @@ function calcGenWealth(){
     h+='<span style="font-size:10px;color:var(--mu)">'+fmt(g.prem)+'/mo · Years '+(i*30+1)+'–'+((i+1)*30)+'</span></div>';
     h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;text-align:center">';
     h+='<div><div style="font-family:var(--fd);font-size:20px;color:var(--gr)">'+fmtK(g.cv)+'</div><div style="font-size:9px;color:var(--mu)">Cash Value</div></div>';
-    h+='<div><div style="font-family:var(--fd);font-size:20px;color:'+g.col+'">'+fmtK(g.db)+'</div><div style="font-size:9px;color:var(--mu)">Death Benefit</div></div>';
+    h+='<div><div style="font-family:var(--fd);font-size:20px;color:'+g.col+'">'+(hasIllustration?fmtK(g.db):'—')+'</div><div style="font-size:9px;color:var(--mu)">Death Benefit</div></div>';
     h+='<div><div style="font-family:var(--fd);font-size:20px;color:var(--mu)">'+fmtK(g.totalPrem)+'</div><div style="font-size:9px;color:var(--mu)">Total Premiums</div></div>';
     h+='</div>';
-    if(g.inherited>0) h+='<div style="font-size:10px;color:'+g.col+';margin-top:6px">↳ Inherited <span style="font-weight:700">'+fmtK(g.inherited)+'</span> death benefit (tax-free) from previous generation</div>';
+    if(hasIllustration&&g.inherited>0) h+='<div style="font-size:10px;color:'+g.col+';margin-top:6px">↳ Inherited <span style="font-weight:700">'+fmtK(g.inherited)+'</span> death benefit (tax-free) from previous generation</div>';
     h+='</div>';
   });
 
-  // ── 90-Year Legacy Summary ──
+  // 90-Year Legacy Summary
   h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin:12px 0">';
   h+=statTile(fmtK(cv),'Final Cash Value','var(--gr)');
-  h+=statTile(fmtK(prevDB),'Final Death Benefit','var(--pu)');
-  h+=statTile(fmtK(cv+prevDB),'Total Family Wealth','#5B9BFF');
+  h+=statTile(hasIllustration?fmtK(prevDB):'—','Final Death Benefit','var(--pu)');
+  h+=statTile(hasIllustration?fmtK(cv+prevDB):fmtK(cv),hasIllustration?'Total Family Wealth':'Total Cash Value','#5B9BFF');
   var roi=totalPrem>0?((cv/totalPrem-1)*100).toFixed(0):0;
   h+=statTile(roi+'%','ROI on Premiums','var(--gr)');
   h+='</div>';
 
-  // ── IBC vs Traditional Comparison ──
-  h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">';
-  h+='<div style="padding:12px;background:rgba(34,197,94,.04);border:2px solid rgba(34,197,94,.12);border-radius:4px;text-align:center">';
-  h+='<div style="font-size:9px;font-family:var(--fh);font-weight:700;color:var(--gr);letter-spacing:.1em">IBC GENERATIONAL</div>';
-  h+='<div style="font-family:var(--fd);font-size:22px;color:var(--gr)">'+fmtK(cv+prevDB)+'</div>';
-  h+='<div style="font-size:9px;color:var(--gr)">Tax-free transfers at each death</div></div>';
-
-  h+='<div style="padding:12px;background:rgba(249,115,22,.04);border:1px solid rgba(249,115,22,.12);border-radius:4px;text-align:center">';
-  h+='<div style="font-size:9px;font-family:var(--fh);font-weight:700;color:var(--or);letter-spacing:.1em">TRADITIONAL INVEST</div>';
-  h+='<div style="font-family:var(--fd);font-size:22px;color:var(--or)">'+fmtK(tradAfterTax)+'</div>';
-  h+='<div style="font-size:9px;color:var(--or)">After capital gains taxes</div></div>';
-  h+='</div>';
-
-  if(ibcAdvantage>0){
-    h+='<div style="padding:10px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.12);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--gr);line-height:1.6;text-align:center">';
-    h+='IBC generational strategy creates <strong>'+fmtK(ibcAdvantage)+' more</strong> in family wealth vs traditional investing — because death benefits transfer tax-free and compound across generations.';
+  // IBC vs Traditional (only with a real, uploaded death benefit)
+  if(hasIllustration){
+    h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px">';
+    h+='<div style="padding:12px;background:rgba(34,197,94,.04);border:2px solid rgba(34,197,94,.12);border-radius:4px;text-align:center">';
+    h+='<div style="font-size:9px;font-family:var(--fh);font-weight:700;color:var(--gr);letter-spacing:.1em">IBC GENERATIONAL</div>';
+    h+='<div style="font-family:var(--fd);font-size:22px;color:var(--gr)">'+fmtK(cv+prevDB)+'</div>';
+    h+='<div style="font-size:9px;color:var(--gr)">Tax-free transfers at each death</div></div>';
+    h+='<div style="padding:12px;background:rgba(249,115,22,.04);border:1px solid rgba(249,115,22,.12);border-radius:4px;text-align:center">';
+    h+='<div style="font-size:9px;font-family:var(--fh);font-weight:700;color:var(--or);letter-spacing:.1em">TRADITIONAL INVEST</div>';
+    h+='<div style="font-family:var(--fd);font-size:22px;color:var(--or)">'+fmtK(tradAfterTax)+'</div>';
+    h+='<div style="font-size:9px;color:var(--or)">After capital gains taxes</div></div>';
     h+='</div>';
+    if(ibcAdvantage>0){
+      h+='<div style="padding:10px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.12);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--gr);line-height:1.6;text-align:center">';
+      h+='IBC generational strategy creates <strong>'+fmtK(ibcAdvantage)+' more</strong> in family wealth vs traditional investing — because death benefits transfer tax-free and compound across generations.';
+      h+='</div>';
+    }
   }
 
   h+='<div style="padding:8px;background:rgba(234,179,8,.04);border:1px solid rgba(234,179,8,.12);border-radius:4px;margin-bottom:8px;font-size:10px;color:var(--yl);line-height:1.5">⚠️ <strong>Important:</strong> These projections use simplified assumptions. Real-world results vary based on market conditions, tax changes, and personal circumstances. Use as a planning guide, not a guarantee.</div>';
   h+=cssBar(Math.min(100,75),'#5B9BFF',8);
   h+=calcAdvisorTeaser('Generational wealth planning requires <strong>precise policy design, ownership structuring, and transfer strategies</strong>. An advisor can illustrate this with actual carrier illustrations and coordinate with your estate plan.');
   h+=calcShareCTA();
-  h+=calcDisclaim('Generational projections involve multiple assumption layers. Cash value accumulation simplified — actual results depend on policy type, carrier performance, cost of insurance, and policy design. Death benefits pass income-tax-free to named beneficiaries. IBC requires properly structured whole life from a mutual carrier. This is educational — consult a licensed professional for actual policy illustrations.');
+  h+=calcDisclaim('Cash-value accumulation is simplified — actual results depend on policy type, carrier performance, cost of insurance, and policy design. Death benefits, when shown, are derived from your uploaded illustration and pass income-tax-free to named beneficiaries. IBC requires properly structured whole life from a mutual carrier. This is educational — consult a licensed professional for actual policy illustrations.');
   el.innerHTML=h;
 }
 
@@ -9089,7 +9063,7 @@ function calcInsNeeds(){
   if(income<=0){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--mu)">Enter your annual income to see results.</div>';return;}
 
   // ── Life Insurance Need ──
-  // CLUSTER 4: insurance-needs math single-sourced � window.PFOSEngine.calculators.insNeeds. Render verbatim.
+  // CLUSTER 4: insurance-needs math single-sourced � window.PFOSEngine.calculators.insNeeds. Render verbatim.
   var _ECin=window.PFOSEngine&&window.PFOSEngine.calculators;
   var _ins=_ECin?_ECin.insNeeds({income:income,spouseInc:spouseInc,deps:deps,totalDebt:totalDebt,monthlyExp:monthlyExp,kidYrs:kidYrs,lifeCov:lifeCov,disCov:disCov,nw:nw,age:age,hasRental:hasRental,hasTeens:hasTeens}):null;
   if(!_ins)return;
@@ -17811,6 +17785,6 @@ var m=document.createElement('div');m.style.cssText='position:fixed;bottom:20px;
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v22.js" defer></script>
+<script src="/pfos-core.v23.js" defer></script>
 </body>
 </html>
