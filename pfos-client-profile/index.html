@@ -5444,18 +5444,22 @@ async function deleteClient(clientId){
     _advShowToast('Delete error: ' + e.message,'error');
   }
 }
+// Canonical calcs for a client's financial_data: computed fresh from S via the
+// engine (no staleness, no divergent fallbacks). Falls back to stored calcs only
+// if the engine isn't loaded.
+function _engineCalcs(fd){
+  try{
+    if(window.PFOSEngine && window.PFOSEngine.computeCalcs && fd && fd.S){
+      return window.PFOSEngine.computeCalcs(fd.S);
+    }
+  }catch(e){ console.warn('[engine] computeCalcs failed, using stored calcs:', e && e.message); }
+  return (fd&&fd.calcs)||(fd&&fd.S&&fd.S.calcs)||{};
+}
 function renderProfileSnapshot(fd, scores){
   var kv=function(k,v,c){ return '<div class="kv"><span class="kk">'+k+'</span><span class="kv-val" style="color:'+(c||'var(--wh)')+'">'+v+'</span></div>'; };
-  var c=fd.calcs||(fd.S&&fd.S.calcs)||{};
-  var rawS=fd.S||{};
-  // Compute from raw state if calcs are stale
-  var inc=c.inc||(rawS.incomeSources?rawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0):0);
-  var debt=c.totalDebt||(rawS.debts?rawS.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0):0);
-  var assets=c.totalAssets||0;if(!assets&&rawS.assets){assets=(parseFloat(rawS.assets.checking)||0)+(parseFloat(rawS.assets.savings)||0)+(parseFloat(rawS.assets.invest)||0)+(parseFloat(rawS.assets.re)||0)+(parseFloat(rawS.assets.other)||0);}
-  var nw=c.netWorth||(assets-debt);
-  var exp=c.baseExp||0;if(!exp&&rawS.expData){Object.keys(rawS.expData).forEach(function(k){exp+=(parseFloat((rawS.expData[k]||{}).amount)||0);});}
-  var ncf=c.netCF||(inc-exp);
-  var sr=c.savingsRate||(inc>0?Math.round((inc-exp)/inc*100*10)/10:0);
+  // Canonical metrics from the engine (was: stored calcs + divergent stale-fallbacks).
+  var c=_engineCalcs(fd);
+  var inc=c.inc||0, debt=c.totalDebt||0, assets=c.totalAssets||0, nw=c.netWorth||0, exp=c.baseExp||0, ncf=c.netCF||0, sr=c.savingsRate||0;
   var hasData=inc>0||debt>0||assets>0||Object.keys(c).length>0;
   var snap = hasData
     ? kv('Monthly Income',fmt(inc),inc>0?'var(--gr)':'var(--wh)')+kv('Net Cash Flow',fmt(ncf),ncf>=0?'var(--gr)':'var(--rd)')+kv('Net Worth',fmtK(nw),nw>=0?'var(--gr)':'var(--rd)')+kv('Total Debt',fmtK(debt),'var(--or)')+kv('Savings Rate',sr.toFixed(1)+'%')
@@ -5463,17 +5467,11 @@ function renderProfileSnapshot(fd, scores){
   set('profileSnapshotData', snap);
 }
 function renderProfileRedFlags(fd){
-  var c=(fd&&fd.calcs)?fd.calcs:((fd&&fd.S&&fd.S.calcs)?fd.S.calcs:{});
+  // Canonical metrics from the engine (was: stored calcs + divergent stale-fallbacks
+  // for inc/debt/efBal/baseExp/netCF/savingsRate/dti/efMonths). The ===undefined
+  // derivations below are non-engine fields (protGap, noRetirement) and remain.
+  var c=_engineCalcs(fd);
   var rawS=(fd&&fd.S)?fd.S:{};
-  // Compute from raw state if calcs are stale
-  if(!c.inc&&rawS.incomeSources&&rawS.incomeSources.length)c.inc=rawS.incomeSources.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0);
-  if(!c.totalDebt&&rawS.debts&&rawS.debts.length)c.totalDebt=rawS.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
-  if(!c.efBal&&rawS.assets)c.efBal=(parseFloat(rawS.assets.checking)||0)+(parseFloat(rawS.assets.savings)||0);
-  if(!c.baseExp&&rawS.expData){var _exp=0;Object.keys(rawS.expData).forEach(function(k){_exp+=(parseFloat((rawS.expData[k]||{}).amount)||0);});c.baseExp=_exp;}
-  if(c.inc&&!c.netCF)c.netCF=c.inc-(c.baseExp||0);
-  if(c.inc&&!c.savingsRate)c.savingsRate=c.inc>0?Math.round((c.inc-(c.baseExp||0))/c.inc*100*10)/10:0;
-  if(c.inc&&!c.dti&&rawS.debts){var _min=rawS.debts.reduce(function(t,d){return t+(parseFloat(d.payment)||0);},0);c.dti=c.inc>0?Math.round(_min/c.inc*100):0;}
-  if(!c.efMonths&&c.efBal&&c.baseExp)c.efMonths=c.baseExp>0?c.efBal/c.baseExp:0;
   // Derive flags that pfos-main calc() normally computes
   if(c.retGap===undefined&&rawS.retAccounts){
     var _retBal=rawS.retAccounts.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
@@ -30117,5 +30115,7 @@ async function _checkUnreadMessages(){
   </div>
 </div>
 
+<!-- PFOS canonical engine (single source of truth) — advisor metrics compute on-read. -->
+<script src="/pfos-core.v2.js" defer></script>
 </body>
 </html>
