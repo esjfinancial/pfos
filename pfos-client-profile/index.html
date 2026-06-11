@@ -25820,93 +25820,26 @@ function _ibcProjectPolicy(policy,fromMonth,toMonth){
 // loan-and-repay cycle with anniversary-anchored CV. Returns months to original debts
 // gone, fullFreeMonth (CV=AV recovery month after policy loans repaid), total interest,
 // CV at recovery, and the per-debt payoff log.
-function _cpCalcIBCDebt(debts,budget){
+function _cpCalcIBCDebt(debts,budget,userRepayOverride){
+  // CANONICAL: delegates to the single engine cascade (simulateIBCDebtCascadeBest) —
+  // strict-avalanche vs affordable-first, 90% LTV, returns the quicker with a written
+  // payoff-order description (owner-signed-off spec). Replaces the old per-page mechanic.
+  // The 3rd arg (RULE 8 loan-repayment override) is now honored on BOTH pages — the
+  // profile copy previously dropped it. Adapts the engine result to the fields plan
+  // consumers read (eligible/intSaved/_total* renames).
   if(!debts||!debts.length||budget<=0)return null;
   var surplus=CPLAN.surplus||0;
   if(surplus<200)return{eligible:false,reason:'Need at least $200/mo positive cash flow.'};
   if(CPLAN.totalDebt<=0)return{eligible:false,reason:'No active debts.'};
-  // True IBC mechanics:
-  // 1. ALL of "budget" (extras) flows to the policy each month. Debts get only minimums.
-  // 2. When CV >= next-highest-rate debt's balance, take a policy loan and kill that debt.
-  //    Add that debt's freed minimum to a combined pool.
-  // 3. Combined pool repays the COMBINED policy loan balance with simple interest on
-  //    current outstanding balance each month (no compounding of unpaid interest).
-  // 4. Continue until all debts are loaned out + all loans are repaid.
-  var ibcParams=Object.assign({},_ibcPolicyDefaults('wl'),{monthlyPremium:budget});
-  var loanAnnRate=0.05;
-  var ds=debts.map(function(d,i){return{name:d.name||('Debt '+(i+1)),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,annualRate:(parseFloat(d.rate)||0),min:parseFloat(d.min)||0,paid:false};});
-  // Avalanche order — pay highest-INTEREST debt first when CV is sufficient
-  ds.sort(function(a,b){return b.rate-a.rate;});
-  var vehicle=0,totalDebtInt=0,totalLoanInt=0,payoffLog=[],origFreeMonth=null,month=0;
-  var totalLoanBalance=0;
-  var totalLoanFreedMins=0;
-  var lastAnnivCV=0;
-  var premiumSinceAnniv=0;
-  while(month<720){
-    month++;
-    // Step 1: premium flows in monthly (continuous, real cash flow)
-    premiumSinceAnniv+=budget;
-    vehicle=lastAnnivCV+premiumSinceAnniv;
-    // Step 2: each unpaid debt accrues its own interest and gets its minimum payment
-    ds.forEach(function(d){
-      if(d.bal<0.01||d.paid)return;
-      var interest=d.bal*d.rate;
-      totalDebtInt+=interest;
-      d.bal+=interest;
-      var pmt=Math.min(d.min,d.bal);
-      d.bal-=pmt;
-      if(d.bal<0.01)d.bal=0;
-    });
-    // Step 3: if available CV (vehicle minus existing loans) covers next debt, loan it out
-    ds.forEach(function(d){
-      if(d.paid||d.bal<0.01)return;
-      var availableCV=vehicle-totalLoanBalance;
-      if(availableCV>=d.bal){
-        totalLoanBalance+=d.bal;
-        totalLoanFreedMins+=d.min;
-        payoffLog.push({name:d.name,month:month,balAtLoan:Math.round(d.bal),annualRate:d.annualRate,freedMin:d.min});
-        d.bal=0;
-        d.paid=true;
-      }
-    });
-    // Step 4: combined freed-minimums pool repays the combined loan balance (simple interest)
-    if(totalLoanBalance>0){
-      var loanInterest=totalLoanBalance*loanAnnRate/12;
-      totalLoanInt+=loanInterest;
-      totalLoanBalance+=loanInterest;
-      var loanPayment=Math.min(totalLoanFreedMins,totalLoanBalance);
-      totalLoanBalance-=loanPayment;
-      if(totalLoanBalance<0.01)totalLoanBalance=0;
-    }
-    // Step 5: ANNIVERSARY CREDITING — every 12 months, apply WL annual credit
-    if(month%12===0){
-      var policyYear=month/12;
-      var annualCredit=_ibcWLAnnualCredit(ibcParams,policyYear,lastAnnivCV,0);
-      var efficiency=_ibcYearFactor(ibcParams.cvEfficiencyYr,policyYear,1.0);
-      var stuckPremiumCV=premiumSinceAnniv*efficiency;
-      var growthOnExistingCV=annualCredit.breakdown.guaranteedGrowth+annualCredit.breakdown.dividend;
-      lastAnnivCV=lastAnnivCV+stuckPremiumCV+growthOnExistingCV;
-      premiumSinceAnniv=0;
-      vehicle=lastAnnivCV;
-    }
-    // Step 6: track milestones
-    var origLeft=ds.some(function(d2){return d2.bal>0.01;});
-    if(!origLeft&&origFreeMonth===null)origFreeMonth=month;
-    if(!origLeft&&totalLoanBalance<=0)break;
-  }
-  return {
-    eligible:true,
-    months:origFreeMonth||month,
-    fullFreeMonth:month,
-    interest:Math.round(totalDebtInt+totalLoanInt),
-    vehicle:Math.round(vehicle),
-    budget:budget,
-    payoffLog:payoffLog,
-    intSaved:0,
-    _totalLoanInterest:Math.round(totalLoanInt),
-    _totalDebtInterest:Math.round(totalDebtInt),
-    _totalPremiumsPaid:Math.round(budget*month)
-  };
+  var EC=window.PFOSEngine&&window.PFOSEngine.ibcCascade;
+  if(!EC||!EC.simulateIBCDebtCascadeBest)return null;
+  var r=EC.simulateIBCDebtCascadeBest(debts,budget,{userRepayOverride:(typeof userRepayOverride==='number'&&userRepayOverride>=0)?userRepayOverride:null});
+  if(!r)return null;
+  r.eligible=true; r.intSaved=0;
+  r._totalLoanInterest=r.totalLoanInterest;
+  r._totalDebtInterest=r.totalDebtInterest;
+  r._totalPremiumsPaid=r.totalPremiumsPaid;
+  return r;
 }
 
 // Toggle Option A (continue policy) vs Option B (cancel + take CV lump sum)
