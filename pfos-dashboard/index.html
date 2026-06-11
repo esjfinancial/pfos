@@ -3053,7 +3053,7 @@ async function generatePreMeetingBrief(clientId){
     var {data:snaps}=await db.from('client_snapshots').select('*').eq('client_id',clientId).order('snapshot_date',{ascending:false}).limit(2);
     var fd=(profile&&profile.financial_data)?profile.financial_data:{};
     var sc=(profile&&profile.scores)?profile.scores:{};
-    var c=fd.calcs||{};
+    var c=freshCalcs(fd);
     var openRecs=(recs||[]).filter(function(r){return r.status!=='implemented'&&r.status!=='completed'&&r.status!=='active';}).length;
     var implRecs=(recs||[]).filter(function(r){return r.status==='implemented'||r.status==='completed'||r.status==='active';}).length;
     // Changes since last snapshot
@@ -3519,6 +3519,20 @@ function healthScoreBadge(score){
   if(score===null) return '<span style="font-size:11px;color:var(--mu)">—</span>';
   var col = score>=7?'#22C55E':score>=5?'#EAB308':'#EF4444';
   return '<span style="font-family:var(--fh);font-size:10px;font-weight:700;color:'+col+';background:'+col+'14;border:1px solid '+col+'40;padding:2px 7px;border-radius:10px">'+score+'/10</span>';
+}
+// Freshest canonical calcs for a profile: compute on-read from the full raw S via
+// the engine for SELF-CONTAINED households (single/separate) so a metric-definition
+// change reflects immediately without a backfill. Couples (joint/hybrid) need the
+// runtime _jointItems assembly that lives in pfos-main and is absent from fd.S, so
+// they keep the stored backfilled-canonical calcs (pfos-main refreshes them on edit).
+function freshCalcs(fd){
+  try{
+    var S=fd&&fd.S, hh=S&&S.householdType;
+    if(window.PFOSEngine&&window.PFOSEngine.computeCalcs&&S&&S.profile&&hh!=='joint'&&hh!=='hybrid'){
+      return window.PFOSEngine.computeCalcs(S);
+    }
+  }catch(e){}
+  return (fd&&fd.calcs)||(fd&&fd.S&&fd.S.calcs)||{};
 }
 function computeHealthScore(scores){
   if(!scores) return null;
@@ -4977,7 +4991,7 @@ async function renderClientLeaderboard(){
     // Build leaderboard data
     var entries=myClients.map(function(c){
       var prof=profMap[c.id]||{};
-      var fd=(prof.financial_data)||{};var calcs=fd.calcs||{};var scores=prof.scores||{};
+      var fd=(prof.financial_data)||{};var calcs=freshCalcs(fd);var scores=prof.scores||{};
       var health=computeHealthScore(scores);
       var rm=recMap[c.id]||{total:0,impl:0};
       var compliance=rm.total>0?Math.round(rm.impl/rm.total*100):null;
@@ -6095,7 +6109,7 @@ async function advLoadClient(){
     var {data:profile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',val).maybeSingle();
     var fd=(profile&&profile.financial_data)?profile.financial_data:{};
     var sc=(profile&&profile.scores)?profile.scores:{};
-    var c=fd.calcs||{};
+    var c=freshCalcs(fd);
     window.S={calcs:c,debts:fd.debts||[],retAccounts:fd.retAccounts||[],currentAge:fd.currentAge||0,riskProfile:fd.riskProfile||null,creditScore:sc.creditScore||fd.creditScore||0,children:fd.children||[],insurancePolicies:fd.insurancePolicies||[],dependents:fd.dependents||0,protCalcs:fd.protCalcs||{},snapshot:fd.snapshot||{},expData:fd.expData||{},goals:fd.goals||[],buckets:fd.buckets||[]};
     if(info) info.innerHTML='<strong style="color:var(--wh)">'+(client.name||'')+'</strong> loaded';
   }catch(err){
