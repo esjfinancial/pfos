@@ -7862,7 +7862,9 @@ function calcRetScenarios(){
 
   var years=Math.max(1,retAge-age);
   var needFromPortfolio=need-ss;// monthly gap SS doesn't cover
-  var fiNumber=0;var _inflRS=(pf(gv('rs_infl'))||3)/100;for(var _y=0;_y<Math.max(1,90-retAge);_y++){fiNumber+=needFromPortfolio*12*Math.pow(1+_inflRS,_y);}fiNumber=Math.round(fiNumber);
+  // CLUSTER 1: FI single-sourced → fiTargetMC (MC @95% survival, SS ignored, risk-personalized).
+  var _ecRS=window.PFOSEngine&&window.PFOSEngine.calculators;
+  var fiNumber=_ecRS?_ecRS.fiTargetMC(need*12,Math.max(1,90-retAge),{infl:(pf(gv('rs_infl'))||3)/100,riskLevel:(S.calcs&&S.calcs.retRiskLevel)||'moderate',targetSuccess:0.95}):Math.round(need*12*25);
 
   // ── 3 Scenarios ──
   var scenarios=[
@@ -7895,7 +7897,7 @@ function calcRetScenarios(){
   h+='<div style="text-align:center;padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;margin:14px 0 12px">';
   h+='<div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.15em">BALANCE NEEDED FOR YOUR TARGET</div>';
   h+='<div style="font-family:var(--fd);font-size:34px;color:#5B9BFF">'+fmtK(fiNumber)+'</div>';
-  h+='<div style="font-size:12px;color:var(--mu)">'+fmt(need)+'/mo desired − '+fmt(ss)+'/mo SS = '+fmt(needFromPortfolio)+'/mo from portfolio &times; ~25 years (sustainable withdrawal horizon)</div>';
+  h+='<div style="font-size:12px;color:var(--mu)">'+fmt(need)+'/mo desired income, funded by your portfolio to survive 95% of simulated market paths (Social Security treated as upside, not counted)</div>';
   h+='</div>';
 
   // ── Story Hook ──
@@ -8572,7 +8574,12 @@ function calcWhatIf(){
   // FI impact
   var retBal=(cRet('wi')).reduce(function(t,a){return t+(a.balance||0);},0);
   var retContr=(cRet('wi')).reduce(function(t,a){return t+(a.contrib||0);},0);
-  var _retAgeWI=(S.calcs&&S.calcs.retAge)||65;var _inflWI=(S.calcs&&S.calcs.retInflation)||0.03;var fiNumber=0;for(var _yw=0;_yw<Math.max(1,90-_retAgeWI);_yw++){fiNumber+=Math.round(newInc*0.8)*12*Math.pow(1+_inflWI,_yw);}fiNumber=Math.round(fiNumber);
+  // CLUSTER 1: FI single-sourced → fiTargetMC (MC @95% survival, SS ignored). What-if scales
+  // the profile's retIncome by the income-change ratio (owner decision), not an 0.8 proxy.
+  var _retAgeWI=(S.calcs&&S.calcs.retAge)||65;var _inflWI=(S.calcs&&S.calcs.retInflation)||0.03;
+  var _ratioWI=inc>0?(newInc/inc):1;var _scaledRetIncWI=((S.calcs&&S.calcs.retInc)||5000)*_ratioWI;
+  var _ecWI=window.PFOSEngine&&window.PFOSEngine.calculators;
+  var fiNumber=_ecWI?_ecWI.fiTargetMC(_scaledRetIncWI*12,Math.max(1,90-_retAgeWI),{infl:_inflWI,riskLevel:(S.calcs&&S.calcs.retRiskLevel)||'moderate',targetSuccess:0.95}):Math.round(_scaledRetIncWI*12*25);
   var _wiRet=(S.calcs&&S.calcs.blendedRetReturn||7)/100;var yrsToFICur=0;var rb=retBal;while(rb<fiNumber&&yrsToFICur<50){yrsToFICur++;rb=rb*(1+_wiRet)+retContr*12;}
   var yrsToFINew=0;rb=retBal;while(rb<fiNumber&&yrsToFINew<50){yrsToFINew++;rb=rb*(1+_wiRet)+(retContr+retExtra)*12;}
 
@@ -12409,34 +12416,17 @@ function renderMonteCarlo(){
 }
 
 function calcMonteCarlo(){
-  var bal=pf(gv('mc_bal'))||200000;var contr=pf(gv('mc_contr'))||500;
-  var ret=(pf(gv('mc_ret'))||7)/100;var std=(pf(gv('mc_std'))||12)/100;
+  // CLUSTER 1: math single-sourced → window.PFOSEngine.calculators.monteCarloRetirement
+  // (seeded mulberry32 — deterministic + reproducible). Render kept verbatim below.
+  var el=document.getElementById('mc_results');if(!el)return;
+  var contr=pf(gv('mc_contr'))||500;var ret=(pf(gv('mc_ret'))||7)/100;var std=(pf(gv('mc_std'))||12)/100;
   var retAge=parseInt(gv('mc_retAge'))||65;var spend=pf(gv('mc_spend'))||5000;
   var age=cAge('mc');var rp=(S.riskProfile&&S.riskProfile.label)||'moderate';
-  var el=document.getElementById('mc_results');if(!el)return;
-
-  var accYrs=Math.max(1,retAge-age);var lifeExpMC=parseInt(gv('mc_lifeExp'))||90;var drawYrs=Math.max(1,lifeExpMC-retAge);
-  var sims=500;var successes=0;var finalVals=[];var failYears=[];
-  function randNorm(){var u=1-Math.random();var v=Math.random();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
-
-  for(var s=0;s<sims;s++){
-    var b=bal;
-    for(var y=0;y<accYrs;y++){var r=ret+std*randNorm();b=b*(1+r)+contr*12;}
-    var survived=true;
-    for(var y2=0;y2<drawYrs;y2++){var r2=ret*0.8+std*0.8*randNorm();b=b*(1+r2)-spend*12*(1+0.03*y2);// inflation-adjusted spending
-      if(b<=0){survived=false;failYears.push(y2);break;}}
-    if(survived) successes++;
-    finalVals.push(Math.max(0,Math.round(b)));
-  }
-  finalVals.sort(function(a,b){return a-b;});
-  var prob=Math.round(successes/sims*100);
-  var worst5=finalVals[Math.round(sims*0.05)];
-  var p10=finalVals[Math.round(sims*0.10)];
-  var p25=finalVals[Math.round(sims*0.25)];
-  var median=finalVals[Math.round(sims*0.5)];
-  var p75=finalVals[Math.round(sims*0.75)];
-  var best5=finalVals[Math.round(sims*0.95)];
-  var avgFailYr=failYears.length>0?Math.round(failYears.reduce(function(a,b){return a+b;},0)/failYears.length):0;
+  var lifeExpMC=parseInt(gv('mc_lifeExp'))||90;var drawYrs=Math.max(1,lifeExpMC-retAge);
+  var EC=window.PFOSEngine&&window.PFOSEngine.calculators;
+  var _r=EC?EC.monteCarloRetirement({bal:pf(gv('mc_bal'))||200000,contrib:contr,accumReturn:pf(gv('mc_ret'))||7,std:pf(gv('mc_std'))||12,age:age,retAge:retAge,lifeExp:lifeExpMC,spend:spend,sims:500}):null;
+  if(!_r)return;
+  var sims=_r.sims,successes=_r.successes,prob=_r.prob,worst5=_r.worst5,p10=_r.p10,p25=_r.p25,median=_r.median,p75=_r.p75,best5=_r.best5,avgFailYr=_r.avgFailYr;
 
   var probColor=prob>=80?'var(--gr)':prob>=60?'var(--yl)':'var(--rd)';
 
@@ -12473,7 +12463,7 @@ function calcMonteCarlo(){
   h+='</div>';
 
   // ── Failed scenarios detail ──
-  if(failYears.length>0){
+  if((sims-successes)>0){
     h+='<div style="padding:10px;background:rgba(239,68,68,.04);border:1px solid rgba(239,68,68,.12);border-radius:4px;margin-bottom:12px;font-size:13px;color:var(--mu);line-height:1.7">';
     h+='<strong style="color:var(--rd)">📉 In failed scenarios:</strong> Money runs out at average age <span style="color:var(--rd);font-weight:700">'+(retAge+avgFailYr)+'</span> ('+avgFailYr+' years into retirement). '+(sims-successes)+' of '+sims+' scenarios failed.';
     h+='</div>';
@@ -16142,36 +16132,15 @@ function renderFIRECalc(){
   h+='<div id="fire_results"></div>';el.innerHTML=h;calcFIRE();
 }
 function calcFIRE(){
-  var age=parseInt(gv('fire_age'))||0;var retAge=parseInt(gv('fire_retAge'))||55;
-  var lifeExp=parseInt(gv('fire_lifeExp'))||90;
-  var income=pf(gv('fire_income'))||0;var expenses=pf(gv('fire_exp'))||0;
-  var assets=pf(gv('fire_assets'))||0;var ret=(pf(gv('fire_return'))||7)/100;
-  var monthlyNeed=pf(gv('fire_retSpend'))||0;var ss=pf(gv('fire_ss'))||0;
-  var infl=(pf(gv('fire_infl'))||3)/100;
+  // CLUSTER 1: math single-sourced → window.PFOSEngine.calculators.retirementFI
+  // (MC-derived FI @95% survival, SS ignored, risk-personalized drawdown). Render kept verbatim.
   var el=document.getElementById('fire_results');if(!el)return;
+  var age=parseInt(gv('fire_age'))||0;var monthlyNeed=pf(gv('fire_retSpend'))||0;
   if(age<=0||monthlyNeed<=0){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--mu)">Enter your age and monthly retirement need to see results.</div>';return;}
-  var annualSav=income-expenses;var savRate=income>0?Math.round(annualSav/income*100):0;
-  var retYears=Math.max(1,lifeExp-retAge);
-  var annualNeed=(monthlyNeed-ss)*12;if(annualNeed<0)annualNeed=0;
-  var fiNumber=0;
-  for(var y=0;y<retYears;y++){fiNumber+=annualNeed*Math.pow(1+infl,y);}
-  fiNumber=Math.round(fiNumber);
-  var bal=assets;var actualRetAge=0;
-  for(var y2=0;y2<80;y2++){
-    var curAge=age+y2;var remainYrs=Math.max(0,lifeExp-curAge);var remainNeed=0;
-    for(var r=0;r<remainYrs;r++){remainNeed+=annualNeed*Math.pow(1+infl,y2+r);}
-    if(bal>=remainNeed&&curAge>=age){actualRetAge=curAge;break;}
-    bal=(bal+Math.max(0,annualSav))*(1+ret);
-  }
-  if(!actualRetAge) actualRetAge=lifeExp;
-  var progress=fiNumber>0?Math.min(100,Math.round(assets/fiNumber*100)):0;
-  var gap=Math.max(0,fiNumber-assets);var gapToGoal=actualRetAge-retAge;
-  var reqIncrease=0;
-  if(gapToGoal>0){var yrsToGoal=Math.max(1,retAge-age);var mr=ret/12;var months=yrsToGoal*12;var fvBal=assets*Math.pow(1+mr,months);var needed=fiNumber-fvBal;reqIncrease=needed>0&&mr>0?Math.round(needed*mr/(Math.pow(1+mr,months)-1)):0;reqIncrease=Math.max(0,reqIncrease-Math.round(annualSav/12));}
-  var scenarios=[];
-  [0,5,10,15].forEach(function(extra){var b2=assets;var fa2=0;for(var y3=0;y3<80;y3++){var ca=age+y3;var rn=0;for(var r2=0;r2<Math.max(0,lifeExp-ca);r2++){rn+=annualNeed*Math.pow(1+infl,y3+r2);}if(b2>=rn){fa2=ca;break;}b2=(b2+annualSav+(income*extra/100))*(1+ret);}if(!fa2)fa2=lifeExp;scenarios.push({extra:extra,age:fa2,diff:fa2-actualRetAge});});
-  var coastBal=assets;for(var y4=0;y4<Math.max(0,retAge-age);y4++)coastBal=coastBal*(1+ret);var coastFIRE=coastBal>=fiNumber;
-  var healthcareCost=0;if(actualRetAge<65){for(var hc=0;hc<65-actualRetAge;hc++){healthcareCost+=12000*Math.pow(1+0.055,hc);}healthcareCost=Math.round(healthcareCost);}
+  var EC=window.PFOSEngine&&window.PFOSEngine.calculators;
+  var _r=EC?EC.retirementFI({age:age,retAge:parseInt(gv('fire_retAge'))||55,lifeExp:parseInt(gv('fire_lifeExp'))||90,income:pf(gv('fire_income'))||0,expenses:pf(gv('fire_exp'))||0,assets:pf(gv('fire_assets'))||0,monthlyNeed:monthlyNeed,ss:pf(gv('fire_ss'))||0,accumReturn:pf(gv('fire_return'))||7,infl:pf(gv('fire_infl'))||3,riskLevel:(S.calcs&&S.calcs.retRiskLevel)||'moderate'}):null;
+  if(!_r)return;
+  var retAge=_r.retAge,lifeExp=_r.lifeExp,income=_r.income,expenses=_r.expenses,assets=_r.assets,ss=_r.ss,infl=_r.infl,annualSav=_r.annualSav,savRate=_r.savRate,retYears=_r.retYears,annualNeed=_r.netAnnualNeed,fiNumber=_r.fiNumber,actualRetAge=_r.actualRetAge,progress=_r.progress,gap=_r.gap,gapToGoal=_r.gapToGoal,reqIncrease=_r.reqIncrease,coastBal=_r.coastBal,coastFIRE=_r.coastFIRE,healthcareCost=_r.healthcareCost,scenarios=_r.scenarios;
   var h='';
   h+=calcStoryBox('🔥','Your FI Number: <span style="color:var(--or);font-weight:700">'+fmtK(fiNumber)+'</span> = '+(lifeExp-retAge)+' years × '+fmtK(Math.round(annualNeed))+'/yr (inflation-adjusted at '+infl*100+'%). '+(gapToGoal<=0?'<span style="color:var(--gr);font-weight:700">You can retire at '+actualRetAge+' — at or before your goal of '+retAge+'!</span>':'At current pace: <span style="color:#5B9BFF">retire at '+actualRetAge+'</span>. Goal: <span style="color:var(--or)">'+retAge+'</span>. <span style="color:var(--yl)">Gap: '+gapToGoal+' years</span>.'+(reqIncrease>0?' <span style="color:var(--gr)">Add +'+fmt(reqIncrease)+'/mo to close it.</span>':'')),gapToGoal<=0?'var(--gr)':'#5B9BFF');
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:14px 0"><div style="text-align:center;padding:16px;background:rgba(249,115,22,.04);border:2px solid rgba(249,115,22,.18);border-radius:6px"><div style="font-size:12px;color:var(--or)">FI Number (Goal: Retire at '+retAge+')</div><div style="font-family:var(--fd);font-size:32px;color:var(--or)">'+fmtK(fiNumber)+'</div><div style="font-size:11px;color:var(--mu)">('+retYears+' years × '+fmtK(Math.round(annualNeed))+'/yr + '+infl*100+'% inflation)</div></div>';
@@ -18525,6 +18494,6 @@ var m=document.createElement('div');m.style.cssText='position:fixed;bottom:20px;
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v4.js" defer></script>
+<script src="/pfos-core.v5.js" defer></script>
 </body>
 </html>
