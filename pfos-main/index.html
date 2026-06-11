@@ -9692,311 +9692,64 @@ function calc(){
   if(_calcRunning) return;
   _calcRunning=true;
   try{
-  // Split income by owner — Phase 1A: also tracks gross for accurate match calcs
-  var incPersonal=0, incSpouse=0, incJoint=0;
-  var incPersonalGross=0, incSpouseGross=0, incJointGross=0;
-  (S.incomeSources||[]).forEach(function(src){
-    var amt=_incSrcMonthlyTakeHome(src);
-    var grossAmt=_incSrcMonthlyGross(src);
-    if(src.owner==='spouse'){ incSpouse+=amt; incSpouseGross+=grossAmt; }
-    else if(src.owner==='joint'){ incJoint+=amt; incJointGross+=grossAmt; }
-    else { incPersonal+=amt; incPersonalGross+=grossAmt; }
-  });
-  // Phase 4 — Hybrid joint income from couple_links.joint_financial_data.
-  // Each joint item is split per spouse via share_pct_a/share_pct_b. The
-  // current user's contribution is amount * (myShare / 100). These are
-  // counted in incJoint so they show up in the joint income bucket — they
-  // don't double-count because Hybrid's S.incomeSources never has
-  // owner='joint' items in V2 (migrated out in Phase 3).
-  if(S.householdType === 'hybrid' && S._jointItems && Array.isArray(S._jointItems.incomeSources)){
-    var myField = (typeof _hybridShareField === 'function') ? _hybridShareField() : 'share_pct_a';
-    S._jointItems.incomeSources.forEach(function(src){
-      var amt = _incSrcMonthlyTakeHome(src);
-      var grossAmt = _incSrcMonthlyGross(src);
-      var pct = (src[myField] !== undefined) ? (parseFloat(src[myField]) || 0) : 50;
-      incJoint += amt * pct / 100;
-      incJointGross += grossAmt * pct / 100;
-    });
-  }
-  var inc=incPersonal+incSpouse+incJoint;
-  var incGross=incPersonalGross+incSpouseGross+incJointGross;
-  // Stay-at-home spouse replacement value (for protection calcs)
-  var sahValue=S.spouseStayHome?(S.sahMonthlyValue||0):0;
+  // ── CUTOVER (step 2): all metrics now come from the canonical engine. This
+  // function only (a) gathers the live DOM inputs onto S, (b) calls the engine,
+  // and (c) applies the page-side side-effects + render. The ~250 lines of inline
+  // math that used to live here were deleted — they are now the single source in
+  // pfos-core (computeCalcs), validated identical via shadow mode.
   initExpData();
-  var baseExp=getTotalMonthlyExp(), netCF=inc-baseExp;
-  var savingsExp=getMonthlyExp('activeSavings'), savingsRate=inc>0?(savingsExp/inc*100):0;
 
-  // Assets — read from DOM, fallback to S.assets
+  // ── Assets: read DOM → S.assets (+ hidden aInvest sync, savings note, total) ──
   var _a=S.assets||{};
   var aChecking=pf(gv('aChecking'))||(_a.checking||0), aSavings=pf(gv('aSavings'))||(_a.savings||0), aSavAPY=pf(gv('aSavAPY'))||(_a.savAPY||0);
   var aCash=aChecking+aSavings;
-  // aInvest is now sourced from S.investments[] (the dedicated Investments card
-  // on panel 6 is the per-account source of truth). Exclude crypto from the
-  // net-worth rollup — no defensible long-term return assumption applies to
-  // speculative digital assets, consistent with the crypto exclusion in
-  // pfos-client plan view. Fallback to legacy _a.invest for clients that
-  // haven't migrated to per-account tracking yet.
-  var _invSum=(S.investments||[]).reduce(function(t,iv){
-    if(!iv)return t;
-    var typ=(iv.type||'').toLowerCase();
-    if(typ==='crypto')return t;
-    return t+(parseFloat(iv.balance)||0);
-  },0);
-  // Phase 4b — Hybrid joint investments from couple_links.joint_financial_data.
-  // Each item's contribution to "my" balance is balance * (myShare / 100).
-  if(S.householdType === 'hybrid' && S._jointItems && Array.isArray(S._jointItems.investments)){
-    var _myFieldI = (typeof _hybridShareField === 'function') ? _hybridShareField() : 'share_pct_a';
-    S._jointItems.investments.forEach(function(iv){
-      if(!iv)return;
-      var typ = (iv.type||'').toLowerCase();
-      if(typ === 'crypto') return;
-      var bal = parseFloat(iv.balance) || 0;
-      var pct = (iv[_myFieldI] !== undefined) ? (parseFloat(iv[_myFieldI]) || 0) : 50;
-      _invSum += bal * pct / 100;
-    });
+  // aInvest from S.investments[] (crypto excluded), legacy _a.invest fallback; + hybrid joint share.
+  var _invSum=(S.investments||[]).reduce(function(t,iv){ if(!iv)return t; var typ=(iv.type||'').toLowerCase(); if(typ==='crypto')return t; return t+(parseFloat(iv.balance)||0); },0);
+  if(S.householdType==='hybrid' && S._jointItems && Array.isArray(S._jointItems.investments)){
+    var _myFieldI=(typeof _hybridShareField==='function')?_hybridShareField():'share_pct_a';
+    S._jointItems.investments.forEach(function(iv){ if(!iv)return; var typ=(iv.type||'').toLowerCase(); if(typ==='crypto')return; var bal=parseFloat(iv.balance)||0; var pct=(iv[_myFieldI]!==undefined)?(parseFloat(iv[_myFieldI])||0):50; _invSum+=bal*pct/100; });
   }
   var aInvest=_invSum>0?_invSum:(_a.invest||0);
-  // Keep hidden input in sync so legacy DOM reads (Diagnostic Engine actions,
-  // migration paths) see a fresh value.
-  var _aInvEl=document.getElementById('aInvest');
-  if(_aInvEl&&_aInvEl.value!==String(aInvest))_aInvEl.value=String(aInvest);
+  var _aInvEl=document.getElementById('aInvest'); if(_aInvEl&&_aInvEl.value!==String(aInvest))_aInvEl.value=String(aInvest);
   var aRE=pf(gv('aRE'))||(_a.re||0), aOther=pf(gv('aOther'))||(_a.other||0);
   S.assets={checking:aChecking,savings:aSavings,savAPY:aSavAPY,invest:aInvest,re:aRE,other:aOther};
-  var totalAssets=aCash+aInvest+aRE+aOther;
+  var _preRetAssets=aCash+aInvest+aRE+aOther;
   var noteEl=document.getElementById('savingsInterestNote');
   if(noteEl&&aSavings>0&&aSavAPY>0){ var ai=aSavings*(aSavAPY/100); noteEl.textContent='✓ Earning ~'+fmt(Math.round(ai/12))+'/mo at '+aSavAPY+'% APY'; noteEl.style.color='#22C55E'; }
   else if(noteEl) noteEl.textContent='';
-  var atd=document.getElementById('aTotalDisp'); if(atd) atd.value=totalAssets>0?'$'+Math.round(totalAssets).toLocaleString():'';
+  var atd=document.getElementById('aTotalDisp'); if(atd) atd.value=_preRetAssets>0?'$'+Math.round(_preRetAssets).toLocaleString():'';
 
-  // Debts
-  var totalDebt=(S.debts||[]).reduce(function(s,d){return s+(d.balance||0);},0);
-  var totalMin=(S.debts||[]).reduce(function(s,d){return s+(d.min||0);},0);
-  // Phase 4c — Hybrid joint debts: count user's weighted share of joint
-  // balances and minimums into totalDebt/totalMin so net worth and DTI
-  // reflect their actual obligation rather than the full household figure.
-  if(S.householdType === 'hybrid' && S._jointItems && Array.isArray(S._jointItems.debts)){
-    var _myFieldD = (typeof _hybridShareField === 'function') ? _hybridShareField() : 'share_pct_a';
-    S._jointItems.debts.forEach(function(d){
-      if(!d) return;
-      var pct = (d[_myFieldD] !== undefined) ? (parseFloat(d[_myFieldD]) || 0) : 50;
-      totalDebt += (parseFloat(d.balance) || 0) * pct / 100;
-      totalMin  += (parseFloat(d.min)     || 0) * pct / 100;
-    });
-  }
-  var retBal=(S.retAccounts||[]).reduce(function(s,a){return s+(a.balance||0);},0);
-  totalAssets+=retBal;
-  var netWorth=totalAssets-totalDebt, dti=inc>0?(totalMin/inc*100):0;
-
-  // EF — savings balance only (not checking). Checking is for monthly bills,
-  // not emergency reserves. Including it inflates the months-of-coverage
-  // calculation. Net worth and total-asset math elsewhere still use aCash
-  // (checking + savings) since those reflect total liquid wealth, but the
-  // EF-specific metrics here measure dedicated emergency reserves.
-  var efMonths=baseExp>0?aSavings/baseExp:0;
-  var efT3=baseExp*3, efT6=baseExp*6, efS3=Math.max(0,efT3-aSavings), efS6=Math.max(0,efT6-aSavings);
-
-  // Credit/age
+  // ── Credit / age: read DOM → S ──
   S.creditScore=pi(gv('creditScore'))||S.creditScore||0; S.currentAge=pi(gv('currentAge'))||S.currentAge||0;
 
-  // Retirement
-  var retAge=pi(gv('retAge'))||65, retInc=pf(gv('retIncome'))||5000;
-  var retLifeExp=pi(gv('retLifeExp'))||90;var retYearsInRetirement=Math.max(1,retLifeExp-retAge);
-  var retInflation=(pf(gv('retInflation'))||3)/100;
-  var yearsToRetire=S.currentAge>0?Math.max(0,retAge-S.currentAge):30;
-  // FI Number: sum of inflation-adjusted annual expenses from retirement to 90
-  var fiNumber=0;for(var _fi=0;_fi<retYearsInRetirement;_fi++){fiNumber+=retInc*12*Math.pow(1+retInflation,_fi);}fiNumber=Math.round(fiNumber);
-  var fiNumberInflAdj=fiNumber;// already inflation-adjusted
-
-  // ── Use multi-account ledger if populated, otherwise legacy fallback ──────
-  var retRiskLevel=gv('retRiskLevel')||'moderate';
-  var _retRates={conservative:{low:2,mid:5,high:7},moderate:{low:4,mid:7,high:10},aggressive:{low:5,mid:9,high:12}};
-  var _rr=_retRates[retRiskLevel]||_retRates.moderate;
-  var blendedRetReturn=pf(gv('retReturn'))||_rr.mid;// Net return after fees
-  var projRetBal=0, totalMonthlyRetContrib=0;
-  var retReturnLow=Math.max(0,blendedRetReturn-3), retReturnHigh=blendedRetReturn+3;
+  // ── Retirement: keep legacy hidden fields in sync from retAccounts ──
   if(S.retAccounts && S.retAccounts.length){
-    // Project each account independently, then sum
-    var totalBal=0, totalWeightedReturn=0;
-    S.retAccounts.forEach(function(a){
-      var rt = RET_TYPES.find(function(t){return t.val===a.type;})||{};
-      var bal = a.balance||0;
-      var contrib = (a.type==='pension' || rt.allowContrib!==false) ? (a.contrib||0) : 0;
-      var matchMonthly = (rt.allowMatch && a.matchPct>0) ? (incGross*(Math.min(a.contribPct||0,a.matchPct)/100)) : 0;
-      var retRate = (a.returnPct!=null?a.returnPct:7)/100;
-      var mrr = retRate/12;
-      var totC = contrib + matchMonthly;
-      var acctProjected;
-      if(a.type==='pension'){
-        // Pension: treat as monthly benefit — convert to lump-sum equivalent at retirement
-        // Monthly pension benefit stored as 'contrib' field for pension type
-        acctProjected = bal + (contrib*12*25); // present value of pension stream
-      } else {
-        acctProjected = mrr>0
-          ? bal*Math.pow(1+mrr,yearsToRetire*12)+totC*((Math.pow(1+mrr,yearsToRetire*12)-1)/mrr)
-          : bal+totC*yearsToRetire*12;
-      }
-      projRetBal += acctProjected;
-      // Pension is fully projected as PV lump sum above — don't add its benefit to monthly contrib total
-      if(a.type!=='pension') totalMonthlyRetContrib += totC;
-      totalBal += bal;
-      totalWeightedReturn += (a.returnPct!=null?a.returnPct:7)*(bal||1);
-    });
-    // Weighted average return for sidebar display
-    var totalBalForWeight = S.retAccounts.reduce(function(s,a){return s+(a.balance||1);},0);
-    blendedRetReturn = totalWeightedReturn/totalBalForWeight;
-    // Keep legacy hidden fields in sync for any fallback renders
-    var totBal = S.retAccounts.reduce(function(s,a){return s+(a.balance||0);},0);
-    var totC2  = S.retAccounts.reduce(function(s,a){return s+(a.contrib||0);},0);
-    var el_rb  = document.getElementById('retBalance'); if(el_rb) el_rb.value=totBal;
-    var el_rc  = document.getElementById('retContrib'); if(el_rc) el_rc.value=totC2;
-  } else {
-    // Legacy single-account fallback
-    var retBal=pf(gv('retBalance')), retContrib=pf(gv('retContrib'));
-    var retReturn=pf(gv('retReturn'))||7, empMatch=pf(gv('empMatch'));
-    blendedRetReturn = retReturn;
-    totalMonthlyRetContrib = retContrib+(incGross*(empMatch/100));
-    var mrr=(retReturn/100)/12;
-    projRetBal = mrr>0
-      ? retBal*Math.pow(1+mrr,yearsToRetire*12)+totalMonthlyRetContrib*((Math.pow(1+mrr,yearsToRetire*12)-1)/mrr)
-      : retBal+totalMonthlyRetContrib*yearsToRetire*12;
-  }
-  S.ret={age:retAge,income:retInc,balance:(S.retAccounts&&S.retAccounts.length?(S.retAccounts.reduce(function(s,a){return s+(a.balance||0);},0)):pf(gv('retBalance'))),contrib:totalMonthlyRetContrib,return_:blendedRetReturn};
-  // 3-scenario projections
-  var projRetBalLow=0,projRetBalHigh=0;
-  if(S.retAccounts&&S.retAccounts.length){
-    S.retAccounts.forEach(function(a){var bal=a.balance||0;var totC=(a.contrib||0)+(a.matchPct>0?(incGross*(Math.min(a.contribPct||0,a.matchPct)/100)):0);var mrrL=retReturnLow/100/12;var mrrH=retReturnHigh/100/12;projRetBalLow+=mrrL>0?bal*Math.pow(1+mrrL,yearsToRetire*12)+totC*((Math.pow(1+mrrL,yearsToRetire*12)-1)/mrrL):bal+totC*yearsToRetire*12;projRetBalHigh+=mrrH>0?bal*Math.pow(1+mrrH,yearsToRetire*12)+totC*((Math.pow(1+mrrH,yearsToRetire*12)-1)/mrrH):bal+totC*yearsToRetire*12;});
-  } else {var _mrrL=retReturnLow/100/12;var _mrrH=retReturnHigh/100/12;var _tb=pf(gv('retBalance'))||0;var _tc=pf(gv('retContrib'))||0;projRetBalLow=_mrrL>0?_tb*Math.pow(1+_mrrL,yearsToRetire*12)+_tc*((Math.pow(1+_mrrL,yearsToRetire*12)-1)/_mrrL):_tb+_tc*yearsToRetire*12;projRetBalHigh=_mrrH>0?_tb*Math.pow(1+_mrrH,yearsToRetire*12)+_tc*((Math.pow(1+_mrrH,yearsToRetire*12)-1)/_mrrH):_tb+_tc*yearsToRetire*12;}
-  var retGap=fiNumber-projRetBal, retStatus=retGap<=0?'on-track':retGap<fiNumber*0.3?'close':'behind';
-
-  // Inflation-adjusted projected balance (real dollars)
-  var projRetBalReal=projRetBal/Math.pow(1+retInflation,yearsToRetire);
-
-  // Required monthly increase to close gap
-  var requiredMonthlyIncrease=0;
-  if(retGap>0&&yearsToRetire>0){
-    var retR=(blendedRetReturn/100)/12;
-    if(retR>0){
-      var fvFactor=(Math.pow(1+retR,yearsToRetire*12)-1)/retR;
-      requiredMonthlyIncrease=fvFactor>0?Math.ceil(retGap/fvFactor):0;
-    } else {
-      requiredMonthlyIncrease=Math.ceil(retGap/(yearsToRetire*12));
-    }
+    var _totBal=S.retAccounts.reduce(function(s,a){return s+(a.balance||0);},0);
+    var _totC2 =S.retAccounts.reduce(function(s,a){return s+(a.contrib||0);},0);
+    var _el_rb=document.getElementById('retBalance'); if(_el_rb) _el_rb.value=_totBal;
+    var _el_rc=document.getElementById('retContrib'); if(_el_rc) _el_rc.value=_totC2;
   }
 
-  // EF build timeline
-  var efBuildMonths3=0, efBuildMonths6=0;
-  if(netCF>0&&efS3>0) efBuildMonths3=Math.ceil(efS3/netCF);
-  if(netCF>0&&efS6>0) efBuildMonths6=Math.ceil(efS6/netCF);
+  // ── Compute every metric via the canonical engine (single source of truth) ──
+  // Engine input = a clone of S overlaid with the exact live DOM values the page
+  // reads, so the engine sees the form, not just stored state (matches the old
+  // inline reads; legacy single-account profiles get ret balance/contrib + empMatch).
+  var _eIn=JSON.parse(JSON.stringify(S));
+  _eIn.profile=_eIn.profile||{};
+  _eIn.profile.retAge=gv('retAge'); _eIn.profile.retIncome=gv('retIncome'); _eIn.profile.retLifeExp=gv('retLifeExp');
+  _eIn.profile.retInflation=gv('retInflation'); _eIn.profile.retRiskLevel=gv('retRiskLevel'); _eIn.profile.retReturn=gv('retReturn');
+  _eIn.profile.creditScore=gv('creditScore'); _eIn.profile.currentAge=gv('currentAge'); _eIn.profile.empMatch=gv('empMatch');
+  _eIn.ret=Object.assign({}, S.ret, {balance:pf(gv('retBalance')), contrib:pf(gv('retContrib'))});
+  if(window.PFOSEngine && window.PFOSEngine.computeCalcs){ S.calcs=window.PFOSEngine.computeCalcs(_eIn); }
+  var c=S.calcs||{};
 
-  // SCORES (preserved from v1)
-  var cfScore=0;
-  if(netCF>0) cfScore=Math.min(10,Math.round((netCF/Math.max(inc,1))*20));
-  if(netCF<0) cfScore=Math.max(0,3+Math.round(netCF/500));
-  var protScore=5;
-  if(getMonthlyExp('insurance')>100) protScore+=2;
-  if(efMonths>=3) protScore+=2; if(efMonths>=6) protScore+=1;
-  if(S.creditScore>=700) protScore+=1;
-  if(S.protCalcs){ var pg=S.protCalcs.gap,pi2=S.protCalcs.annIncome||1; if(pg>pi2*5) protScore-=3; else if(pg>pi2*2) protScore-=2; else if(pg>0) protScore-=1; else if(pg<0) protScore=Math.min(10,protScore+1); }
-  protScore=Math.max(0,Math.min(10,protScore));
-  var growScore=0;
-  if(savingsRate>=20) growScore=10; else if(savingsRate>=15) growScore=8; else if(savingsRate>=10) growScore=6; else if(savingsRate>=5) growScore=4; else if(savingsRate>0) growScore=2;
-  if(S.ret&&S.ret.contrib>0) growScore=Math.min(10,growScore+1);
-  if(aInvest>inc*3) growScore=Math.min(10,growScore+1);
-  var leakCount=Object.keys(S.expData||{}).filter(function(k){return S.expData[k]&&S.expData[k].leakTagged;}).length;
-  var effScore=10; effScore-=leakCount;
-  if(dti>43) effScore-=3; else if(dti>36) effScore-=2; else if(dti>28) effScore-=1;
-  var subRatio=baseExp>0?getMonthlyExp('subscriptions')/baseExp:0;
-  if(subRatio>0.08) effScore-=1;
-  effScore=Math.max(0,Math.min(10,effScore));
-  var fpi=0;
-  if(netCF<0) fpi+=3; else if(netCF<200) fpi+=2;
-  if(dti>43) fpi+=3; else if(dti>36) fpi+=2;
-  if(efMonths<1) fpi+=3; else if(efMonths<3) fpi+=1;
-  if(leakCount>3) fpi+=1; fpi=Math.min(10,fpi);
-  var _inc=S.incomeSources||[];
-  var nonCons=_inc.filter(function(s){return s.consistency!=='consistent';}).length;
-  var incRisk=0;
-  if(_inc.length===1) incRisk+=3;
-  if(nonCons>=_inc.length) incRisk+=3; else if(nonCons>0) incRisk+=1;
-  if(savingsRate<5) incRisk+=2; if(efMonths<3) incRisk+=2; incRisk=Math.min(10,incRisk);
-  var spendStab=Math.max(0,Math.min(10,10-leakCount-(dti>36?2:0)-(subRatio>0.1?1:0)));
-
-  // NEW: Money Efficiency + Idle Cash
-  var idleCash=baseExp>0?Math.max(0,aCash-(efT3)):0;
-  var cashEff=Math.min(10,inc>0?Math.round(((savingsExp+aInvest*0.01)/inc)*40):0);
-  if(idleCash>5000) cashEff=Math.max(0,cashEff-2);
-  if(leakCount>2) cashEff=Math.max(0,cashEff-1);
-
-  // Goal totals
-  var totalGoalsBal=(S.goals||[]).reduce(function(s,g){return s+g.current;},0);
-  var totalBucketsBal=(S.buckets||[]).reduce(function(s,b){return s+b.balance;},0);
-
-  S.calcs={
-    inc,incPersonal,incSpouse,incJoint,sahValue,
-    incGross,incPersonalGross,incSpouseGross,incJointGross,
-    baseExp,totalExp:baseExp,netCF,savingsRate,savingsExp,
-    aCash,totalAssets,totalDebt,totalMin,netWorth,dti,
-    efMonths,efT3,efT6,efS3,efS6,
-    cfScore,protScore,growScore,effScore,fpi,incRisk,spendStab,
-    fiNumber,fiNumberInflAdj,projRetBal,projRetBalLow:Math.round(projRetBalLow),projRetBalHigh:Math.round(projRetBalHigh),projRetBalReal,retGap,retStatus,yearsToRetire,retAge,retInc,
-    retYearsInRetirement,retInflation,requiredMonthlyIncrease,
-    totalMonthlyRetContrib,blendedRetReturn,retReturnLow,retReturnHigh,retRiskLevel,
-    efBuildMonths3,efBuildMonths6,
-    leakCount,subRatio,idleCash,cashEff,
-    totalGoalsBal,totalBucketsBal,
-    // Completeness (Step 1): fields the shells render but that were never
-    // persisted. Additive only — every value is already computed above in calc().
-    efBal:aCash, retLifeExp, currentAge:S.currentAge, creditScore:S.creditScore
-  };
-
-  // ── SHADOW MODE (engine parity) ──────────────────────────────────────────
-  // Runs the canonical engine (window.PFOSEngine.computeCalcs) on a DEEP CLONE
-  // of S overlaid with the same DOM inputs calc() just used, compares to the
-  // freshly-built S.calcs, and logs any divergence. It renders nothing and
-  // mutates nothing (clone is discarded). No-op until pfos-core.v1.js loads.
-  // Silence via `window.PFOS_SHADOW=false`. This is temporary diagnostics —
-  // removed at cutover, when calc() will call the engine for real.
-  try{
-    if(window.PFOSEngine && window.PFOSEngine.computeCalcs && window.PFOS_SHADOW!==false){
-      var _shadowS=JSON.parse(JSON.stringify(S));
-      _shadowS.profile=_shadowS.profile||{};
-      _shadowS.profile.retAge=gv('retAge'); _shadowS.profile.retIncome=gv('retIncome');
-      _shadowS.profile.retLifeExp=gv('retLifeExp'); _shadowS.profile.retInflation=gv('retInflation');
-      _shadowS.profile.retRiskLevel=gv('retRiskLevel'); _shadowS.profile.retReturn=gv('retReturn');
-      _shadowS.profile.creditScore=gv('creditScore'); _shadowS.profile.currentAge=gv('currentAge');
-      var _engCalcs=window.PFOSEngine.computeCalcs(_shadowS), _oldCalcs=S.calcs, _shDiffs=[];
-      Object.keys(_oldCalcs).forEach(function(k){
-        var a=_oldCalcs[k], b=_engCalcs[k];
-        if(typeof a==='number'&&typeof b==='number'){
-          if(Math.abs(a-b)>0.01 && Math.abs(a-b)>Math.abs(a)*1e-9) _shDiffs.push(k+': live='+a+' eng='+b);
-        } else if(a!==b){ _shDiffs.push(k+': live='+JSON.stringify(a)+' eng='+JSON.stringify(b)); }
-      });
-      // Running summary for the soak — inspect any time with:  copy(window.__PFOS_SHADOW)
-      var _SH=window.__PFOS_SHADOW=window.__PFOS_SHADOW||{runs:0,clean:0,diffRuns:0,fields:{},samples:[]};
-      _SH.runs++;
-      if(_shDiffs.length){
-        _SH.diffRuns++;
-        _shDiffs.forEach(function(d){var f=d.split(':')[0]; _SH.fields[f]=(_SH.fields[f]||0)+1;});
-        if(_SH.samples.length<25) _SH.samples.push(_shDiffs);
-        console.warn('[PFOS_SHADOW] '+_shDiffs.length+'/'+Object.keys(_oldCalcs).length+' field diffs:', _shDiffs);
-      } else {
-        _SH.clean++;
-        console.log('[PFOS_SHADOW] ✓ engine matches calc() ('+Object.keys(_oldCalcs).length+' fields)');
-      }
-      // ── CUTOVER (step 1): the canonical engine is now the AUTHORITATIVE source
-      // of S.calcs. The inline math above is retained only for its DOM/side-effects
-      // (S.assets, S.ret, hidden-field syncs) and as the parity monitor; its
-      // computed calcs object is superseded here. Step 2 deletes the redundant
-      // inline calc math. Falls back to the inline calcs if the engine isn't loaded.
-      S.calcs = _engCalcs;
-    }
-  }catch(_shErr){ console.warn('[PFOS_SHADOW] error (non-fatal):', _shErr && _shErr.message); }
-  // ── END SHADOW MODE / CUTOVER ────────────────────────────────────────────
+  // ── S.ret (legacy summary object) rebuilt from the engine output ──
+  S.ret={age:c.retAge,income:c.retInc,balance:(S.retAccounts&&S.retAccounts.length?(S.retAccounts.reduce(function(s,a){return s+(a.balance||0);},0)):pf(gv('retBalance'))),contrib:c.totalMonthlyRetContrib,return_:c.blendedRetReturn};
 
   updateSidebar();
   updateIncomeBreakdown();
   syncFields();
-  var totEl=document.getElementById('expTotal'); if(totEl) totEl.textContent=fmt(baseExp)+'/mo total';
+  var totEl=document.getElementById('expTotal'); if(totEl) totEl.textContent=fmt(c.baseExp)+'/mo total';
 
   // Sync to platform
   clearTimeout(S._syncTimer);
@@ -10022,7 +9775,7 @@ function calc(){
       clearTimeout(S._spouseTaxWriteTimer);
       S._spouseTaxWriteTimer = setTimeout(function(){
         try{
-          var _annualGross = (incGross || inc || 0) * 12;
+          var _annualGross = (c.incGross || c.inc || 0) * 12;
           // Sum my pretax deductions — same logic as _401kSimContext
           var _annualPretax = 0;
           (S.incomeSources || []).forEach(function(src){
