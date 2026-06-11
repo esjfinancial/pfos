@@ -21091,7 +21091,9 @@ function renderStockOptionsCalc(){
   h+='<div class="fi"><label class="lb">Number of Vested Shares</label><input class="inp" type="number" id="so_shares" value="500" oninput="calcStockOptions()" style="min-height:36px"></div></div>';
   h+='<div class="row"><div class="fi"><label class="lb">Exercise / Grant Price</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="so_exercise" value="25" oninput="calcStockOptions()" style="padding-left:22px;min-height:36px"></div></div>';
   h+='<div class="fi"><label class="lb">Current Stock Price</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="so_current" value="85" oninput="calcStockOptions()" style="padding-left:22px;min-height:36px"></div></div></div>';
-  h+='<div class="fi"><label class="lb">Your Tax Bracket %</label><input class="inp" type="number" id="so_bracket" value="24" oninput="calcStockOptions()" style="min-height:36px"></div>';
+  h+='<div class="row"><div class="fi"><label class="lb">Your Tax Bracket %</label><input class="inp" type="number" id="so_bracket" value="24" oninput="calcStockOptions()" style="min-height:36px"></div>';
+  h+='<div class="fi"><label class="lb">Other Annual Income (for AMT)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="so_otherIncome" value="150000" oninput="calcStockOptions()" style="padding-left:22px;min-height:36px"></div></div></div>';
+  h+='<div class="fi"><label class="lb">Filing Status (for AMT)</label><select class="sel" id="so_filing" onchange="calcStockOptions()" style="min-height:36px"><option value="single">Single</option><option value="mfj">Married Filing Jointly</option><option value="mfs">Married Filing Separately</option></select></div>';
 
   h+='<div id="so_results"></div>';
   el.innerHTML=h;calcStockOptions();
@@ -21103,27 +21105,12 @@ function calcStockOptions(){
   var bracket=(pf(gv('so_bracket'))||24)/100;
   var el=document.getElementById('so_results');if(!el)return;
 
-  var spread=current-exercise;var totalValue=shares*current;var totalSpread=shares*spread;
-  var exerciseCost=shares*exercise;
-
-  // Tax by type
-  var taxExercise,taxSellImmediate,taxSellLTCG;
-  if(type==='iso'){
-    taxExercise=0;// no ordinary tax at exercise (but AMT!)
-    taxSellImmediate=Math.round(totalSpread*bracket);// disqualifying disposition
-    taxSellLTCG=Math.round(totalSpread*0.15);// qualifying: exercise + hold 1yr+ and 2yr from grant
-  } else if(type==='nso'){
-    taxExercise=Math.round(totalSpread*bracket);
-    taxSellImmediate=taxExercise;// same since spread taxed at exercise
-    taxSellLTCG=taxExercise;// spread taxed at exercise regardless
-  } else {// RSU
-    taxExercise=Math.round(totalValue*bracket);// full value taxed at vest
-    taxSellImmediate=taxExercise;
-    taxSellLTCG=taxExercise;// already taxed at vest, additional gain at CG
-  }
-
-  var netImmediate=totalValue-taxSellImmediate;
-  var netLTCG=totalValue-taxSellLTCG;
+  // CLUSTER 2: equity-comp math single-sourced → window.PFOSEngine.calculators.stockOptions
+  // (ISO/NSO/RSU + full ISO AMT on the bargain element, IRS 2026). Render verbatim + AMT section.
+  var EC=window.PFOSEngine&&window.PFOSEngine.calculators;
+  var _so=EC?EC.stockOptions({type:type,shares:shares,exercise:exercise,current:current,bracket:gv('so_bracket'),otherIncome:gv('so_otherIncome'),filing:gv('so_filing')}):null;
+  if(!_so)return;
+  var spread=_so.spread,totalValue=_so.totalValue,totalSpread=_so.totalSpread,exerciseCost=_so.exerciseCost,taxExercise=_so.taxExercise,taxSellImmediate=_so.taxSellImmediate,taxSellLTCG=_so.taxSellLTCG,netImmediate=_so.netImmediate,netLTCG=_so.netLTCG,amtDue=_so.amtDue,amtIncome=_so.amtIncome,amtExemption=_so.amtExemption,tmt=_so.tmt,regularTax=_so.regularTax,amtFreeShares=_so.amtFreeShares;
   var concPct=(cpf('so')).netWorth>0?(totalValue/((S.calcs||{}).netWorth)*100):0;
 
   var h='';
@@ -21154,6 +21141,17 @@ function calcStockOptions(){
     h+='<div style="font-family:var(--fd);font-size:18px;color:var(--gr)">Net: '+fmtK(netLTCG)+'</div></div>';
     h+='</div>';
     h+='<div style="font-size:12px;color:var(--gr);text-align:center;margin-bottom:8px">Holding saves <strong>'+fmtK(taxSellImmediate-taxSellLTCG)+'</strong> in taxes</div>';
+    // ── AMT on the bargain element (IRS 2026) ──
+    if(amtDue>0){
+      h+='<div style="padding:14px;background:rgba(239,68,68,.05);border:2px solid rgba(239,68,68,.25);border-radius:4px;margin-bottom:12px">';
+      h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--rd);margin-bottom:6px">🚨 ALTERNATIVE MINIMUM TAX (AMT) DUE: '+fmtK(amtDue)+'</div>';
+      h+='<div style="font-size:13px;color:rgba(226,232,240,.8);line-height:1.7">';
+      h+='Exercising + holding adds the '+fmtK(totalSpread)+' bargain element to your AMT income ('+fmtK(amtIncome)+' AMTI vs '+fmtK(amtExemption)+' exemption), triggering <strong style="color:var(--rd)">'+fmtK(amtDue)+'</strong> of AMT this year.<br><br>';
+      h+='<span style="color:var(--gr)">💡 AMT-free exercise:</span> you can exercise about <strong style="color:var(--gr)">'+amtFreeShares+' shares</strong> this year before AMT begins. AMT paid generates a minimum-tax credit recoverable in future years.';
+      h+='</div></div>';
+    } else {
+      h+='<div style="padding:10px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.15);border-radius:4px;margin-bottom:12px;font-size:12px;color:var(--gr);line-height:1.6">✅ <strong>No AMT</strong> on this exercise at your income — the '+fmtK(totalSpread)+' bargain element stays under the '+fmtK(amtExemption)+' AMT exemption.</div>';
+    }
   }
 
   // ── Type-Specific Strategy ──
@@ -46019,6 +46017,6 @@ function cas_toggleBiometricEnrollment(checkbox){
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v14.js" defer></script>
+<script src="/pfos-core.v15.js" defer></script>
 </body>
 </html>
