@@ -38508,170 +38508,25 @@ function _ibcProjectPolicy(policy, fromMonth, toMonth){
 // ═══════════════════════════════════════════════════════════════════════════
 
 function _cpCalcIBCDebt(debts,budget,userRepayOverride){
+  // CANONICAL: delegates to the single engine cascade (simulateIBCDebtCascadeBest) —
+  // strict-avalanche vs affordable-first, 90% LTV, returns the quicker with a written
+  // payoff-order description (owner-signed-off spec). Replaces the old per-page mechanic.
+  // The 3rd arg (RULE 8 loan-repayment override) is now honored on BOTH pages — the
+  // profile copy previously dropped it. Adapts the engine result to the fields plan
+  // consumers read (eligible/intSaved/_total* renames).
   if(!debts||!debts.length||budget<=0)return null;
   var surplus=CPLAN.surplus||0;
   if(surplus<200)return{eligible:false,reason:'Need at least $200/mo positive cash flow.'};
   if(CPLAN.totalDebt<=0)return{eligible:false,reason:'No active debts.'};
-  // RULE 8: when the user has adjusted the loan-repayment slider on the IBC
-  // continuation card, that amount overrides the simulator's auto-computed
-  // freed-minimums during the post-debt-free recovery phase. Without this,
-  // changing the slider has no effect on Phase 3's arrival time — the sim
-  // keeps using its own pool and the new phase's date doesn't shift. The
-  // override is non-null when set; null/undefined means use auto behavior.
-  var _userRepay=(typeof userRepayOverride==='number'&&userRepayOverride>=0)?userRepayOverride:null;
-  // ── True IBC mechanics ──────────────────────────────────────────────────
-  // 1. ALL of "budget" (the user's extra) flows to the policy each month.
-  //    Debts get only their minimum payments during accumulation phase.
-  // 2. When cash value ≥ next-highest-interest debt's balance, take a policy
-  //    loan to kill that debt. Add that debt's freed minimum to a combined pool.
-  // 3. Pool of freed minimums repays the COMBINED policy loan balance with
-  //    SIMPLE interest charged against the current outstanding balance each
-  //    month (no compounding of unpaid interest into principal).
-  // 4. Continue until all debts are loaned out + all loans are repaid.
-  // ────────────────────────────────────────────────────────────────────────
-  // Use anniversary-anchored crediting via _ibcWLAnnualCredit. CV does NOT
-  // compound monthly — it grows linearly with premium during the year, then
-  // gets a credit injection on each policy anniversary.
-  // For debt-elimination IBC, WL is the most common underlying product, so we
-  // use WL defaults. (IUL-based IBC could be added with a similar branch.)
-  var ibcParams = Object.assign({}, _ibcPolicyDefaults('wl'), {monthlyPremium: budget});
-  var growthRate=0.05,loanAnnRate=0.05;  // legacy vars kept for clarity in chart code below
-  var ds=debts.map(function(d,i){return{name:d.name||('Debt '+(i+1)),bal:parseFloat(d.balance)||0,rate:(parseFloat(d.rate)||0)/100/12,annualRate:(parseFloat(d.rate)||0),min:parseFloat(d.min)||0,paid:false};});
-  // Avalanche order: pay off highest-INTEREST debt first when CV is sufficient.
-  // (IBC's economic rationale is to attack the most expensive debt — which is also
-  // the right behavior whether the user picked avalanche/snowball/hybrid as their
-  // primary strategy, since they explicitly opted into IBC for this debt allocation.)
-  ds.sort(function(a,b){return b.rate-a.rate;});
-  var vehicle=0,totalDebtInt=0,totalLoanInt=0,payoffLog=[],origFreeMonth=null,month=0;
-  var totalLoanBalance=0;
-  // Per-month time series for the chart — kept in sync with this sim's
-  // anniversary-based growth and simple loan interest.
-  var series=[];// [{month, av, cv, loanBal, freedMins}]
-  var totalLoanFreedMins=0;
-  // Track CV at last anniversary (stable until next anniversary) and premium-since-last-anniv.
-  // Inter-anniversary "effective CV" for loan availability = lastAnnivCV + premiumSinceAnniv.
-  // This approximates what's available — premium is in the policy's general account
-  // immediately, even though the dividend/index credit only applies on anniversary.
-  var lastAnnivCV = 0;
-  var premiumSinceAnniv = 0;
-  while(month<720){
-    month++;
-    // Step 1: premium flows in monthly (continuous, real cash flow).
-    premiumSinceAnniv += budget;
-    vehicle = lastAnnivCV + premiumSinceAnniv;
-    // Step 2: each unpaid debt accrues its own interest and gets its minimum payment.
-    ds.forEach(function(d){
-      if(d.bal<0.01||d.paid)return;
-      var interest=d.bal*d.rate;
-      totalDebtInt+=interest;
-      d.bal+=interest;
-      var pmt=Math.min(d.min,d.bal);
-      d.bal-=pmt;
-      if(d.bal<0.01)d.bal=0;
-    });
-    // Step 3: if available CV (vehicle minus existing loans) covers the next-highest-rate
-    // unpaid debt, take a loan against the policy and kill that debt. Add its minimum to
-    // the freed pool. Walk the array (already sorted by rate desc) — multiple debts can
-    // be loaned out in the same month if vehicle is large enough.
-    ds.forEach(function(d){
-      if(d.paid||d.bal<0.01)return;
-      var availableCV=vehicle-totalLoanBalance;
-      if(availableCV>=d.bal){
-        totalLoanBalance+=d.bal;
-        totalLoanFreedMins+=d.min;
-        payoffLog.push({name:d.name,month:month,balAtLoan:Math.round(d.bal),annualRate:d.annualRate,freedMin:d.min});
-        d.bal=0;
-        d.paid=true;
-      }
-    });
-    // Step 4: combined freed-minimums pool repays the combined loan balance.
-    // SIMPLE interest on outstanding balance — standard amortization, no compounding.
-    if(totalLoanBalance>0){
-      var loanInterest=totalLoanBalance*loanAnnRate/12;
-      totalLoanInt+=loanInterest;
-      totalLoanBalance+=loanInterest;
-      // RULE 8 override: when the user has set a specific monthly repayment
-      // amount via the IBC repayment slider, that becomes the authoritative
-      // loan-payment value (clamped at the outstanding balance). The natural
-      // freed-minimums logic still drives the accumulation phase (each card
-      // clearing redirects its minimum), so this only takes effect once the
-      // sim is past origFreeMonth (all debts loan-paid-off). Before that, the
-      // mechanic IS the freed minimums redirecting and we let the sim run.
-      var _baseLoanPmt=totalLoanFreedMins;
-      var _allDebtsPaid=ds.every(function(d){return d.paid||d.bal<0.01;});
-      if(_userRepay!=null&&_allDebtsPaid)_baseLoanPmt=_userRepay;
-      var loanPayment=Math.min(_baseLoanPmt,totalLoanBalance);
-      totalLoanBalance-=loanPayment;
-      if(totalLoanBalance<0.01)totalLoanBalance=0;
-    }
-    // Step 5: ANNIVERSARY CREDITING — every 12 months, apply WL annual credit.
-    // This is when guaranteed growth + dividend hit the policy. Reset the
-    // premium-since-anniversary tracker.
-    if(month % 12 === 0){
-      var policyYear = month / 12;
-      var annualCredit = _ibcWLAnnualCredit(ibcParams, policyYear, lastAnnivCV, 0);
-      // The premium-to-CV portion is already accumulated into vehicle via premiumSinceAnniv,
-      // but with year-N efficiency, only some of that premium "stuck" as CV — adjust.
-      var efficiency = _ibcYearFactor(ibcParams.cvEfficiencyYr, policyYear, 1.0);
-      var stuckPremiumCV = premiumSinceAnniv * efficiency;
-      var growthOnExistingCV = annualCredit.breakdown.guaranteedGrowth + annualCredit.breakdown.dividend;
-      // New anniversary CV = old anniversary CV + stuck premium + growth on existing
-      lastAnnivCV = lastAnnivCV + stuckPremiumCV + growthOnExistingCV;
-      premiumSinceAnniv = 0;
-      vehicle = lastAnnivCV;
-    }
-    // Step 6: track milestones. origFreeMonth = original debts gone.
-    var origLeft=ds.some(function(d2){return d2.bal>0.01;});
-    if(!origLeft&&origFreeMonth===null)origFreeMonth=month;
-    // Snapshot per-month state for the chart. CV (cash value) is the
-    // "what you can take out today" figure: vehicle minus outstanding loans.
-    series.push({
-      month:month,
-      av:Math.round(vehicle),
-      cv:Math.round(Math.max(0,vehicle-totalLoanBalance)),
-      loanBal:Math.round(totalLoanBalance),
-      freedMins:Math.round(totalLoanFreedMins),
-      premiumSinceAnniv:Math.round(premiumSinceAnniv)
-    });
-    if(!origLeft&&totalLoanBalance<=0)break;
-  }
-  // Capture the moment all debts AND loan were cleared (before trail).
-  var fullFreeMonth=month;
-  // Continue tracking series for ~24 more months past full debt-free so the
-  // chart shows the post-debt phase where premium continues, CV keeps growing,
-  // and the user has a permanent asset.
-  var trailMonths=24;
-  for(var _t=0;_t<trailMonths;_t++){
-    month++;
-    premiumSinceAnniv += budget;
-    vehicle = lastAnnivCV + premiumSinceAnniv;
-    if(month % 12 === 0){
-      var pyT=month/12;
-      var acT=_ibcWLAnnualCredit(ibcParams, pyT, lastAnnivCV, 0);
-      var effT=_ibcYearFactor(ibcParams.cvEfficiencyYr, pyT, 1.0);
-      lastAnnivCV = lastAnnivCV + premiumSinceAnniv*effT + acT.breakdown.guaranteedGrowth + acT.breakdown.dividend;
-      premiumSinceAnniv = 0;
-      vehicle = lastAnnivCV;
-    }
-    series.push({
-      month:month,av:Math.round(vehicle),cv:Math.round(vehicle),
-      loanBal:0,freedMins:0,premiumSinceAnniv:Math.round(premiumSinceAnniv)
-    });
-  }
-  return{
-    eligible:true,
-    months:origFreeMonth||fullFreeMonth,
-    fullFreeMonth:fullFreeMonth,
-    interest:Math.round(totalDebtInt+totalLoanInt),
-    vehicle:Math.round(vehicle),
-    budget:budget,
-    payoffLog:payoffLog,
-    intSaved:0,
-    series:series,
-    _totalLoanInterest:Math.round(totalLoanInt),
-    _totalDebtInterest:Math.round(totalDebtInt),
-    _totalPremiumsPaid:Math.round(budget*month)
-  };
+  var EC=window.PFOSEngine&&window.PFOSEngine.ibcCascade;
+  if(!EC||!EC.simulateIBCDebtCascadeBest)return null;
+  var r=EC.simulateIBCDebtCascadeBest(debts,budget,{userRepayOverride:(typeof userRepayOverride==='number'&&userRepayOverride>=0)?userRepayOverride:null});
+  if(!r)return null;
+  r.eligible=true; r.intSaved=0;
+  r._totalLoanInterest=r.totalLoanInterest;
+  r._totalDebtInterest=r.totalDebtInterest;
+  r._totalPremiumsPaid=r.totalPremiumsPaid;
+  return r;
 }
 
 function _cpRenderDebtEngine(debtAlloc,idx){
