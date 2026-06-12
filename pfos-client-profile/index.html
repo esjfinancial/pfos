@@ -2964,6 +2964,9 @@ async function loadClientDataIntoPFOS(clientId){
     coupleData: coupleData });
   // Sync advisor's plan to iframe so Progress section shows plan tracking
   setTimeout(function(){_syncPlanToMain();},500);
+  // Push the latest confirmed audited life policy to pfos-main (calcGenWealth death benefit).
+  // Reuses the cached policy_tracking load — a stored-data read, never a re-audit.
+  try{ _loadTrackedPolicies().then(function(){_syncConfirmedPolicyToMain();}); }catch(e){}
 }
 function toggleTheme(){
   var html = document.documentElement;
@@ -6559,6 +6562,10 @@ window.addEventListener('message', async function(e){
         await db.from('policy_tracking').insert(record);
         console.log('[PFOS-CP] Inserted new policy_tracking record for',carrier,productName);
       }
+      // A fresh audit changed policy_tracking — refresh the cache and push the confirmed life
+      // policy to the embedded pfos-main so calcGenWealth picks it up (stored-data read, no re-audit).
+      APP._trackedPoliciesLoaded=false;
+      try{ await _loadTrackedPolicies(); _syncConfirmedPolicyToMain(); }catch(e2){}
       // Refresh Insurance tab if visible
       if(document.getElementById('advisorInsuranceContent'))renderAdvisorInsurance();
     }catch(ptErr){console.error('[PFOS-CP] policy_tracking save failed:',ptErr);}
@@ -17158,6 +17165,18 @@ function renderClientPlanTracking(){
     return parseFloat(a.amount)||0;
   }
 
+// Newest CONFIRMED permanent-life policy (policy_tracking, status='active') for calcGenWealth in the
+// embedded pfos-main. Reads cached audit data from APP._trackedPolicies — does NOT re-run the AI audit.
+function _confirmedLifePolicyForMain(){
+  var tp=(APP&&APP._trackedPolicies)||[];
+  var perm=tp.filter(function(p){var t=(p.policy_type||'').toLowerCase();return t==='whole_life'||t==='iul'||t==='universal_life';});
+  if(!perm.length)return null;
+  perm.sort(function(a,b){return new Date(b.updated_at||b.created_at||0)-new Date(a.updated_at||a.created_at||0);});
+  var w=perm[0];var db=Math.round(w.death_benefit||0),pm=Math.round(w.premium_monthly||0);
+  if(!(db>0&&pm>0))return null;
+  return {death_benefit:db,premium_monthly:pm,carrier:w.carrier||'your policy'};
+}
+function _syncConfirmedPolicyToMain(){ try{ pfosPost({type:'PFOS_CONFIRMED_POLICY',policy:_confirmedLifePolicyForMain()}); }catch(e){} }
 async function _loadTrackedPolicies(){
   if(!APP.currentClientId||APP._trackedPoliciesLoaded)return;
   APP._trackedPoliciesLoaded=true;
