@@ -17343,79 +17343,10 @@ function calcCCPayoff(){
   // minimum payment joins the extra-payment pool for remaining debts (the
   // "snowball effect"). This significantly speeds up payoff vs the old logic
   // where freed minimums were silently dropped.
-  function simulate(sortFn){
-    var cards=debts.slice().sort(sortFn).map(function(d){var mn=Math.max(parseFloat(d.min)||25,10);return{name:d.name||'Card',bal:d.balance||0,rate:(d.rate||0)/100,min:mn,oMin:mn};});
-    var months=0;var totalInt=0;var wins=[];var schedule=[];var freed=0;
-    while(cards.some(function(c){return c.bal>0;})&&months<600){
-      months++;var moInt=0;
-      cards.forEach(function(c){if(c.bal<=0)return;var ip=c.bal*c.rate/12;moInt+=ip;totalInt+=ip;c.bal+=ip;var pay=Math.min(c.bal,c.min);c.bal-=pay;if(c.bal<0.01){c.bal=0;freed+=c.oMin;}});
-      var extraLeft=extra+freed;
-      for(var i=0;i<cards.length;i++){if(cards[i].bal<=0)continue;var pay=Math.min(cards[i].bal,extraLeft);cards[i].bal-=pay;extraLeft-=pay;if(cards[i].bal<0.01){cards[i].bal=0;freed+=cards[i].oMin;wins.push({name:cards[i].name,month:months});}if(extraLeft<=0)break;}
-      if(months<=12||months%6===0||!cards.some(function(c){return c.bal>0;})){
-        schedule.push({mo:months,totalBal:Math.round(cards.reduce(function(t,c){return t+Math.max(0,c.bal);},0)),moInt:Math.round(moInt)});
-      }
-    }
-    return{months:months,interest:Math.round(totalInt),wins:wins,schedule:schedule};
-  }
-
-  // Permutations helper for true hybrid — capped at 5 debts to keep brute
-  // force fast (5! = 120 sims). Beyond 5 debts the simple avalanche order is
-  // used as the hybrid seed, since exhaustive search isn't viable.
-  function permute(arr){
-    if(arr.length<=1)return [arr.slice()];
-    if(arr.length>5)return [arr.slice()];
-    var result=[];
-    for(var i=0;i<arr.length;i++){
-      var rest=arr.slice(0,i).concat(arr.slice(i+1));
-      permute(rest).forEach(function(p){result.push([arr[i]].concat(p));});
-    }
-    return result;
-  }
-
-  // Minimums only (baseline)
-  var minOnly=simulate(function(a,b){return 0;});
-  // Simulated with extra=0 temporarily
-  var savedExtra=extra;
-  var avRes=simulate(function(a,b){return(b.rate||0)-(a.rate||0);});
-  var snRes=simulate(function(a,b){return(a.balance||0)-(b.balance||0);});
-
-  // True Hybrid: try EVERY ordering, pick the one that finishes soonest
-  // (with lowest interest as tiebreaker). If the best ordering is NOT actually
-  // better than both pure strategies, mark hybrid as N/A — the old fake-hybrid
-  // (60/40 weighted blend of avalanche+snowball) returned numbers that didn't
-  // correspond to any actual payoff strategy. The "true" hybrid only exists
-  // when ordering matters — i.e., when permuting the debt list yields a
-  // payoff faster or cheaper than either pure approach.
-  var hyRes;
-  var _hybridPerms=permute(debts);
-  var _hybridBest=null;
-  _hybridPerms.forEach(function(p){
-    // Re-simulate using the specific permutation by mapping back to original-order positions
-    var permCards=p.map(function(d){var mn=Math.max(parseFloat(d.min)||25,10);return{name:d.name||'Card',bal:d.balance||0,rate:(d.rate||0)/100,min:mn,oMin:mn};});
-    var months=0,totalInt=0,wins=[],schedule=[],freed=0;
-    while(permCards.some(function(c){return c.bal>0;})&&months<600){
-      months++;var moInt=0;
-      permCards.forEach(function(c){if(c.bal<=0)return;var ip=c.bal*c.rate/12;moInt+=ip;totalInt+=ip;c.bal+=ip;var pay=Math.min(c.bal,c.min);c.bal-=pay;if(c.bal<0.01){c.bal=0;freed+=c.oMin;}});
-      var extraLeft=extra+freed;
-      for(var i=0;i<permCards.length;i++){if(permCards[i].bal<=0)continue;var pay=Math.min(permCards[i].bal,extraLeft);permCards[i].bal-=pay;extraLeft-=pay;if(permCards[i].bal<0.01){permCards[i].bal=0;freed+=permCards[i].oMin;wins.push({name:permCards[i].name,month:months});}if(extraLeft<=0)break;}
-      if(months<=12||months%6===0||!permCards.some(function(c){return c.bal>0;})){
-        schedule.push({mo:months,totalBal:Math.round(permCards.reduce(function(t,c){return t+Math.max(0,c.bal);},0)),moInt:Math.round(moInt)});
-      }
-    }
-    var thisRes={months:months,interest:Math.round(totalInt),wins:wins,schedule:schedule};
-    if(!_hybridBest||thisRes.months<_hybridBest.months||(thisRes.months===_hybridBest.months&&thisRes.interest<_hybridBest.interest)){
-      _hybridBest=thisRes;
-    }
-  });
-  // Does best permutation actually beat the better of pure avalanche/snowball?
-  var _bestPure=avRes.months<snRes.months?avRes:(avRes.months>snRes.months?snRes:(avRes.interest<=snRes.interest?avRes:snRes));
-  var _hybridBeats=_hybridBest&&((_hybridBest.months<_bestPure.months)||(_hybridBest.months===_bestPure.months&&_hybridBest.interest<_bestPure.interest));
-  if(_hybridBeats){
-    hyRes=_hybridBest;
-  } else {
-    // N/A signal: hybrid offers no improvement over avalanche/snowball
-    hyRes={months:0,interest:0,wins:[],schedule:[],_naReason:'No ordering finishes faster or cheaper than avalanche/snowball'};
-  }
+  var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
+  var _dp=_EC?_EC.debtPayoff(debts,extra):null;
+  if(!_dp)return;
+  var minOnly=_dp.minOnly,avRes=_dp.avalanche,snRes=_dp.snowball,hyRes=_dp.hybrid;
 
   // IBC: real policy-loan cascade via the canonical engine (replaces the prior
   // fabricated multipliers). Premium = the user's "extra"; NO death benefit is
@@ -45059,6 +44990,6 @@ function cas_toggleBiometricEnrollment(checkbox){
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v37.js" defer></script>
+<script src="/pfos-core.v38.js" defer></script>
 </body>
 </html>
