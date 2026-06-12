@@ -4659,6 +4659,14 @@ async function loadClientDataIntoPFOS(clientId){
     }catch(e){ console.warn('[jm] merge-on-read failed, using primary row only:', e&&e.message); }
   }
 
+  // ── Household type: couple_links is the single source of truth on load ──
+  // The stored financial_data.S.householdType can drift from couple_links (e.g.
+  // an admin changed the type while the client wasn't loaded). Always trust the
+  // live couple_links value so the iframe/shell never renders a stale type label.
+  if(typeof couple!=='undefined' && couple && couple.household_type && stateData){
+    stateData.householdType = couple.household_type;
+  }
+
   var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'core';
   if(clientEffTier === 'none') clientEffTier = 'core';
   var pfosTier = (mode === 'advisor') ? 'pro_plus' : clientEffTier;
@@ -10358,6 +10366,21 @@ window.addEventListener('message',async function(e){
       var touched=state._touched||{};
       if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
         var exS=ex.data.financial_data.S;
+        // V2 joint: `state` is the COMBINED view (A self/joint + B's items tagged
+        // spouse) and the de-merge below splits B's items back out to B's row.
+        // The untouched-section preservation must therefore baseline against the
+        // COMBINED existing (A's stored row merged with B's stored row), not A's
+        // row alone. Otherwise an untouched array (e.g. on a no-edit load→save) is
+        // restored to A-only data, stripping B's spouse items, and the de-merge
+        // then writes an empty/degraded B-row that the DB's data-protection trigger
+        // blocks — silently dropping B's joint contributions.
+        if(_cpSave && _cpSave.household_type==='joint' && _isJointModelV2(_cpSave)){
+          try{
+            var _exBr=await db.from('client_profiles').select('financial_data').eq('client_id',_cpSave.client_b_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            var _exBrS=(_exBr&&_exBr.data&&_exBr.data.financial_data&&_exBr.data.financial_data.S)?_exBr.data.financial_data.S:null;
+            exS=_mergeJointState(exS,_exBrS);
+          }catch(_eMx){ console.warn('[jm] preserve-baseline merge failed, using primary-only:',_eMx&&_eMx.message); }
+        }
         var _protectedSections=['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations'];
         _protectedSections.forEach(function(sec){
           if(!touched[sec]){

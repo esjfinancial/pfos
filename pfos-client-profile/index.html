@@ -2924,6 +2924,13 @@ async function loadClientDataIntoPFOS(clientId){
       stateData = _mergeJointState(stateData, _bS);
     }catch(e){ console.warn('[jm] merge-on-read failed, using primary row only:', e&&e.message); }
   }
+  // ── Household type: couple_links is the single source of truth on load ──
+  // The stored financial_data.S.householdType can drift from couple_links (e.g.
+  // an admin changed the type while the client wasn't loaded). Always trust the
+  // live couple_links value so the iframe never renders a stale type label.
+  if(couple && couple.household_type && stateData){
+    stateData.householdType = couple.household_type;
+  }
   var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'core';
   if(clientEffTier === 'none') clientEffTier = 'core';
   var pfosTier = (mode === 'advisor') ? 'pro_plus' : clientEffTier;
@@ -6778,6 +6785,19 @@ window.addEventListener('message', async function(e){
       if(ex&&ex.data)APP._lastDataVersion=ex.data.data_version||0;
       if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
         var exS = ex.data.financial_data.S;
+        // V2 joint: `state` is the COMBINED view and the de-merge below splits B's
+        // items back to B's row. Baseline the untouched-section preservation against
+        // the COMBINED existing (A's stored row merged with B's), not A's row alone —
+        // otherwise an untouched array is restored to A-only data, stripping B's
+        // spouse items, and the de-merge writes a degraded B-row the DB blocks.
+        var _jmCpl0 = (typeof getCoupleForClient==='function') ? getCoupleForClient(APP.currentClientId) : null;
+        if(_jmCpl0 && _jmCpl0.household_type==='joint' && _isJointModelV2(_jmCpl0)){
+          try{
+            var _exBr2=await db.from('client_profiles').select('financial_data').eq('client_id',_jmCpl0.client_b_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            var _exBr2S=(_exBr2&&_exBr2.data&&_exBr2.data.financial_data&&_exBr2.data.financial_data.S)?_exBr2.data.financial_data.S:null;
+            exS=_mergeJointState(exS,_exBr2S);
+          }catch(_eMx2){ console.warn('[jm] preserve-baseline merge failed, using primary-only:',_eMx2&&_eMx2.message); }
+        }
         // Protected sections: only use incoming if user intentionally modified them
         var _protectedSections = ['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile'];
         _protectedSections.forEach(function(sec){
