@@ -35425,89 +35425,17 @@ function _cpEffectiveCapNote(type,idx){
 //     as "addressed by plan" and scores partial credit. Full credit only
 //     when the user marks the item Done (i.e., they actually got coverage).
 function _cpCalcHealthScore(){
-  var score=0;
-  var sim=CPLAN._sim;
-  var af=sim?sim.allocFuture:null;
-  // Helper: check if allocation is active now OR will be funded via cascade
-  function willBeFunded(type){
-    if(CPLAN.allocations.some(function(a){return a.type===type&&a.amount>0;}))return true;
-    if(af)return af.some(function(f){return f.type===type&&f.futureAmount>0;});
-    return false;
-  }
-  // Emergency coverage (0-15)
-  // If EF is already funded → 15. If plan has an EF allocation → 12 (path exists,
-  // not yet there). If neither → score against current efBal/efTarget ratio.
-  var efPct=CPLAN.efTarget>0?Math.min(1,CPLAN.efBal/CPLAN.efTarget):0;
-  var efAlloc=CPLAN.allocations.find(function(a){return a.type==='ef'&&a.amount>0;});
-  if(efPct>=1)score+=15;
-  else if(efAlloc&&efAlloc._completed)score+=Math.max(12,Math.round(efPct*12)+3);
-  else if(efAlloc)score+=12; // plan addresses the gap — partial credit pre-completion
-  else score+=Math.round(efPct*15);
-  // Debt trajectory (0-15)
-  if(CPLAN.totalDebt<=0)score+=15;
-  else{
-    var dAlloc=CPLAN.allocations.find(function(a){return a.type==='debt'&&a.amount>0;});
-    if(dAlloc){
-      // Trajectory: faster payoff = more points
-      var dfm=sim?sim.debtFreeMonth:0;
-      if(dfm>0&&dfm<=24)score+=13;else if(dfm>0&&dfm<=48)score+=10;else if(dfm>0&&dfm<=72)score+=7;else if(dAlloc)score+=5;
-    } else {
-      var dRatio=CPLAN.income>0?CPLAN.totalDebt/(CPLAN.income*12):5;
-      if(dRatio<0.5)score+=8;else if(dRatio<1)score+=4;else score+=2;
-    }
-    score+=dAlloc?2:0;
-  }
-  // Savings rate (0-15)
-  var sr=CPLAN.income>0?(CPLAN.income-CPLAN.expenses)/CPLAN.income*100:0;
-  if(sr>=20)score+=15;else if(sr>=15)score+=12;else if(sr>=10)score+=8;else if(sr>=5)score+=4;
-  // Protection coverage (0-15)
-  // Each of life / disability / health is worth 5 points.
-  // Full credit (5): user has a real policy on file.
-  // Partial credit (3): plan has an active protection action item — addressing the gap
-  // No credit (0): no policy AND no plan item.
-  var protTypes={};
-  (CPLAN.policies||[]).forEach(function(p){var t=(p.type||'').toLowerCase();if(t.indexOf('life')>=0||t.indexOf('term')>=0)protTypes.life=true;if(t.indexOf('disab')>=0)protTypes.disability=true;if(t.indexOf('health')>=0)protTypes.health=true;});
-  // Plan-level addressing: action items in the plan with title/customName matching
-  // life/disability/health intent
-  var planAddresses={life:false,disability:false,health:false};
-  CPLAN.allocations.forEach(function(a){
-    if(a.type!=='protection'&&a.type!=='custom')return;
-    var n=(a.customName||'').toLowerCase();
-    if(n.indexOf('term life')>=0||n.indexOf('life insur')>=0)planAddresses.life=true;
-    if(n.indexOf('disab')>=0)planAddresses.disability=true;
-    if(n.indexOf('health')>=0||n.indexOf('medical')>=0)planAddresses.health=true;
+  var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
+  if(!_EC||!_EC.healthScore)return 0;
+  var _le;try{_le=parseInt(APP._currentClientFd.S.calcs.retLifeExp)||90;}catch(e){_le=90;}
+  return _EC.healthScore({
+    income:CPLAN.income,expenses:CPLAN.expenses,efTarget:CPLAN.efTarget,efBal:CPLAN.efBal,totalDebt:CPLAN.totalDebt,
+    allocations:CPLAN.allocations,policies:CPLAN.policies,sim:CPLAN._sim,
+    age:CPLAN.age,retirementAge:CPLAN.retirementAge,
+    spAge:CPLAN._partner&&CPLAN._partner.age,spRetAge:CPLAN._partner&&CPLAN._partner.retirementAge,
+    lifeExp:_le,householdType:CPLAN._householdType,hasPartner:!!CPLAN._partner,
+    myRetTarget:_cpRetIncomeTarget('self'),spRetTarget:_cpRetIncomeTarget('spouse')
   });
-  score+=protTypes.life?5:(planAddresses.life?3:0);
-  score+=protTypes.disability?5:(planAddresses.disability?3:0);
-  score+=protTypes.health?5:(planAddresses.health?3:0);
-  // Tax efficiency (0-10) — uses trajectory: will these be funded eventually?
-  if(willBeFunded('roth'))score+=3;
-  if(willBeFunded('401k'))score+=3;
-  if(willBeFunded('iul')||willBeFunded('wl'))score+=4;
-  // Retirement readiness (0-15) — uses trajectory projected value.
-  // sim.projRetValue now reflects the gate-disabled trajectory when no items are
-  // completed yet, so a freshly-recommended plan can score full points if it
-  // has a credible path to FI.
-  if(sim&&sim.projRetValue>0){
-    var fiNum=(CPLAN.income||0)*12*25;// Simple 25x annual income
-    var fiPct=fiNum>0?sim.projRetValue/fiNum:0;
-    if(fiPct>=1)score+=15;else if(fiPct>=0.75)score+=12;else if(fiPct>=0.5)score+=8;else if(fiPct>=0.25)score+=4;else if(fiPct>0)score+=2;
-  } else {
-    var retAllocs=CPLAN.allocations.filter(function(a){return(a.type==='roth'||a.type==='401k'||a.type==='iul'||a.type==='wl'||a.type==='ibc'||a.type==='hsa'||a.type==='trad_ira'||a.type==='solo401k'||a.type==='roth401k'||a.type==='invest')&&a.amount>0;});
-    var retTotal=retAllocs.reduce(function(t,a){return t+a.amount;},0);
-    var retPct=CPLAN.income>0?retTotal/CPLAN.income*100:0;
-    if(retPct>=20)score+=15;else if(retPct>=15)score+=12;else if(retPct>=10)score+=8;else if(retPct>=5)score+=4;else if(retPct>0)score+=2;
-  }
-  // Diversification (0-15) — counts future-funded items too
-  var activeTypes=[];
-  CPLAN.allocations.forEach(function(a,i){
-    var amt=a.amount;
-    if(af&&af[i]&&af[i].futureAmount>0)amt=Math.max(amt,af[i].futureAmount);
-    if(amt>0&&activeTypes.indexOf(a.type)<0)activeTypes.push(a.type);
-  });
-  var uniqueTypes=activeTypes.length;
-  if(uniqueTypes>=5)score+=15;else if(uniqueTypes>=4)score+=12;else if(uniqueTypes>=3)score+=8;else if(uniqueTypes>=2)score+=4;else if(uniqueTypes>=1)score+=2;
-  return Math.min(100,score);
 }
 function _cpRenderHealthScore(){
   var el=document.getElementById('cplanHealthScore');if(!el)return;
@@ -44722,6 +44650,6 @@ function cas_toggleBiometricEnrollment(checkbox){
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v48.js" defer></script>
+<script src="/pfos-core.v49.js" defer></script>
 </body>
 </html>
