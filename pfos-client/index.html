@@ -4690,6 +4690,9 @@ async function loadClientDataIntoPFOS(clientId){
   _pfosDataLoaded=true;
   // Sync plan data to pfos-main iframe after plan initializes
   setTimeout(function(){_cpEnsurePlanLoaded();_syncPlanToMain();},500);
+  // Push the latest confirmed audited life policy to pfos-main (for calcGenWealth's death benefit).
+  // Reuses the cached policy_tracking load — a stored-data read, never a re-audit.
+  try{ _loadTrackedPolicies().then(function(){_syncConfirmedPolicyToMain();}); }catch(e){}
   // Apply advisor-nav visibility based on this client's client_type
   // (default markup hides advisor items; reveal them here if advisory)
   if(typeof _cpUpdateAdvisoryNav==='function')_cpUpdateAdvisoryNav();
@@ -10243,6 +10246,10 @@ window.addEventListener('message',async function(e){
         await db.from('policy_tracking').insert(trackingData);
         console.log('[PFOS] Policy tracking created:',trackingData.carrier,isAnn?'(annuity)':'(life)');
       }
+      // A fresh audit changed policy_tracking — refresh the cache and push the confirmed life
+      // policy to pfos-main so calcGenWealth picks it up immediately (stored-data read, no re-audit).
+      APP._trackedPoliciesLoaded=false;
+      try{ await _loadTrackedPolicies(); _syncConfirmedPolicyToMain(); }catch(e2){}
     }catch(e){console.warn('[PFOS] Policy tracking save failed:',e);}
     return;
   }
@@ -15516,12 +15523,15 @@ function calcGenWealth(){
   var age=parseInt(gv('gw_age'))||40;
   var el=document.getElementById('gw_results');if(!el)return;
   // CLUSTER 4: cascade single-sourced -> window.PFOSEngine.calculators.genWealth.
-  // §5B: DB is NEVER simulated. It will be wired only from a CONFIRMED audited policy
-  // (policy_tracking, status='active', newest wins) — pending that data flow into this iframe.
-  // Until then, no DB is sourced: the calc shows cash-value-only + a prompt (no fabrication,
-  // and no risk of using a transient/superseded upload).
-  var _illusDB=0,_illusPrem=0,_illusCarrier='your policy';
-  var _dbRatio=null;
+  // §5B: DB is NEVER simulated. It comes from the latest CONFIRMED audited policy
+  // (policy_tracking, status='active', newest wins), pushed in by the parent shell via
+  // PFOS_CONFIRMED_POLICY -> S.confirmedLifePolicy. This is a read of already-stored audit data —
+  // the AI audit is NOT re-run (no extra charge). No confirmed policy -> cash-value-only.
+  var _clp=(S.confirmedLifePolicy)||null;
+  var _illusDB=_clp?Math.round(_clp.death_benefit||0):0;
+  var _illusPrem=_clp?Math.round(_clp.premium_monthly||0):0;
+  var _illusCarrier=(_clp&&_clp.carrier)||'your policy';
+  var _dbRatio=(_illusDB>0&&_illusPrem>0)?(_illusDB/_illusPrem):null;
   var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
   var _gw=_EC?_EC.genWealth({prem:prem,growth:growth,gen2Inc:gen2Inc,gen3Inc:gen3Inc,dbRatio:_dbRatio}):null;
   if(!_gw)return;
@@ -25149,6 +25159,18 @@ function renderClientPlanTracking(){
 }
 
 // Load tracked policies from Supabase
+// Newest CONFIRMED permanent-life policy (policy_tracking, status='active') for calcGenWealth.
+// Reads already-stored audit data from APP._trackedPolicies — does NOT re-invoke the AI audit.
+function _confirmedLifePolicyForMain(){
+  var tp=(APP&&APP._trackedPolicies)||[];
+  var perm=tp.filter(function(p){var t=(p.policy_type||'').toLowerCase();return t==='whole_life'||t==='iul'||t==='universal_life';});
+  if(!perm.length)return null;
+  perm.sort(function(a,b){return new Date(b.updated_at||b.created_at||0)-new Date(a.updated_at||a.created_at||0);});
+  var w=perm[0];var db=Math.round(w.death_benefit||0),pm=Math.round(w.premium_monthly||0);
+  if(!(db>0&&pm>0))return null;
+  return {death_benefit:db,premium_monthly:pm,carrier:w.carrier||'your policy'};
+}
+function _syncConfirmedPolicyToMain(){ try{ pfosPost({type:'PFOS_CONFIRMED_POLICY',policy:_confirmedLifePolicyForMain()}); }catch(e){} }
 async function _loadTrackedPolicies(){
   if(!APP.currentClientId||APP._trackedPoliciesLoaded)return;
   APP._trackedPoliciesLoaded=true;
