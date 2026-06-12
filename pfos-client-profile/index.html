@@ -8017,64 +8017,17 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
     flags.push({icon:'🏥',title:'No long-term care planning'+tag,desc:'Premiums for '+spName+' are best locked 50-60 — nearly double after 65. Consider hybrid life/LTC.',type:'opp',action:'protection_spouse',owner:'spouse'});
 }
 function _cpCalcHealthScore(){
-  var s=0,d=CPLAN;if(d.income<=0)return 0;
-  var efMo=d.expenses>0?d.efBal/d.expenses:0;s+=Math.min(20,Math.round(efMo/3*20));
-  if(d.totalDebt<=0)s+=15;else{var dti=d.debtMin/d.income;s+=Math.max(0,Math.round((1-dti/0.43)*15));}
-  var sr=(d.income-d.expenses)/d.income;s+=Math.min(15,Math.round(sr/0.2*15));
-  var hasLife=(d.policies||[]).some(function(p){return(p.type||'').toLowerCase().indexOf('life')>=0;});
-  var hasDisab=(d.policies||[]).some(function(p){return(p.type||'').toLowerCase().indexOf('disab')>=0;});
-  s+=(hasLife?5:0)+(hasDisab?5:0);
-  // Phase 2: retirement readiness — replaces the old vehicle-count component (15 pts max).
-  // Single user: how much of stated monthly target the projected balance can sustain.
-  // Couple: each partner needs their own target met (using their own balance share);
-  // household score = min(self_pct, spouse_pct) × 15. The min reflects distributional risk:
-  // a household with one well-prepared partner and one underprepared partner is fragile.
-  var retScore=0;
-  if(CPLAN._sim&&CPLAN._sim.projRetValue!=null){
-    if(CPLAN._partner&&(CPLAN._householdType==='joint'||CPLAN._householdType==='hybrid')&&CPLAN._sim.retirementByOwner){
-      // Couple per-partner readiness against each partner's own target
-      var _myAge=CPLAN.age||35;
-      var _spAge=CPLAN._partner.age||35;
-      var _myRetAge=CPLAN.retirementAge||65;
-      var _spRetAge=CPLAN._partner.retirementAge||65;
-      var _myYr=Math.max(1,Math.min(30,_myRetAge-_myAge));
-      var _spYr=Math.max(1,Math.min(30,_spRetAge-_spAge));
-      var _jtYr=Math.max(_myYr,_spYr);
-      var _selfArr=CPLAN._sim.retirementByOwner.self||[];
-      var _spArr=CPLAN._sim.retirementByOwner.spouse||[];
-      var _jtArr=CPLAN._sim.retirementByOwner.joint||[];
-      function _atY(arr,y){return arr[y]!=null?arr[y]:(arr[arr.length-1]||0);}
-      var _myBal=_atY(_selfArr,_myYr)+_atY(_jtArr,_jtYr)*0.5;
-      var _spBal=_atY(_spArr,_spYr)+_atY(_jtArr,_jtYr)*0.5;
-      var _lifeExpHS=parseInt((APP._currentClientFd&&APP._currentClientFd.S&&APP._currentClientFd.S.calcs&&APP._currentClientFd.S.calcs.retLifeExp))||90;
-      var _myInc=_cpSustainableMonthly(_myBal,Math.max(1,(_lifeExpHS-_myRetAge)||25),0.01);
-      var _spInc=_cpSustainableMonthly(_spBal,Math.max(1,(_lifeExpHS-_spRetAge)||25),0.01);
-      var _myTgt=_cpRetIncomeTarget('self');
-      var _spTgt=_cpRetIncomeTarget('spouse');
-      var _myPct=_myTgt>0?Math.min(1,_myInc/_myTgt):0;
-      var _spPct=_spTgt>0?Math.min(1,_spInc/_spTgt):0;
-      retScore=Math.round(Math.min(_myPct,_spPct)*15);
-    }else{
-      // Single user readiness vs stated target
-      var _proj=CPLAN._sim.projRetValue||0;
-      var _projInc=_cpSustainableMonthly(_proj,25,0.01);
-      var _tgt=_cpRetIncomeTarget('self');
-      var _pct=_tgt>0?Math.min(1,_projInc/_tgt):0;
-      retScore=Math.round(_pct*15);
-    }
-  }else{
-    // No simulation yet — fall back to vehicle-count partial credit so the score isn't 0
-    // before the user generates a plan. Half-credit per vehicle, max 7 of 15 points.
-    var retAllocs=CPLAN.allocations.filter(function(a){return['roth','401k','iul','wl','ibc','trad_ira'].indexOf(a.type)>=0&&a.amount>0;});
-    retScore=Math.min(7,retAllocs.length*2);
-  }
-  s+=retScore;
-  var types=CPLAN.allocations.filter(function(a){return a.amount>0;}).map(function(a){return a.type;});
-  var unique=types.filter(function(t,i){return types.indexOf(t)===i;});s+=Math.min(10,unique.length*2);
-  var taxFree=CPLAN.allocations.some(function(a){return(a.type==='roth'||a.type==='hsa')&&a.amount>0;});s+=(taxFree?5:0);
-  var allocated=CPLAN.allocations.reduce(function(t,a){return t+a.amount;},0);
-  if(allocated>d.surplus*1.05)s=Math.max(0,s-15);
-  return Math.min(100,Math.max(0,s));
+  var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
+  if(!_EC||!_EC.healthScore)return 0;
+  var _le;try{_le=parseInt(APP._currentClientFd.S.calcs.retLifeExp)||90;}catch(e){_le=90;}
+  return _EC.healthScore({
+    income:CPLAN.income,expenses:CPLAN.expenses,efTarget:CPLAN.efTarget,efBal:CPLAN.efBal,totalDebt:CPLAN.totalDebt,
+    allocations:CPLAN.allocations,policies:CPLAN.policies,sim:CPLAN._sim,
+    age:CPLAN.age,retirementAge:CPLAN.retirementAge,
+    spAge:CPLAN._partner&&CPLAN._partner.age,spRetAge:CPLAN._partner&&CPLAN._partner.retirementAge,
+    lifeExp:_le,householdType:CPLAN._householdType,hasPartner:!!CPLAN._partner,
+    myRetTarget:_cpRetIncomeTarget('self'),spRetTarget:_cpRetIncomeTarget('spouse')
+  });
 }
 // Phase C: owner-aware IRS limits. Pass an allocation OR a literal owner ('self'/'spouse'/'joint')
 // to use the right partner's age for 50+ catch-up. Joint allocations use the older partner's age.
@@ -29822,6 +29775,6 @@ async function _checkUnreadMessages(){
 </div>
 
 <!-- PFOS canonical engine (single source of truth) — advisor metrics compute on-read. -->
-<script src="/pfos-core.v48.js" defer></script>
+<script src="/pfos-core.v49.js" defer></script>
 </body>
 </html>
