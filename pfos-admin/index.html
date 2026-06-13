@@ -2075,14 +2075,10 @@ async function approveDeletionRequest(reqId,clientId){
   try{
     // Get client info before deletion for notification
     var {data:clientData}=await db.from('clients').select('email,name').eq('id',clientId).maybeSingle();
-    await db.from('implementation_log').delete().eq('client_id',clientId);
-    await db.from('client_snapshots').delete().eq('client_id',clientId);
-    await db.from('client_profiles').delete().eq('client_id',clientId);
-    await db.from('advisor_recommendations').delete().eq('client_id',clientId);
-    await db.from('messages').delete().eq('client_id',clientId);
-    await db.from('client_notifications').delete().eq('client_id',clientId);
-    await db.from('deletion_requests').update({status:'approved'}).eq('id',reqId);
-    await db.from('clients').delete().eq('id',clientId);
+    // Complete right-to-erasure: one admin-only cascade removes ALL the client's data across
+    // every table (was only 6 → orphaned PII), incl. deletion_requests + the clients row.
+    var _casc=await db.rpc('delete_client_cascade',{p_client_id:clientId});
+    if(_casc.error){ alert('Deletion failed: '+_casc.error.message); return; }
     // Send deletion confirmation email
     if(clientData && clientData.email){
       db.functions.invoke('send-notification',{body:{type:'deletion_confirmed',clientId:clientId,clientName:clientData.name||'',clientEmail:clientData.email}}).catch(function(e){console.warn('Notification failed:',e);});
@@ -2849,7 +2845,7 @@ function copyIndexSQL(){
 }
 
 initSupabase(function(){
-  logSetupSQL(); initTheme(); setTimeout(initAccessibility,1200);
+  initTheme(); setTimeout(initAccessibility,1200); /* schema/RLS console dump removed (O15a) */
   initOfflineDetection(); initErrorMonitoring();
   // Auth guard — admin only
   try{
