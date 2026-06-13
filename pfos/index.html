@@ -443,6 +443,19 @@ tbody td{padding:11px 14px;font-size:13px;color:rgba(226,232,240,.8)}
       <div class="login-footer"><a href="javascript:void(0)" onclick="showLogin()">&#8592; Back to login</a></div>
     </div>
 
+    <!-- SET NEW PASSWORD (landing from the reset email link) -->
+    <div id="resetPasswordForm" style="display:none">
+      <div class="fi">
+        <label class="lb">New Password</label>
+        <input class="inp" type="password" id="resetNewPassword" placeholder="New password (8+ characters)" autocomplete="new-password">
+      </div>
+      <div class="fi">
+        <label class="lb">Confirm New Password</label>
+        <input class="inp" type="password" id="resetConfirmPassword" placeholder="Re-enter new password" autocomplete="new-password" onkeydown="if(event.key==='Enter')doSetNewPassword()">
+      </div>
+      <button class="btn btn-bl" onclick="doSetNewPassword()">Update Password</button>
+    </div>
+
     <!-- CLIENT PORTAL FORM -->
     <div id="clientLoginForm" style="display:none">
       <div class="fi">
@@ -712,6 +725,11 @@ var APP = {
   loginTab:       'advisor'
 };
 
+// Capture the URL hash at script-load time — supabase-js strips it once it processes a
+// recovery/auth token, so reading it later in initAuth would miss the type=recovery marker.
+var _initialUrlHash = '';
+try{ _initialUrlHash = (window.location && window.location.hash) || ''; }catch(e){}
+
 function initSupabase(cb){
   if(window.supabase && window.supabase.createClient){
     db = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
@@ -729,12 +747,21 @@ function initSupabase(cb){
 }
 
 async function initAuth(){
+  // Password-reset landing: the recovery token arrives in the URL hash (type=recovery).
+  // Detect it BEFORE getSession()/auto-route, or the recovery session would be routed
+  // straight into the app and the user could never set a new password.
+  var isRecovery = _initialUrlHash.indexOf('type=recovery') >= 0 || window._passwordRecovery === true;
+  if(isRecovery) window._passwordRecovery = true;
   try {
-    var result = await db.auth.getSession();
-    if(result.error) throw result.error;
-    var session = result.data && result.data.session;
-    if(session){ APP.user = session.user; await determineRoleAndRoute(); }
-    else showScreen('loginScreen');
+    if(isRecovery){
+      showResetPassword();   // show "set new password" form; do not auto-route
+    } else {
+      var result = await db.auth.getSession();
+      if(result.error) throw result.error;
+      var session = result.data && result.data.session;
+      if(session){ APP.user = session.user; await determineRoleAndRoute(); }
+      else showScreen('loginScreen');
+    }
   } catch(e) {
     console.error('Supabase init error:', e);
     showScreen('loginScreen');
@@ -745,8 +772,16 @@ async function initAuth(){
   }
 
   db.auth.onAuthStateChange(async function(event, session){
+    if(event === 'PASSWORD_RECOVERY'){
+      // User clicked the reset email link — show the set-new-password form, don't route in.
+      window._passwordRecovery = true;
+      showResetPassword();
+      return;
+    }
     if(event === 'SIGNED_IN' && session){
       APP.user = session.user;
+      // In a recovery session, stay on the set-password form instead of routing into the app.
+      if(window._passwordRecovery) return;
       // ── BIOMETRIC OWNERSHIP CHECK ──
       // If biometrics are enrolled on this device, they're tied to one specific
       // account (stored as pfos_biometric_user_id). If a DIFFERENT user signs
@@ -799,7 +834,7 @@ async function _checkInviteToken(){
     }
     // Show invite signup form
     APP._inviteData=inv;
-    var allForms=['advisorLoginForm','forgotForm','clientLoginForm','agentRegisterForm','clientRegisterForm'];
+    var allForms=['advisorLoginForm','forgotForm','resetPasswordForm','clientLoginForm','agentRegisterForm','clientRegisterForm'];
     allForms.forEach(function(id){var el2=document.getElementById(id);if(el2)el2.style.display='none';});
     document.getElementById('tabClient').classList.add('active');
     document.getElementById('tabAdvisor').classList.remove('active');
@@ -1410,7 +1445,7 @@ function setLoginTab(tab){
   APP.loginTab = tab;
   document.getElementById('tabAdvisor').classList.toggle('active', tab==='advisor');
   document.getElementById('tabClient').classList.toggle('active', tab==='client');
-  var allForms = ['advisorLoginForm','forgotForm','clientLoginForm','agentRegisterForm','clientRegisterForm','inviteSignupForm'];
+  var allForms = ['advisorLoginForm','forgotForm','resetPasswordForm','clientLoginForm','agentRegisterForm','clientRegisterForm','inviteSignupForm'];
   allForms.forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   clearLoginMessages();
   if(tab==='advisor') document.getElementById('advisorLoginForm').style.display='block';
@@ -1424,9 +1459,36 @@ function showForgot(){
 }
 
 function showLogin(){
-  ['forgotForm','agentRegisterForm','clientRegisterForm','clientLoginForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
+  ['forgotForm','resetPasswordForm','agentRegisterForm','clientRegisterForm','clientLoginForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
   document.getElementById('advisorLoginForm').style.display='block';
   clearLoginMessages();
+}
+
+// Landing form after the user clicks the password-reset email link (recovery session).
+function showResetPassword(){
+  showScreen('loginScreen');
+  ['advisorLoginForm','forgotForm','agentRegisterForm','clientRegisterForm','clientLoginForm','inviteSignupForm'].forEach(function(id){ var el=document.getElementById(id); if(el) el.style.display='none'; });
+  var f=document.getElementById('resetPasswordForm'); if(f) f.style.display='block';
+  clearLoginMessages();
+  showLoginMsg('Enter a new password for your account.');
+}
+
+// Completes the reset: sets the new password on the recovery session, then routes in.
+async function doSetNewPassword(){
+  var p1=v('resetNewPassword'), p2=v('resetConfirmPassword');
+  if(!p1 || p1.length < 8){ showLoginErr('Password must be at least 8 characters.'); return; }
+  if(p1 !== p2){ showLoginErr('Passwords do not match.'); return; }
+  try{
+    var res = await db.auth.updateUser({ password: p1 });
+    if(res.error){ showLoginErr(res.error.message); return; }
+    window._passwordRecovery = false;
+    // Strip the recovery token from the URL so a refresh doesn't re-enter recovery mode.
+    try{ history.replaceState(null, '', window.location.pathname + window.location.search); }catch(e){}
+    showLoginMsg('Password updated — signing you in…');
+    await determineRoleAndRoute();
+  }catch(e){
+    showLoginErr('Could not update password. Please try again.');
+  }
 }
 
 function showAgentRegister(){
