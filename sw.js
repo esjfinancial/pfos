@@ -9,15 +9,15 @@
 //     be cached or users will see stale balances, plans, and policies.
 //   - External CDN scripts (cdnjs): cache-first with stale-while-revalidate.
 
-const CACHE_VERSION = 'pfos-v1';
+const CACHE_VERSION = 'pfos-v2';
 const RUNTIME_CACHE = 'pfos-runtime-v1';
 
 // Files to pre-cache on install. Keep this small — only the essentials needed
 // to render an offline shell. Everything else is cached on first fetch.
 const PRECACHE_URLS = [
   '/',
-  '/pfos-client.html',
-  '/pfos-main.html',
+  '/pfos-client',
+  '/pfos-main',
   '/manifest.json',
   '/pfos-icon-192.png',
   '/pfos-icon-512.png'
