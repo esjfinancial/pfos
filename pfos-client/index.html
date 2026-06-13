@@ -9356,8 +9356,15 @@ async function generateProgressReport(clientId){
 async function downloadClientDataExport(){
   try{
     var client=APP.currentClient||{};var exportObj=null;
-    // Try Supabase first
+    // Full Subject-Access-Request export: every table of the client's own data (O19).
     if(APP.currentClientId){
+      try{
+        var sar=await db.rpc('export_client_data',{p_client_id:APP.currentClientId});
+        if(!sar.error && sar.data){exportObj=sar.data;}
+      }catch(e3){console.warn('SAR export rpc fallback:',e3);}
+    }
+    // Fallback: latest financial profile only (if the SAR rpc is unavailable)
+    if(!exportObj && APP.currentClientId){
       try{
         var res=await db.from('client_profiles').select('*').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
         if(res.data){exportObj={exported_at:new Date().toISOString(),client:{name:client.name||'',email:client.email||'',tier:client.pfos_tier||''},financial_data:res.data.financial_data||{},scores:res.data.scores||{}};}
@@ -9392,7 +9399,10 @@ async function acceptDisclosure(){
   if(!check||!check.checked){ _cpToast('Please check the acknowledgment box.'); return; }
   try{
     if(APP.currentClientId){
-      await db.from('clients').update({disclosure_accepted_at:new Date().toISOString()}).eq('id',APP.currentClientId);
+      var _nowISO=new Date().toISOString();
+      await db.from('clients').update({disclosure_accepted_at:_nowISO}).eq('id',APP.currentClientId);
+      // Richer consent ledger (immutable, per-acceptance) alongside the clients flag.
+      db.from('client_consents').insert({client_id:APP.currentClientId,consent_type:'disclosure',acknowledged_at:_nowISO,user_agent:(navigator&&navigator.userAgent)||null}).then(function(r){ if(r&&r.error) console.warn('consent ledger:',r.error.message); });
     }
     closeModal('disclosureModal');
     try{ sessionStorage.setItem('pfos_disclosure_accepted','1'); }catch(ex){}
@@ -10850,7 +10860,7 @@ async function submitSatisfactionRating(){
 }
 
 try{ initSupabase(function(){
-  logSetupSQL();
+  // (schema/RLS dump to console removed — see version-controlled migrations instead)
   initAuth();
   initTheme();
   setTimeout(initAccessibility, 800);
