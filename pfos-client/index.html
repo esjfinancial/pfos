@@ -36538,15 +36538,30 @@ function _cpWhy(type){
 }
 
 // ── DEBT ENGINE (ported from pfos-main + consolidation + IBC) ──
+// ── _cp engine cache (stale-while-revalidate; keeps _cpCalc* SYNC so the 75+ callers —
+// _cpRunSimulation, cplanSave, sliders, renders — stay untouched). Miss → bg pfosCalc + a
+// debounced _cpRenderPlanV2 repaint; pre-slim the local fast-path fills in a microtask. ──
+var _cpEngCache={},_cpEngPending={},_cpEngRenderT=null;
+function _cpEngGet(ns,fn,args){
+  var key=ns+'.'+fn+':'+JSON.stringify(args);
+  if(key in _cpEngCache)return _cpEngCache[key];
+  if(!_cpEngPending[key]){
+    _cpEngPending[key]=true;
+    pfosCalc(ns,fn,args).then(function(r){_cpEngCache[key]=r;delete _cpEngPending[key];_cpEngScheduleRender();}).catch(function(){delete _cpEngPending[key];});
+  }
+  return (key in _cpEngCache)?_cpEngCache[key]:null;
+}
+function _cpEngScheduleRender(){
+  if(_cpEngRenderT)clearTimeout(_cpEngRenderT);
+  _cpEngRenderT=setTimeout(function(){_cpEngRenderT=null;try{if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();}catch(e){}},60);
+}
 function _cpCalcDebtPlan(debts,extra,method){
-  var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
-  return _EC&&_EC.debtPlan?_EC.debtPlan(debts,extra,method):{months:0,interest:0,intSaved:0,order:[],perDebt:[]};
+  return _cpEngGet('calculators','debtPlan',[debts,extra,method])||{months:0,interest:0,intSaved:0,order:[],perDebt:[]};
 }
 
 function _cpCalcConsolidation(debts){
   var creditScore=700;try{var snap=APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.snapshot;if(snap&&snap.credit_score)creditScore=parseInt(snap.credit_score)||700;}catch(e){}
-  var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
-  return _EC&&_EC.consolidationPlan?_EC.consolidationPlan(debts,creditScore):null;
+  return _cpEngGet('calculators','consolidationPlan',[debts,creditScore]);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -36618,9 +36633,7 @@ function _cpCalcIBCDebt(debts,budget,userRepayOverride){
   var surplus=CPLAN.surplus||0;
   if(surplus<200)return{eligible:false,reason:'Need at least $200/mo positive cash flow.'};
   if(CPLAN.totalDebt<=0)return{eligible:false,reason:'No active debts.'};
-  var EC=window.PFOSEngine&&window.PFOSEngine.ibcCascade;
-  if(!EC||!EC.simulateIBCDebtCascadeBest)return null;
-  var r=EC.simulateIBCDebtCascadeBest(debts,budget,{userRepayOverride:(typeof userRepayOverride==='number'&&userRepayOverride>=0)?userRepayOverride:null});
+  var r=_cpEngGet('ibcCascade','simulateIBCDebtCascadeBest',[debts,budget,{userRepayOverride:(typeof userRepayOverride==='number'&&userRepayOverride>=0)?userRepayOverride:null}]);
   if(!r)return null;
   r.eligible=true; r.intSaved=0;
   r._totalLoanInterest=r.totalLoanInterest;
