@@ -5189,13 +5189,10 @@ function getFullName(){ var p=getProfile(); return (p.firstName+' '+p.lastName).
 // Born 1960+: 67.0
 // Returns FRA in years (decimal). Integer year → integer/decimal age.
 // Source: ssa.gov/oact/quickcalc/early_late.html
-function _ssFRA(birthYearOrDob){return window.PFOSEngine.calculators.ssFRA(birthYearOrDob);}
 // Returns a formatted FRA string like "66" or "66 yr 8 mo" or "67"
-function _ssFRAStr(by){return window.PFOSEngine.calculators.ssFRAStr(by);}
 // Adjustment factor for claiming at a given age vs FRA.
 // Early: -5/9 of 1% per month for first 36 months before FRA, then -5/12 of 1% per additional month.
 // Delayed: +8% per year (2/3% per month) after FRA up to age 70. After 70, no further increase.
-function _ssClaimAdjustment(claimAge,fra){return window.PFOSEngine.calculators.ssClaimAdjustment(claimAge,fra);}
 
 function syncAgeFromDOB(){
   var dob=gv('cpDOB'); if(!dob) return;
@@ -12099,7 +12096,7 @@ function renderTaxEstimation(){
 }
 
 // ── PROJECTIONS PANEL ───────────────────────────────
-function renderProjections(){
+async function renderProjections(){
   // Tier gate — Projections requires PRO or higher (advisors always get pro_plus)
   if(S.mode === 'client' && !hasFeature('projections')){
     var upgradeHtml='<div style="padding:24px;text-align:center;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px"><div style="font-size:28px;margin-bottom:10px">🔒</div><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:6px">Wealth Projections — PRO Feature</div><div style="font-size:12px;color:var(--mu);line-height:1.7;margin-bottom:14px">Money flow maps, net worth tracking, retirement gap analysis, and FI projections require a PRO subscription.</div><button class="btn bor" style="width:auto;padding:9px 20px" onclick="showUpgrade()">Upgrade to PRO</button></div>';
@@ -12215,12 +12212,13 @@ function renderProjections(){
     // Use profile DOB to derive birth year and FRA. Defaults to 67 if unknown.
     var _ssBYear=null;
     if(prof.dob){var _dDob=new Date(prof.dob);if(!isNaN(_dDob.getTime()))_ssBYear=_dDob.getFullYear();}
-    var _ssFRAyrs=_ssFRA(_ssBYear);
-    var _ssFRAlbl=_ssFRAStr(_ssBYear);
+    var _ssR=null; try{ _ssR=await pfosCalc('calculators','socialSecurity',[{pia:ssBenefit,birthYr:_ssBYear,lifeExp:85,otherInc:0,taxBrackPct:0,spousePIA:0,colaPct:0,spouseBirthYr:null}]); }catch(_e){ _ssR=null; }
+    var _ssFRAyrs=_ssR?_ssR.fra:67;
+    var _ssFRAlbl=_ssR?_ssR.fraStr:'67';
     var _ssFRAfloor=Math.floor(_ssFRAyrs);
-    var ss62=Math.round(ssBenefit*_ssClaimAdjustment(62,_ssFRAyrs));
-    var ssFRA=Math.round(ssBenefit*_ssClaimAdjustment(_ssFRAyrs,_ssFRAyrs));// = ssBenefit
-    var ss70=Math.round(ssBenefit*_ssClaimAdjustment(70,_ssFRAyrs));
+    var ss62=_ssR?_ssR.at62:0;
+    var ssFRA=_ssR?_ssR.atFRA:0;// = ssBenefit
+    var ss70=_ssR?_ssR.at70:0;
     // Lifetime comparison assuming life to 85
     var life62=(85-62)*12*ss62, lifeFRA=(85-_ssFRAfloor)*12*ssFRA, life70=(85-70)*12*ss70;
     retH+='<div style="margin-top:14px"><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Social Security Optimization &middot; FRA '+_ssFRAlbl+'</div>';
@@ -16873,7 +16871,7 @@ async function _runRetScenarios(){
   el.innerHTML=h;
 }
 
-function renderSocialSecurityCalc(){
+async function renderSocialSecurityCalc(){
   document.getElementById('insCalcTitle').textContent='🔄 Social Security Optimizer — When to Claim for Maximum Lifetime Income';
   var el=document.getElementById('insCalcContent');if(!el)return;
   if(document.getElementById('ss_pia')){calcSocialSecurity();return;}
@@ -16886,11 +16884,16 @@ function renderSocialSecurityCalc(){
   var _userBirthYr=null;
   if(_profile.dob){var _d=new Date(_profile.dob);if(!isNaN(_d.getTime()))_userBirthYr=_d.getFullYear();}
   if(!_userBirthYr&&age){_userBirthYr=new Date().getFullYear()-age;}
-  var _userFRA=_ssFRA(_userBirthYr);
-  var _userFRAStr=_ssFRAStr(_userBirthYr);
   var _spouseBirthYr=null;
   if(_profile.spDOB){var _sd=new Date(_profile.spDOB);if(!isNaN(_sd.getTime()))_spouseBirthYr=_sd.getFullYear();}
-  var _spouseFRA=_ssFRA(_spouseBirthYr);
+  var _userFRAStr='—', _spFRAStr='';
+  try{
+    var _ssFraCalls=[pfosCalc('calculators','socialSecurity',[{pia:pia,birthYr:_userBirthYr}])];
+    if(_spouseBirthYr) _ssFraCalls.push(pfosCalc('calculators','socialSecurity',[{pia:pia,birthYr:_spouseBirthYr}]));
+    var _ssFraRes=await Promise.all(_ssFraCalls);
+    if(_ssFraRes[0]) _userFRAStr=_ssFraRes[0].fraStr;
+    if(_spouseBirthYr&&_ssFraRes[1]) _spFRAStr=_ssFraRes[1].fraStr;
+  }catch(_e){}
 
   // ── Toggle ──
   var h=calcToggleHTML('ss','calcSocialSecurity');
@@ -16901,7 +16904,7 @@ function renderSocialSecurityCalc(){
   // ── Profile Bar ──
   h+='<div style="padding:12px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.18);border-radius:4px;margin-bottom:12px;font-size:11px;color:var(--mu);line-height:1.8">';
   h+='<strong style="color:var(--wh)">📋 Your Profile:</strong> Age: <span style="color:#5B9BFF;font-weight:600">'+age+'</span> · Birth year: <span style="color:#5B9BFF;font-weight:600">'+(_userBirthYr||'—')+'</span> · FRA: <span style="color:var(--gr);font-weight:600">'+_userFRAStr+'</span> · Est. PIA: <span style="color:var(--gr);font-weight:600">'+fmt(pia)+'/mo</span>';
-  if(spouseInc>0) h+='<br>👥 Spouse income detected — couple optimization available'+(_spouseBirthYr?' (spouse FRA: '+_ssFRAStr(_spouseBirthYr)+')':'');
+  if(spouseInc>0) h+='<br>👥 Spouse income detected — couple optimization available'+(_spouseBirthYr?' (spouse FRA: '+_spFRAStr+')':'');
   h+='</div>';
 
   // ── Inputs ──
