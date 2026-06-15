@@ -35387,18 +35387,34 @@ function _cpEffectiveCapNote(type,idx){
 //     protection action item (term life, DI, health) in the plan counts
 //     as "addressed by plan" and scores partial credit. Full credit only
 //     when the user marks the item Done (i.e., they actually got coverage).
-function _cpCalcHealthScore(){
-  var _EC=window.PFOSEngine&&window.PFOSEngine.calculators;
-  if(!_EC||!_EC.healthScore)return 0;
+var _cpHealthCache=null,_cpHealthKey=null,_cpHealthPending=null;
+function _cpHealthCtx(){
   var _le;try{_le=parseInt(APP._currentClientFd.S.calcs.retLifeExp)||90;}catch(e){_le=90;}
-  return _EC.healthScore({
+  return {
     income:CPLAN.income,expenses:CPLAN.expenses,efTarget:CPLAN.efTarget,efBal:CPLAN.efBal,totalDebt:CPLAN.totalDebt,
     allocations:CPLAN.allocations,policies:CPLAN.policies,sim:CPLAN._sim,
     age:CPLAN.age,retirementAge:CPLAN.retirementAge,
     spAge:CPLAN._partner&&CPLAN._partner.age,spRetAge:CPLAN._partner&&CPLAN._partner.retirementAge,
     lifeExp:_le,householdType:CPLAN._householdType,hasPartner:!!CPLAN._partner,
     myRetTarget:_cpRetIncomeTarget('self'),spRetTarget:_cpRetIncomeTarget('spouse')
-  });
+  };
+}
+// Stale-while-revalidate facade — stays SYNC for the 40+ sync callers (cplanSave, sliders,
+// renders). Returns the cached score immediately; on a cache miss/stale it routes healthScore
+// to the edge (pfosCalc) in the background and repaints via _cpRenderHealthScore when it lands.
+// Pre-slim the local fast-path resolves in a microtask, so the cache fills effectively instantly.
+function _cpCalcHealthScore(){
+  var ctx=_cpHealthCtx();var key=JSON.stringify(ctx);
+  if(key===_cpHealthKey&&_cpHealthCache!=null)return _cpHealthCache;
+  if(_cpHealthPending!==key){
+    _cpHealthPending=key;
+    pfosCalc('calculators','healthScore',[ctx]).then(function(s){
+      if(_cpHealthPending!==key)return; // superseded by a newer request
+      _cpHealthCache=s;_cpHealthKey=key;_cpHealthPending=null;
+      try{_cpRenderHealthScore();}catch(e){}
+    }).catch(function(){if(_cpHealthPending===key)_cpHealthPending=null;});
+  }
+  return _cpHealthCache!=null?_cpHealthCache:0;
 }
 function _cpRenderHealthScore(){
   var el=document.getElementById('cplanHealthScore');if(!el)return;
