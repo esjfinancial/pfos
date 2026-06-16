@@ -7678,6 +7678,12 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
     // were shared across the cached/stored profile. JSON clone isolates per client.
     CPLAN.allocations=JSON.parse(JSON.stringify(allocPlan.allocations));
     if(allocPlan.debtStrategy)CPLAN.debtStrategy=allocPlan.debtStrategy;
+    // Breathing room: hydrate a saved value + whether the advisor manually set it,
+    // so the hybrid auto-rule (_cpRecomputeHybridPools) doesn't clobber an override.
+    if(allocPlan._breathingPct!=null)CPLAN._breathingPct=allocPlan._breathingPct;
+    if(allocPlan._breathingTouched)CPLAN._breathingTouched=true;
+    if(allocPlan._selfBreathingPct!=null)CPLAN._selfBreathingPct=allocPlan._selfBreathingPct;
+    if(allocPlan._partnerBreathingPct!=null)CPLAN._partnerBreathingPct=allocPlan._partnerBreathingPct;
     // ── Migration: upgrade legacy action-only protection cards (Life/Disability
     // "Review") into the new term_life/disability slider cards. Shared helper so
     // every plan-load path applies it (see _cpMigrateProtectionCards).
@@ -7781,6 +7787,13 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             if(typeof _cpRecomputeHybridPools==='function'){_cpRecomputeHybridPools();}
           } else {
             CPLAN._combinedSurplus=null;CPLAN._selfPersonalSurplus=null;CPLAN._partnerPersonalSurplus=null;
+          }
+          // ── Shared editable master ── For hybrid/separate, the owner-tagged master
+          // lives once on couple_links.master_plan_cards. Load it (mapped relative to
+          // the centered client) as CPLAN.allocations so the advisor edits the SAME
+          // plan from either spouse. No-op (keeps the seed) if no master exists yet.
+          if((CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate')&&typeof _cpLoadCoupleMaster==='function'){
+            await _cpLoadCoupleMaster(couple);
           }
           // Tag any existing allocations without owner — assume self
           (CPLAN.allocations||[]).forEach(function(a){if(!a.owner)a.owner='self';});
@@ -7943,10 +7956,11 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
   function _sp(arr,field){return (arr||[]).filter(function(x){return x&&(x[field||'owner']||'personal')==='spouse';});}
   // Data sourcing differs by household model:
   //  • JOINT: both spouses share ONE row; spouse items are owner==='spouse' in rawS2.
-  //  • HYBRID: each spouse has their OWN row; the partner's data is on CPLAN._partner
-  //    (a separate profile), where their accounts are owner 'self'/'personal' on THEIR
-  //    row. So for hybrid we read straight from CPLAN._partner rather than filtering rawS2.
-  var _isHybridSp=(CPLAN._householdType==='hybrid' && CPLAN._partner);
+  //  • HYBRID + SEPARATE: each spouse has their OWN row; the partner's data is on
+  //    CPLAN._partner (a separate profile), where their accounts are owner
+  //    'self'/'personal' on THEIR row. So for both we read straight from
+  //    CPLAN._partner rather than filtering rawS2.
+  var _isHybridSp=((CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate') && CPLAN._partner);
   var spIncSrcs, spInc, spRetAccts, spPolicies;
   if(_isHybridSp){
     spInc=Math.max(0, CPLAN._partner.income||0);
@@ -7964,6 +7978,48 @@ function _cpAppendSpouseFlags(flags, rawS2, d){
   // Helper: does the plan already have a spouse-owned allocation of these types with money?
   function _spHasAlloc(types){
     return CPLAN.allocations.some(function(a){return a&&a.owner==='spouse'&&types.indexOf(a.type)>=0&&(parseFloat(a.amount)||0)>0;});
+  }
+  // ── Core financial-health flags (spouse) — only when we have the partner's OWN
+  // profile (hybrid + separate). Joint shares one row, so the primary extraction
+  // already covers the household. These mirror the four self "core" flags
+  // (cash-flow, emergency fund, debt, employer match) for the partner so Combined
+  // surfaces every gap for BOTH spouses. efTarget = 3 months of expenses (mirrors
+  // the self formula).
+  if(_isHybridSp){
+    var _pt=CPLAN._partner;
+    var _ptInc=Math.max(0,_pt.income||0);
+    var _ptExp=Math.max(0,_pt.expenses||0);
+    var _ptEf=Math.max(0,_pt.efBal||0);
+    var _ptEfTarget=Math.round(_ptExp*3);
+    var _ptDebts=(_pt.debts||[]).filter(function(x){return x&&(parseFloat(x.balance)||0)>0;});
+    var _ptTotalDebt=_ptDebts.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);
+    // Cash flow
+    if(_ptInc>0&&_ptExp>=_ptInc){
+      flags.push({icon:'🚨',title:'Spending exceeds income'+tag,desc:spName+'\'s expenses ('+fmt(_ptExp)+'/mo) meet or exceed income ('+fmt(_ptInc)+'/mo). Trim spending or raise income before funding goals.',type:'warn',action:'cashflow_spouse',owner:'spouse'});
+    } else if(_ptInc>0&&(_ptInc-_ptExp)<200){
+      flags.push({icon:'⚠️',title:'Razor-thin cash flow'+tag,desc:spName+' has only '+fmt(_ptInc-_ptExp)+'/mo of buffer after expenses — a small surprise could mean new debt.',type:'warn',action:'cashflow_spouse',owner:'spouse'});
+    }
+    // Emergency fund
+    if(_ptEfTarget>0&&_ptEf<_ptEfTarget*0.25){
+      flags.push({icon:'🛟',title:'Emergency fund critically low'+tag,desc:spName+' has '+fmt(_ptEf)+' of a '+fmt(_ptEfTarget)+' target (3 months of expenses). Build this first.',type:'warn',action:'ef_spouse',owner:'spouse'});
+    } else if(_ptEfTarget>0&&_ptEf<_ptEfTarget){
+      flags.push({icon:'🛟',title:'Emergency fund below target'+tag,desc:spName+' needs '+fmt(_ptEfTarget)+' for 3 months of expenses ('+fmt(_ptEf)+' saved so far).',type:'opp',action:'ef_spouse',owner:'spouse'});
+    }
+    // High-interest / outstanding debt
+    var _ptHi=_ptDebts.filter(function(x){return (parseFloat(x.rate)||0)>=15;});
+    if(_ptHi.length>0){
+      var _ptHiTotal=_ptHi.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);
+      flags.push({icon:'🔥',title:'High-interest debt'+tag+': '+fmtK(_ptHiTotal),desc:_ptHi.length+' account'+(_ptHi.length>1?'s':'')+' above 15% APR for '+spName+'. A payoff strategy could save thousands.',type:'warn',action:'debt_spouse',owner:'spouse'});
+    } else if(_ptTotalDebt>0){
+      flags.push({icon:'💳',title:'Outstanding debt'+tag+': '+fmtK(_ptTotalDebt),desc:_ptDebts.length+' account'+(_ptDebts.length>1?'s':'')+' for '+spName+' — a payoff strategy could save on interest.',type:'opp',action:'debt_spouse',owner:'spouse'});
+    }
+    // Employer 401(k) match (heuristic — mirrors the self fallback when match data
+    // isn't separately modeled for the partner: an employer + no active 401k).
+    var _ptHasEmployer=!!(_pt.employer&&String(_pt.employer).trim());
+    var _ptHas401kContrib=(_pt.retAccounts||[]).some(function(r){var t=(r.type||'').toLowerCase();return t.indexOf('401k')>=0&&(parseFloat(r.contrib)||0)>0;});
+    if(_ptHasEmployer&&!_ptHas401kContrib&&!_spHasAlloc(['401k','roth401k'])&&_ptInc>0){
+      flags.push({icon:'🎁',title:'Employer match likely available'+tag,desc:spName+' has an employer but no active 401(k) contribution. Capturing any employer match is an immediate, guaranteed return — fund this first.',type:'warn',action:'retirement_spouse',owner:'spouse'});
+    }
   }
   // ── No retirement savings (spouse) ──
   // Count BOTH a spouse-owned retirement allocation in the plan AND an existing
@@ -8234,12 +8290,20 @@ function _cpHouseholdSurplus(){
 // Module-level tab derivation (mirror of the local _cpTabOf in _cpRenderPlanFull)
 // so budget math can be pool-scoped outside the render closure.
 function _cpTabOfAlloc(a){
-  if(a&&a._tab&&['combined','self','partner','joint'].indexOf(a._tab)>=0)return a._tab;
+  // BUDGET membership. Joint cards draw the COMBINED pool (hybrid) and so map to
+  // 'combined' here; their cross-tab DISPLAY (both named tabs) is handled by
+  // _cpAllocInTab. There is no 'joint' tab anymore.
+  if(a&&a._tab&&['combined','self','partner'].indexOf(a._tab)>=0)return a._tab;
   var o=(a&&a.owner)||'self';
-  if(o==='joint')return'joint';
+  if(o==='joint')return'combined';
   if(o==='spouse')return'partner';
   return'self';
 }
+// Card types that may be co-owned ('Shared'/joint). Retirement vehicles and
+// cash-value insurance are excluded (single-owner per IRS) — they lock to a
+// named spouse. Single source of truth for the per-person lock + make-joint gating.
+var _CP_JOINT_ELIGIBLE={ef:1,edu:1,house:1,custom:1,invest:1,debt:1,protection:1};
+function _cpJointEligible(type){return _CP_JOINT_ELIGIBLE[type]===1;}
 // Which surplus pool funds a given hybrid tab.
 function _cpHybridPoolForTab(tab){
   if(tab==='self')return Math.max(0,CPLAN._selfPersonalSurplus||0);
@@ -8265,6 +8329,25 @@ function _cpAvailableBudget(excludeIdx){
       _depH+=(parseFloat(a.amount)||0);
     });
     return Math.max(0,Math.round(_pool-_brH-_depH));
+  }
+  if(CPLAN._householdType==='separate'){
+    // OWNER-keyed: a single-slider card draws from ITS OWNER's pot only (self pot =
+    // centered surplus, partner pot = partner surplus), each less that spouse's own
+    // breathing room, minus that owner's deployments (own cards + their half of any
+    // shared cards). No cross-subsidy. (Joint cards use _cpSlideJoint's own caps.)
+    var _aS=(excludeIdx!=null&&CPLAN.allocations[excludeIdx])?CPLAN.allocations[excludeIdx]:null;
+    var _who=(_aS&&_aS.owner==='spouse')?'spouse':'self';
+    var _potS=(_who==='spouse')?((CPLAN._partner&&CPLAN._partner.surplus)||0):(CPLAN.surplus||0);
+    var _brS=((_who==='spouse')?(CPLAN._partnerBreathingPct!=null?CPLAN._partnerBreathingPct:15):(CPLAN._selfBreathingPct!=null?CPLAN._selfBreathingPct:15))/100;
+    var _resS=Math.round(_potS*_brS);
+    var _depS2=0;
+    CPLAN.allocations.forEach(function(a,i){
+      if(i===excludeIdx)return;
+      var ow=a.owner||'self';
+      if(ow==='joint'){_depS2+=(_who==='self'?(parseFloat(a.amountSelf)||0):(parseFloat(a.amountSpouse)||0));}
+      else if(((ow==='spouse')?'spouse':'self')===_who){_depS2+=(parseFloat(a.amount)||0);}
+    });
+    return Math.max(0,Math.round(_potS-_resS-_depS2));
   }
   var surplus=_cpHouseholdSurplus();
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
@@ -10245,11 +10328,19 @@ function _cpRunSimulation(){
       var key=a.type+'_'+idx;
       if(allocSeries[key])allocSeries[key].push(Math.round(bal));
       totalAssets+=bal;
-      // Per-owner asset routing: every growth balance contributes to exactly one bucket.
+      // Per-owner asset routing: every growth balance contributes to a bucket.
+      // A SHARED (joint) card is split between the two spouses by their contribution
+      // share so each person's per-person chart reflects only their own portion
+      // (exact — a constant-rate balance is linear in the monthly contribution).
       var _aOwn=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
-      if(_aOwn==='self')_selfAssetsThisYr+=bal;
-      else if(_aOwn==='spouse')_spouseAssetsThisYr+=bal;
-      else _jointAssetsThisYr+=bal;
+      var _rSelf=0.5;
+      if(_aOwn==='joint'){
+        var _js=parseFloat(a.amountSelf);var _jp=parseFloat(a.amountSpouse);
+        if(isNaN(_js))_js=0;if(isNaN(_jp))_jp=0;var _jt=_js+_jp;
+        _rSelf=_jt>0?_js/_jt:0.5;
+        _selfAssetsThisYr+=bal*_rSelf;_spouseAssetsThisYr+=bal*(1-_rSelf);
+      } else if(_aOwn==='self'){_selfAssetsThisYr+=bal;}
+      else {_spouseAssetsThisYr+=bal;}
       // Track retirement-only assets separately. Taxable brokerage ('invest')
       // IS counted as a retirement asset because in real-world planning that
       // account is sold at LTCG rates, harvested for dividends, or used as
@@ -10265,9 +10356,9 @@ function _cpRunSimulation(){
       if(['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa','invest'].indexOf(a.type)>=0 || a._ibcDebtStrategy){
         if(!_retOnlyByYear[yr])_retOnlyByYear[yr]=0;
         _retOnlyByYear[yr]+=bal;
-        if(_aOwn==='self')_retSelfThisYr+=bal;
-        else if(_aOwn==='spouse')_retSpouseThisYr+=bal;
-        else _retJointThisYr+=bal;
+        if(_aOwn==='joint'){_retSelfThisYr+=bal*_rSelf;_retSpouseThisYr+=bal*(1-_rSelf);}
+        else if(_aOwn==='self')_retSelfThisYr+=bal;
+        else _retSpouseThisYr+=bal;
       }
     });
     // Persist per-owner year-end snapshots for downstream consumers
@@ -10641,15 +10732,21 @@ function _cpRunSimulation(){
   return CPLAN._sim;
 }
 
-function _cpRenderChart(targetId){
+function _cpRenderChart(targetId,bucket){
   var el=document.getElementById(targetId||'cplanChart');if(!el)return;
   if(!CPLAN._chartView)CPLAN._chartView='nw';
   var _isRetView=CPLAN._chartView==='retirement';
+  // bucket: 'self' | 'spouse' for per-person couple charts; falsy = household chart.
+  var _bk=(bucket==='self'||bucket==='spouse')?bucket:null;
   var _retTypes=['roth','401k','roth401k','iul','wl','trad_ira','solo401k','sep_ira','hsa','ibc'];
   var _chartGrowthTypes=_isRetView?_retTypes:['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc','ef','house','rental'];
   var active=CPLAN.allocations.filter(function(a){
     if(a.type==='protection'||a.type==='debt')return false;
     if(a.type==='custom'&&a.amount===0)return false;
+    // Per-person chart: a card belongs to this bucket if owned by that spouse, or
+    // joint (shown — its balance is split into each bucket by the simulation).
+    if(_bk==='self'&&a.owner==='spouse')return false;
+    if(_bk==='spouse'&&a.owner!=='spouse'&&a.owner!=='joint')return false;
     if(_isRetView&&_retTypes.indexOf(a.type)<0)return false;// Retirement view: only retirement vehicles
     if(_chartGrowthTypes.indexOf(a.type)<0&&a.type!=='custom')return false;
     if(a.amount>0)return true;
@@ -10662,8 +10759,12 @@ function _cpRenderChart(targetId){
   _toggleH+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">'+(_isRetView?'RETIREMENT PROJECTION':'NET WORTH PROJECTION')+'</div>';
   _toggleH+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
   var _chartTarget=targetId?("'"+targetId+"'"):'';
-  _toggleH+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
-  _toggleH+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderChart('+_chartTarget+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
+  // Preserve the bucket through the NW/Retirement toggle so a per-person chart
+  // doesn't revert to the household view on toggle. (For per-person charts the
+  // shared toggle in _cpRenderCharts also drives these — both stay in sync.)
+  var _chartBucket=_bk?(",'"+_bk+"'"):(targetId?',null':'');
+  _toggleH+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderChart('+_chartTarget+_chartBucket+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
+  _toggleH+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderChart('+_chartTarget+_chartBucket+')" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
   _toggleH+='</div></div>';
   var W=600,H=260,padL=50,padR=55,padT=24,padB=28;var years=30;
 
@@ -10671,8 +10772,15 @@ function _cpRenderChart(targetId){
   var sim=CPLAN._sim;
   var baselineData,totalData,rawSeries;
   if(sim&&sim.netWorth&&sim.netWorth.length>0){
-    baselineData=sim.baseline;
-    totalData=_isRetView?(sim.retirement||sim.netWorth):sim.netWorth;
+    // Per-person bucket: read that spouse's own projection series (computed by the
+    // simulation, with each shared card's balance split by contribution share).
+    if(_bk&&sim['netWorth_'+_bk]){
+      baselineData=sim['baseline_'+_bk]||sim.baseline;
+      totalData=_isRetView?(sim['retirement_'+_bk]||sim['netWorth_'+_bk]):sim['netWorth_'+_bk];
+    } else {
+      baselineData=sim.baseline;
+      totalData=_isRetView?(sim.retirement||sim.netWorth):sim.netWorth;
+    }
     // Build rawSeries from sim.allocSeries for displacement bands
     rawSeries={};
     active.forEach(function(a,aIdx){
@@ -10720,7 +10828,7 @@ function _cpRenderChart(targetId){
   var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto;display:block;max-height:300px">';
   for(var g=0;g<=4;g++){var gv=minV+(maxV-minV)*g/4;var gy=yf(gv);svg+='<line x1="'+padL+'" y1="'+gy+'" x2="'+(W-padR)+'" y2="'+gy+'" stroke="rgba(0,68,191,.06)" stroke-width="0.5"/>';svg+='<text x="'+(padL-4)+'" y="'+(gy+3)+'" fill="rgba(100,116,139,.5)" font-size="8" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(gv))+'</text>';}
   if(minV<0&&maxV>0)svg+='<line x1="'+padL+'" y1="'+yf(0)+'" x2="'+(W-padR)+'" y2="'+yf(0)+'" stroke="rgba(100,116,139,.2)" stroke-width="0.5" stroke-dasharray="3,3"/>';
-  var _chartAge=CPLAN.age||35;
+  var _chartAge=(_bk==='spouse'&&CPLAN._partner&&CPLAN._partner.age)?CPLAN._partner.age:(CPLAN.age||35);
   [0,5,10,15,20,25,30].forEach(function(yr5){svg+='<text x="'+x(yr5)+'" y="'+(H-padB+14)+'" fill="rgba(100,116,139,.4)" font-size="7" text-anchor="middle" font-family="var(--fh)">Age '+(_chartAge+yr5)+'</text>';});
 
   // ── Displacement bands: proportioned between baseline and plan ──
@@ -10878,7 +10986,9 @@ function _cpRenderChart(targetId){
   svg+='<span><span style="display:inline-block;width:12px;height:3px;border-radius:1px;background:#5B9BFF;margin-right:4px;vertical-align:middle"></span>'+(_isRetView?'Retirement':'This plan')+' ('+fmtK(totalData[years])+')</span>';
   if(simData&&simData.length>0){var simLegCol=simData[years]>=totalData[years]?'#22C55E':'#EF4444';svg+='<span><span style="display:inline-block;width:12px;height:2px;border-radius:1px;background:'+simLegCol+';margin-right:4px;vertical-align:middle;border-top:1px dashed '+simLegCol+'"></span>Simulated ('+fmtK(simData[years])+')</span>';}
   svg+='</div>';
-  el.innerHTML=_toggleH+svg;
+  // Per-person child charts get no inner NW/Retirement toggle — the shared toggle
+  // in _cpRenderCharts drives them in lockstep.
+  el.innerHTML=(_bk?'':_toggleH)+svg;
 }
 
 function _cpProj(a){
@@ -11421,15 +11531,18 @@ function _cpStartSelf(){
     var sol=solMap[f.action];
     if(!sol)return;
     // For protection, allow multiple cards (life + disability + LTC + etc).
+    // Owner-scoped dedup: a self flag and the same-type SPOUSE flag must BOTH
+    // survive (one card per owner), so a couple's Combined shows both gaps.
+    var _fOwner=f.owner||'self';
     var dup;
     if(sol.type==='protection'){
-      dup=CPLAN.allocations.some(function(a){return a.type==='protection'&&a.flagTitle===f.title;});
+      dup=CPLAN.allocations.some(function(a){return a.type==='protection'&&a.flagTitle===f.title&&(a.owner||'self')===_fOwner;});
     } else {
-      dup=CPLAN.allocations.some(function(a){return a.type===sol.type;});
+      dup=CPLAN.allocations.some(function(a){return a.type===sol.type&&(a.owner||'self')===_fOwner;});
     }
-    // Extended dedup: skip if a partner-shared card of this type exists.
+    // Extended dedup: skip if a partner-shared card of this type exists (same owner).
     if(!dup && _pscDedupTypes[sol.type] && Array.isArray(CPLAN.partnerSharedCards)){
-      dup=CPLAN.partnerSharedCards.some(function(c){return c&&c.type===sol.type;});
+      dup=CPLAN.partnerSharedCards.some(function(c){return c&&c.type===sol.type&&(c.owner||'self')===_fOwner;});
     }
     if(dup)return;
     // Map protection sub-flag to a distinct card header.
@@ -11454,6 +11567,7 @@ function _cpStartSelf(){
       flagTitle:f.title,
       flagType:f.type,
       flagIcon:f.icon,
+      owner:_fOwner,
       reason:f.desc||''
     });
     if(_customNm)pushObj.customName=_customNm;
@@ -18843,7 +18957,10 @@ function _cpOwnerBadge(a){
   var _sel='<select title="'+safeTitle+'" onchange="_cpSetCardOwner('+_ix+',this.value)" onclick="event.stopPropagation()" style="margin-left:8px;padding:2px 6px;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.06em;color:'+color+';background:'+bg+';border:1px solid '+brd+';border-radius:2px;text-transform:uppercase;white-space:nowrap;cursor:pointer;-webkit-appearance:none;appearance:none;padding-right:18px;background-image:url(\'data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%228%22 height=%228%22 viewBox=%220 0 8 8%22><path d=%22M1 2.5L4 5.5L7 2.5%22 stroke=%22%23999%22 stroke-width=%221.2%22 fill=%22none%22 stroke-linecap=%22round%22/></svg>\');background-repeat:no-repeat;background-position:right 5px center">';
   _sel+='<option value="self"'+(owner==='self'?' selected':'')+'>'+_selfNm+'</option>';
   _sel+='<option value="spouse"'+(owner==='spouse'?' selected':'')+'>'+_spNm+'</option>';
-  _sel+='<option value="joint"'+(owner==='joint'?' selected':'')+'>Shared</option>';
+  // Per-person lock: retirement + cash-value insurance can't be Shared (single-owner
+  // per IRS). Offer 'Shared' only for joint-eligible types (or if already joint, so a
+  // mis-set card can be read/changed away).
+  if(_cpJointEligible(a.type)||owner==='joint')_sel+='<option value="joint"'+(owner==='joint'?' selected':'')+'>Shared</option>';
   _sel+='</select>';
   return _sel;
 }
@@ -18858,15 +18975,15 @@ function _cpTabBadge(a){
   var _ix=CPLAN.allocations.indexOf(a);
   // Current tab: explicit _tab, else derived from owner (matches _cpTabOf).
   var cur=a._tab;
-  if(['combined','self','partner','joint'].indexOf(cur)<0){
-    var o=a.owner||'self';cur=(o==='joint')?'joint':(o==='spouse')?'partner':'self';
+  if(['combined','self','partner'].indexOf(cur)<0){
+    var o=a.owner||'self';cur=(o==='joint')?'combined':(o==='spouse')?'partner':'self';
   }
   var selfNm=(typeof esc==='function')?esc(_cpOwnerFirstName('self')):_cpOwnerFirstName('self');
   var spNm=(typeof esc==='function')?esc(_cpOwnerFirstName('spouse')):_cpOwnerFirstName('spouse');
-  var opts=[['combined','Combined'],['self',selfNm],['partner',spNm],['joint','Joint']];
+  var opts=[['combined','Combined'],['self',selfNm],['partner',spNm]];
   // Placement cue: explicit _tab = advisor placed it here (pin); otherwise the tab is
   // auto-derived from owner and will follow owner changes until placed.
-  var _explicit=(['combined','self','partner','joint'].indexOf(a._tab)>=0);
+  var _explicit=(['combined','self','partner'].indexOf(a._tab)>=0);
   var _cueMark=_explicit?'\uD83D\uDCCD ':'';// 📍 when explicitly placed
   var _cueTitle=_explicit?'Placed in this tab by you (fixed; won\u2019t move when owner changes)':'Tab auto-set from owner \u2014 pick one to lock placement';
   var s='<span style="margin-left:6px;font-size:10px;color:var(--mu);opacity:.8">'+_cueMark+'</span>';
@@ -19513,8 +19630,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   // are excluded from joint conversion because IRS rules require a single
   // owner. EF, education, house, custom goals, taxable invest, and debt CAN
   // be joint (joint savings, joint mortgage, joint debt, etc).
-  var _jointEligible={ef:1,edu:1,house:1,custom:1,invest:1,debt:1};
-  var _jointEligible_isType=_jointEligible[a.type]===1;
+  var _jointEligible_isType=_cpJointEligible(a.type);
   // Treat undefined/missing owner as 'self' so legacy cards (added before
   // owner-tagging was wired up) still get the Hybrid sharing controls.
   // Also accept 'personal' — the retirement and brokerage seeders default to
@@ -20713,7 +20829,7 @@ function _cpBuildCard(a,idx,isUnassigned){
       function _iy(v){return _iPT+_iCH-(v/_iMaxV)*_iCH;}
 
 function _cpSetBreathingRoom(v){
-  CPLAN._breathingPct=parseInt(v)||15;
+  var _n=parseInt(v);CPLAN._breathingPct=isNaN(_n)?15:_n;// 0 must stick (||15 turned 0→15)
   CPLAN._breathingTouched=true;
   // Targeted update — don't re-render the whole page (which would destroy the slider being dragged)
   var brPct=CPLAN._breathingPct;
@@ -21515,10 +21631,13 @@ function _cpExtractRedFlags(){
     }
   }
 
-  // ── Spouse flags (JOINT only) — see _cpAppendSpouseFlags. This is the flag
+  // ── Spouse flags (all couple types) — see _cpAppendSpouseFlags. This is the flag
   // function that feeds the unassigned CARDS, so the spouse pass must run here
   // too (not only in _cpExtractFlags, which feeds the fork-screen issue list).
-  if(CPLAN._householdType==='joint'){
+  // Hybrid + separate (each spouse has their own profile, read from CPLAN._partner)
+  // need this just as much as joint (one shared row) — so Combined surfaces every
+  // gap for BOTH spouses.
+  if(CPLAN._householdType==='joint'||CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate'){
     try{ _cpAppendSpouseFlags(flags, rawS2, d); }catch(_sf){console.warn('Spouse flags (cards):',_sf); }
   }
 
@@ -22171,41 +22290,46 @@ function _cpRunCheckInFlow(){
 
 function _cpRenderCharts(){
   var el=document.getElementById('cplanChart');if(!el)return;
-  var isHybrid=(CPLAN._householdType==='hybrid')&&!!CPLAN._partner;
-  if(!isHybrid){
-    // Single chart — call the existing renderer in its original mode. The chart
-    // function expects to write into 'cplanChart' which already exists.
+  var _ht=CPLAN._householdType;
+  var _isCouple=((_ht==='hybrid'||_ht==='separate')&&!!CPLAN._partner);// per-person charts for both couple types
+  if(!_isCouple){
+    // Single household chart — existing renderer, original mode.
     _cpRenderChart('cplanChart');
     return;
   }
   if(!CPLAN._chartView)CPLAN._chartView='nw';
   var _isRetView=CPLAN._chartView==='retirement';
-  // Shared toggle row at the top — drives all three child charts in lockstep.
-  // We re-call _cpRenderCharts on toggle so the bucket parameter is preserved
-  // for each child chart.
+  var _tab=CPLAN._hybridTab||'combined';
+  var _selfNm=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('self'):'You';
+  var _spNm=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('spouse'):'Spouse';
+  // Shared NW/Retirement toggle — drives the per-person child charts in lockstep
+  // (their own inner toggles are suppressed; see _cpRenderChart).
   var h='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">';
   h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">'+(_isRetView?'RETIREMENT PROJECTION':'NET WORTH PROJECTION')+'</div>';
   h+='<div style="display:flex;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;overflow:hidden">';
   h+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderCharts()" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
   h+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderCharts()" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
   h+='</div></div>';
-  // Three side-by-side chart containers. On narrow viewports they stack via
-  // CSS media query (handled elsewhere) — the inline grid keeps desktop layout.
-  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">';
-  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_self"></div></div>';
-  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_spouse"></div></div>';
-  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_joint"></div></div>';
-  h+='</div>';
-  el.innerHTML=h;
-  // Defer child-chart rendering one tick so the DOM exists before _cpRenderChart
-  // queries for the target ids. _cpRenderChart preserves the bucket parameter
-  // through its own toggle clicks (its own toggle is suppressed for non-'all'
-  // bucket renders — handled inside _cpRenderChart).
-  setTimeout(function(){
-    try{_cpRenderChart('cplanChart_self','self');}catch(e){}
-    try{_cpRenderChart('cplanChart_spouse','spouse');}catch(e){}
-    try{_cpRenderChart('cplanChart_joint','joint');}catch(e){}
-  },10);
+  if(_tab==='self'||_tab==='partner'){
+    // Named tab → one chart for that spouse only.
+    var _bk=(_tab==='self')?'self':'spouse';
+    var _nm=(_tab==='self')?_selfNm:_spNm;
+    var _clr=(_tab==='self')?'#5B9BFF':'#F97316';
+    h+='<div class="info-card" style="padding:12px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+_clr+';letter-spacing:.06em;margin-bottom:4px">'+esc(_nm)+'</div><div id="cplanChart_one"></div></div>';
+    el.innerHTML=h;
+    setTimeout(function(){try{_cpRenderChart('cplanChart_one',_bk);}catch(e){}},10);
+  } else {
+    // Combined → two charts, one per spouse.
+    h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:10px">';
+    h+='<div class="info-card" style="padding:12px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;letter-spacing:.06em;margin-bottom:4px">'+esc(_selfNm)+'</div><div id="cplanChart_self"></div></div>';
+    h+='<div class="info-card" style="padding:12px"><div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#F97316;letter-spacing:.06em;margin-bottom:4px">'+esc(_spNm)+'</div><div id="cplanChart_spouse"></div></div>';
+    h+='</div>';
+    el.innerHTML=h;
+    setTimeout(function(){
+      try{_cpRenderChart('cplanChart_self','self');}catch(e){}
+      try{_cpRenderChart('cplanChart_spouse','spouse');}catch(e){}
+    },10);
+  }
 }
 
 function _cpUpdateSliderCaps(skipIdx,opts){
@@ -22342,6 +22466,15 @@ function _cpSlideJoint(i,side,v){
   var selfShare=combInc>0?(selfInc/combInc):0.5;
   var selfBudget=Math.round(budgetTotal*selfShare);
   var spouseBudget=Math.round(budgetTotal*(1-selfShare));
+  // Separate household: NO income-share split — each spouse's cap is their OWN pot
+  // (own surplus less own breathing room), no cross-subsidy.
+  var _sepJoint=(CPLAN._householdType==='separate');
+  if(_sepJoint){
+    var _sBrJ=(CPLAN._selfBreathingPct!=null?CPLAN._selfBreathingPct:15)/100;
+    var _pBrJ=(CPLAN._partnerBreathingPct!=null?CPLAN._partnerBreathingPct:15)/100;
+    selfBudget=Math.round((CPLAN.surplus||0)*(1-_sBrJ));
+    spouseBudget=Math.round(((CPLAN._partner&&CPLAN._partner.surplus)||0)*(1-_pBrJ));
+  }
   // Subtract this spouse's other joint-card portions from their per-spouse budget
   var selfOtherJoint=0,spouseOtherJoint=0;
   (CPLAN.allocations||[]).forEach(function(other,j){
@@ -22359,8 +22492,12 @@ function _cpSlideJoint(i,side,v){
     if(other.owner!=='self')return;
     selfOtherRegular+=parseFloat(other.amount)||0;
   });
+  // Separate: the spouse's own pot is also consumed by THEIR regular (spouse-owned)
+  // cards — subtract them so the spouse side can't overdraw their pot.
+  var spouseOtherRegular=0;
+  if(_sepJoint){(CPLAN.allocations||[]).forEach(function(other,j){if(j===i)return;if(other.owner!=='spouse')return;spouseOtherRegular+=parseFloat(other.amount)||0;});}
   var selfAvail=Math.max(0,selfBudget-selfOtherJoint-selfOtherRegular);
-  var spouseAvail=Math.max(0,spouseBudget-spouseOtherJoint);
+  var spouseAvail=Math.max(0,spouseBudget-spouseOtherJoint-spouseOtherRegular);
   // Apply the per-spouse budget cap to the dragged side
   if(side==='self'&&newVal>selfAvail)newVal=selfAvail;
   if(side==='spouse'&&newVal>spouseAvail)newVal=spouseAvail;
@@ -22757,8 +22894,7 @@ function _cpConvertToJoint(i){
   if(a.owner!=='self'&&a.owner!=='personal'&&a.owner){_cpToast('This card is already joint or spouse-owned');return;}
   // Type allowlist mirrors the UI gating so this is hard to misuse even if
   // the button is somehow rendered on an excluded type.
-  var _jointEligible={ef:1,edu:1,house:1,custom:1,invest:1,debt:1};
-  if(!_jointEligible[a.type]){_cpToast('This card type can\'t be made joint');return;}
+  if(!_cpJointEligible(a.type)){_cpToast('This card type can\'t be made joint');return;}
   var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
   var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
   var prevAmt=parseFloat(a.amount)||0;
@@ -22922,6 +23058,8 @@ function _cpSetName(i,v){CPLAN.allocations[i].customName=v;}
 function _cpSetCardOwner(i,owner){
   var a=CPLAN.allocations[i];if(!a)return;
   if(['self','spouse','joint'].indexOf(owner)<0)owner='self';
+  // Per-person lock: retirement + cash-value insurance can't be Shared.
+  if(owner==='joint'&&!_cpJointEligible(a.type)){if(typeof _cpToast==='function')_cpToast('This card type can\'t be Shared — set a person');return;}
   a.owner=owner;
   // Joint cards use per-spouse split fields; seed/clear them so the split slider
   // renders correctly. When moving OFF joint, drop the split so the single slider
@@ -22935,17 +23073,17 @@ function _cpSetCardOwner(i,owner){
   if(typeof _cpToast==='function'){var nm=owner==='joint'?'Shared':(owner==='spouse'?_cpOwnerFirstName('spouse'):_cpOwnerFirstName('self'));_cpToast('Allocation owner set to '+nm);}
 }
 
-// Hybrid: move a card to a tab (combined/self/partner/joint) by setting a._tab.
+// Hybrid: move a card to a tab (combined/self/partner) by setting a._tab.
 // Independent of owner — the advisor decides placement (a his-owned card can sit
 // in Combined). Switches the active tab to follow the card.
 function _cpSetCardTab(i,tab){
   var a=CPLAN.allocations[i];if(!a)return;
-  if(['combined','self','partner','joint'].indexOf(tab)<0)tab='combined';
+  if(['combined','self','partner'].indexOf(tab)<0)tab='combined';
   a._tab=tab;
-  // Combined and Joint tabs are shared and use the his/her split mechanic — seed
-  // split fields if missing. Personal tabs (self/partner) use a single slider, so
-  // drop the split fields there. Match cards are left alone (they manage their own).
-  if(tab==='combined'||tab==='joint'){
+  // A Shared (joint) card on Combined uses the his/her split mechanic — seed the
+  // split fields if missing. Personal placement (self/partner) uses a single slider,
+  // so drop the split there. Match cards manage their own fields.
+  if(tab==='combined'&&a.owner==='joint'){
     if(!(a._hasMatch&&a._retAccountId) && a.amountSelf==null && a.amountSpouse==null){
       var _h=(parseFloat(a.amount)||0)/2;a.amountSelf=Math.round(_h);a.amountSpouse=Math.round((parseFloat(a.amount)||0)-_h);
     }
@@ -22958,7 +23096,7 @@ function _cpSetCardTab(i,tab){
   if(tab==='combined'){CPLAN._coupleView='ours';_cpLoadCouplePlan();}
   else _cpRenderPlanFull();
   if(typeof _cpToast==='function'){
-    var lbl=tab==='combined'?'Combined':tab==='joint'?'Joint':tab==='partner'?_cpOwnerFirstName('spouse'):_cpOwnerFirstName('self');
+    var lbl=tab==='combined'?'Combined':tab==='partner'?_cpOwnerFirstName('spouse'):_cpOwnerFirstName('self');
     _cpToast('Card moved to '+lbl+' tab');
   }
 }
@@ -22974,6 +23112,14 @@ function _cpRecomputeHybridPools(){
   CPLAN._selfPersonalSurplus=Math.round(_selfSurplus*(100-_selfPct)/100);
   CPLAN._partnerPersonalSurplus=Math.round(_partnerSurplus*(100-_partnerPct)/100);
   CPLAN._combinedSurplus=Math.round(_selfSurplus*_selfPct/100 + _partnerSurplus*_partnerPct/100);
+  // Breathing-room auto-rule (until the advisor manually overrides it): when both
+  // spouses route 100% to the combined pool there's no carved-out personal buffer,
+  // so reserve 15%; if either carves money out (<100%), that carve-out IS the
+  // buffer, so the combined breathing room drops to 0. A manual edit sets
+  // _breathingTouched=true and locks the value.
+  if(!CPLAN._breathingTouched){
+    CPLAN._breathingPct=(_selfPct===100&&_partnerPct===100)?15:0;
+  }
 }
 
 // Advisor adjusts how much of a spouse's surplus goes to the combined plan, right
@@ -23794,18 +23940,50 @@ function _cpRenderPlanFull(){
   // plan only ever showed the centered spouse's surplus.)
   var _cpCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
   var _cpHouseholdType=_cpCouple?_cpCouple.household_type:'individual';
+  // Couple builds (hybrid + separate) share the Combined-master tab model.
+  var _isCoupleBuild=(_cpHouseholdType==='hybrid'||_cpHouseholdType==='separate');
+  // The 'joint' tab was removed; fold any stale state to Combined.
+  if(CPLAN._hybridTab==='joint')CPLAN._hybridTab='combined';
   if(_cpHouseholdType==='hybrid'){
     var _ht3=CPLAN._hybridTab||'combined';
-    if(_ht3==='combined'||_ht3==='joint')_tabSurplus=Math.max(0,CPLAN._combinedSurplus||0);
+    if(_ht3==='combined')_tabSurplus=Math.max(0,CPLAN._combinedSurplus||0);
     else if(_ht3==='self')_tabSurplus=Math.max(0,CPLAN._selfPersonalSurplus||0);
     else if(_ht3==='partner')_tabSurplus=Math.max(0,CPLAN._partnerPersonalSurplus||0);
-    // Allocated within this tab only (cards that pass the tab filter).
+    // Allocated within this tab's POOL (budget membership, not display). Joint
+    // cards belong to the combined pool, so they're counted (full his+her) only
+    // on the Combined tab — never against a personal pool.
     _tabAllocated=CPLAN.allocations.reduce(function(t,a){
-      if(!_cpAllocInTab(a))return t;
+      if(_cpTabOf(a)!==_ht3)return t;
       if(a._completed&&(a._policyId||a._retAccountId||a._investmentId||a.type==='term_life'||a.type==='disability'))return t;
       if(a._linkedPolicyId&&a._ibcState==='active')return t;
-      if(a.owner==='joint'){var sp=parseFloat(a.amountSelf);if(isNaN(sp)||sp===0)sp=(parseFloat(a.amount)||0)/2;return t+sp;}
+      if(a.owner==='joint'){var s=parseFloat(a.amountSelf);if(isNaN(s))s=(parseFloat(a.amount)||0)/2;var p=parseFloat(a.amountSpouse);if(isNaN(p))p=(parseFloat(a.amount)||0)-((parseFloat(a.amount)||0)/2);return t+s+p;}
       return t+(parseFloat(a.amount)||0);
+    },0);
+    _tabUnalloc=Math.max(0,_tabSurplus-_tabAllocated);
+    _tabAllocPct=_tabSurplus>0?Math.round(_tabAllocated/_tabSurplus*100):0;
+  } else if(_cpHouseholdType==='separate'){
+    // OWNER-keyed: each spouse funds from their OWN pot (no combined pool, no
+    // cross-subsidy). self pot = centered surplus; partner pot = partner surplus;
+    // each reduced by that spouse's own breathing room. A Shared card draws each
+    // spouse's half from their own pot. Combined view shows the two pots summed.
+    var _ht3s=CPLAN._hybridTab||'combined';
+    var _selfBrS=(CPLAN._selfBreathingPct!=null?CPLAN._selfBreathingPct:15)/100;
+    var _partBrS=(CPLAN._partnerBreathingPct!=null?CPLAN._partnerBreathingPct:15)/100;
+    var _selfPotS=Math.max(0,Math.round((CPLAN.surplus||0)*(1-_selfBrS)));
+    var _partPotS=Math.max(0,Math.round(((CPLAN._partner&&CPLAN._partner.surplus)||0)*(1-_partBrS)));
+    _tabSurplus=(_ht3s==='self')?_selfPotS:(_ht3s==='partner')?_partPotS:(_selfPotS+_partPotS);
+    function _sepShare(a,who){
+      var ow=a.owner||'self';
+      if(ow==='joint'){var s=parseFloat(a.amountSelf);if(isNaN(s))s=(parseFloat(a.amount)||0)/2;var p=parseFloat(a.amountSpouse);if(isNaN(p))p=(parseFloat(a.amount)||0)-((parseFloat(a.amount)||0)/2);return who==='self'?s:p;}
+      var w=(ow==='spouse')?'spouse':'self';
+      return (w===who)?(parseFloat(a.amount)||0):0;
+    }
+    _tabAllocated=CPLAN.allocations.reduce(function(t,a){
+      if(a._completed&&(a._policyId||a._retAccountId||a._investmentId||a.type==='term_life'||a.type==='disability'))return t;
+      if(a._linkedPolicyId&&a._ibcState==='active')return t;
+      if(_ht3s==='self')return t+_sepShare(a,'self');
+      if(_ht3s==='partner')return t+_sepShare(a,'spouse');
+      return t+_sepShare(a,'self')+_sepShare(a,'spouse');// combined = both pots
     },0);
     _tabUnalloc=Math.max(0,_tabSurplus-_tabAllocated);
     _tabAllocPct=_tabSurplus>0?Math.round(_tabAllocated/_tabSurplus*100):0;
@@ -23819,16 +23997,20 @@ function _cpRenderPlanFull(){
   // owner so existing cards (no _tab yet) land sensibly: joint→joint,
   // spouse→partner, else→self. Combined shows cards explicitly placed there.
   function _cpTabOf(a){
-    if(a&&a._tab&&['combined','self','partner','joint'].indexOf(a._tab)>=0)return a._tab;
+    // BUDGET membership (mirror of _cpTabOfAlloc). Joint → 'combined'; no 'joint' tab.
+    if(a&&a._tab&&['combined','self','partner'].indexOf(a._tab)>=0)return a._tab;
     var o=(a&&a.owner)||'self';
-    if(o==='joint')return'joint';
+    if(o==='joint')return'combined';
     if(o==='spouse')return'partner';
     return'self';
   }
-  // Only filter for hybrid; every other household type shows all its cards.
+  // DISPLAY membership. Couple builds filter by the active tab; a joint card is
+  // shown on Combined AND both named tabs (each tab renders that spouse's share).
   function _cpAllocInTab(a){
     if(_cpHouseholdType!=='hybrid')return true;
-    return _cpTabOf(a)===(CPLAN._hybridTab||'combined');
+    var ht=CPLAN._hybridTab||'combined';
+    if((a&&a.owner)==='joint')return true;
+    return _cpTabOf(a)===ht;
   }
   var _cpPlanView=CPLAN._coupleView||'mine';// 'mine' or 'ours'
 
@@ -23849,12 +24031,14 @@ function _cpRenderPlanFull(){
       _cpPlanView='ours';CPLAN._coupleView='ours';
       if(_cpHouseholdType==='hybrid'&&!CPLAN._partnerCalcs){_cpLoadCouplePlan();return;}
     }
-    // Only render the toggle when the client actually has a choice (hybrid).
-    if(_cpHouseholdType==='hybrid'){
-      // ── Hybrid 4-tab bar: Combined / <self> / <partner> / Joint ──
-      // Combined = shared plan funded by the combined surplus pool (built joint-style).
-      // <self>/<partner> = each spouse's personal plan funded by their personal pool.
-      // Joint = joint-owned cards only. Tab state lives on CPLAN._hybridTab.
+    // Couple builds (hybrid + separate) use the Combined-master tab bar.
+    if(_isCoupleBuild){
+      var _isSep=(_cpHouseholdType==='separate');
+      // ── Couple tab bar: Combined / <self> / <partner> ──
+      // Combined = master where the advisor builds the whole plan and assigns owners.
+      // <self>/<partner> = each spouse's cards. Funding differs by type: hybrid draws
+      // a combined pool (cross-subsidy); separate uses each spouse's own pot (no
+      // cross-subsidy). Tab state lives on CPLAN._hybridTab.
       var _ht=CPLAN._hybridTab||'combined';
       var _selfNmTab=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('self'):'You';
       var _partnerNmTab=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('spouse'):'Spouse';
@@ -23864,14 +24048,40 @@ function _cpRenderPlanFull(){
       var _tabs=[
         {k:'combined',lbl:'Combined',clr:'#22C55E',bg:'rgba(34,197,94,.15)'},
         {k:'self',lbl:_selfNmTab,clr:'#5B9BFF',bg:'rgba(91,155,255,.15)'},
-        {k:'partner',lbl:_partnerNmTab,clr:'#F97316',bg:'rgba(249,115,22,.15)'},
-        {k:'joint',lbl:'Joint',clr:'#A855F7',bg:'rgba(168,85,247,.15)'}
+        {k:'partner',lbl:_partnerNmTab,clr:'#F97316',bg:'rgba(249,115,22,.15)'}
       ];
       // ── Household summary: the whole couple's plan at a glance ──
       // Stitches the four tabs into one picture: each spouse's chosen combined %
       // (editable inline), the three pool sizes with deployed/available, and the
       // household totals. The "here's your complete plan" view for the couple.
       (function(){
+        if(_isSep){
+          // ── Separate household: two independent pots, two breathing rooms, no combined pool ──
+          var _sBr=(CPLAN._selfBreathingPct!=null?CPLAN._selfBreathingPct:15);
+          var _pBr=(CPLAN._partnerBreathingPct!=null?CPLAN._partnerBreathingPct:15);
+          var _sPot=Math.round(Math.max(0,CPLAN.surplus||0)*(1-_sBr/100));
+          var _pPot=Math.round(Math.max(0,(CPLAN._partner&&CPLAN._partner.surplus)||0)*(1-_pBr/100));
+          function _sepDep(who){return CPLAN.allocations.reduce(function(t,a){var ow=a.owner||'self';if(ow==='joint'){var s=parseFloat(a.amountSelf);if(isNaN(s))s=(parseFloat(a.amount)||0)/2;var p=parseFloat(a.amountSpouse);if(isNaN(p))p=(parseFloat(a.amount)||0)-((parseFloat(a.amount)||0)/2);return t+(who==='self'?s:p);}var w=(ow==='spouse')?'spouse':'self';return t+((w===who)?(parseFloat(a.amount)||0):0);},0);}
+          var _sDep=_sepDep('self'),_pDep=_sepDep('spouse');
+          function _avCol2(av){return av<0?'var(--rd)':'var(--gr)';}
+          function _potRow(nm,clr,pot,dep,brPctV,which){
+            var av=pot-dep;
+            var r='<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid rgba(100,116,139,.12)">';
+            r+='<div style="display:flex;align-items:center;gap:7px;min-width:0;flex-wrap:wrap"><span style="width:8px;height:8px;border-radius:2px;background:'+clr+';flex-shrink:0"></span><span style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+esc(nm)+'</span>';
+            r+='<span style="font-size:10px;color:var(--mu);display:inline-flex;align-items:center;gap:2px">breathing <input type="number" min="0" max="30" step="5" value="'+brPctV+'" onchange="_cpSet'+(which==='self'?'Self':'Partner')+'BreathingRoom(this.value)" onclick="event.stopPropagation()" style="width:42px;padding:2px 4px;font-family:var(--fh);font-size:11px;font-weight:700;text-align:right;color:'+clr+';background:rgba(100,116,139,.1);border:1px solid var(--bd);border-radius:3px">%</span></div>';
+            r+='<div style="font-size:11px;color:var(--mu);text-align:right;white-space:nowrap">'+fmt(dep)+' / '+fmt(pot)+'<span style="color:'+_avCol2(av)+'"> · '+fmt(av)+' left</span></div>';
+            r+='</div>';return r;
+          }
+          h+='<div style="margin-bottom:12px;padding:12px 14px;background:linear-gradient(135deg,rgba(91,155,255,.05),rgba(249,115,22,.04));border:1px solid var(--bd);border-radius:6px">';
+          h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">Household Plan — separate finances</div>';
+          h+=_potRow(_selfNmTab,'#5B9BFF',_sPot,_sDep,_sBr,'self');
+          h+=_potRow(_partnerNmTab,'#F97316',_pPot,_pDep,_pBr,'partner');
+          var _hAv=(_sPot+_pPot)-(_sDep+_pDep);
+          h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0 0;margin-top:2px"><span style="font-family:var(--fh);font-size:12px;font-weight:800;color:var(--wh)">Household total</span><div style="font-size:11px;color:var(--mu);text-align:right;white-space:nowrap"><strong style="color:var(--wh)">'+fmt(_sDep+_pDep)+'</strong> / '+fmt(_sPot+_pPot)+'/mo<span style="color:'+_avCol2(_hAv)+'"> · '+fmt(_hAv)+' left</span></div></div>';
+          h+='<div style="font-size:10px;color:var(--mu);margin-top:6px;opacity:.8">Separate finances — each pot funds only that spouse; no cross-subsidy. A Shared card splits its cost, each half drawn from that spouse’s own pot.</div>';
+          h+='</div>';
+          return;
+        }
         var _selfP=(typeof CPLAN._selfCombinedPct==='number')?CPLAN._selfCombinedPct:100;
         var _partP=(typeof CPLAN._partnerCombinedPct==='number')?CPLAN._partnerCombinedPct:100;
         var _poolC=Math.max(0,CPLAN._combinedSurplus||0);
@@ -23884,7 +24094,7 @@ function _cpRenderPlanFull(){
             return t+(parseFloat(a.amount)||0);
           },0);
         }
-        var _depC=_depIn('combined')+_depIn('joint');// combined + joint draw the combined pool
+        var _depC=_depIn('combined');// joint cards now map to 'combined' (no separate joint tab)
         var _depS=_depIn('self');
         var _depP=_depIn('partner');
         var _poolHouse=_poolC+_poolS+_poolP;
@@ -23923,14 +24133,14 @@ function _cpRenderPlanFull(){
       });
       h+='</div>';
       // Pool indicator: which surplus pool the active tab spends from + its size.
-      var _poolLbl=(_ht==='combined')?'Combined pool':(_ht==='joint')?'Combined pool (joint cards)':(_ht==='self')?_selfNmTab+'\u2019s personal pool':_partnerNmTab+'\u2019s personal pool';
+      var _poolLbl=_isSep
+        ?((_ht==='combined')?'Both pots (each funds its own owner)':(_ht==='self')?_selfNmTab+'\u2019s pot':_partnerNmTab+'\u2019s pot')
+        :((_ht==='combined')?'Combined pool':(_ht==='self')?_selfNmTab+'\u2019s personal pool':_partnerNmTab+'\u2019s personal pool');
       h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;width:100%">'+esc(_poolLbl)+': <strong style="color:var(--gr)">'+fmt(_tabSurplus)+'</strong>/mo available</div>';
       // ── Stage 6: per-tab guidance + overspend / unused-pool warnings ──
       (function(){
-        var _guide=(_ht==='combined')
+        var _guide=_isSep?((_ht==='combined')?'Master plan — every card for both spouses; each spouse funds from their OWN pot (no cross-subsidy); a Shared card splits his/her, each half from that spouse’s own pot.':(_ht==='self')?(esc(_selfNmTab)+'’s cards, funded only from '+esc(_selfNmTab)+'’s own pot.'):(esc(_partnerNmTab)+'’s cards, funded only from '+esc(_partnerNmTab)+'’s own pot.')):(_ht==='combined')
             ?'Shared plan — goals and cards you fund together from the combined pool. Use the Tab dropdown on any card to place it here; split each contribution his/her below.'
-          :(_ht==='joint')
-            ?'Joint-owned cards (e.g. shared accounts) drawn from the combined pool, split between both spouses.'
           :(_ht==='self')
             ?esc(_selfNmTab)+'\u2019s personal priorities, funded only from the surplus '+esc(_selfNmTab)+' kept out of the combined plan.'
             :esc(_partnerNmTab)+'\u2019s personal priorities, funded only from the surplus '+esc(_partnerNmTab)+' kept out of the combined plan.';
@@ -24161,10 +24371,11 @@ function _cpRenderPlanFull(){
       var _sm=CPLAN._sim;
       h+='<div style="margin-top:12px;padding-top:10px;border-top:1px solid rgba(168,85,247,.12)">';
       h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">RETIREMENT PROJECTION BY BUCKET</div>';
-      h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;font-size:12px">';
+      // Two buckets now (per-person). Shared cards' retirement value is folded into
+      // each spouse's own bucket by contribution share, so there's no JOINT column.
+      h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;font-size:12px">';
       h+='<div style="text-align:center;padding:8px;background:rgba(91,155,255,.05);border-radius:2px"><div style="font-size:11px;color:#5B9BFF;font-weight:700">YOU</div><div style="font-family:var(--fd);font-size:14px;color:#5B9BFF;margin-top:2px">'+fmt(_sm.projRetIncome_self||0)+'/mo</div></div>';
       h+='<div style="text-align:center;padding:8px;background:rgba(168,85,247,.05);border-radius:2px"><div style="font-size:11px;color:#A855F7;font-weight:700">'+esc((pNm||'PARTNER').toUpperCase())+'</div><div style="font-family:var(--fd);font-size:14px;color:#A855F7;margin-top:2px">'+fmt(_sm.projRetIncome_spouse||0)+'/mo</div></div>';
-      h+='<div style="text-align:center;padding:8px;background:rgba(34,197,94,.05);border-radius:2px"><div style="font-size:11px;color:var(--gr);font-weight:700">JOINT</div><div style="font-family:var(--fd);font-size:14px;color:var(--gr);margin-top:2px">'+fmt(_sm.projRetIncome_joint||0)+'/mo</div></div>';
       h+='</div></div>';
     }
     h+='</div>';
@@ -24926,7 +25137,7 @@ function _cpSlideEnd(idx){
 // Updates the visible percentage display only. The full recompute (which affects
 // every allocation's effective cap) runs once on release via _cpSetBreathingRoomAgent.
 function _cpSlideBreathing(val){
-  CPLAN._breathingPct=parseInt(val)||15;
+  var _n=parseInt(val);CPLAN._breathingPct=isNaN(_n)?15:_n;// 0 must stick
   var el=document.getElementById('cpBreathingDisplay');
   if(el)el.textContent=CPLAN._breathingPct+'%';
 }
@@ -24943,9 +25154,24 @@ function _cpSlideTermCoverage(idx,val){
 }
 // Phase B: agent breathing room handler (warn-and-let-fix; no silent rescaling)
 function _cpSetBreathingRoomAgent(v){
-  CPLAN._breathingPct=parseInt(v)||15;
+  var _n=parseInt(v);CPLAN._breathingPct=isNaN(_n)?15:_n;// 0 must stick
+  CPLAN._breathingTouched=true;
   CPLAN.modified=true;
   _cpUpdateOverBudgetBanner();
+  _cpRenderPlanFull();
+}
+// Separate household: one breathing room per spouse (own pot). Default 15%,
+// advisor-editable, no auto-rule (separate has no combined %).
+function _cpSetSelfBreathingRoom(v){
+  var _n=parseInt(v);CPLAN._selfBreathingPct=isNaN(_n)?15:Math.max(0,Math.min(30,_n));
+  CPLAN.modified=true;if(typeof _cpMarkModified==='function')_cpMarkModified();
+  if(typeof cplanSave==='function'){try{cplanSave();}catch(e){}}
+  _cpRenderPlanFull();
+}
+function _cpSetPartnerBreathingRoom(v){
+  var _n=parseInt(v);CPLAN._partnerBreathingPct=isNaN(_n)?15:Math.max(0,Math.min(30,_n));
+  CPLAN.modified=true;if(typeof _cpMarkModified==='function')_cpMarkModified();
+  if(typeof cplanSave==='function'){try{cplanSave();}catch(e){}}
   _cpRenderPlanFull();
 }
 function _cpSetPhase(idx,phase){CPLAN.allocations[idx].phase=parseInt(phase)||1;_cpRenderPlanFull();}
@@ -27652,27 +27878,123 @@ function _cpClearAudit(idx){
 
 // Phase D: Split allocations by ownership for household-aware save.
 // Returns: { selfAllocs, jointAllocs, hasSpouseOwned }
-function _cpSplitAllocsByOwner(){
-  var self=[],joint=[],spouseCount=0;
-  (CPLAN.allocations||[]).forEach(function(a){
-    var ow=a.owner||'self';
-    if(ow==='joint')joint.push(a);
-    else if(ow==='spouse')spouseCount++;// not saved from this side; partner edits these
-    else self.push(a);
-  });
-  return{selfAllocs:self,jointAllocs:joint,hasSpouseOwned:spouseCount>0};
-}
-// Phase D: Save joint allocations to couple_links.joint_financial_data.
-// Reads current joint_financial_data, merges allocations, writes back.
-async function _cpSaveJointAllocs(jointAllocs){
-  if(!CPLAN._coupleLink||!CPLAN._coupleLink.id)return;
+// ── Couple plan propagation (hybrid + separate) ──────────────────────────────
+// The advisor's CPLAN.allocations is the owner-tagged MASTER (self/spouse/joint,
+// relative to the centered client). The single source of truth persists on
+// couple_links.master_plan_cards with ABSOLUTE owner keys ('a'|'b'|'joint') so it
+// loads correctly from either spouse. Per-portal views (client_profiles.allocation_plan)
+// and the joint store (shared_plan_cards) are DERIVED here and written atomically by
+// the cp_publish_couple_plan RPC. Joint shares are stored A/B-absolute (amountSelf =
+// client_a's share). Replaces the old split-and-discard path (which dropped spouse
+// cards and wrote joint to the wrong column).
+function _cpCoupleCenteredKey(couple){return (couple&&couple.client_a_id===APP.currentClientId)?'a':'b';}
+function _cpUiOwnerToKey(owner,centeredKey){var o=owner||'self';return o==='joint'?'joint':(o==='spouse'?(centeredKey==='a'?'b':'a'):centeredKey);}
+function _cpKeyToUiOwner(key,centeredKey){return key==='joint'?'joint':(key===centeredKey?'self':'spouse');}
+
+// Read the persisted master and map it into CPLAN.allocations relative to the
+// centered client. No-op when no master exists yet (first build / legacy plans) —
+// the centered client's already-loaded allocations stay as the seed.
+async function _cpLoadCoupleMaster(couple){
+  if(!couple||!couple.id)return;
   try{
-    var cur=await db.from('couple_links').select('joint_financial_data').eq('id',CPLAN._coupleLink.id).maybeSingle();
-    var jfd=(cur&&cur.data&&cur.data.joint_financial_data)||{};
-    jfd.allocations=jointAllocs;
-    jfd.updated_at=new Date().toISOString();
-    await db.from('couple_links').update({joint_financial_data:jfd}).eq('id',CPLAN._coupleLink.id);
-  }catch(e){console.warn('Joint allocs save failed:',e);}
+    var r=await db.from('couple_links').select('master_plan_cards').eq('id',couple.id).maybeSingle();
+    var master=(r&&r.data&&Array.isArray(r.data.master_plan_cards))?r.data.master_plan_cards:null;
+    if(!master||!master.length)return;
+    var ck=_cpCoupleCenteredKey(couple);
+    CPLAN.allocations=master.map(function(c){
+      var mc=JSON.parse(JSON.stringify(c));
+      mc.owner=_cpKeyToUiOwner(mc._ownerKey,ck);
+      // Joint shares are stored A/B-absolute; present them centered-relative.
+      if(mc.owner==='joint'&&ck==='b'){var s=mc.amountSelf;mc.amountSelf=mc.amountSpouse;mc.amountSpouse=s;}
+      return mc;
+    });
+  }catch(e){console.warn('Couple master load failed:',e);}
+}
+
+// Build the absolute-keyed master from the current (centered-relative) allocations.
+function _cpBuildMasterCards(couple){
+  var ck=_cpCoupleCenteredKey(couple);
+  return (CPLAN.allocations||[]).map(function(a){
+    var mc=JSON.parse(JSON.stringify(a));
+    mc._ownerKey=_cpUiOwnerToKey(a.owner,ck);
+    if(mc._ownerKey==='joint'&&ck==='b'){var s=mc.amountSelf;mc.amountSelf=mc.amountSpouse;mc.amountSpouse=s;}
+    return mc;
+  });
+}
+
+// Merge new plan content into an existing allocation_plan envelope WITHOUT clobbering
+// engagement history (checkIns, planStartDate, originalProjection, ai_generations,
+// catchUpBoosts, planCommitted…). Only plan-content fields change.
+function _cpMergePlanEnvelope(existing,allocations){
+  var base=(existing&&typeof existing==='object')?JSON.parse(JSON.stringify(existing)):{};
+  base.allocations=allocations;
+  base.debtStrategy=CPLAN.debtStrategy;
+  base._breathingPct=CPLAN._breathingPct;
+  base._breathingTouched=!!CPLAN._breathingTouched;
+  if(CPLAN._selfBreathingPct!=null)base._selfBreathingPct=CPLAN._selfBreathingPct;
+  if(CPLAN._partnerBreathingPct!=null)base._partnerBreathingPct=CPLAN._partnerBreathingPct;
+  return base;
+}
+
+// Propagate the master to both spouses + the shared store, atomically and
+// non-destructively. Returns true on success, false (with a toast) on failure.
+async function _cpPropagateCouplePlan(planStatus){
+  var couple=CPLAN._coupleLink;
+  if(!couple||!couple.id||!couple.client_a_id||!couple.client_b_id){
+    if(typeof _advShowToast==='function')_advShowToast('Couldn’t find this couple’s link — plan NOT saved. Reload and try again.','error');
+    return false;
+  }
+  var master=_cpBuildMasterCards(couple);
+  // Per-portal personal allocations: a client's own cards, owner normalized to
+  // 'self', joint dropped (joint comes from shared_plan_cards), split fields stripped.
+  function _portal(key){
+    return master.filter(function(c){return c._ownerKey===key;}).map(function(c){
+      var p=JSON.parse(JSON.stringify(c));delete p._ownerKey;delete p.amountSelf;delete p.amountSpouse;p.owner='self';return p;
+    });
+  }
+  var _nowIso=new Date().toISOString();
+  var shared=master.filter(function(c){return c._ownerKey==='joint';}).map(function(c,i){
+    var amt=parseFloat(c.amount)||0;
+    var aShare=parseFloat(c.amountSelf);var bShare=parseFloat(c.amountSpouse);// A/B-absolute in master
+    if(isNaN(aShare))aShare=Math.round(amt/2);if(isNaN(bShare))bShare=amt-Math.round(amt/2);
+    return {
+      sharedId:c._sharedId||('cp_'+(c.type||'x')+'_'+i+'_'+Math.random().toString(36).slice(2,8)),
+      ownerClientId:null,owner:'joint',type:c.type,amount:amt,target:parseFloat(c.target)||0,
+      phase:parseInt(c.phase)||2,cascade:c.cascade||c.cascade_to||'',customName:c.customName||'',
+      eduVehicle:c.eduVehicle||'',reason:c.reason||c.recommendation||'',
+      _ibcDebtStrategy:c._ibcDebtStrategy===true,_ibcUnderlyingType:c._ibcUnderlyingType||null,
+      _state:c._state||'proposed',_policyNumber:c._policyNumber||null,_lockedPremium:c._lockedPremium||null,
+      amountSelf:aShare,amountSpouse:bShare,updatedAt:_nowIso
+    };
+  });
+  try{
+    var exA=await db.from('client_profiles').select('allocation_plan').eq('client_id',couple.client_a_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    var exB=await db.from('client_profiles').select('allocation_plan').eq('client_id',couple.client_b_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    var planA=_cpMergePlanEnvelope(exA&&exA.data&&exA.data.allocation_plan,_portal('a'));
+    var planB=_cpMergePlanEnvelope(exB&&exB.data&&exB.data.allocation_plan,_portal('b'));
+    var rpc=await db.rpc('cp_publish_couple_plan',{
+      p_couple_link_id:couple.id,p_client_a_plan:planA,p_client_b_plan:planB,
+      p_shared_plan_cards:shared,p_master_plan_cards:master,p_plan_status:planStatus
+    });
+    if(rpc.error){if(typeof _advShowToast==='function')_advShowToast('Plan save failed: '+(rpc.error.message||'please try again'),'error');return false;}
+    return true;
+  }catch(e){console.warn('Couple propagate failed:',e);if(typeof _advShowToast==='function')_advShowToast('Plan save failed: '+(e.message||'please try again'),'error');return false;}
+}
+
+// Notify BOTH spouses that the plan was published (in-app + email). Best-effort.
+async function _cpNotifyCouplePublished(couple,wasFirst){
+  if(!couple)return;
+  var nowIso=new Date().toISOString();
+  var ids=[couple.client_a_id,couple.client_b_id].filter(Boolean);
+  try{
+    var cres=await db.from('clients').select('id,name,email').in('id',ids);
+    var byId={};((cres&&cres.data)||[]).forEach(function(c){byId[c.id]=c;});
+    ids.forEach(function(cid){
+      try{db.from('client_notifications').insert({client_id:cid,type:'plan_published',message:wasFirst?'Your financial plan is ready! Your advisor has published your personalized plan to your dashboard.':'Your advisor updated your financial plan. Log in to see the changes.',is_read:false,created_at:nowIso}).catch(function(){});}catch(e){}
+      var c=byId[cid]||{};
+      if(c.email){try{db.functions.invoke('send-notification',{body:{type:wasFirst?'plan_published':'plan_updated',clientId:cid,clientName:c.name||'',clientEmail:c.email}}).catch(function(){});}catch(e){}}
+    });
+  }catch(e){console.warn('Notify couple failed:',e);}
 }
 // ─────────────────────────────────────────────────────────────────────────────
 // Wave 5 advisor port: Plan snapshot capture
@@ -27774,30 +28096,22 @@ async function _cpSavePlan(){
     _cpCaptureSnapshot('allocation_completed','advisor','Activated by advisor: '+migrated.join(', '));
   }
   try{
-    var ex=await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(ex&&ex.data){
-      // Phase D: split by ownership.
-      // - hybrid/separate: self stays on this client, joint goes to couple_links, spouse-owned was read-only here
-      // - joint household: keep all on this record (partners share the same client_a record)
-      // - individual: keep all on this record
-      var split=_cpSplitAllocsByOwner();
-      var allocsToSave;
-      if(CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate'){
-        allocsToSave=split.selfAllocs;
-        await _cpSaveJointAllocs(split.jointAllocs);
-      } else {
-        allocsToSave=CPLAN.allocations;
+    if(CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate'){
+      // Couple master → both portals + shared store, atomic + non-destructive.
+      var _ok=await _cpPropagateCouplePlan('draft');
+      if(!_ok)return;// toast already shown; never silently lose spouse/joint cards
+    } else {
+      // Individual / joint: single shared row. Read-merge-preserve so we don't
+      // clobber the client's engagement history (checkIns, planStartDate, …).
+      var ex=await db.from('client_profiles').select('id,allocation_plan').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(ex&&ex.data){
+        var _plan=_cpMergePlanEnvelope(ex.data.allocation_plan,CPLAN.allocations);
+        await db.from('client_profiles').update({
+          allocation_plan:_plan,
+          plan_status:'draft',
+          updated_at:new Date().toISOString()
+        }).eq('id',ex.data.id);
       }
-      // Wave 5: persist new fields (state machine + override + per-card UI extras travel inside allocations)
-      await db.from('client_profiles').update({
-        allocation_plan:{
-          allocations:allocsToSave,
-          debtStrategy:CPLAN.debtStrategy,
-          _breathingPct:CPLAN._breathingPct
-        },
-        plan_status:'draft',
-        updated_at:new Date().toISOString()
-      }).eq('id',ex.data.id);
     }
     CPLAN._planStatus='draft';CPLAN.modified=false;
     // Snapshot the manual save event
@@ -27814,25 +28128,19 @@ async function _cpPublishPlan(){
   var btn=document.querySelector('[onclick="_cpPublishPlan()"]');
   if(btn){btn.disabled=true;btn.textContent='Publishing…';}
   try{
-    var ex=await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(!ex||!ex.data){throw new Error('Client profile row not found');}
     var nowIso=new Date().toISOString();
     var wasFirstPublish=!CPLAN._planPublishedAt;
-    // Phase D: split by ownership for hybrid/separate; joint households publish all to client_a
-    var split=_cpSplitAllocsByOwner();
-    var allocsToPublish;
-    if(CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate'){
-      allocsToPublish=split.selfAllocs;
-      await _cpSaveJointAllocs(split.jointAllocs);
+    var _isCouplePub=(CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate');
+    if(_isCouplePub){
+      // Couple master → both portals + shared store, atomic + non-destructive.
+      var _ok=await _cpPropagateCouplePlan('published');
+      if(!_ok){if(btn){btn.disabled=false;btn.textContent=CPLAN._planPublishedAt?'📤 Publish Changes':'📤 Publish to Client';}return;}
     } else {
-      allocsToPublish=CPLAN.allocations;
+      var ex=await db.from('client_profiles').select('id,allocation_plan').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(!ex||!ex.data){throw new Error('Client profile row not found');}
+      var planObj=_cpMergePlanEnvelope(ex.data.allocation_plan,CPLAN.allocations);
+      await db.from('client_profiles').update({allocation_plan:planObj,plan_status:'published',plan_published_at:nowIso,updated_at:nowIso}).eq('id',ex.data.id);
     }
-    var planObj={
-      allocations:allocsToPublish,
-      debtStrategy:CPLAN.debtStrategy,
-      _breathingPct:CPLAN._breathingPct
-    };
-    await db.from('client_profiles').update({allocation_plan:planObj,plan_status:'published',plan_published_at:nowIso,updated_at:nowIso}).eq('id',ex.data.id);
     // ── Stage 4 write-back: sync shared-goal planned contributions to shared_goals ──
     // Each Combined-tab shared-goal card carries _sharedGoalRowId. Persist its planned
     // monthly contribution (his + her split, or the single amount) to the canonical
@@ -27853,29 +28161,34 @@ async function _cpPublishPlan(){
       _cpCaptureSnapshot('plan_published','advisor',
         wasFirstPublish?'Initial plan published to client':'Plan changes published to client');
     }
-    // In-app notification for client
-    try{
-      db.from('client_notifications').insert({
-        client_id:APP.currentClientId,
-        type:'plan_published',
-        message:wasFirstPublish?'Your financial plan is ready! Your advisor has published your personalized plan to your dashboard.':'Your advisor updated your financial plan. Log in to see the changes.',
-        is_read:false,
-        created_at:nowIso
-      }).catch(function(){});
-    }catch(e){}
-    // Email notification via edge function
-    try{
-      var clientEmail=(APP.currentClient&&APP.currentClient.email)||'';
-      var clientName=(APP.currentClient&&APP.currentClient.name)||'';
-      if(clientEmail){
-        db.functions.invoke('send-notification',{body:{
-          type:wasFirstPublish?'plan_published':'plan_updated',
-          clientId:APP.currentClientId,
-          clientName:clientName,
-          clientEmail:clientEmail
-        }}).catch(function(){});
-      }
-    }catch(e){}
+    if(_isCouplePub&&CPLAN._coupleLink){
+      // Notify BOTH spouses (couple publish reaches both portals).
+      await _cpNotifyCouplePublished(CPLAN._coupleLink,wasFirstPublish);
+    } else {
+      // In-app notification for client
+      try{
+        db.from('client_notifications').insert({
+          client_id:APP.currentClientId,
+          type:'plan_published',
+          message:wasFirstPublish?'Your financial plan is ready! Your advisor has published your personalized plan to your dashboard.':'Your advisor updated your financial plan. Log in to see the changes.',
+          is_read:false,
+          created_at:nowIso
+        }).catch(function(){});
+      }catch(e){}
+      // Email notification via edge function
+      try{
+        var clientEmail=(APP.currentClient&&APP.currentClient.email)||'';
+        var clientName=(APP.currentClient&&APP.currentClient.name)||'';
+        if(clientEmail){
+          db.functions.invoke('send-notification',{body:{
+            type:wasFirstPublish?'plan_published':'plan_updated',
+            clientId:APP.currentClientId,
+            clientName:clientName,
+            clientEmail:clientEmail
+          }}).catch(function(){});
+        }
+      }catch(e){}
+    }
     if(btn){btn.disabled=false;btn.textContent='✓ Published!';setTimeout(function(){_cpRenderPlanFull();},1200);}
   }catch(e){
     console.warn('Plan publish failed:',e);
