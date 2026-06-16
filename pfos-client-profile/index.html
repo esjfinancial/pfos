@@ -7795,6 +7795,16 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
           if((CPLAN._householdType==='hybrid'||CPLAN._householdType==='separate')&&typeof _cpLoadCoupleMaster==='function'){
             await _cpLoadCoupleMaster(couple);
           }
+          // Separate: map the ABSOLUTE (A/B) breathing rooms back to centered-relative
+          // self/partner so the values don't swap when switching which spouse is open.
+          if(CPLAN._householdType==='separate'){
+            var _apA=allocPlan&&allocPlan._breathingA, _apB=allocPlan&&allocPlan._breathingB;
+            if(_apA!=null||_apB!=null){
+              var _ckLB=(couple.client_a_id===APP.currentClientId)?'a':'b';
+              CPLAN._selfBreathingPct=(_ckLB==='a')?_apA:_apB;
+              CPLAN._partnerBreathingPct=(_ckLB==='a')?_apB:_apA;
+            }
+          }
           // Tag any existing allocations without owner — assume self
           (CPLAN.allocations||[]).forEach(function(a){if(!a.owner)a.owner='self';});
         }
@@ -27925,14 +27935,21 @@ function _cpBuildMasterCards(couple){
 // Merge new plan content into an existing allocation_plan envelope WITHOUT clobbering
 // engagement history (checkIns, planStartDate, originalProjection, ai_generations,
 // catchUpBoosts, planCommitted…). Only plan-content fields change.
-function _cpMergePlanEnvelope(existing,allocations){
+function _cpMergePlanEnvelope(existing,allocations,absBr){
   var base=(existing&&typeof existing==='object')?JSON.parse(JSON.stringify(existing)):{};
   base.allocations=allocations;
   base.debtStrategy=CPLAN.debtStrategy;
   base._breathingPct=CPLAN._breathingPct;
   base._breathingTouched=!!CPLAN._breathingTouched;
+  // Separate household: store the two breathing rooms ABSOLUTELY (per client_a/b) so
+  // they don't swap when the advisor switches which spouse is centered. The
+  // centered-relative copies are kept too (harmless / back-compat).
   if(CPLAN._selfBreathingPct!=null)base._selfBreathingPct=CPLAN._selfBreathingPct;
   if(CPLAN._partnerBreathingPct!=null)base._partnerBreathingPct=CPLAN._partnerBreathingPct;
+  if(absBr){
+    if(absBr.a!=null)base._breathingA=absBr.a;
+    if(absBr.b!=null)base._breathingB=absBr.b;
+  }
   return base;
 }
 
@@ -27970,8 +27987,12 @@ async function _cpPropagateCouplePlan(planStatus){
   try{
     var exA=await db.from('client_profiles').select('allocation_plan').eq('client_id',couple.client_a_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
     var exB=await db.from('client_profiles').select('allocation_plan').eq('client_id',couple.client_b_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    var planA=_cpMergePlanEnvelope(exA&&exA.data&&exA.data.allocation_plan,_portal('a'));
-    var planB=_cpMergePlanEnvelope(exB&&exB.data&&exB.data.allocation_plan,_portal('b'));
+    // Absolute breathing rooms (separate): map centered-relative self/partner → A/B.
+    var _ckBr=_cpCoupleCenteredKey(couple);
+    var _brAbs={a:(_ckBr==='a')?CPLAN._selfBreathingPct:CPLAN._partnerBreathingPct,
+                b:(_ckBr==='a')?CPLAN._partnerBreathingPct:CPLAN._selfBreathingPct};
+    var planA=_cpMergePlanEnvelope(exA&&exA.data&&exA.data.allocation_plan,_portal('a'),_brAbs);
+    var planB=_cpMergePlanEnvelope(exB&&exB.data&&exB.data.allocation_plan,_portal('b'),_brAbs);
     var rpc=await db.rpc('cp_publish_couple_plan',{
       p_couple_link_id:couple.id,p_client_a_plan:planA,p_client_b_plan:planB,
       p_shared_plan_cards:shared,p_master_plan_cards:master,p_plan_status:planStatus
