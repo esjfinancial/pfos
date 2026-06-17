@@ -2312,9 +2312,19 @@ var _JOINT_MERGE_ARRAYS = ['incomeSources','retAccounts','investments','debts','
 
 // sp* profile field <-> partner self profile field mapping (D4). Used to project
 // B's self profile fields into A's sp* fields on read, and split them back on write.
+// KEEP IN SYNC WITH pfos-client / pfos-client-profile (the other copy of this block).
+// sp* spouse field -> partner's SELF field. Merge projects B's self into A's sp*;
+// demerge mirrors BOTH directions so each row is a complete self+spouse profile.
+// Shared household assumptions are deliberately NOT mirrored (retLifeExp,
+// retInflation/retReturn/retRiskLevel/retTaxBracket/retCapGainsBracket, liSpouseYears,
+// liMortgage/liOtherDebt/liDependents/liChildcare/liEduPerChild/liCollegeSavings/liFinal,
+// taxFilingStatus/hhSize/state/marital/children, ltc*/umb*/pc*/est*).
 var _JOINT_SP_MAP = {
   spFirstName:'firstName', spLastName:'lastName', spEmail:'email', spOccupation:'occupation',
-  spouse_employment_type:'employment_type', spouseEmploymentType:'employmentType'
+  spouse_employment_type:'employment_type', spouseEmploymentType:'employmentType',
+  spCurrentAge:'currentAge', spDOB:'dob',
+  spRetAge:'retAge', spRetIncome:'retIncome', spSsBenefit:'ssBenefit',
+  spAnnualIncome:'liAnnualIncome', spYearsReplace:'liYearsReplace', spCoverage:'liCoverage', spDiCoverage:'diHasCoverage'
 };
 
 // MERGE-ON-READ: given A's state (S) and B's state (S), synthesize the single
@@ -2340,7 +2350,8 @@ function _mergeJointState(aS, bS){
       }
     });
   });
-  // 2) Profile sp* fields from B self fields (only fill if A doesn't already have them).
+  // 2) Profile sp* fields <- B's self fields (AUTHORITATIVE: B's current self always
+  //    wins on A's sp* projection; skipped only when B's value is empty/missing).
   if(bS.profile){
     if(!merged.profile) merged.profile = {};
     Object.keys(_JOINT_SP_MAP).forEach(function(spKey){
@@ -2385,14 +2396,20 @@ function _demergeJointState(mergedS, baseB){
     aS[arr] = keepA;
     bS[arr] = toB;
   });
-  // Profile: move sp* fields into B self fields; strip sp* from A.
+  // Profile: MIRROR (KEEP IN SYNC with pfos-client). Each row ends COMPLETE =
+  // self + partner-summary(sp*). B.self <- A.sp* (the spouse data entered on the
+  // joint profile); B.sp* <- A.self (B's mirror of A); A KEEPS its sp* (A's mirror
+  // of B) — never stripped, re-derived from B.self so each row is self-consistent
+  // if read alone (hybrid/separate load it standalone).
   if(aS.profile){
+    if(!bS.profile) bS.profile = {};
     Object.keys(_JOINT_SP_MAP).forEach(function(spKey){
       var selfKey = _JOINT_SP_MAP[spKey];
-      if(aS.profile[spKey] !== undefined){
-        bS.profile[selfKey] = aS.profile[spKey];
-        delete aS.profile[spKey];
-      }
+      var aSp = aS.profile[spKey], aSelf = aS.profile[selfKey];
+      if(aSp !== undefined && aSp !== '' && aSp !== null) bS.profile[selfKey] = aSp; // B self <- spouse data
+      if(aSelf !== undefined) bS.profile[spKey] = aSelf;                              // B sp* <- A self
+      var bSelf = bS.profile[selfKey];
+      if(bSelf !== undefined && bSelf !== '' && bSelf !== null) aS.profile[spKey] = bSelf; // A keeps sp* = B self
     });
   }
   // B inherits household-level context so its row is self-consistent if read alone.
@@ -2418,6 +2435,56 @@ function _jmRowHasData(row){
   if(!row || !row.financial_data || !row.financial_data.S) return false;
   var S = row.financial_data.S;
   return _JOINT_MERGE_ARRAYS.some(function(a){ return Array.isArray(S[a]) && S[a].length>0; });
+}
+
+// _jmFieldSet: a profile scalar counts as "set" when it's not undefined/empty/null.
+function _jmFieldSet(v){ return (v!==undefined && v!=='' && v!==null); }
+
+// _jmRowHasSpProjection: true if a row carries any populated FINANCIAL sp* projection
+// (a partner summary), i.e. the mirror has been written for at least one money field.
+// Quick per-row probe; couple-level completeness is _jmCoupleMirrorComplete below.
+function _jmRowHasSpProjection(row){
+  if(!row || !row.financial_data || !row.financial_data.S) return false;
+  var p = row.financial_data.S.profile || {};
+  return Object.keys(_JOINT_SP_MAP).some(function(spKey){ return _jmFieldSet(p[spKey]); });
+}
+
+// _jmCoupleMirrorComplete: completeness is inherently a COUPLE property — a single
+// row's sp* can't be judged complete without the partner's self. Returns true when
+// the two states are already a consistent mirror, so a rebuild would be a no-op:
+//   - no STRANDED data: one row holds the partner's summary (sp* set) while the
+//     partner's own self field is EMPTY (recoverable -> not complete);
+//   - no PROJECTION DRIFT: each row's sp* equals the partner's authoritative self.
+// (Replaces a literal per-row probe; documented as the real idempotency classifier.)
+function _jmCoupleMirrorComplete(aS, bS){
+  if(!aS || !bS) return false;
+  var ap = aS.profile || {}, bp = bS.profile || {};
+  var complete = true;
+  Object.keys(_JOINT_SP_MAP).forEach(function(spKey){
+    var selfKey = _JOINT_SP_MAP[spKey];
+    var aSelf = ap[selfKey], bSelf = bp[selfKey], aSp = ap[spKey], bSp = bp[spKey];
+    // Stranded: A projects B's summary but B's own self is empty (and vice-versa).
+    if(_jmFieldSet(aSp) && !_jmFieldSet(bSelf)) complete = false;
+    if(_jmFieldSet(bSp) && !_jmFieldSet(aSelf)) complete = false;
+    // Drift: A.sp must equal B.self (and B.sp must equal A.self) when self is set.
+    if(_jmFieldSet(bSelf) && String(aSp) !== String(bSelf)) complete = false;
+    if(_jmFieldSet(aSelf) && String(bSp) !== String(aSelf)) complete = false;
+  });
+  return complete;
+}
+
+// _jmChangedSelfFields: dryRun reporting helper. Lists self profile fields whose
+// value changed between two states (used to surface what a rebuild recovered).
+function _jmChangedSelfFields(beforeS, afterS){
+  var bp = (beforeS && beforeS.profile) || {}, ap = (afterS && afterS.profile) || {};
+  var out = {};
+  Object.keys(_JOINT_SP_MAP).forEach(function(spKey){
+    var selfKey = _JOINT_SP_MAP[spKey];
+    if(String(bp[selfKey]==null?'':bp[selfKey]) !== String(ap[selfKey]==null?'':ap[selfKey])){
+      out[selfKey] = { from:(bp[selfKey]==null?'':bp[selfKey]), to:(ap[selfKey]==null?'':ap[selfKey]) };
+    }
+  });
+  return out;
 }
 
 // ── Identity routing (replaces the old "client_a is always self/primary" assumption) ──
@@ -2470,14 +2537,32 @@ function _jmNameMatches(first, fullName){
 // Returns {status, ...}: status in {skipped, needs_review, dryrun, ok, error}.
 async function _advBackfillJointCouple(couple, opts){
   opts = opts || {};
-  if(!couple || couple.household_type!=='joint') return {status:'skipped', reason:'not joint'};
-  if(_isJointModelV2(couple)) return {status:'skipped', reason:'already v2'};
+  if(!couple) return {status:'skipped', reason:'no couple'};
+  var _rebuild = (opts.rebuildV2 === true);
+  // Two modes:
+  //  - LEGACY backfill (default): convert a joint couple NOT yet V2 (A holds the whole
+  //    profile, B empty) into two mirror rows + set the V2 flag.
+  //  - rebuildV2 (opts.rebuildV2): REPAIR an EXISTING V2 couple (any household_type)
+  //    whose two rows are partial/stranded — built with the old incomplete sp* map —
+  //    into complete mirrors. A hybrid/separate V2 couple still must carry full sp*
+  //    projections (hidden in the UI, present in the data) so a flip back to joint is
+  //    lossless; that's why rebuild is NOT gated on household_type==='joint'.
+  if(!_rebuild){
+    if(couple.household_type!=='joint') return {status:'skipped', reason:'not joint'};
+    if(_isJointModelV2(couple)) return {status:'skipped', reason:'already v2'};
+  } else {
+    if(!_isJointModelV2(couple)) return {status:'skipped', reason:'not v2 — use legacy backfill'};
+  }
   var aId = couple.client_a_id, bId = couple.client_b_id;
   if(!aId || !bId) return {status:'skipped', reason:'missing client id'};
 
   var rowA = await _jmReadRow(aId);
   if(!rowA || !rowA.financial_data || !rowA.financial_data.S) return {status:'error', error:'primary row not found'};
   var rowB = await _jmReadRow(bId);
+
+  // rebuildV2: delegate to the dedicated repair path (keeps the legacy logic below
+  // untouched — zero regression risk to the proven legacy conversion).
+  if(_rebuild) return await _advRebuildV2Couple(couple, rowA, rowB, opts);
 
   // If B already has real data, apply LAST-WRITE-WINS: A is authoritative when A's
   // row is newer or equal (the live joint profile). Only flag needs_review when B's
@@ -2565,27 +2650,160 @@ async function _advBackfillJointCouple(couple, opts){
   return {status:'ok', aId:aId, bId:bId};
 }
 
+// ── rebuildV2: repair an already-V2 couple into two COMPLETE MIRROR rows ──
+// Unlike legacy backfill (A holds everything, B empty), here BOTH rows already exist
+// and each may hold the authoritative copy of some data, while the other row's sp*
+// projection of it is stale or missing (the old map never crossed financial fields).
+// Steps:
+//   (1) PRE-MERGE RECONCILIATION — recover stranded partner data: if a row's own self
+//       field is empty but the partner projected it into their sp*, seed it so the
+//       merge has the real value to mirror (bidirectional, fills only EMPTY self).
+//   (2) MERGE both rows into the joint view; (3) DE-MERGE back into two mirrors
+//       (base = B's reconciled S, so any B-only drift e.g. expData/assets survives).
+//   (4) IDENTITY ROUTING — each person's data lands on THEIR client row (self may be B).
+//   (5) VERIFIED WRITES + backup rotation on BOTH rows. Idempotent: a couple that is
+//       already a consistent mirror returns v2_complete_noop with NO write.
+// household_type is NOT changed here; the V2 flag is already set. opts.dryRun returns
+// the planned rows + a `recovered` diff without writing.
+async function _advRebuildV2Couple(couple, rowA, rowB, opts){
+  opts = opts || {};
+  var aId = couple.client_a_id, bId = couple.client_b_id;
+  var aS0 = rowA.financial_data.S;
+  var bS0 = (rowB && rowB.financial_data && rowB.financial_data.S) ? rowB.financial_data.S : null;
+  if(!bS0){
+    // No B state at all — treat like a legacy split to seed a B row from A's sp*.
+    bS0 = _demergeJointState(aS0, null).bS;
+  }
+
+  // Idempotency: already a consistent complete mirror -> nothing to do.
+  if(_jmCoupleMirrorComplete(aS0, bS0)) return {status:'v2_complete_noop', aId:aId, bId:bId};
+
+  // (1) PRE-MERGE RECONCILIATION (bidirectional). Fill an EMPTY self field from the
+  // partner's sp* projection of it — never overwrite a populated self value (the
+  // owner's own row stays authoritative for their data).
+  var aRec = JSON.parse(JSON.stringify(aS0));
+  var bRec = JSON.parse(JSON.stringify(bS0));
+  if(!aRec.profile) aRec.profile = {};
+  if(!bRec.profile) bRec.profile = {};
+  Object.keys(_JOINT_SP_MAP).forEach(function(spKey){
+    var selfKey = _JOINT_SP_MAP[spKey];
+    if(!_jmFieldSet(bRec.profile[selfKey]) && _jmFieldSet(aRec.profile[spKey])) bRec.profile[selfKey] = aRec.profile[spKey];
+    if(!_jmFieldSet(aRec.profile[selfKey]) && _jmFieldSet(bRec.profile[spKey])) aRec.profile[selfKey] = bRec.profile[spKey];
+  });
+
+  // (2) MERGE -> joint view; (3) DE-MERGE -> two complete mirror rows.
+  var merged = _mergeJointState(aRec, bRec);
+  var split  = _demergeJointState(merged, bRec);
+  var newA_S = split.aS, newB_S = split.bS;
+
+  // (4) IDENTITY ROUTING (self may be client_b). Resolve from the merged self-person.
+  try{
+    var _idRes = await db.from('clients').select('id,name,email').in('id',[aId,bId]);
+    if(!_idRes.error && _idRes.data && _idRes.data.length===2){
+      var _cA = _idRes.data.filter(function(c){ return c.id===aId; })[0];
+      var _cB = _idRes.data.filter(function(c){ return c.id===bId; })[0];
+      var _selfOwner = _jmResolveSelfOwner(merged, _cA, _cB);
+      if(_selfOwner==='ambiguous') return {status:'needs_review', reason:'rebuildV2: cannot determine whose data is self (email & name inconclusive)', aId:aId, bId:bId};
+      if(_selfOwner==='b'){ var _t=newA_S; newA_S=newB_S; newB_S=_t; }
+    }
+  }catch(e){ return {status:'error', error:'rebuildV2 identity resolution failed: '+e.message}; }
+
+  // Stamp migration flags (defense-in-depth vs the pfos-main sweep). Preserve each
+  // row's existing _migratedHouseholdType; do NOT change household_type here.
+  newA_S._migratedToV2 = true; newB_S._migratedToV2 = true;
+  if(aS0._migratedHouseholdType) newA_S._migratedHouseholdType = aS0._migratedHouseholdType;
+  if(bS0._migratedHouseholdType) newB_S._migratedHouseholdType = bS0._migratedHouseholdType;
+
+  var fdA = Object.assign({}, rowA.financial_data, {S:newA_S});
+  var fdB = Object.assign({}, (rowB && rowB.financial_data) || {}, {S:newB_S});
+  if(!fdB.calcs && rowA.financial_data.calcs) fdB.calcs = rowA.financial_data.calcs;
+
+  if(opts.dryRun){
+    return {status:'dryrun_rebuild', plannedA:fdA, plannedB:fdB,
+            recoveredA:_jmChangedSelfFields(aS0, newA_S), recoveredB:_jmChangedSelfFields(bS0, newB_S), hadBRow:!!(rowB&&rowB.id)};
+  }
+
+  // (5) VERIFIED WRITES + backup rotation. B first (update or insert), then A.
+  var wB;
+  if(rowB && rowB.id){
+    var ppB = { financial_data:fdB, updated_at:new Date().toISOString() };
+    if(rowB.financial_data){ ppB.previous_financial_data=rowB.financial_data;
+      if(rowB.previous_financial_data) ppB.previous_financial_data_2=rowB.previous_financial_data;
+      if(rowB.previous_financial_data_2) ppB.previous_financial_data_3=rowB.previous_financial_data_2; }
+    try{ var rb=await db.from('client_profiles').update(ppB).eq('id',rowB.id); wB={ok:!rb.error,error:rb.error&&rb.error.message}; }
+    catch(e){ wB={ok:false,error:e.message}; }
+  } else {
+    try{ var rb2=await db.from('client_profiles').insert({client_id:bId,financial_data:fdB,updated_at:new Date().toISOString()}); wB={ok:!rb2.error,error:rb2.error&&rb2.error.message}; }
+    catch(e){ wB={ok:false,error:e.message}; }
+  }
+  if(!wB.ok) return {status:'error', error:'rebuildV2 B write failed: '+wB.error};
+
+  var ppA = { financial_data:fdA, updated_at:new Date().toISOString(), previous_financial_data:rowA.financial_data };
+  if(rowA.previous_financial_data) ppA.previous_financial_data_2=rowA.previous_financial_data;
+  if(rowA.previous_financial_data_2) ppA.previous_financial_data_3=rowA.previous_financial_data_2;
+  try{ var ra=await db.from('client_profiles').update(ppA).eq('id',rowA.id); if(ra.error) return {status:'error', error:'rebuildV2 A write failed (B already written): '+ra.error.message}; }
+  catch(e){ return {status:'error', error:'rebuildV2 A write ex (B already written): '+e.message}; }
+
+  return {status:'rebuilt', aId:aId, bId:bId, recoveredA:_jmChangedSelfFields(aS0, newA_S), recoveredB:_jmChangedSelfFields(bS0, newB_S)};
+}
+
 // ── Backfill runner (admin) ──
 // Iterates all joint couples, classifies each, and (only when opts.execute===true)
 // backfills the safe ones. SAFE BY DEFAULT: with no opts (or dryRun), it writes
 // NOTHING and just returns a report. Couples whose partner already has a populated
 // row are never auto-written — they are listed under needsReview for manual
 // handling. Returns { report:[...], summary:{...} }.
+//
+// opts.rebuildV2: switches to REPAIR mode — iterate EXISTING V2 couples (any
+// household_type) and rebuild partial/stranded rows into complete mirrors via
+// _advRebuildV2Couple. Couples already a consistent mirror classify v2_complete_noop
+// (no write). Still SAFE BY DEFAULT (dry run unless execute:true).
 // Usage (from admin console):
-//   await _advRunJointBackfill()            -> dry run, report only
-//   await _advRunJointBackfill({execute:true}) -> backfill clean couples
+//   await _advRunJointBackfill()                          -> legacy dry run, report only
+//   await _advRunJointBackfill({execute:true})            -> legacy backfill clean couples
+//   await _advRunJointBackfill({rebuildV2:true})          -> rebuild dry run, report only
+//   await _advRunJointBackfill({rebuildV2:true, execute:true}) -> rebuild partial V2 couples
 async function _advRunJointBackfill(opts){
   opts = opts || {};
   var execute = opts.execute === true;
+  var rebuild = opts.rebuildV2 === true;
   if(!Array.isArray(APP_COUPLES) || !APP_COUPLES.length){
     try{ if(typeof loadCouples==='function') await loadCouples(); }catch(e){}
   }
-  var couples = (APP_COUPLES||[]).filter(function(c){ return c && c.household_type==='joint'; });
+  // Legacy mode targets joint couples not yet V2; rebuild mode targets existing V2
+  // couples of ANY household_type (their rows must still be complete mirrors).
+  var couples = (APP_COUPLES||[]).filter(function(c){
+    if(!c) return false;
+    return rebuild ? _isJointModelV2(c) : (c.household_type==='joint');
+  });
   var report = [];
-  var summary = { total:couples.length, already_v2:0, clean_done:0, clean_pending:0, needs_review:0, errors:0 };
+  var summary = { total:couples.length, already_v2:0, clean_done:0, clean_pending:0, needs_review:0, errors:0, v2_complete_noop:0, would_rebuild:0, rebuilt:0 };
   for(var i=0;i<couples.length;i++){
     var c = couples[i];
     var label = (getClientName(c.client_a_id)||'A')+' + '+(getClientName(c.client_b_id)||'B');
+    if(rebuild){
+      // REBUILD MODE: read both rows, classify via the couple-level completeness probe.
+      var rRowA = await _jmReadRow(c.client_a_id);
+      var rRowB = await _jmReadRow(c.client_b_id);
+      var raS = (rRowA && rRowA.financial_data && rRowA.financial_data.S) ? rRowA.financial_data.S : null;
+      var rbS = (rRowB && rRowB.financial_data && rRowB.financial_data.S) ? rRowB.financial_data.S : null;
+      if(!raS){ summary.errors++; report.push({couple:c.id, label:label, status:'error', error:'rebuildV2: primary row not found'}); continue; }
+      if(rbS && _jmCoupleMirrorComplete(raS, rbS)){ summary.v2_complete_noop++; report.push({couple:c.id, label:label, status:'v2_complete_noop'}); continue; }
+      if(!execute){
+        // Dry-run: compute the planned repair so the report shows what would be recovered.
+        var dr = await _advBackfillJointCouple(c, {rebuildV2:true, dryRun:true});
+        summary.would_rebuild++;
+        report.push({couple:c.id, label:label, status:'would_rebuild_v2', recoveredA:dr.recoveredA, recoveredB:dr.recoveredB, reason:dr.reason, drStatus:dr.status});
+        continue;
+      }
+      var rres = await _advBackfillJointCouple(c, {rebuildV2:true});
+      if(rres.status==='rebuilt'){ summary.rebuilt++; report.push({couple:c.id, label:label, status:'rebuilt', recoveredA:rres.recoveredA, recoveredB:rres.recoveredB}); }
+      else if(rres.status==='v2_complete_noop'){ summary.v2_complete_noop++; report.push({couple:c.id, label:label, status:'v2_complete_noop'}); }
+      else if(rres.status==='needs_review'){ summary.needs_review++; report.push({couple:c.id, label:label, status:'needs_review', reason:rres.reason}); }
+      else if(rres.status==='skipped'){ report.push({couple:c.id, label:label, status:'skipped', reason:rres.reason}); }
+      else { summary.errors++; report.push({couple:c.id, label:label, status:'error', error:rres.error}); }
+      continue;
+    }
     if(_isJointModelV2(c)){ summary.already_v2++; report.push({couple:c.id, label:label, status:'already_v2'}); continue; }
     // Probe both rows to classify (read-only). Last-write-wins: a populated B is
     // still auto-backfillable when A is newer (A authoritative); only B-newer needs review.
@@ -7772,9 +7990,12 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             combinedAllocPct:(typeof pRawS.combinedAllocPct==='number')?pRawS.combinedAllocPct:100
           };
           if(CPLAN._householdType==='joint'){
-            CPLAN._jointSurplus=CPLAN.surplus+CPLAN._partner.surplus;
-            CPLAN._jointIncome=CPLAN.income+CPLAN._partner.income;
-            CPLAN._jointExpenses=CPLAN.expenses+CPLAN._partner.expenses;
+            // The joint profile is loaded MERGED (loadFrom=client_a + _mergeJointState),
+            // so CPLAN.surplus/income/expenses already reflect BOTH spouses. Adding
+            // _partner.* here would double-count the partner (real once couples are V2).
+            CPLAN._jointSurplus=CPLAN.surplus;
+            CPLAN._jointIncome=CPLAN.income;
+            CPLAN._jointExpenses=CPLAN.expenses;
           }
           // ── Part 2 (hybrid 4-tab): split each spouse's surplus into a combined
           //    pool and a personal pool, based on the % each chose at Mark Profile

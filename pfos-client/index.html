@@ -3256,9 +3256,19 @@ var _JOINT_MERGE_ARRAYS = ['incomeSources','retAccounts','investments','debts','
 
 // sp* profile field <-> partner self profile field mapping (D4). Used to project
 // B's self profile fields into A's sp* fields on read, and split them back on write.
+// KEEP IN SYNC WITH pfos-client / pfos-client-profile (the other copy of this block).
+// sp* spouse field -> partner's SELF field. Merge projects B's self into A's sp*;
+// demerge mirrors BOTH directions so each row is a complete self+spouse profile.
+// Shared household assumptions are deliberately NOT mirrored (retLifeExp,
+// retInflation/retReturn/retRiskLevel/retTaxBracket/retCapGainsBracket, liSpouseYears,
+// liMortgage/liOtherDebt/liDependents/liChildcare/liEduPerChild/liCollegeSavings/liFinal,
+// taxFilingStatus/hhSize/state/marital/children, ltc*/umb*/pc*/est*).
 var _JOINT_SP_MAP = {
   spFirstName:'firstName', spLastName:'lastName', spEmail:'email', spOccupation:'occupation',
-  spouse_employment_type:'employment_type', spouseEmploymentType:'employmentType'
+  spouse_employment_type:'employment_type', spouseEmploymentType:'employmentType',
+  spCurrentAge:'currentAge', spDOB:'dob',
+  spRetAge:'retAge', spRetIncome:'retIncome', spSsBenefit:'ssBenefit',
+  spAnnualIncome:'liAnnualIncome', spYearsReplace:'liYearsReplace', spCoverage:'liCoverage', spDiCoverage:'diHasCoverage'
 };
 
 // MERGE-ON-READ: given A's state (S) and B's state (S), synthesize the single
@@ -3284,7 +3294,8 @@ function _mergeJointState(aS, bS){
       }
     });
   });
-  // 2) Profile sp* fields from B self fields (only fill if A doesn't already have them).
+  // 2) Profile sp* fields <- B's self fields (AUTHORITATIVE: B's current self always
+  //    wins on A's sp* projection; skipped only when B's value is empty/missing).
   if(bS.profile){
     if(!merged.profile) merged.profile = {};
     Object.keys(_JOINT_SP_MAP).forEach(function(spKey){
@@ -3321,14 +3332,20 @@ function _demergeJointState(mergedS, baseB){
     aS[arr] = keepA;
     bS[arr] = toB;
   });
-  // Profile: move sp* fields into B self fields; strip sp* from A.
+  // Profile: MIRROR (KEEP IN SYNC with pfos-client-profile). Each row ends COMPLETE =
+  // self + partner-summary(sp*). B.self <- A.sp* (the spouse data entered on the
+  // joint profile); B.sp* <- A.self (B's mirror of A); A KEEPS its sp* (A's mirror
+  // of B) — never stripped, re-derived from B.self so each row is self-consistent
+  // if read alone (hybrid/separate load it standalone).
   if(aS.profile){
+    if(!bS.profile) bS.profile = {};
     Object.keys(_JOINT_SP_MAP).forEach(function(spKey){
       var selfKey = _JOINT_SP_MAP[spKey];
-      if(aS.profile[spKey] !== undefined){
-        bS.profile[selfKey] = aS.profile[spKey];
-        delete aS.profile[spKey];
-      }
+      var aSp = aS.profile[spKey], aSelf = aS.profile[selfKey];
+      if(aSp !== undefined && aSp !== '' && aSp !== null) bS.profile[selfKey] = aSp; // B self <- spouse data
+      if(aSelf !== undefined) bS.profile[spKey] = aSelf;                              // B sp* <- A self
+      var bSelf = bS.profile[selfKey];
+      if(bSelf !== undefined && bSelf !== '' && bSelf !== null) aS.profile[spKey] = bSelf; // A keeps sp* = B self
     });
   }
   // B inherits household-level context so its row is self-consistent if read alone.
@@ -10302,6 +10319,10 @@ window.addEventListener('message',async function(e){
     try{
       var state=msg.state,calcs=state.calcs||{};
       // ══ FIRST-SAVE DATA PROTECTION ══
+      // (Two-row MIRROR note) For V2 joint, the incoming `state` is the MERGED view
+      // (A's items + B's items as owner='spouse' + joint), while the stored client_a
+      // row is A-alone + joint. Incoming is therefore always >= the stored baseline,
+      // so these weight guards never false-trigger on a legit joint save (T-E3).
       if(!_firstSaveGuardPassed){
         _firstSaveGuardPassed=true;
         var _inW=_cpStateWeight(state,calcs);
@@ -30222,7 +30243,11 @@ function _cpUnsubscribeFromJointFinancials(){
 // ════════════════════════════════════════════════════════════════════════════
 // JOINT HOUSEHOLD — REALTIME SYNC: client_profiles shared row
 // ════════════════════════════════════════════════════════════════════════════
-// Joint couples share ONE client_profiles row (the one under client_a_id).
+// Joint couples: the authoritative joint write always routes to client_a (loadFrom
+// /_saveToId pin to client_a; the B row is a derived de-merge of A). Under the
+// two-row MIRROR model both rows exist, but BOTH spouses' joint edits still land on
+// client_a, so watching client_a alone catches every joint change — no need to also
+// subscribe to client_b (documented A-only decision).
 // When one spouse saves their plan via cplanSave(), the other spouse's
 // CPLAN.allocations is now stale until they manually reload. This subscription
 // listens for UPDATEs on the shared row and surfaces a refresh banner.
@@ -30344,14 +30369,12 @@ async function _cpLoadPartnerForAI(){
     var pPlan={};
 
     if(householdType==='joint'){
-      // Joint households share ONE client_profiles row on client_a_id. The partner
-      // has no profile row of their own — querying WHERE client_id=partnerId returns
-      // nothing, producing default-everything (age 35, retirementAge 65, empty arrays).
-      // Instead: read from the SHARED profile (already in APP._portalFd because the
-      // load path routes Joint to client_a) and pull the partner's fields from the
-      // spouse-prefixed columns on profile (spCurrentAge, spRetAge, spIncome, spRetIncome,
-      // spouseEmploymentType) and the owner='spouse' subset of shared arrays
-      // (retAccounts, policies, incomeSources, investments, debts).
+      // Joint loads the MERGED view from client_a (loadFrom routes joint→client_a and
+      // _mergeJointState folds B in). Under the two-row MIRROR the partner DOES now have
+      // their own row, but we still read the partner's fields from this already-loaded
+      // merged profile — its sp* fields (spCurrentAge/spRetAge/spRetIncome/...) and its
+      // owner='spouse' array items are the partner — which avoids an extra round-trip and
+      // stays consistent with the joint view. (A separate partner-row query is unnecessary.)
       var sharedFd=(APP._portalFd)||{};
       var sharedRawS=sharedFd.S||{};
       var sharedProfile=sharedRawS.profile||{};

@@ -3233,8 +3233,10 @@ function _setHHRaw(type){
   var spouseVisible = (type === 'joint');
   if(sp) sp.style.display = spouseVisible ? 'block' : 'none';
   if(spDobRow) spDobRow.style.display = spouseVisible ? '' : 'none';
-  // When hiding, clear the DOM inputs so a subsequent _doSync doesn't
-  // re-write stale values back into S.profile.
+  // Two-row MIRROR model: this clear is DISPLAY-ONLY. It hides the inputs but does
+  // NOT wipe the stored S.profile sp* (the row's mirror of the partner) — _spKeep()
+  // in calc (≈line 9607) restores the stored value when the DOM input is empty, so
+  // the mirror persists and a flip back to joint is lossless.
   if(!spouseVisible){
     ['spDOB','spCurrentAge','spRetAge','spSsBenefit','spRetIncome'].forEach(function(id){
       var el = document.getElementById(id);
@@ -3822,27 +3824,9 @@ function _wipeSpouseFields(){
   // household type changes. Returns 0 so callers' logging still works.
   return 0;
 }
-function _wipeSpouseFields_DISABLED(){
-  // Remove spouse-info fields from S.profile and clear S.spouseInfo.
-  // Safe to call repeatedly. Returns count of fields wiped (for logging).
-  // Also clears the DOM inputs so a subsequent _doSync doesn't read stale
-  // values back into S.profile.
-  var count = 0;
-  if(S.profile){
-    SPOUSE_FIELDS.forEach(function(k){
-      if(S.profile[k] !== undefined){ delete S.profile[k]; count++; }
-    });
-  }
-  if(S.spouseInfo && Object.keys(S.spouseInfo).length){ S.spouseInfo = {}; count++; }
-  // Clear DOM input values for the visible spouse fields. The IDs aren't a
-  // perfect superset of SPOUSE_FIELDS (some fields are state-only with no
-  // DOM counterpart), so we just clear the ones we know exist as inputs.
-  ['spDOB','spCurrentAge','spRetAge','spSsBenefit','spRetIncome'].forEach(function(id){
-    var el = document.getElementById(id);
-    if(el && el.value){ el.value = ''; count++; }
-  });
-  return count;
-}
+// (Two-row MIRROR model) The earlier destructive variant of this function was
+// deleted: spouse fields are part of each row's mirror and must never be wiped on a
+// household-type change.
 
 function _dropSpouseOwnedItems(){
   // NON-DESTRUCTIVE (intentionally a no-op). A profile's stored data must never
@@ -3853,34 +3837,9 @@ function _dropSpouseOwnedItems(){
   // per-type organization. Returns zero counts so callers' guards/logs still work.
   return {incomeDropped:0, retDropped:0, invDropped:0, debtDropped:0};
 }
-function _dropSpouseOwnedItems_DISABLED(){
-  // Drop items tagged owner='spouse' from arrays where they shouldn't live
-  // in the V2 model. For Hybrid/Separate these belong on partner's own
-  // profile. For Individual they shouldn't exist at all.
-  // Returns {incomeDropped, retDropped, invDropped, debtDropped} for logging.
-  var counts = {incomeDropped:0, retDropped:0, invDropped:0, debtDropped:0};
-  if(Array.isArray(S.incomeSources)){
-    var before = S.incomeSources.length;
-    S.incomeSources = S.incomeSources.filter(function(s){ return (s.owner||'self') !== 'spouse'; });
-    counts.incomeDropped = before - S.incomeSources.length;
-  }
-  if(Array.isArray(S.retAccounts)){
-    var before2 = S.retAccounts.length;
-    S.retAccounts = S.retAccounts.filter(function(r){ return (r.owner||'self') !== 'spouse'; });
-    counts.retDropped = before2 - S.retAccounts.length;
-  }
-  if(Array.isArray(S.investments)){
-    var before3 = S.investments.length;
-    S.investments = S.investments.filter(function(i){ return (i.owner||'self') !== 'spouse'; });
-    counts.invDropped = before3 - S.investments.length;
-  }
-  if(Array.isArray(S.debts)){
-    var before4 = S.debts.length;
-    S.debts = S.debts.filter(function(d){ return (d.owner||'self') !== 'spouse'; });
-    counts.debtDropped = before4 - S.debts.length;
-  }
-  return counts;
-}
+// (Two-row MIRROR model) The earlier destructive variant of this function was
+// deleted: owner='spouse' items are part of the merged joint view and the de-merge
+// routes them to the partner's row — they must never be dropped on a type change.
 
 function _defensiveSpouseCleanup(){
   // Runs on every load for non-Joint household types — owner='spouse' items
@@ -15212,34 +15171,32 @@ function submitAdvisorRequestFromModal(){
               try{ if(typeof _syncJointGoalsToCoupleLinks === 'function') _syncJointGoalsToCoupleLinks(); }catch(e){}
             }, 800);
           }
-          if(jfd.employmentType){
-            if(!S.profile)S.profile={};
-            // Autofilled spouse value — overwrites manual entry since they're linked
+          // Two-row MIRROR model: each row already carries the partner's complete sp*
+          // summary (authoritative). The cached jfd relay only FILLS GAPS — it must
+          // not clobber the row's own mirror sp* with a possibly-stale cached value.
+          if(!S.profile)S.profile={};
+          if(jfd.employmentType && !S.profile.spouse_employment_type){
             S.profile.spouse_employment_type=jfd.employmentType;
             S.profile.spouseEmploymentType=jfd.employmentType;
             S.profile._spouseEmploymentAutofilled=true;
           }
-          // Phase 1B: Spouse retirement-age autofill from linked partner's profile
-          // Partner B's profile has THEIR retAge/dob/currentAge/ssBenefit. From partner A's
-          // view those are "spouse" fields — autofill so both partners see consistent data.
-          if(!S.profile)S.profile={};
-          if(jfd.retAge){
+          if(jfd.retAge && !S.profile.spRetAge){
             S.profile.spRetAge=jfd.retAge;
             S.profile._spouseRetAgeAutofilled=true;
             var spRetEl=document.getElementById('spRetAge');
             if(spRetEl&&!spRetEl.dataset.manualEdit)spRetEl.value=jfd.retAge;
           }
-          if(jfd.dob){
+          if(jfd.dob && !S.profile.spDOB){
             S.profile.spDOB=jfd.dob;
             var spDobEl=document.getElementById('spDOB');
             if(spDobEl&&!spDobEl.dataset.manualEdit){spDobEl.value=jfd.dob;syncSpouseAgeFromDOB();}
           }
-          if(jfd.currentAge){
+          if(jfd.currentAge && !S.profile.spCurrentAge){
             S.profile.spCurrentAge=jfd.currentAge;
             var spAgeEl=document.getElementById('spCurrentAge');
             if(spAgeEl&&!spAgeEl.dataset.manualEdit&&!spAgeEl.value)spAgeEl.value=jfd.currentAge;
           }
-          if(jfd.ssBenefit){
+          if(jfd.ssBenefit && !S.profile.spSsBenefit){
             S.profile.spSsBenefit=jfd.ssBenefit;
             var spSsEl=document.getElementById('spSsBenefit');
             if(spSsEl&&!spSsEl.dataset.manualEdit&&!spSsEl.value)spSsEl.value=jfd.ssBenefit;
