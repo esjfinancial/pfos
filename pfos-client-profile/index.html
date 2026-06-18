@@ -8400,6 +8400,7 @@ function _cpIRSMax(type,allocOrOwner){
   var owner=null;var alloc=null;
   if(typeof allocOrOwner==='string')owner=allocOrOwner;
   else if(allocOrOwner&&typeof allocOrOwner==='object'){owner=allocOrOwner.owner||'self';alloc=allocOrOwner;}
+  if(owner==='personal')owner='self';// 'personal' is the engine's synonym for the centered client ('self')
   // Wave 5: advisor override — treat as no cap when override attested
   if(alloc&&alloc._overrideIrs)return 99999;
   var age=CPLAN.age||35;
@@ -8539,13 +8540,13 @@ function _cpOwnerCurrentlyRetired(owner){
 // contribution under the IRS earned-income test (working partner's earned income
 // must cover the sum of both partners' IRA contributions).
 function _cpWorkingPartnerIncomeRemaining(retiredOwner){
-  var workingIsSpouse=(retiredOwner==='self');
+  var workingIsSpouse=(retiredOwner!=='spouse');// 'self'/'personal' both mean the centered client
   var workingMonthly=workingIsSpouse?(CPLAN._partner&&CPLAN._partner.income||0):(CPLAN.income||0);
   if(workingMonthly<=0)return 0;
   var workingOwner=workingIsSpouse?'spouse':'self';
   // Sum working partner's own IRA contributions (Roth + Traditional)
   var workingOwnIRAs=(CPLAN.allocations||[]).reduce(function(t,a){
-    var ao=a.owner||'self';
+    var ao=a.owner||'self';if(ao==='personal')ao='self';
     if(ao===workingOwner&&(a.type==='roth'||a.type==='trad_ira'))return t+(parseFloat(a.amount)||0);
     return t;
   },0);
@@ -8666,7 +8667,7 @@ function _cpEffectiveCapNote(type,idx){
   // Phase C: when joint/hybrid/separate, also note which partner this allocation belongs to
   var ownerNote='';
   if(alloc&&CPLAN._partner&&CPLAN._householdType!=='individual'){
-    var oOwner=alloc.owner||'self';
+    var oOwner=alloc.owner||'self';if(oOwner==='personal')oOwner='self';
     // Pick the right age + name for the owner of this allocation, then
     // word the note based on what catch-up actually applies at that age.
     // Under 50: no catch-up exists, so a "50+ catch-up uses age N" note
@@ -8675,7 +8676,9 @@ function _cpEffectiveCapNote(type,idx){
     if(oOwner==='self'){_onAge=CPLAN.age||35;_onName=((APP.currentClient&&APP.currentClient.name)||'You').split(' ')[0]||'You';}
     else if(oOwner==='spouse'){_onAge=CPLAN._partner.age||35;_onName=CPLAN._partner.firstName||'Partner';}
     if(oOwner==='joint'){
-      ownerNote=' &middot; joint &mdash; older partner\'s age applies';
+      // Age only governs IRS catch-up retirement cards. Joint house/invest/ef/debt
+      // (irsMax===99999, governed by available budget) have no age rule — don't imply one.
+      ownerNote=(irsMax<99999)?' &middot; joint &mdash; older partner\'s age applies':' &middot; joint &mdash; shared by both';
     } else if(_onAge>=60&&_onAge<=63){
       ownerNote=' &middot; 60–63 super catch-up uses age '+_onAge+' ('+esc(_onName)+')';
     } else if(_onAge>=50){
@@ -10484,7 +10487,7 @@ function _cpRunSimulation(){
     var _retCtx={};
     growthIdxList.forEach(function(idx){
       var a=CPLAN.allocations[idx];
-      var aOwner=a.owner||'self';
+      var aOwner=a.owner||'self';if(aOwner==='personal')aOwner='self';
       var isIRA=(a.type==='roth'||a.type==='trad_ira'||a.type==='ira');
       var spousalEligible=isIRA&&CPLAN._partner&&(aOwner==='self'||aOwner==='spouse');
       var otherOwner=aOwner==='self'?'spouse':'self';
@@ -19192,7 +19195,7 @@ function _cpAutoSuggestV2(){
 function _cpOwnerFirstName(which){
   // Resolve first name for 'self' (current user) or 'spouse' (partner).
   // Falls back to a sensible default per side.
-  if(which==='self'){
+  if(which==='self'||which==='personal'){
     var fd=APP._currentClientFd||{};
     var profile=(fd.S&&fd.S.profile)||{};
     if(profile.firstName) return profile.firstName;
@@ -19243,7 +19246,7 @@ function _cpOwnerBadge(a){
   var _selfNm=(typeof esc==='function')?esc(_cpOwnerFirstName('self')):_cpOwnerFirstName('self');
   var _spNm=(typeof esc==='function')?esc(_cpOwnerFirstName('spouse')):_cpOwnerFirstName('spouse');
   var _sel='<select title="'+safeTitle+'" onchange="_cpSetCardOwner('+_ix+',this.value)" onclick="event.stopPropagation()" style="margin-left:8px;padding:2px 6px;font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.06em;color:'+color+';background:'+bg+';border:1px solid '+brd+';border-radius:2px;text-transform:uppercase;white-space:nowrap;cursor:pointer;-webkit-appearance:none;appearance:none;padding-right:18px;background-image:url(\'data:image/svg+xml;utf8,<svg xmlns=%22http://www.w3.org/2000/svg%22 width=%228%22 height=%228%22 viewBox=%220 0 8 8%22><path d=%22M1 2.5L4 5.5L7 2.5%22 stroke=%22%23999%22 stroke-width=%221.2%22 fill=%22none%22 stroke-linecap=%22round%22/></svg>\');background-repeat:no-repeat;background-position:right 5px center">';
-  _sel+='<option value="self"'+(owner==='self'?' selected':'')+'>'+_selfNm+'</option>';
+  _sel+='<option value="self"'+((owner==='self'||owner==='personal')?' selected':'')+'>'+_selfNm+'</option>';
   _sel+='<option value="spouse"'+(owner==='spouse'?' selected':'')+'>'+_spNm+'</option>';
   // Per-person lock: retirement + cash-value insurance can't be Shared (single-owner
   // per IRS). Offer 'Shared' only for joint-eligible types (or if already joint, so a
@@ -19876,7 +19879,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='</div>';
     // Your portion
     h+='<div style="display:flex;align-items:center;gap:8px">';
-    h+='<div style="width:80px;font-size:11px;color:#5B9BFF;font-weight:700">You</div>';
+    h+='<div style="width:80px;font-size:11px;color:#5B9BFF;font-weight:700">'+esc(_cpOwnerFirstName('self'))+'</div>';
     h+='<input type="range" data-cpjointidx="'+idx+'" data-cpjointside="self" min="0" max="'+_jointMax+'" step="5" value="'+Math.round(_curSelfPart)+'" oninput="_cpSlideJoint('+idx+',\'self\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:#5B9BFF;height:6px">';
     h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpJointSelf'+idx+'" value="'+Math.round(_curSelfPart)+'" min="0" max="'+_jointMax+'" step="5" oninput="_cpSlideJoint('+idx+',\'self\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
     h+='</div>';
@@ -21495,7 +21498,7 @@ function _cpExtractRedFlags(){
     // 401(k)s aren't possible (one-owner IRS rule), so just self-owned matter.
     var _planExtra=CPLAN.allocations.reduce(function(t,a){
       if(!a||a.type!=='401k')return t;
-      if(a.owner&&a.owner!=='self')return t;
+      if(a.owner&&a.owner!=='self'&&a.owner!=='personal')return t;
       return t+(parseFloat(a.amount)||0);
     },0);
     var _totalContrib=_curContrib+_planExtra;
@@ -22759,8 +22762,11 @@ function _cpSlideJoint(i,side,v){
   var totalSurplus=CPLAN.surplus||0;
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
   var budgetTotal=Math.round(totalSurplus*(1-brPct));
-  var selfInc=CPLAN.income||0;
   var spouseInc=(CPLAN._partner&&CPLAN._partner.income)||0;
+  // In a JOINT household CPLAN.income is ALREADY the merged both-spouses income, so the
+  // centered client's own income = merged - partner. Hybrid/separate keep CPLAN.income
+  // self-only, so leave it as-is there (subtracting the partner would under-count self).
+  var selfInc=(CPLAN._householdType==='joint')?Math.max(0,(CPLAN.income||0)-spouseInc):(CPLAN.income||0);
   var combInc=selfInc+spouseInc;
   var selfShare=combInc>0?(selfInc/combInc):0.5;
   var selfBudget=Math.round(budgetTotal*selfShare);
@@ -22788,7 +22794,7 @@ function _cpSlideJoint(i,side,v){
   var selfOtherRegular=0;
   (CPLAN.allocations||[]).forEach(function(other,j){
     if(j===i)return;
-    if(other.owner!=='self')return;
+    if(other.owner!=='self'&&other.owner!=='personal')return;
     selfOtherRegular+=parseFloat(other.amount)||0;
   });
   // Separate: the spouse's own pot is also consumed by THEIR regular (spouse-owned)
