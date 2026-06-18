@@ -9982,8 +9982,35 @@ function _cpRunSimulation(){
     // engine runs at every _cpRunSimulation call (not time-walking), and
     // zeroing unconditionally would erase the user's pre-recovery loan info
     // in every simulation pass, breaking the Phase 2 loan UI entirely.
-    // Specific cascade target — gate by owner match in hybrid
-    if(ev.cascade){
+    // Advisor-chosen split (cascadeSplit) takes priority over the single-target /
+    // proportional default. Each entry routes a fixed $/mo to a destination card
+    // (matched by type — new destination cards are created at prompt time and tagged
+    // to this source's completion phase, so they already exist here). Boosts land via
+    // allocFuture so the existing phase renderer shows the grayed source + funds moving
+    // + the new card. Any IRS-capped remainder falls through to the passes below.
+    var _split=(_srcAlloc&&_srcAlloc.cascadeSplit&&_srcAlloc.cascadeSplit.length)?_srcAlloc.cascadeSplit:null;
+    if(_split){
+      _split.forEach(function(sp){
+        if(freed<=0)return;
+        var want=Math.min(parseFloat(sp.amount)||0,freed);
+        if(want<=0)return;
+        var sIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===sp.type&&sIdx<0&&_cascadeOwnerOK(a2.owner))sIdx=i2;});
+        if(sIdx<0)return;
+        var irsMaxSp=_cpIRSMax(CPLAN.allocations[sIdx].type,CPLAN.allocations[sIdx]);
+        var addSp=Math.min(want,Math.max(0,irsMaxSp-allocAmounts[sIdx]));
+        if(addSp>0){
+          allocAmounts[sIdx]+=addSp;
+          if(allocFuture[sIdx].startsMonth<0)allocFuture[sIdx].startsMonth=ev.month;
+          allocFuture[sIdx].futureAmount=allocAmounts[sIdx];
+          allocFuture[sIdx].reason=ev.label;
+          allocFuture[sIdx].boosts.push({month:ev.month,amount:addSp,from:ev.label});
+          destinations.push({type:CPLAN.allocations[sIdx].type,name:CPLAN.allocations[sIdx].customName||CP_NM[CPLAN.allocations[sIdx].type],amount:addSp});
+          freed-=addSp;
+        }
+      });
+    }
+    // Specific cascade target — gate by owner match in hybrid. Skipped when a split routed.
+    if(!_split&&ev.cascade){
       var tIdx=-1;CPLAN.allocations.forEach(function(a2,i2){if(a2.type===ev.cascade&&tIdx<0&&_cascadeOwnerOK(a2.owner))tIdx=i2;});
       if(tIdx>=0){
         var irsMax=_cpIRSMax(CPLAN.allocations[tIdx].type,CPLAN.allocations[tIdx]);
@@ -20981,7 +21008,11 @@ function _cpBuildCard(a,idx,isUnassigned){
     // Resolve the cascade label — what destination does this item flow to when done?
     var _casLabel='Redistributes to all growth accounts';
     var _casColor='var(--gr)';
-    if(a.cascade&&a.cascade!=='__new__'){
+    var _hasSplit=a.cascadeSplit&&a.cascadeSplit.length;
+    if(_hasSplit){
+      _casLabel='Splits: '+a.cascadeSplit.map(function(s){return fmt(s.amount)+'→'+(CP_NM[s.type]||s.type);}).join(', ');
+      _casColor='#5B9BFF';
+    } else if(a.cascade&&a.cascade!=='__new__'){
       var _destAlloc=CPLAN.allocations.find(function(x){return x.type===a.cascade;});
       if(_destAlloc){
         var _destName=_destAlloc.customName||CP_NM[_destAlloc.type]||_destAlloc.type;
@@ -21002,7 +21033,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     }
     h+='</div>';
     if(a.amount>0&&!a._completed){
-      var _flowText=a.cascade&&a.cascade!=='__new__'?fmt(_estFreed2)+'/mo freed → all goes to '+_casLabel.replace(/^Boosts /,''):fmt(_estFreed2)+'/mo freed → distributed proportionally across all active growth items';
+      var _flowText=_hasSplit?fmt(_estFreed2)+'/mo freed → '+_casLabel.replace(/^Splits: /,''):(a.cascade&&a.cascade!=='__new__'?fmt(_estFreed2)+'/mo freed → all goes to '+_casLabel.replace(/^Boosts /,''):fmt(_estFreed2)+'/mo freed → distributed proportionally across all active growth items');
       h+='<div style="font-size:11px;color:var(--mu);margin-top:2px">'+_flowText+'</div>';
     }
   }
@@ -27622,36 +27653,33 @@ function _cpShowCascadePromptModal(idx,growthCandidates,months){
   } else {
     h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.6;margin-bottom:14px">Once you set a monthly amount and this finishes funding, the freed cash needs a destination. By default it spreads proportionally across all growth allocations. Direct it to one specific place if you prefer.</div>';
   }
-  h+='<div style="display:flex;flex-direction:column;gap:8px;margin-bottom:14px">';
-  // Option 1: Proportional (default)
-  var isProportional=!a.cascade;
-  h+='<label style="display:flex;gap:10px;padding:10px 12px;background:'+(isProportional?'rgba(34,197,94,.06)':'transparent')+';border:1px solid '+(isProportional?'rgba(34,197,94,.25)':'var(--bd)')+';border-radius:4px;cursor:pointer;transition:background .12s ease">';
-  h+='<input type="radio" name="cpCascadeChoice" value="" '+(isProportional?'checked':'')+' style="accent-color:var(--gr);margin-top:2px;flex-shrink:0">';
-  h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--gr);margin-bottom:2px">Proportional redistribution <span style="font-size:11px;color:var(--mu);font-weight:600;letter-spacing:.04em">(default)</span></div>';
-  h+='<div style="font-size:11px;color:var(--mu);line-height:1.5">Spreads <strong style="color:var(--wh)">'+fmt(freed)+'/mo</strong> across all '+(growthCandidates.length||'')+' growth allocations weighted by their current amount.</div></div></label>';
-  // Option 2: Boost existing
-  if(growthCandidates.length>0){
-    h+='<label style="display:flex;gap:10px;padding:10px 12px;background:'+(a.cascade&&a.cascade!=='__new__'?'rgba(91,155,255,.06)':'transparent')+';border:1px solid '+(a.cascade&&a.cascade!=='__new__'?'rgba(91,155,255,.25)':'var(--bd)')+';border-radius:4px;cursor:pointer;transition:background .12s ease">';
-    h+='<input type="radio" name="cpCascadeChoice" value="boost" '+(a.cascade&&a.cascade!=='__new__'?'checked':'')+' style="accent-color:#5B9BFF;margin-top:2px;flex-shrink:0" onchange="document.getElementById(\'cpCascadeBoostSel\').focus()">';
-    h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;margin-bottom:6px">Boost an existing allocation</div>';
-    h+='<select id="cpCascadeBoostSel" style="width:100%;padding:8px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:3px;box-sizing:border-box;min-height:34px" onfocus="document.querySelector(\'input[name=cpCascadeChoice][value=boost]\').checked=true">';
-    growthCandidates.forEach(function(c){
-      var cnm=c.customName||CP_NM[c.type]||c.type;
-      var ic=CP_IC[c.type]||'⭐';
-      var sel=a.cascade===c.type?' selected':'';
-      var preview=fmt((c.amount||0)+freed);
-      h+='<option value="'+c.type+'"'+sel+'>'+ic+' '+esc(cnm)+' — boost from '+fmt(c.amount||0)+' to '+preview+'/mo</option>';
-    });
-    h+='</select>';
-    h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;line-height:1.5">All <strong style="color:var(--wh)">'+fmt(freed)+'/mo</strong> goes to chosen item once this finishes.</div>';
-    h+='</div></label>';
-  }
-  // Option 3: Add new
-  h+='<label style="display:flex;gap:10px;padding:10px 12px;background:'+(a.cascade==='__new__'?'rgba(168,85,247,.06)':'transparent')+';border:1px solid '+(a.cascade==='__new__'?'rgba(168,85,247,.25)':'var(--bd)')+';border-radius:4px;cursor:pointer;transition:background .12s ease">';
-  h+='<input type="radio" name="cpCascadeChoice" value="new" '+(a.cascade==='__new__'?'checked':'')+' style="accent-color:#A855F7;margin-top:2px;flex-shrink:0">';
-  h+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#A855F7;margin-bottom:2px">Add a new allocation as the destination</div>';
-  h+='<div style="font-size:11px;color:var(--mu);line-height:1.5">Pick a new growth vehicle (Roth, IUL, brokerage, etc.) and the freed <strong style="color:var(--wh)">'+fmt(freed)+'/mo</strong> will boost it once this finishes.</div></div></label>';
+  // ── Split editor: allocate the freed $/mo across existing + new destinations ──
+  // Each amount routes a fixed $/mo to that destination when this source finishes.
+  // New accounts are created tagged to this source's completion phase, so they
+  // appear as new cards in that phase (with the funds-moving boost banner).
+  var _tgtPhase=(typeof _cpSourcePhase==='function')?_cpSourcePhase(idx):2;
+  var _savedSplit={};
+  if(a.cascadeSplit&&a.cascadeSplit.length){a.cascadeSplit.forEach(function(sp){_savedSplit[sp.type]=(_savedSplit[sp.type]||0)+(parseFloat(sp.amount)||0);});}
+  h+='<div style="font-size:12px;color:var(--mu);line-height:1.5;margin-bottom:8px">Split the freed <strong style="color:var(--gr)">'+fmt(freed)+'/mo</strong> across any of these. New accounts appear in <strong style="color:var(--wh)">Phase '+_tgtPhase+'</strong> when '+esc(nm)+' finishes. Leave everything at $0 to keep the default proportional spread.</div>';
+  h+='<div style="display:flex;flex-direction:column;gap:6px;margin-bottom:8px">';
+  growthCandidates.forEach(function(c){
+    var cnm=c.customName||CP_NM[c.type]||c.type;
+    var ic=CP_IC[c.type]||'⭐';
+    var pre=Math.round(_savedSplit[c.type]||0);
+    h+='<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;background:rgba(91,155,255,.04);border:1px solid var(--bd);border-radius:4px">';
+    h+='<span style="font-size:14px">'+ic+'</span><div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+esc(cnm)+'</div><div style="font-size:10px;color:var(--mu)">now '+fmt(c.amount||0)+'/mo</div></div>';
+    h+='<div class="inp-prefix" style="width:96px;flex-shrink:0"><span class="pfx">$</span><input class="inp cpSplitAmt" data-dtype="'+c.type+'" data-isnew="0" type="number" min="0" step="5" value="'+pre+'" oninput="_cpCascadeSplitTotal()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+    h+='</div>';
+  });
   h+='</div>';
+  // Add-new destination row
+  h+='<div style="display:flex;align-items:center;gap:8px;padding:7px 10px;background:rgba(168,85,247,.05);border:1px dashed rgba(168,85,247,.3);border-radius:4px;margin-bottom:10px">';
+  h+='<span style="font-size:14px">&#10133;</span>';
+  h+='<select id="cpSplitNewType" style="flex:1;min-width:0;padding:6px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:12px;border-radius:3px;min-height:30px"><option value="">New account&hellip;</option><option value="roth">Roth IRA</option><option value="trad_ira">Traditional IRA</option><option value="401k">401(k) &mdash; beyond match</option><option value="hsa">HSA</option><option value="invest">Taxable Brokerage</option></select>';
+  h+='<div class="inp-prefix" style="width:96px;flex-shrink:0"><span class="pfx">$</span><input class="inp cpSplitAmt" id="cpSplitNewAmt" data-isnew="1" type="number" min="0" step="5" value="0" oninput="_cpCascadeSplitTotal()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
+  h+='</div>';
+  // Live total
+  h+='<div id="cpSplitTotalRow" data-freed="'+Math.round(freed)+'" style="display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-radius:4px;background:rgba(100,116,139,.06);margin-bottom:10px;font-size:12px"><span style="color:var(--mu)">Allocated</span><span id="cpSplitTotalTxt" style="font-family:var(--fd);font-weight:700;color:var(--gr)">'+fmt(0)+' / '+fmt(freed)+'</span></div>';
   // Don't ask again
   h+='<label style="display:flex;align-items:center;gap:8px;font-size:11px;color:var(--mu);cursor:pointer;padding:6px 0;border-top:1px solid var(--bd);margin-top:6px">';
   h+='<input type="checkbox" id="cpCascadeDontAsk" style="width:16px;height:16px;accent-color:#5B9BFF;cursor:pointer"> Don\'t ask about cascade for the rest of this session';
@@ -27666,44 +27694,135 @@ function _cpShowCascadePromptModal(idx,growthCandidates,months){
   openModal('cpCascadePromptModal');
 }
 
-// Apply choice — reads radio + boost dropdown + don't-ask toggle
+// Apply — reads the per-destination split amounts, creates any new destination
+// card (tagged to the source's completion phase), and stores a.cascadeSplit.
+// Leaving everything at $0 clears the split → the proportional default applies.
 function _cpCascadePromptApply(idx){
   var a=CPLAN.allocations[idx];if(!a){closeModal('cpCascadePromptModal');return;}
-  var choice='';
-  var radios=document.getElementsByName('cpCascadeChoice');
-  for(var i=0;i<radios.length;i++){if(radios[i].checked){choice=radios[i].value;break;}}
   var dontAsk=!!(document.getElementById('cpCascadeDontAsk')||{}).checked;
   if(dontAsk)CPLAN._cascadePromptOff=true;
-  if(choice==='boost'){
-    var sel=document.getElementById('cpCascadeBoostSel');
-    var destType=sel?sel.value:'';
-    a.cascade=destType||'';
-    CPLAN.modified=true;
-    closeModal('cpCascadePromptModal');
-    _cpRenderPlanFull();
-    _cpToast('✓ Cascade set: when '+(a.customName||CP_NM[a.type]||a.type)+' finishes, all freed cash boosts '+(CP_NM[destType]||destType));
-  } else if(choice==='new'){
-    a.cascade='__new__';// pending — resolved when advisor adds the new allocation
-    CPLAN.modified=true;
-    closeModal('cpCascadePromptModal');
-    // Open the Add Menu so advisor picks the new destination type
-    var phaseForNew=a.phase>0?a.phase:1;
-    _cpShowAddMenu(phaseForNew);
-    CPLAN._cascadePendingFor=idx;
-    _cpToast('Pick a new allocation — it will receive the cascade once the source finishes');
-  } else {
-    // Proportional — clear cascade
-    a.cascade='';
-    CPLAN.modified=true;
-    closeModal('cpCascadePromptModal');
-    _cpRenderPlanFull();
+  var split=[];var newType='';var newAmt=0;
+  var inputs=document.querySelectorAll('.cpSplitAmt');
+  for(var i=0;i<inputs.length;i++){
+    var amt=parseFloat(inputs[i].value)||0;
+    if(amt<=0)continue;
+    if(inputs[i].getAttribute('data-isnew')==='1'){
+      var selN=document.getElementById('cpSplitNewType');newType=selN?selN.value:'';newAmt=amt;
+    } else {
+      split.push({type:inputs[i].getAttribute('data-dtype'),amount:Math.round(amt)});
+    }
   }
+  // Create the new destination card at the source's completion phase, then add to split.
+  if(newType&&newAmt>0&&typeof _cpCreateCascadeDest==='function'){
+    var tgtPhase=(typeof _cpSourcePhase==='function')?_cpSourcePhase(idx):2;
+    _cpCreateCascadeDest(newType,tgtPhase);
+    split.push({type:newType,amount:Math.round(newAmt)});
+  }
+  if(split.length){
+    a.cascadeSplit=split;a.cascade='';
+    _cpToast('✓ Cascade set: '+split.map(function(s){return fmt(s.amount)+'→'+(CP_NM[s.type]||s.type);}).join(', ')+' when '+(a.customName||CP_NM[a.type]||a.type)+' finishes');
+  } else {
+    a.cascadeSplit=null;a.cascade='';// proportional default
+  }
+  CPLAN.modified=true;
+  closeModal('cpCascadePromptModal');
+  _cpRenderPlanFull();
 }
 
 function _cpCascadePromptDismiss(){
   var dontAsk=!!(document.getElementById('cpCascadeDontAsk')||{}).checked;
   if(dontAsk)CPLAN._cascadePromptOff=true;
   closeModal('cpCascadePromptModal');
+}
+// Live "allocated / freed" total in the split editor — green when balanced, red when over.
+function _cpCascadeSplitTotal(){
+  var row=document.getElementById('cpSplitTotalRow');if(!row)return;
+  var freed=parseFloat(row.getAttribute('data-freed'))||0;
+  var inputs=document.querySelectorAll('.cpSplitAmt');var tot=0;
+  for(var i=0;i<inputs.length;i++)tot+=parseFloat(inputs[i].value)||0;
+  var txt=document.getElementById('cpSplitTotalTxt');
+  if(txt){txt.textContent=fmt(Math.round(tot))+' / '+fmt(freed);txt.style.color=(tot>freed+0.5)?'var(--rd)':((tot>0&&Math.abs(tot-freed)<1)?'var(--gr)':'var(--yl)');}
+}
+// Create a new growth destination card tagged to a later phase (so it renders as a
+// "new card" in that phase). amount starts at 0 — the cascade boost funds it.
+function _cpCreateCascadeDest(type,phase){
+  var isInsurance=(type==='iul'||type==='wl'||type==='ibc'||type==='term_life');
+  var policyId=isInsurance?('pol_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8)):null;
+  var alloc={type:type,amount:0,target:0,phase:phase||2,cascade:'',customName:'',
+    _state:'proposed',_policyId:policyId,_policyNumber:null,_lockedPremium:null,_openedDate:null,
+    _isActionOnly:false,_cascadeDest:true};
+  if(type==='edu')alloc.eduVehicle='529';
+  CPLAN.allocations.push(alloc);
+  return CPLAN.allocations.length-1;
+}
+// Which phase does this source allocation's freed cash start in? Its completion is
+// the Nth cascade event (event 0 → Phase 2, event 1 → Phase 3, …). Mirrors the
+// phase-tab derivation in _cpRenderPlanFull. Defaults to Phase 2.
+function _cpSourcePhase(srcIdx){
+  var evs=((CPLAN._sim&&CPLAN._sim.events)||[]).filter(function(e){return (e.freed>0||e._ibcContinues>0)&&e.type!=='debt_milestone'&&(e.month||0)>0;});
+  for(var i=0;i<evs.length;i++){if(evs[i].allocIdx===srcIdx)return i+2;}
+  return 2;
+}
+// ── Publish-time cascade reconciliation guard ──
+// Returns issues (empty = clean): freed money stranded with no destination
+// (overflow), or a split whose total no longer matches freed / points at a
+// removed account. Re-runs the sim so the freed/overflow figures are current.
+function _cpCascadeIssues(){
+  var issues=[];
+  if(typeof _cpRunSimulation==='function'){try{_cpRunSimulation();}catch(e){}}
+  var evs=((CPLAN._sim&&CPLAN._sim.events)||[]);
+  evs.forEach(function(ev){
+    if(!ev||ev.type==='debt_milestone'||(ev.month||0)<=0)return;
+    if((ev.freed||0)<=0)return;
+    var over=ev._cascadeOverflow||0;
+    if(over>0.5){
+      var src=(ev.allocIdx!=null)?CPLAN.allocations[ev.allocIdx]:null;
+      issues.push({srcIdx:(ev.allocIdx!=null?ev.allocIdx:-1),kind:'unallocated',
+        label:src?(src.customName||CP_NM[src.type]||src.type):(ev.label||'A goal'),
+        date:_cpFormatCompletionLabel(ev.month),amount:Math.round(over)});
+    }
+  });
+  CPLAN.allocations.forEach(function(a,i){
+    if(!a||!a.cascadeSplit||!a.cascadeSplit.length)return;
+    var freed=(parseFloat(a.amount)||0)+(a.type==='debt'?(CPLAN.debtMin||0):0);
+    var sum=a.cascadeSplit.reduce(function(t,s){return t+(parseFloat(s.amount)||0);},0);
+    var missing=a.cascadeSplit.filter(function(s){return !CPLAN.allocations.some(function(x){return x.type===s.type;});});
+    if(sum>freed+1||missing.length){
+      issues.push({srcIdx:i,kind:'broken',label:(a.customName||CP_NM[a.type]||a.type),
+        date:_cpFormatCompletionLabel(_cpEstCompletionMonths(a)),amount:Math.round(sum),freed:Math.round(freed)});
+    }
+  });
+  return issues;
+}
+function _cpShowCascadeGuardModal(issues){
+  var el=document.getElementById('cpCascadeGuardModal');
+  if(!el){el=document.createElement('div');el.id='cpCascadeGuardModal';el.className='modal-bg';el.setAttribute('role','dialog');el.setAttribute('aria-modal','true');el.onclick=function(ev){if(ev.target===el)closeModal('cpCascadeGuardModal');};document.body.appendChild(el);}
+  var h='<div class="modal" style="max-width:540px">';
+  h+='<button class="modal-close" onclick="closeModal(\'cpCascadeGuardModal\')" aria-label="Close">✕</button>';
+  h+='<div class="modal-hdr"><div class="modal-title"><span style="margin-right:8px">🔄</span>Freed funds need a destination</div></div>';
+  h+='<div style="padding:0 4px 8px">';
+  h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.6;margin-bottom:12px">Before publishing, set where this freed money goes so nothing slips through the cracks — or publish anyway and it stays as cash / breathing room.</div>';
+  issues.forEach(function(it){
+    var msg=it.kind==='broken'
+      ? esc(it.label)+'’s split ('+fmt(it.amount)+'/mo) no longer matches the freed '+fmt(it.freed)+'/mo, or points at a removed account.'
+      : esc(it.label)+' frees '+fmt(it.amount)+'/mo'+(it.date?' by '+it.date:'')+' — not redistributed.';
+    h+='<div style="display:flex;align-items:center;gap:10px;padding:10px 12px;margin-bottom:8px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.22);border-radius:4px">';
+    h+='<span style="font-size:14px;flex-shrink:0">'+(it.kind==='broken'?'⚠️':'🔄')+'</span>';
+    h+='<div style="flex:1;min-width:0;font-size:12px;color:var(--wh);line-height:1.5">'+msg+'</div>';
+    if(it.srcIdx>=0)h+='<button onclick="closeModal(\'cpCascadeGuardModal\');_cpMaybeShowCascadePrompt('+it.srcIdx+',true)" style="flex-shrink:0;padding:7px 12px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.15);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:34px">Reallocate</button>';
+    h+='</div>';
+  });
+  h+='<div style="display:flex;gap:8px;justify-content:flex-end;padding-top:10px;border-top:1px solid var(--bd);margin-top:6px">';
+  h+='<button onclick="closeModal(\'cpCascadeGuardModal\')" style="padding:10px 18px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Go back</button>';
+  h+='<button onclick="_cpCascadeGuardPublishAnyway()" style="padding:10px 22px;background:rgba(34,197,94,.16);border:1px solid rgba(34,197,94,.4);color:var(--gr);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">Publish anyway</button>';
+  h+='</div></div></div>';
+  el.innerHTML=h;
+  openModal('cpCascadeGuardModal');
+}
+function _cpCascadeGuardPublishAnyway(){
+  CPLAN._cpPublishBypassCascade=true;
+  closeModal('cpCascadeGuardModal');
+  _cpPublishPlan();
 }
 
 // ─── Wave 5 round 11: Why explainer + learn slug map ───
@@ -28495,6 +28614,14 @@ async function _cpSavePlan(){
 async function _cpPublishPlan(){
   if(!APP.currentClientId)return;
   if(!CPLAN.allocations||!CPLAN.allocations.length){_advShowToast('Add at least one allocation before publishing.','warning');return;}
+  // Cascade reconciliation guard — freed money must have a destination, and any
+  // split must still reconcile. Surfaces a prompt (reallocate / publish anyway)
+  // so nothing slips through. Skippable for one call via _cpPublishBypassCascade.
+  if(!CPLAN._cpPublishBypassCascade && typeof _cpCascadeIssues==='function'){
+    var _casIssues=_cpCascadeIssues();
+    if(_casIssues.length){_cpShowCascadeGuardModal(_casIssues);return;}
+  }
+  CPLAN._cpPublishBypassCascade=false;
   var btn=document.querySelector('[onclick="_cpPublishPlan()"]');
   if(btn){btn.disabled=true;btn.textContent='Publishing…';}
   try{
