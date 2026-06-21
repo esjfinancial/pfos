@@ -2018,6 +2018,10 @@ async function _approveUnlink(reqId,clientId){
 async function _approveDelReq(reqId,clientId){
   if(!confirm('This will PERMANENTLY delete the client account and ALL associated data. Are you sure?'))return;
   try{
+    // Chunk 17: detach + purge the client's Plaid items FIRST (tokens still decryptable) so no bank item is
+    // orphaned/billing; abort if it can't (retryable).
+    var _pdc=await db.functions.invoke('plaid-delete-client',{body:{client_id:clientId}});
+    if(_pdc.error||(_pdc.data&&_pdc.data.ok===false)){ alert('Could not disconnect the client’s linked banks — deletion aborted. Please retry.'); return; }
     // Complete right-to-erasure via the admin-only cascade (was: only the clients row → orphaned PII).
     var _casc=await db.rpc('delete_client_cascade',{p_client_id:clientId});
     if(_casc.error){ alert('Deletion failed: '+_casc.error.message); return; }
@@ -2593,7 +2597,12 @@ async function confirmDeleteClient(clientId){
   if(APP.role !== 'admin'){ alert('Only admins can delete clients.'); return; }
   if(!confirm('Permanently delete this client and all their data? This cannot be undone.')) return;
   try{
-    await db.from('clients').delete().eq('id', clientId);
+    // Chunk 17: route through the Plaid pre-step (detach+purge bank items FIRST) + the admin cascade RPC — the
+    // raw clients.delete() orphaned Plaid items (still billing) AND skipped the RPC's non-FK purges.
+    var _pdc=await db.functions.invoke('plaid-delete-client',{body:{client_id:clientId}});
+    if(_pdc.error||(_pdc.data&&_pdc.data.ok===false)){ alert('Could not disconnect the client’s linked banks — deletion aborted. Please retry.'); return; }
+    var _casc=await db.rpc('delete_client_cascade',{p_client_id:clientId});
+    if(_casc.error){ alert('Delete failed: '+_casc.error.message); return; }
     APP.myClients  = APP.myClients.filter(function(c){ return c.id !== clientId; });
     APP.allClients = (APP.allClients||[]).filter(function(c){ return c.id !== clientId; });
     await renderDashboard();
@@ -2807,7 +2816,7 @@ window.addEventListener('message',async function(e){
       var touched=state._touched||{};
       if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
         var exS=ex.data.financial_data.S;
-        ['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations'].forEach(function(sec){
+        ['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash'].forEach(function(sec){
           if(!touched[sec]){
             var exVal=exS[sec];
             if(exVal===undefined||exVal===null)return;
@@ -4220,8 +4229,9 @@ function getEffectiveTier(client){
   var trialStart = client.trial_start_date ? new Date(client.trial_start_date) : null;
   if(!trialStart) return t; // no trial_start_date = show purchased tier directly
   var daysUsed = Math.floor((Date.now() - trialStart.getTime()) / 86400000);
-  if(daysUsed < 14) return 'trial';
-  return t; // trial expired — resolve to purchased tier
+  // Trial only UPGRADES a sub-Pro tier; never downgrade a paid Pro/Pro+ client (comp returned above).
+  if(daysUsed < 14 && t!=='pro' && t!=='pro_plus') return 'trial';
+  return t; // trial expired (or paid tier already >= Pro) — resolve to purchased tier
 }
 function getTrialDaysLeft(client){
   if(!client || !client.trial_start_date) return 0;
@@ -17001,6 +17011,6 @@ var m=document.createElement('div');m.style.cssText='position:fixed;bottom:20px;
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v53.js" defer></script>
+<script src="/pfos-core.v54.js" defer></script>
 </body>
 </html>

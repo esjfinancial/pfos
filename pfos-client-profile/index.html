@@ -2308,7 +2308,7 @@ function _isJointModelV2(couple){
 }
 
 // Owner-taggable arrays that participate in the joint merge.
-var _JOINT_MERGE_ARRAYS = ['incomeSources','retAccounts','investments','debts','goals'];
+var _JOINT_MERGE_ARRAYS = ['incomeSources','retAccounts','investments','debts','goals','linkedCash'];
 
 // sp* profile field <-> partner self profile field mapping (D4). Used to project
 // B's self profile fields into A's sp* fields on read, and split them back on write.
@@ -2350,6 +2350,19 @@ function _mergeJointState(aS, bS){
       }
     });
   });
+  // 1b) Chunk 13 — dedupe a SAME real account that BOTH partners linked (jointly-held). After appending B's
+  //     items, drop any B-appended Plaid item whose institution_id+mask+subtype matches an A item — the
+  //     deterministic winner is A's copy (A-row is the canonical joint store). Keyed ONLY when _instId AND
+  //     _mask are present (Plaid can omit a mask -> skip/keep both); manual items (no _instId) never match;
+  //     cross-owner only (A keys from non-_fromBRow), so a partner's own distinct accounts never collapse.
+  _JOINT_MERGE_ARRAYS.forEach(function(arr){
+    var items = merged[arr]; if(!Array.isArray(items)) return;
+    var aKeys = {};
+    items.forEach(function(it){ if(it && !it._fromBRow && it._instId && it._mask) aKeys[it._instId+'|'+it._mask+'|'+(it.subtype||it.type||'')] = true; });
+    merged[arr] = items.filter(function(it){
+      return !(it && it._fromBRow && it._instId && it._mask && aKeys[it._instId+'|'+it._mask+'|'+(it.subtype||it.type||'')]);
+    });
+  });
   // 2) Profile sp* fields <- B's self fields (AUTHORITATIVE: B's current self always
   //    wins on A's sp* projection; skipped only when B's value is empty/missing).
   if(bS.profile){
@@ -2378,6 +2391,7 @@ function _demergeJointState(mergedS, baseB){
   if(!bS.profile) bS.profile = {};
   _JOINT_MERGE_ARRAYS.forEach(function(arr){
     var items = Array.isArray(aS[arr]) ? aS[arr] : [];
+    var bOrig = Array.isArray(bS[arr]) ? bS[arr] : [];   // Chunk 13: B's stored items, before overwrite
     var keepA = [];
     var toB = [];
     items.forEach(function(it){
@@ -2395,6 +2409,11 @@ function _demergeJointState(mergedS, baseB){
     });
     aS[arr] = keepA;
     bS[arr] = toB;
+    // Chunk 13: re-home B's OWN synced (Plaid) items that the joint-merge inst+mask dedupe dropped from the
+    // merged view, so a joint save never strips a linked account from B's row (B keeps what B linked). Keyed
+    // by _plaidAccountId; only re-adds synced items ABSENT from toB (manual items round-trip via toB as before).
+    var inB = {}; toB.forEach(function(it){ if(it && it._plaidAccountId) inB[it._plaidAccountId] = true; });
+    bOrig.forEach(function(it){ if(it && it._plaidAccountId && !inB[it._plaidAccountId]){ var c = Object.assign({}, it); delete c._fromBRow; bS[arr].push(c); } });
   });
   // Profile: MIRROR (KEEP IN SYNC with pfos-client). Each row ends COMPLETE =
   // self + partner-summary(sp*). B.self <- A.sp* (the spouse data entered on the
@@ -2872,7 +2891,7 @@ async function _jmDemergeWriteB(couple, mergedState){
 // Hybrid/Separate store shared items in couple_links.joint_financial_data (JFD),
 // hydrated by pfos-main into S._jointItems. Switching between these MUST relocate
 // the shared items between the two stores (personal data never moves).
-var _JM_JFD_ARRAYS = ['incomeSources','retAccounts','investments','debts'];
+var _JM_JFD_ARRAYS = ['incomeSources','retAccounts','investments','debts','linkedCash']; // Chunk 13: linkedCash relocates on joint<->hybrid switch too (else joint linked cash strands on A at 100%, not share-weighted)
 
 // Shape a joint item for JFD (matches pfos-main _collectJointItemsForMigration).
 function _jmShapeForJFD(src, fromClientId){
@@ -3754,7 +3773,8 @@ function getEffectiveTier(client){
   if(t === 'comp') return 'comp';
   if(client.trial_start_date){
     var diffDays = Math.floor((Date.now() - new Date(client.trial_start_date).getTime()) / (1000*60*60*24));
-    if(diffDays <= 14) return 'trial';
+    // Trial only UPGRADES a sub-Pro tier; never downgrade a paid Pro/Pro+ client (comp returned above).
+    if(diffDays <= 14 && t!=='pro' && t!=='pro_plus') return 'trial';
   }
   return t;
 }
@@ -5664,8 +5684,14 @@ async function confirmDeleteClient(clientId){
   deleteClient(clientId);
 }
 async function deleteClient(clientId){
+  if(APP.role!=='admin'){ _advShowToast('Only admins can delete clients.','error'); return; }  // Chunk 17 LOW: client-side guard for a clean message (the edge fn + RPC already enforce admin server-side)
   try {
-    const { error } = await db.from('clients').delete().eq('id', clientId);
+    // Chunk 17: detach + purge the client's Plaid items FIRST (tokens still decryptable → no orphaned/billing
+    // item), then the admin cascade RPC. Replaces a raw clients.delete() that orphaned Plaid items + skipped the
+    // RPC. The edge fn (role='admin') + the RPC (get_my_role()='admin') enforce admin server-side regardless.
+    const _pdc = await db.functions.invoke('plaid-delete-client',{body:{client_id:clientId}});
+    if(_pdc.error || (_pdc.data && _pdc.data.ok===false)){ _advShowToast('Could not disconnect linked banks — deletion aborted. Please retry.','error'); return; }
+    const { error } = await db.rpc('delete_client_cascade',{p_client_id:clientId});
     if(error){ _advShowToast('Delete failed: ' + error.message,'error'); return; }
     APP.myClients = APP.myClients.filter(function(c){ return c.id !== clientId; });
     if(APP.allClients) APP.allClients = APP.allClients.filter(function(c){ return c.id !== clientId; });
@@ -7023,7 +7049,7 @@ window.addEventListener('message', async function(e){
           }catch(_eMx2){ console.warn('[jm] preserve-baseline merge failed, using primary-only:',_eMx2&&_eMx2.message); }
         }
         // Protected sections: only use incoming if user intentionally modified them
-        var _protectedSections = ['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations'];
+        var _protectedSections = ['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash'];
         _protectedSections.forEach(function(sec){
           if(!touched[sec]){
             // Section was NOT touched by user — check if existing has data worth keeping
@@ -7253,7 +7279,9 @@ function buildNWSData(){
   var debts=(S.debts||[]).filter(function(d){return (d.balance||0)>0;});
   var retAccts=(S.retAccounts||[]);
   var retTotal=retAccts.reduce(function(s,a){return s+(a.balance||0);},0);
-  var cash=(assets.checking||0)+(assets.savings||0);
+  // Use the engine's c.aCash (manual scalar + Plaid linkedCash fold) so the NWS net worth matches the
+  // on-screen tiles. Falls back to the manual scalar if calcs is absent. (c.X!=null, not ||, so 0 counts.)
+  var cash=(c&&c.aCash!=null)?c.aCash:((assets.checking||0)+(assets.savings||0));
   var invest=(assets.invest||0);
   var re=(assets.re||0);
   var other=(assets.other||0);
@@ -7876,7 +7904,8 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
   if(!exp&&rawS.expData)Object.keys(rawS.expData).forEach(function(k){exp+=(parseFloat((rawS.expData[k]||{}).amount)||0);});
   CPLAN.income=inc;CPLAN.expenses=exp;CPLAN.surplus=Math.max(0,inc-exp);
   CPLAN.efTarget=Math.max(exp*3,1);CPLAN.efBal=0;
-  if(rawS.assets)CPLAN.efBal=(parseFloat(rawS.assets.checking)||0)+(parseFloat(rawS.assets.savings)||0);
+  // Prefer the engine's c.efBal (= aCash incl. Plaid linkedCash); fall back to the manual scalar.
+  CPLAN.efBal=(c&&c.efBal!=null)?c.efBal:(rawS.assets?((parseFloat(rawS.assets.checking)||0)+(parseFloat(rawS.assets.savings)||0)):0);
   CPLAN.debts=rawS.debts||[];CPLAN.totalDebt=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
   CPLAN.debtMin=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
   CPLAN.age=parseInt(rawS.currentAge)||parseInt(c.age)||35;
@@ -7977,7 +8006,7 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
             spRetirementIncome:parseFloat(pProfile.spRetIncome)||0,
             allocations:pAllocs,
             debts:pRawS.debts||[],
-            efBal:pRawS.assets?(parseFloat(pRawS.assets.checking)||0)+(parseFloat(pRawS.assets.savings)||0):0,
+            efBal:(pRawS.assets?(parseFloat(pRawS.assets.checking)||0)+(parseFloat(pRawS.assets.savings)||0):0)+((pRawS.linkedCash||[]).reduce(function(_t,_c){return _t+((_c&&_c.include!==false)?(parseFloat(_c.balance)||0):0);},0)),// Chunk 13.6: include the partner's own linked depository cash (their personal linkedCash; joint cash lives in _jointItems)
             employer:pRawS.employer||pProfile.employer||'',
             employmentType:pProfile.employmentType||'',
             healthStatus:pProfile.healthStatus||'',
@@ -24208,9 +24237,9 @@ function _cpRenderPlanFull(){
       CPLAN.allocations.forEach(function(a){if(a.type==='debt')a.target=CPLAN.totalDebt;});
     }
     if(_liveS.assets){
-      var _efBal=0;
-      if(_liveS.assets.savings)_efBal=parseFloat(_liveS.assets.savings)||0;
-      if(_liveS.assets.checking)_efBal+=parseFloat(_liveS.assets.checking)||0;
+      // Prefer engine efBal (= aCash incl. Plaid linkedCash) over the manual scalar sum.
+      var _efBal=(_liveS.calcs&&_liveS.calcs.efBal!=null)?_liveS.calcs.efBal:0;
+      if(!_efBal){ if(_liveS.assets.savings)_efBal=parseFloat(_liveS.assets.savings)||0; if(_liveS.assets.checking)_efBal+=parseFloat(_liveS.assets.checking)||0; }
       if(_efBal>0)CPLAN.efBal=_efBal;
     }
     if(_liveS.children&&_liveS.children.length)CPLAN.children=_liveS.children;
@@ -30635,6 +30664,6 @@ async function _checkUnreadMessages(){
 </div>
 
 <!-- PFOS canonical engine (single source of truth) — advisor metrics compute on-read. -->
-<script src="/pfos-core.v53.js" defer></script>
+<script src="/pfos-core.v54.js" defer></script>
 </body>
 </html>

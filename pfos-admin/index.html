@@ -437,6 +437,7 @@ body{background:var(--bg);}
     <div class="sb-section">Compliance</div>
     <div class="sb-item" id="nav-audit-log" onclick="showPage('audit-log');renderAuditLogPage()"><span class="icon">📋</span> Audit Log</div>
     <div class="sb-item" id="nav-compliance" onclick="showPage('compliance');renderComplianceReport()"><span class="icon">📑</span> Compliance Report</div>
+    <div class="sb-item" id="nav-plaid-health" onclick="showPage('plaid-health');renderPlaidHealth()"><span class="icon">🔌</span> Plaid Health <span id="plaidHealthBadge" style="display:none;background:var(--rd);color:#fff;font-size:9px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
   </div>
   <div class="sb-bottom">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;padding:0 4px">
@@ -522,6 +523,31 @@ body{background:var(--bg);}
         <button class="btn btn-bl" style="width:auto;padding:8px 16px;font-size:12px" onclick="renderAuditLogPage()">⟳ Refresh</button>
       </div>
       <div id="auditLogList"></div>
+    </div>
+
+<div class="pg" id="pg-plaid-health">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:18px;flex-wrap:wrap;gap:10px">
+        <div><div class="pg-title">Plaid Health</div><div class="pg-sub">Connection sync status, errors, webhook activity &amp; downgrade queue</div></div>
+        <button class="btn btn-bl" style="width:auto;padding:8px 16px;font-size:12px" onclick="renderPlaidHealth()">⟳ Refresh</button>
+      </div>
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="stat-card"><div class="stat-val" id="ph-items-active">0</div><div class="stat-lbl">Active Items</div></div>
+        <div class="stat-card"><div class="stat-val" id="ph-items-error">0</div><div class="stat-lbl">Error / Re-auth</div></div>
+        <div class="stat-card"><div class="stat-val" id="ph-items-stale">0</div><div class="stat-lbl">Stale (&gt;20h)</div></div>
+        <div class="stat-card"><div class="stat-val" id="ph-downgrade-queued">0</div><div class="stat-lbl">Downgrade Queue</div></div>
+      </div>
+      <div class="stat-grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="stat-card"><div class="stat-val" id="ph-items-archived">0</div><div class="stat-lbl">Disconnected</div></div>
+        <div class="stat-card"><div class="stat-val" id="ph-err-24h">0</div><div class="stat-lbl">Errors (24h)</div></div>
+        <div class="stat-card"><div class="stat-val" id="ph-wh-24h">0</div><div class="stat-lbl">Webhooks (24h)</div></div>
+        <div class="stat-card"><div class="stat-val" id="ph-cost-est">—</div><div class="stat-lbl">Est. Refresh Cost</div></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:18px">
+        <div class="info-card"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Recent Errors (24h)</div><div id="phErrors"></div></div>
+        <div class="info-card"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Webhook Activity (24h)</div><div id="phWebhooks"></div></div>
+      </div>
+      <div class="pg-sub" style="margin:0 0 8px">Connected Items</div>
+      <div class="tbl-wrap"><div id="phItemsTbl"></div></div>
     </div>
 
 <div class="pg" id="pg-agents">
@@ -793,6 +819,7 @@ async function determineRoleAndRoute(){
         try{ await loadAgents(); }catch(ex){ console.warn('loadAgents:', ex); }
         try{ await loadCouples(); }catch(ex){ console.warn('loadCouples:', ex); }
         renderSystemDashboard();
+        if(typeof updatePlaidHealthBadge==='function') updatePlaidHealthBadge();
         // Check if redirected here from dashboard with a specific section request
         try{
           var requestedSection = sessionStorage.getItem('pfos_admin_section');
@@ -803,6 +830,7 @@ async function determineRoleAndRoute(){
             else if(requestedSection === 'unlink-requests') renderUnlinkRequestsPage();
             else if(requestedSection === 'deletion-requests') renderDeletionRequestsPage();
             else if(requestedSection === 'audit-log') renderAuditLogPage();
+            else if(requestedSection === 'plaid-health') renderPlaidHealth();
           }
         }catch(ex){}
         return;
@@ -1292,7 +1320,8 @@ function getEffectiveTier(client){
   if(!client) return 'none';
   if(client.trial_start_date){
     var diffDays = Math.floor((Date.now() - new Date(client.trial_start_date).getTime()) / (1000*60*60*24));
-    if(diffDays <= 14) return 'trial';
+    // Trial only UPGRADES a sub-Pro tier; never downgrade a paid Pro/Pro+/Comp client.
+    if(diffDays <= 14 && client.pfos_tier!=='pro' && client.pfos_tier!=='pro_plus' && client.pfos_tier!=='comp') return 'trial';
   }
   return client.pfos_tier || 'none';
 }
@@ -2077,6 +2106,10 @@ async function approveDeletionRequest(reqId,clientId){
     var {data:clientData}=await db.from('clients').select('email,name').eq('id',clientId).maybeSingle();
     // Complete right-to-erasure: one admin-only cascade removes ALL the client's data across
     // every table (was only 6 → orphaned PII), incl. deletion_requests + the clients row.
+    // Chunk 17: detach + purge the client's Plaid items FIRST (while their tokens are still decryptable) so no
+    // bank connection is left orphaned + billing. Abort the whole deletion if it can't (tokens survive for retry).
+    var _pdc=await db.functions.invoke('plaid-delete-client',{body:{client_id:clientId}});
+    if(_pdc.error||(_pdc.data&&_pdc.data.ok===false)){ alert('Could not disconnect the client’s linked banks — deletion aborted. Please retry.'); return; }
     var _casc=await db.rpc('delete_client_cascade',{p_client_id:clientId});
     if(_casc.error){ alert('Deletion failed: '+_casc.error.message); return; }
     // Send deletion confirmation email
@@ -2130,6 +2163,73 @@ async function renderAuditLogPage(){
       }).join('')
     +'</tbody></table>';
   }catch(e){ el.innerHTML='<div style="color:var(--rd);font-size:12px">Error: '+esc(e.message)+'</div>'; }
+}
+// ── Chunk 15: read-only Plaid Health panel. Reads plaid_items/plaid_errors/plaid_webhooks_log directly via the
+// admin's JWT (the plaid_*_admin_all / plaid_wh_admin_read RLS already authorize admins). No mutations, no
+// service key in the browser. Renders cleanly at zero data. ──
+function _phRow(left,right){ return '<div style="display:flex;justify-content:space-between;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:12px"><span style="color:var(--mu)">'+left+'</span><span style="color:#E2E8F0;text-align:right">'+right+'</span></div>'; }
+async function renderPlaidHealth(){
+  updatePlaidHealthBadge();
+  var c24=new Date(Date.now()-864e5).toISOString();      // 24h ago
+  var c20=new Date(Date.now()-72e6).toISOString();        // 20h ago (matches the cron staleness guard)
+  async function cnt(q){ try{ const {count}=await q; return count||0; }catch(e){ return 0; } }
+  // accurate counts via head:true count queries (cheap, correct at scale)
+  var res=await Promise.all([
+    cnt(db.from('plaid_items').select('*',{count:'exact',head:true}).eq('status','active')),
+    cnt(db.from('plaid_items').select('*',{count:'exact',head:true}).eq('status','error')),
+    cnt(db.from('plaid_items').select('*',{count:'exact',head:true}).eq('status','active').or('last_sync_at.is.null,last_sync_at.lt.'+c20)),
+    cnt(db.from('plaid_items').select('*',{count:'exact',head:true}).eq('downgrade_pending',true)),
+    cnt(db.from('plaid_errors').select('*',{count:'exact',head:true}).gte('created_at',c24)),
+    cnt(db.from('plaid_webhooks_log').select('*',{count:'exact',head:true}).gte('received_at',c24)),
+    cnt(db.from('plaid_items').select('*',{count:'exact',head:true}).eq('status','archived'))  // Chunk 16: disconnected/frozen-to-manual
+  ]);
+  var active=res[0];
+  set('ph-items-active',active); set('ph-items-error',res[1]); set('ph-items-stale',res[2]); set('ph-downgrade-queued',res[3]);
+  set('ph-err-24h',res[4]); set('ph-wh-24h',res[5]); set('ph-items-archived',res[6]);
+  // est. cron refresh cost: balance-only safety-net = ~1 Plaid call/active item/day (client on-open syncs are extra/user-driven)
+  set('ph-cost-est','≈'+(active*30).toLocaleString()+'<div style="font-size:10px;color:var(--mu);margin-top:2px">calls/mo (est.)</div>');
+  // recent errors (24h)
+  try{
+    const {data:errs}=await db.from('plaid_errors').select('created_at,error_type,error_code,display_message,error_message,item_id').gte('created_at',c24).order('created_at',{ascending:false}).limit(20);
+    var er=errs||[];
+    set('phErrors', er.length? er.map(function(e){ return _phRow(fmtDate(e.created_at), esc(e.error_type||'')+(e.error_code?' · '+esc(e.error_code):'')+' — '+esc((e.display_message||e.error_message||'').slice(0,70))); }).join('') : '<div style="color:var(--mu);font-size:13px;padding:8px 0">No errors in the last 24h.</div>');
+  }catch(e){ set('phErrors','<div style="color:var(--rd);font-size:12px">Error: '+esc(e.message)+'</div>'); }
+  // webhook tally by code (24h)
+  try{
+    const {data:whs}=await db.from('plaid_webhooks_log').select('webhook_code,status').gte('received_at',c24).limit(300);
+    var tally={}; (whs||[]).forEach(function(w){ var k=w.webhook_code||'?'; tally[k]=(tally[k]||0)+1; });
+    var keys=Object.keys(tally).sort(function(a,b){return tally[b]-tally[a];});
+    set('phWebhooks', keys.length? keys.map(function(k){ return _phRow(esc(k), String(tally[k])); }).join('') : '<div style="color:var(--mu);font-size:13px;padding:8px 0">No webhooks in the last 24h.</div>');
+  }catch(e){ set('phWebhooks','<div style="color:var(--rd);font-size:12px">Error: '+esc(e.message)+'</div>'); }
+  // connected items (oldest-synced first) + client emails
+  try{
+    const {data:items}=await db.from('plaid_items').select('item_id,institution_name,status,last_sync_at,needs_refresh,sync_status,downgrade_pending,downgrade_tier_at_detect,client_id,error_code').order('last_sync_at',{ascending:true,nullsFirst:true}).limit(80);
+    var its=items||[];
+    var ids=Array.from(new Set(its.map(function(i){return i.client_id;}).filter(Boolean)));
+    var emap={};
+    if(ids.length){ const {data:cl}=await db.from('clients').select('id,email').in('id',ids); (cl||[]).forEach(function(c){ emap[c.id]=c.email; }); }
+    var th=function(h){ return '<th style="text-align:left;padding:8px 0;font-size:11px;color:var(--mu);border-bottom:1px solid var(--bd)">'+h+'</th>'; };
+    var td=function(v){ return '<td style="padding:8px 0;border-bottom:1px solid rgba(255,255,255,.04);font-size:11px;color:var(--mu)">'+v+'</td>'; };
+    set('phItemsTbl', its.length? '<table style="width:100%;border-collapse:collapse"><thead><tr>'+th('Client')+th('Institution')+th('Status')+th('Last sync')+th('Flags')+'</tr></thead><tbody>'
+      +its.map(function(i){
+        var st = i.status==='error' ? '<span style="color:var(--rd)">error'+(i.error_code?' ('+esc(i.error_code)+')':'')+'</span>'
+               : i.status==='archived' ? '<span style="color:var(--mu)">archived</span>'
+               : '<span style="color:var(--gr)">active</span>';
+        var flags=[]; if(i.needs_refresh)flags.push('needs-merge'); if(i.sync_status==='cron')flags.push('cron'); if(i.downgrade_pending)flags.push('<span style="color:var(--or)">downgrade '+esc(i.downgrade_tier_at_detect||'')+'</span>');
+        return '<tr>'+td(esc(emap[i.client_id]||(i.client_id||'').slice(0,8)))+td('<span style="color:#E2E8F0">'+esc(i.institution_name||'—')+'</span>')+td(st)+td(i.last_sync_at?fmtDate(i.last_sync_at):'never')+td(flags.join(', ')||'—')+'</tr>';
+      }).join('')+'</tbody></table>'
+      : '<div style="color:var(--mu);font-size:13px;padding:20px 0">No linked Plaid items yet.</div>');
+  }catch(e){ set('phItemsTbl','<div style="color:var(--rd);font-size:12px">Error: '+esc(e.message)+'</div>'); }
+}
+async function updatePlaidHealthBadge(){
+  if(APP.role!=='admin') return;
+  try{
+    const a=await db.from('plaid_items').select('*',{count:'exact',head:true}).eq('status','error');
+    const b=await db.from('plaid_items').select('*',{count:'exact',head:true}).eq('downgrade_pending',true);
+    var count=((a&&a.count)||0)+((b&&b.count)||0);
+    var badge=document.getElementById('plaidHealthBadge');
+    if(badge){ badge.textContent=count; badge.style.display=count>0?'inline':'none'; }
+  }catch(e){}
 }
 async function downloadSystemReport(){
   try{

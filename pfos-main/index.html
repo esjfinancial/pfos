@@ -1278,6 +1278,8 @@ html[data-theme="light"] .pwa-bar{background:linear-gradient(0deg,#FFFFFF,#F8FAF
   <div class="card-instructions" id="cardInstr_panel4" style="color:rgba(226,232,240,.85);margin-bottom:18px"></div>
   <div style="font-family:var(--fh);font-size:11px;font-weight:700;color:#5B9BFF;margin-bottom:10px;letter-spacing:.05em">ASSETS</div>
   <div class="row"><div class="fi"><label class="lb">Checking</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="aChecking" placeholder="0" oninput="calc()" style="padding-left:22px"></div></div><div class="fi"><label class="lb">Savings</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="aSavings" placeholder="0" oninput="calc()" style="padding-left:22px"></div></div></div>
+  <!-- Plaid-linked depository accounts (read-only display; balances fold into the engine's cash totals). Populated by renderLinkedCash(). -->
+  <div id="linkedCashRows"></div>
   <div class="row"><div class="fi"><label class="lb">Savings APY %</label><input class="inp" type="number" id="aSavAPY" placeholder="4.5" step="0.01" min="0" oninput="calc()"><div id="savingsInterestNote" style="font-size:11px;margin-top:3px"></div></div><div class="fi"></div></div>
   <!-- aInvest retained as a hidden input so legacy reads in calc() and migration paths don't crash. Value is auto-populated from sum of S.investments[].balance excluding crypto. The Investments card (panel 6) is now the source of truth for per-account balances. -->
   <input type="hidden" id="aInvest" value="0">
@@ -2018,8 +2020,8 @@ var _saveGuardActive=false, _loadedWeight=0;
 // _doSync to detect a populated→empty transition that the user never initiated
 // (the signature of a programmatic/stale-context wipe, e.g. the owner='spouse'
 // cleanup that once deleted a real HSA). Legitimate user deletes set S._touched.<key>,
-// which stands the guard down. Only these four high-value arrays are protected.
-var _PROTECTED_ARRAYS=['investments','retAccounts','debts','incomeSources'];
+// which stands the guard down. Only these high-value arrays are protected.
+var _PROTECTED_ARRAYS=['investments','retAccounts','debts','incomeSources','linkedCash','spendingEntries'];
 var _lastGoodArrays=null;
 function _snapshotGoodArrays(){
   try{
@@ -2055,7 +2057,7 @@ var S = {
   expData:{}, expSub:{}, leakTags:{},
   expView:'mo',
   // assets/debts
-  assets:{}, debts:[],
+  assets:{}, debts:[], linkedCash:[], // linkedCash[] = Plaid-linked depository accounts (engine folds into cash totals; never the scalar S.assets)
   creditScore:0, currentAge:0, hhSize:1,
   // goals & buckets
   goals:[], buckets:[],
@@ -3989,7 +3991,7 @@ function _pfosRunMigration(){
       // before the standard cleanup, so the user doesn't lose data.
       if(prevMigratedType === 'hybrid' && S._jointItems){
         var pulled = 0;
-        ['incomeSources','retAccounts','investments','debts'].forEach(function(arrName){
+        ['incomeSources','retAccounts','investments','debts','linkedCash'].forEach(function(arrName){ // Chunk 13 fix: re-inflate/convert joint linked cash on household-type switch (else it's dropped/mislabeled)
           var src = S._jointItems[arrName];
           if(!Array.isArray(src)) return;
           if(!Array.isArray(S[arrName])) S[arrName] = [];
@@ -4002,7 +4004,7 @@ function _pfosRunMigration(){
             pulled++;
           });
         });
-        S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+        S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
         console.log('[migration] pulled '+pulled+' joint items back from couple_links to personal');
       }
       // Silent cleanup — wipe residue from a previous coupled state
@@ -4012,7 +4014,7 @@ function _pfosRunMigration(){
       // Convert any owner='joint' items to 'personal' — Individual has no
       // joint storage, so stray joint-tagged items would be invisible.
       var convCountI = 0;
-      ['incomeSources','retAccounts','investments','debts'].forEach(function(arrName){
+      ['incomeSources','retAccounts','investments','debts','linkedCash'].forEach(function(arrName){ // Chunk 13 fix: re-inflate/convert joint linked cash on household-type switch (else it's dropped/mislabeled)
         var arr = S[arrName];
         if(!Array.isArray(arr)) return;
         arr.forEach(function(item){
@@ -4033,7 +4035,7 @@ function _pfosRunMigration(){
       if(prevMigratedType === 'hybrid' && S._jointItems){
         if(isPrimary){
           var pulledJ = 0;
-          ['incomeSources','retAccounts','investments','debts'].forEach(function(arrName){
+          ['incomeSources','retAccounts','investments','debts','linkedCash'].forEach(function(arrName){ // Chunk 13 fix: re-inflate/convert joint linked cash on household-type switch (else it's dropped/mislabeled)
             var src = S._jointItems[arrName];
             if(!Array.isArray(src)) return;
             if(!Array.isArray(S[arrName])) S[arrName] = [];
@@ -4050,7 +4052,7 @@ function _pfosRunMigration(){
         } else {
           console.log('[migration] joint (non-primary): clearing _jointItems without re-inflation (Joint reads from primary only)');
         }
-        S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+        S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
       }
       // Joint households legitimately share ONE profile with both spouses'
       // data tagged via owner field. No further changes needed.
@@ -4059,7 +4061,7 @@ function _pfosRunMigration(){
       // Phase 9 — if migrating FROM Hybrid, pull joint items back as personal.
       if(prevMigratedType === 'hybrid' && S._jointItems){
         var pulledS = 0;
-        ['incomeSources','retAccounts','investments','debts'].forEach(function(arrName){
+        ['incomeSources','retAccounts','investments','debts','linkedCash'].forEach(function(arrName){ // Chunk 13 fix: re-inflate/convert joint linked cash on household-type switch (else it's dropped/mislabeled)
           var src = S._jointItems[arrName];
           if(!Array.isArray(src)) return;
           if(!Array.isArray(S[arrName])) S[arrName] = [];
@@ -4072,7 +4074,7 @@ function _pfosRunMigration(){
             pulledS++;
           });
         });
-        S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+        S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
         console.log('[migration] separate: pulled '+pulledS+' joint items back as personal');
       }
       var wiped2 = _wipeSpouseFields();
@@ -4082,7 +4084,7 @@ function _pfosRunMigration(){
       // share data in V2 (only joint goals via shared_plan_cards). Stray
       // joint-tagged items would otherwise be invisible in the V2 UI.
       var convCount = 0;
-      ['incomeSources','retAccounts','investments','debts'].forEach(function(arrName){
+      ['incomeSources','retAccounts','investments','debts','linkedCash'].forEach(function(arrName){ // Chunk 13 fix: re-inflate/convert joint linked cash on household-type switch (else it's dropped/mislabeled)
         var arr = S[arrName];
         if(!Array.isArray(arr)) return;
         arr.forEach(function(item){
@@ -4124,7 +4126,7 @@ function _pfosRunMigration(){
         // (when PFOS_LOAD's hydration step would read the freshly written
         // couple_links row). _markItem already added share_pct_a/b; we just
         // add a local _jointId for renderer keying.
-        if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+        if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
         var _stamp = function(it){
           var c = Object.assign({}, it);
           if(!c._jointId) c._jointId = 'j_' + Date.now() + '_' + Math.random().toString(36).slice(2,8);
@@ -4159,6 +4161,7 @@ function _pfosRunMigration(){
     if(typeof renderRetAccounts === 'function')renderRetAccounts();
     if(typeof renderInvAccounts === 'function')renderInvAccounts();
     if(typeof renderDebts === 'function')renderDebts();
+    if(typeof renderLinkedCash === 'function')renderLinkedCash();
     if(typeof calc === 'function')calc();
   }catch(err){
     console.error('[migration] sweep failed:', err);
@@ -4201,7 +4204,7 @@ function _postJointItemsWrite(){
   // Posts the current S._jointItems to pfos-client for couple_links write.
   // No-op if not Hybrid or no couple link.
   if(S.householdType !== 'hybrid' || !S.coupleLinkId) return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   // Always refresh _jointItems.goals from current S.goals BEFORE posting.
   // _jointItems.goals starts as a snapshot from PFOS_LOAD hydration but goal
   // mutations update S.goals (the renderer's source), not _jointItems. Without
@@ -4232,7 +4235,7 @@ function _postJointItemsWrite(){
 // the _jointItems.goals copy is the canonical cross-spouse store.
 function _syncJointGoalsToCoupleLinks(){
   if(S.householdType !== 'hybrid' || !S.coupleLinkId) return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   S._jointItems.goals = (S.goals||[]).filter(function(g){return g && g.owner==='joint';});
   _postJointItemsWrite();
 }
@@ -4243,7 +4246,7 @@ function _syncJointGoalsToCoupleLinks(){
 // a couple_links write and re-renders.
 function _hybridToggleIncomeJoint(idx, isJoint){
   if(S.householdType !== 'hybrid') return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   if(isJoint){
     // Move from personal → joint
     if(!Array.isArray(S.incomeSources) || idx < 0 || idx >= S.incomeSources.length) return;
@@ -4295,7 +4298,7 @@ function _hybridUpdateIncomeSharePct(idx, val){
 // button in Hybrid mode (instead of addIncome('joint') which writes to S).
 function _hybridAddJointIncome(){
   if(S.householdType !== 'hybrid') return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   if(!Array.isArray(S._jointItems.incomeSources)) S._jointItems.incomeSources = [];
   var src = {
     id: ++incomeIdCtr,
@@ -4347,7 +4350,7 @@ function _hybridDelJointIncome(idx){
 
 function _hybridToggleInvJoint(idx, isJoint){
   if(S.householdType !== 'hybrid') return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   if(isJoint){
     // Move from personal → joint
     if(!Array.isArray(S.investments) || idx < 0 || idx >= S.investments.length) return;
@@ -4402,7 +4405,7 @@ function _hybridUpdateInvSharePct(idx, val){
 
 function _hybridAddJointInv(){
   if(S.householdType !== 'hybrid') return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   if(!Array.isArray(S._jointItems.investments)) S._jointItems.investments = [];
   var src = {
     id: ++invAcctIdCtr,
@@ -4478,7 +4481,7 @@ function _hybridUpdJointInvReturn(idx){
 
 function _hybridToggleDebtJoint(idx, isJoint){
   if(S.householdType !== 'hybrid') return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   if(isJoint){
     if(!Array.isArray(S.debts) || idx < 0 || idx >= S.debts.length) return;
     var src = S.debts[idx];
@@ -4524,7 +4527,7 @@ function _hybridUpdateDebtSharePct(idx, val){
 
 function _hybridAddJointDebt(){
   if(S.householdType !== 'hybrid') return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   if(!Array.isArray(S._jointItems.debts)) S._jointItems.debts = [];
   var src = {
     id: ++debtIdCtr,
@@ -4594,7 +4597,7 @@ function _hybridFindJointExp(catKey, subKey){
 
 function _hybridToggleExpJoint(catKey, subKey, subLabel, isJoint){
   if(S.householdType !== 'hybrid') return;
-  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[]};
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
   if(!Array.isArray(S._jointItems.expenses)) S._jointItems.expenses = [];
   if(!S.expData) S.expData = {};
   if(!S.expData[catKey]) S.expData[catKey] = {amount:'',period:'monthly',expanded:true,subs:{},leakTagged:false,essential:true,recurring:true};
@@ -7656,6 +7659,8 @@ function renderRetAccounts(){
 }
 function _retAccountRowHtml(a,i){
   if(!a)return'';
+  // Plaid-linked retirement: balance is synced (read-only); contributions/match/return stay editable.
+  var isPlaid=!!(a&&a._source==='plaid'), ro=isPlaid?' readonly title="Synced from your linked account"':'', roBg=isPlaid?';background:rgba(168,85,247,.06)':'';
   var infl=parseFloat(gv('retInflation'))||3;
   var rt=RET_TYPES.find(function(t){return t.val===a.type;})||RET_TYPES[0];
   var typeOpts=RET_TYPES.map(function(t){return'<option value="'+t.val+'"'+(a.type===t.val?' selected':'')+'>'+t.label+'</option>';}).join('');
@@ -7669,9 +7674,10 @@ function _retAccountRowHtml(a,i){
     +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">'
     +'<select class="sel" style="flex:1;min-width:180px" onchange="updRetAccount('+i+',\'type\',this.value);renderRetAccounts()">'+typeOpts+'</select>'
     +'<button onclick="delRetAccount('+i+')" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444;padding:6px 10px;border-radius:2px;cursor:pointer;font-family:var(--fh);font-size:11px;font-weight:700">✕</button>'
+    +(isPlaid?'<span style="font-size:10px;color:#A855F7;white-space:nowrap;margin-left:auto">🔗 Linked'+(a._lastSynced?(' · '+new Date(a._lastSynced).toLocaleDateString()):'')+'</span>':'')
     +'</div>'
     +'<div class="row">'
-    +'<div class="fi"><label class="lb">Current Balance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="updRetAccount('+i+',\'balance\',this.value)" style="padding-left:22px"></div></div>'
+    +'<div class="fi"><label class="lb">Current Balance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="updRetAccount('+i+',\'balance\',this.value)"'+ro+' style="padding-left:22px'+roBg+'"></div></div>'
     +(rt.allowContrib?'<div class="fi"><label class="lb">'+(isPension?'Est. Monthly Benefit':'Monthly Contribution')+'</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" id="retContrib_'+i+'" type="number" placeholder="0" value="'+(a.contrib||'')+'" oninput="updRetAccount('+i+',\'contrib\',this.value)" style="padding-left:22px"></div></div>':'')
     +'</div>'
     +(rt.allowMatch?'<div class="row"><div class="fi"><label class="lb">Your Contribution %</label><input class="inp" id="retContribPct_'+i+'" type="number" placeholder="0" value="'+(a.contribPct||'')+'" oninput="updRetAccount('+i+',\'contribPct\',this.value)" min="0" max="100"></div><div class="fi"><label class="lb">Employer Match % (up to)</label><input class="inp" type="number" placeholder="0" value="'+(a.matchPct||'')+'" oninput="updRetAccount('+i+',\'matchPct\',this.value)" min="0" max="100"></div></div>':'');
@@ -7977,6 +7983,8 @@ function _hsaFsaPaycheckWarnHtml(src){
 }
 function _invAccountRowHtml(a,i){
   if(!a)return'';
+  // Plaid-linked investment: balance is synced (read-only); provider/label/contribution/return stay editable.
+  var isPlaid=!!(a&&a._source==='plaid'), ro=isPlaid?' readonly title="Synced from your linked account"':'', roBg=isPlaid?';background:rgba(168,85,247,.06)':'';
   var rt=INV_TYPES.find(function(t){return t.val===a.type;})||INV_TYPES[0];
   var typeOpts=INV_TYPES.map(function(t){return'<option value="'+t.val+'"'+(a.type===t.val?' selected':'')+'>'+t.label+'</option>';}).join('');
   if(a.grossReturn==null){a.grossReturn=a.returnPct!=null?a.returnPct:7;a.fundFee=0;a.advFee=0;}
@@ -7986,13 +7994,14 @@ function _invAccountRowHtml(a,i){
     +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">'
     +'<select class="sel" style="flex:1;min-width:180px" onchange="updInvAccount('+i+',\'type\',this.value);renderInvAccounts()">'+typeOpts+'</select>'
     +'<button onclick="delInvAccount('+i+')" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444;padding:6px 10px;border-radius:2px;cursor:pointer;font-family:var(--fh);font-size:11px;font-weight:700">✕</button>'
+    +(isPlaid?'<span style="font-size:10px;color:#A855F7;white-space:nowrap;margin-left:auto">🔗 Linked'+(a._lastSynced?(' · '+new Date(a._lastSynced).toLocaleDateString()):'')+'</span>':'')
     +'</div>'
     +'<div class="row">'
     +'<div class="fi"><label class="lb">Provider / Brokerage</label><input class="inp" type="text" placeholder="e.g. Fidelity, Vanguard, Robinhood" value="'+escH(a.provider||'')+'" oninput="updInvAccount('+i+',\'provider\',this.value)"></div>'
     +'<div class="fi"><label class="lb">Account Label (Optional)</label><input class="inp" type="text" placeholder="e.g. Long-Term Growth, Crypto Wallet" value="'+escH(a.accountLabel||'')+'" oninput="updInvAccount('+i+',\'accountLabel\',this.value)"></div>'
     +'</div>'
     +'<div class="row">'
-    +'<div class="fi"><label class="lb">Current Balance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="updInvAccount('+i+',\'balance\',this.value)" style="padding-left:22px"></div></div>'
+    +'<div class="fi"><label class="lb">Current Balance</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="updInvAccount('+i+',\'balance\',this.value)"'+ro+' style="padding-left:22px'+roBg+'"></div></div>'
     +'<div class="fi"><label class="lb">Monthly Contribution</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.monthlyContrib||'')+'" oninput="updInvAccount('+i+',\'monthlyContrib\',this.value)" style="padding-left:22px"></div></div>'
     +'</div>';
   // HSA-specific: coverage type field (affects IRS contribution limit)
@@ -8312,9 +8321,13 @@ function _hybridJointInvRowHtml(a, i){
   var myBalShare = Math.round(bal * myShare / 100);
   var contrib = parseFloat(a.monthlyContrib)||0;
   var myContribShare = Math.round(contrib * myShare / 100);
+  // Chunk 13.4: a Plaid-linked joint item renders its SYNCED balance read-only + a 🔗 badge (plan fields
+  // share_pct / return assumptions stay editable). Mirrors the personal read-only-linked pattern.
+  var _isPlaid=!!(a&&a._source==='plaid'), _ro=_isPlaid?' readonly title="Synced from your linked account"':'', _roBg=_isPlaid?';background:rgba(168,85,247,.06)':'';
   var h = '<div style="background:rgba(168,85,247,.05);border:1px solid rgba(168,85,247,.18);border-left:2px solid #5B9BFF;border-radius:2px;padding:12px;margin-bottom:8px">'
     +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap">'
     +'<span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;padding:3px 7px;background:rgba(91,155,255,.12);border-radius:3px">Joint</span>'
+    +(_isPlaid?'<span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;color:#a855f7;padding:3px 7px;background:rgba(168,85,247,.12);border-radius:3px">🔗 Linked</span>':'')
     +'<select class="sel" style="flex:1;min-width:180px" onchange="_hybridUpdJointInv('+i+',\'type\',this.value);renderInvAccounts()">'+typeOpts+'</select>'
     +'<button onclick="_hybridDelJointInv('+i+')" style="background:rgba(239,68,68,.1);border:1px solid rgba(239,68,68,.3);color:#EF4444;padding:6px 10px;border-radius:2px;cursor:pointer;font-family:var(--fh);font-size:11px;font-weight:700">✕</button>'
     +'</div>'
@@ -8323,7 +8336,7 @@ function _hybridJointInvRowHtml(a, i){
       +'<div class="fi"><label class="lb">Account Label (Optional)</label><input class="inp" type="text" placeholder="e.g. Joint Brokerage" value="'+escH(a.accountLabel||'')+'" oninput="_hybridUpdJointInv('+i+',\'accountLabel\',this.value)"></div>'
     +'</div>'
     +'<div class="row">'
-      +'<div class="fi"><label class="lb">Total Balance (household)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="_hybridUpdJointInv('+i+',\'balance\',this.value)" style="padding-left:22px"></div></div>'
+      +'<div class="fi"><label class="lb">Total Balance (household)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.balance||'')+'" oninput="_hybridUpdJointInv('+i+',\'balance\',this.value)"'+_ro+' style="padding-left:22px'+_roBg+'"></div></div>'
       +'<div class="fi"><label class="lb">Monthly Contribution (household)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" placeholder="0" value="'+(a.monthlyContrib||'')+'" oninput="_hybridUpdJointInv('+i+',\'monthlyContrib\',this.value)" style="padding-left:22px"></div></div>'
     +'</div>'
     +'<div style="margin-top:10px;padding:10px;background:rgba(0,68,191,.04);border:1px solid rgba(0,68,191,.1);border-radius:3px">'
@@ -8362,16 +8375,21 @@ function _hybridJointDebtRowHtml(d, i){
   var min = parseFloat(d.min) || 0;
   var myBalShare = Math.round(bal * myShare / 100);
   var myMinShare = Math.round(min * myShare / 100);
+  // Chunk 13.4: a Plaid-linked joint debt locks its SYNCED fields (name/balance always; rate/min only when
+  // Plaid supplied them — Business CC etc. stay editable) + shows a 🔗 badge. Plan fields (due_day/term/share) stay editable.
+  var _isPlaid=!!(d&&d._source==='plaid'), _ro=_isPlaid?' readonly title="Synced from your linked account"':'', _roBg=_isPlaid?';background:rgba(168,85,247,.06)':'';
+  var _roRate=(_isPlaid&&typeof d.rate==='number')?' readonly':'', _roMin=(_isPlaid&&typeof d.min==='number')?' readonly':'';
   return '<div class="debt-row" style="background:rgba(0,68,191,.03);border-left:2px solid #5B9BFF;padding-left:8px">'
-    +'<input class="inp" type="text" placeholder="Joint debt name" value="'+escH(d.name||'')+'" oninput="_hybridUpdJointDebt('+i+',\'name\',this.value)">'
+    +'<input class="inp" type="text" placeholder="Joint debt name" value="'+escH(d.name||'')+'" oninput="_hybridUpdJointDebt('+i+',\'name\',this.value)"'+_ro+'>'
     +'<select class="sel" onchange="_hybridUpdJointDebt('+i+',\'type\',this.value);renderDebts()">'+typeOpts+'</select>'
-    +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Balance" value="'+(bal>0?bal.toLocaleString():'')+'" oninput="_hybridUpdJointDebt('+i+',\'balance\',autoComma(this))" style="padding-left:22px"></div>'
-    +'<div style="position:relative"><input class="inp" type="number" placeholder="Rate%" value="'+(d.rate||'')+'" oninput="_hybridUpdJointDebt('+i+',\'rate\',this.value)" style="padding-right:20px"><span style="position:absolute;right:7px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:11px;pointer-events:none">%</span></div>'
-    +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Min Pmt" value="'+(min>0?min.toLocaleString():'')+'" oninput="_hybridUpdJointDebt('+i+',\'min\',autoComma(this))" style="padding-left:22px"></div>'
+    +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Balance" value="'+(bal>0?bal.toLocaleString():'')+'" oninput="_hybridUpdJointDebt('+i+',\'balance\',autoComma(this))"'+_ro+' style="padding-left:22px'+_roBg+'"></div>'
+    +'<div style="position:relative"><input class="inp" type="number" placeholder="Rate%" value="'+(d.rate||'')+'" oninput="_hybridUpdJointDebt('+i+',\'rate\',this.value)"'+_roRate+' style="padding-right:20px'+(_roRate?_roBg:'')+'"><span style="position:absolute;right:7px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:11px;pointer-events:none">%</span></div>'
+    +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Min Pmt" value="'+(min>0?min.toLocaleString():'')+'" oninput="_hybridUpdJointDebt('+i+',\'min\',autoComma(this))"'+_roMin+' style="padding-left:22px'+(_roMin?_roBg:'')+'"></div>'
     +'<div style="position:relative"><input class="inp" type="number" placeholder="Due" value="'+(d.due_day||'')+'" min="1" max="31" oninput="_hybridUpdJointDebt('+i+',\'due_day\',this.value)" title="Day of month payment is due (1-31)"></div>'
     +(d.type!=='Credit Card'?'<div style="position:relative"><input class="inp" type="number" placeholder="Months left" value="'+(d.term||'')+'" oninput="_hybridUpdJointDebt('+i+',\'term\',this.value)" title="Remaining months"></div>':'<div></div>')
     +'<button class="src-del" onclick="_hybridDelJointDebt('+i+')">✕</button>'
     +'<div style="grid-column:1/-1;display:flex;align-items:center;gap:12px;font-size:11px;color:var(--mu);margin-top:6px;padding-top:6px;border-top:1px dashed rgba(91,155,255,.15);flex-wrap:wrap">'
+      +(_isPlaid?'<span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.08em;color:#a855f7;padding:2px 6px;background:rgba(168,85,247,.12);border-radius:3px">🔗 Linked</span>':'')
       +'<label style="display:flex;align-items:center;gap:6px;cursor:pointer">'
         +'<input type="checkbox" checked onchange="_hybridToggleDebtJoint('+i+',false)" style="accent-color:#5B9BFF">'
         +'<span>Joint</span>'
@@ -8427,7 +8445,18 @@ function _incomeRowDetailedHtml(src,i){
   ].map(function(f){return '<option value="'+f.v+'"'+(src.pay_frequency===f.v?' selected':'')+'>'+f.l+'</option>';}).join('');
   var monthlyTakeHome=Math.round(_incSrcMonthlyTakeHome(src));
   var monthlyGross=Math.round(_incSrcMonthlyGross(src));
+  // Chunk 12: linked-paycheck banner. _source==='plaid' → a "Linked paycheck" tag; while _grossEstimated is
+  // set, a caution badge tells the user the gross is estimated (deductions assumed $0) until they fill the
+  // pre-tax deduction fields below (which clears _grossEstimated via updIncome).
+  var _incLinkBanner = (src._source==='plaid')
+    ? '<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap"><span style="font-size:11px;font-weight:700;color:#a855f7">🔗 Linked paycheck</span>'
+      + (src._grossEstimated
+          ? '<span style="font-size:10px;font-weight:700;color:#eab308;background:rgba(234,179,8,.12);border:1px solid rgba(234,179,8,.3);border-radius:3px;padding:2px 7px">⚠ Gross estimated — enter your pre-tax deductions for an exact figure</span>'
+          : '<span style="font-size:10px;font-weight:700;color:var(--gr)">✓ Gross confirmed</span>')
+      + '</div>'
+    : '';
   return '<div class="src-row-detailed" style="background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-radius:4px;padding:14px;margin-bottom:10px">'
+    +_incLinkBanner
     +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;flex-wrap:wrap">'
       +'<input class="inp" type="text" placeholder="Source name (e.g. Acme Corp Paycheck)" value="'+escH(src.name||'')+'" oninput="updIncome('+i+',\'name\',this.value)" style="flex:2;min-width:160px">'
       +'<select class="sel" onchange="updIncome('+i+',\'consistency\',this.value)" style="flex:1;min-width:120px">'+conOpts+'</select>'
@@ -8631,6 +8660,13 @@ function updIncome(i,key,val){
   // Phase 1A: Numeric fields (paycheck breakdown) get parsed to floats; everything else stays as string
   var numericFields=['amount','take_home_per_check','deduction_401k','deduction_health','deduction_hsa','deduction_other','employer_match_pct','employer_match_cap'];
   S.incomeSources[i][key]=numericFields.indexOf(key)!==-1?(pf(val)):val;
+  // Chunk 12: editing a LINKED paycheck's W-2 detail (take-home / deductions / pay frequency) clears the
+  // provisional 'gross estimated' flag — the gross is now based on the user's confirmed take-home + real
+  // deductions, not the $0-deduction estimate. (Badge refreshes on the next render; flag clears immediately
+  // so the persisted state + engine gross are authoritative.)
+  if(S.incomeSources[i]._source==='plaid'&&S.incomeSources[i]._grossEstimated&&['take_home_per_check','deduction_401k','deduction_health','deduction_hsa','deduction_other','pay_frequency'].indexOf(key)!==-1){
+    delete S.incomeSources[i]._grossEstimated;
+  }
   // Update the computed monthly take-home / gross display for detailed mode without re-rendering the whole row
   if(_incSrcMode(S.incomeSources[i])==='detailed'){
     var disp=document.getElementById('incCalcDisp_'+i);
@@ -9334,6 +9370,103 @@ function addDebtRow(){
   S._touched.debts=true;
   renderDebts();
 }
+// Renders S.linkedCash[] (Plaid-linked depository accounts) as READ-ONLY display rows in the
+// Assets section. Their balances are synced and already fold into the engine's cash totals
+// (computeCalcs), so these rows are display-only — never bound to the manual aChecking/aSavings
+// scalars (which calc() rebuilds from the DOM and would double-count). Include/owner are managed
+// in the "Linked Accounts" view (server-mediated via plaid-update-account-tags), not edited here.
+function renderLinkedCash(){
+  var el=document.getElementById('linkedCashRows'); if(!el) return;
+  var arr=Array.isArray(S.linkedCash)?S.linkedCash.slice():[];
+  // Chunk 13: also LIST hybrid JOINT linked cash (routed to S._jointItems.linkedCash). The engine already
+  // counts it (share-weighted), but without this it would be counted-but-not-shown in the Assets list. Tag Joint.
+  if(S.householdType==='hybrid' && S._jointItems && Array.isArray(S._jointItems.linkedCash)){
+    S._jointItems.linkedCash.forEach(function(c){ if(c){ var cc=Object.assign({}, c); cc.owner='joint'; arr.push(cc); } });
+  }
+  if(!arr.length){ el.innerHTML=''; return; }
+  var coupled = S.householdType && S.householdType!=='individual';
+  var rows=arr.map(function(c){
+    if(!c) return '';
+    var label=((c.subtype||'')==='savings')?'Linked Savings':'Linked Checking';
+    var bal='$'+Math.round(pf(c.balance)).toLocaleString();
+    var ownerTxt=coupled?(' · '+(c.owner==='spouse'?'Spouse':(c.owner==='joint'?'Joint':'You'))):'';
+    var synced=c._lastSynced?(' · synced '+new Date(c._lastSynced).toLocaleDateString()):'';
+    return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border:1px solid rgba(168,85,247,.2);background:rgba(168,85,247,.04);border-radius:4px;margin-bottom:6px">'
+      +'<div><div style="font-size:13px;font-weight:700;color:var(--wh)">'+label+'</div>'
+      +'<div style="font-size:10px;color:#A855F7">🔗 Linked'+ownerTxt+synced+'</div></div>'
+      +'<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:#5B9BFF">'+bal+'</div>'
+    +'</div>';
+  }).join('');
+  el.innerHTML='<div style="font-size:10px;color:var(--mu);margin:4px 0 6px;letter-spacing:.04em">LINKED CASH ACCOUNTS</div>'+rows;
+}
+// ── Chunk 16: freeze linked rows to MANUAL. `ids` = the plaid_account_ids to freeze (debts/ret/inv/linkedCash).
+// opts.whole = whole-item / downgrade freeze → ALSO preserve linked income as manual (strip markers; income is
+// the user's salary / plan data — NOT transaction history — so it is PRESERVED, never purged), PURGE the plaid
+// spendingEntries window (privacy; the 24mo server store is purged by removeAndPurgeItem), and strip markers off
+// hybrid _jointItems (idempotent across both spouses). NET WORTH / DEBTS / DTI / PLAN ARE INVARIANT: balances/
+// rates/mins are untouched; a linkedCash dollar moves from the engine's linkedCash fold into the manual scalar
+// (the engine folds linkedCash[] into c.aCash, never the scalar, so the cash total is unchanged). _touched is set
+// for EVERY mutated _PROTECTED_ARRAYS key (line ~2024) or the wipe guard reverts the freeze on save. Idempotent:
+// after a run no _source==='plaid' rows remain, so re-running freezes nothing. Never deletes financial data
+// (except the intentional spendingEntries purge).
+function _freezePlaidIds(ids, opts){
+  opts=opts||{};
+  try{
+    var list=Array.isArray(ids)?ids.filter(Boolean):[]; var idset={}; list.forEach(function(i){ idset[i]=true; });
+    S._touched=S._touched||{};
+    // (1) PRESERVE debts/ret/inv → strip plaid markers, leaving editable manual rows at their last balance.
+    ['debts','retAccounts','investments'].forEach(function(k){
+      var arr=S[k]; if(!Array.isArray(arr))return;
+      arr.forEach(function(x){ if(x && x._source==='plaid' && idset[x._plaidAccountId]){ delete x._source; delete x._plaidAccountId; delete x._lastSynced; S._touched[k]=true; } });
+    });
+    // (2) FOLD linked cash into the manual scalar, ATOMIC per id (fold + splice together → no double-count).
+    if(Array.isArray(S.linkedCash)){
+      for(var _k=S.linkedCash.length-1;_k>=0;_k--){
+        var _uc=S.linkedCash[_k];
+        if(_uc && idset[_uc._plaidAccountId]){
+          var _ub=pf(_uc.balance); S.assets=S.assets||{};
+          if((_uc.subtype||'')==='savings'){ S.assets.savings=(pf(S.assets.savings)||0)+_ub; var _se=document.getElementById('aSavings'); if(_se)_se.value=S.assets.savings; }
+          else { S.assets.checking=(pf(S.assets.checking)||0)+_ub; var _ce=document.getElementById('aChecking'); if(_ce)_ce.value=S.assets.checking; }
+          S.linkedCash.splice(_k,1); S._touched.linkedCash=true; S._touched.assets=true;
+        }
+      }
+    }
+    // (3) PURGE the plaid spending window — for ANY whole-bank disconnect (downgrade OR voluntary) so the
+    //     "transaction history is removed" promise holds (the 24mo server store is purged server-side). NOT the
+    //     per-account unlink (which keeps the bank). The engine never reads spendingEntries, so this is privacy-only.
+    if(opts.purgeSpending && Array.isArray(S.spendingEntries)){
+      var _ns=S.spendingEntries.length;
+      S.spendingEntries=S.spendingEntries.filter(function(x){ return !(x && x._source==='plaid' && x._plaidTxnId); });
+      if(S.spendingEntries.length!==_ns) S._touched.spendingEntries=true;
+    }
+    if(opts.whole){
+      // (3a) PRESERVE income — strip markers off ALL linked paychecks → manual income. DELIBERATE: income is the
+      //      user's salary (plan data: savings rate / DTI / retirement), NOT a bank transaction → preserve, do
+      //      NOT purge. (Do not "fix" this to symmetry with the spending purge.)
+      if(Array.isArray(S.incomeSources)){
+        S.incomeSources.forEach(function(x){ if(x && x._source==='plaid'){ delete x._source; delete x._plaidIncomeStreamId; delete x._grossEstimated; S._touched.incomeSources=true; } });
+      }
+      // (3b) HYBRID joint — strip markers off the shared _jointItems linked rows (kept as manual joint items with
+      //      shares preserved → household net worth + split unchanged). Idempotent across both spouses.
+      try{
+        if(S._jointItems){
+          var _jt=false;
+          ['debts','investments','linkedCash'].forEach(function(k){
+            var arr=S._jointItems[k]; if(!Array.isArray(arr))return;
+            arr.forEach(function(x){ if(x && x._source==='plaid'){ delete x._source; delete x._plaidAccountId; delete x._lastSynced; _jt=true; } });
+          });
+          if(_jt && typeof _postJointItemsWrite==='function') _postJointItemsWrite();
+        }
+      }catch(_je){ console.warn('[PFOS] joint freeze skipped:', _je); }
+    }
+    if(typeof renderDebts==='function')renderDebts();
+    if(typeof renderRetAccounts==='function')renderRetAccounts();
+    if(typeof renderInvAccounts==='function')renderInvAccounts();
+    if(typeof renderLinkedCash==='function')renderLinkedCash();
+    if(opts.whole && typeof renderIncomeRow==='function')renderIncomeRow();
+    calc();
+  }catch(err){ console.warn('[PFOS] _freezePlaidIds failed:', err); }
+}
 function renderDebts(){
   var list=document.getElementById('debtRows'); if(!list) return;
   var ht = S.householdType || 'individual';
@@ -9360,16 +9493,31 @@ function renderDebts(){
           +'</label>'
         +'</div>';
       }
+      // Plaid-linked debts: synced fields (balance/rate/min) are read-only with a badge; plan
+      // fields (name/type/due/term) stay editable. Manual debts (no _source) render unchanged.
+      var isPlaid = !!(d && d._source==='plaid');
+      var ro = isPlaid ? ' readonly title="Synced from your linked account — manage in Linked Accounts"' : '';
+      var roBg = isPlaid ? ';background:rgba(168,85,247,.06)' : '';
+      // Rate/min are read-only ONLY when the linked account actually supplied them. If Plaid has no
+      // liability data for this debt (e.g. some business cards), leave them editable so the user can fill
+      // them in — DTI then counts the min. The re-sync merge preserves the user's value (it overwrites a
+      // synced field only when Plaid returns one), so a later sync won't wipe it.
+      var rateSynced = isPlaid && typeof d.rate === 'number';
+      var minSynced  = isPlaid && typeof d.min === 'number';
+      var roRate = rateSynced ? ro : '', roBgRate = rateSynced ? roBg : '';
+      var roMin  = minSynced  ? ro : '', roBgMin  = minSynced  ? roBg : '';
+      var linkBadge = isPlaid ? '<div style="grid-column:1/-1;font-size:10px;color:#A855F7;margin-top:3px">🔗 Linked'+(d._lastSynced?(' · synced '+new Date(d._lastSynced).toLocaleDateString()):'')+'</div>' : '';
       return '<div class="debt-row">'
         +'<input class="inp" type="text" placeholder="Debt name" value="'+escH(d.name||'')+'" oninput="updDebt('+i+',\'name\',this.value)">'
         +'<select class="sel" onchange="updDebt('+i+',\'type\',this.value);renderDebts()">'+typeOpts+'</select>'
-        +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Balance" value="'+((d.balance||0)>0?(d.balance).toLocaleString():'')+'" oninput="updDebt('+i+',\'balance\',autoComma(this))" style="padding-left:22px"></div>'
-        +'<div style="position:relative"><input class="inp" type="number" placeholder="Rate%" value="'+(d.rate||'')+'" oninput="updDebt('+i+',\'rate\',this.value)" style="padding-right:20px"><span style="position:absolute;right:7px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:11px;pointer-events:none">%</span></div>'
-        +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Min Pmt" value="'+((d.min||0)>0?(d.min).toLocaleString():'')+'" oninput="updDebt('+i+',\'min\',autoComma(this))" style="padding-left:22px"></div>'
+        +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Balance" value="'+((d.balance||0)>0?(d.balance).toLocaleString():'')+'" oninput="updDebt('+i+',\'balance\',autoComma(this))"'+ro+' style="padding-left:22px'+roBg+'"></div>'
+        +'<div style="position:relative"><input class="inp" type="number" placeholder="Rate%" value="'+(d.rate||'')+'" oninput="updDebt('+i+',\'rate\',this.value)"'+roRate+' style="padding-right:20px'+roBgRate+'"><span style="position:absolute;right:7px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:11px;pointer-events:none">%</span></div>'
+        +'<div style="position:relative"><span style="position:absolute;left:8px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;pointer-events:none">$</span><input class="inp" type="text" inputmode="numeric" placeholder="Min Pmt" value="'+((d.min||0)>0?(d.min).toLocaleString():'')+'" oninput="updDebt('+i+',\'min\',autoComma(this))"'+roMin+' style="padding-left:22px'+roBgMin+'"></div>'
         +'<div style="position:relative"><input class="inp" type="number" placeholder="Due" value="'+(d.due_day||'')+'" min="1" max="31" oninput="updDebt('+i+',\'due_day\',this.value)" title="Day of month payment is due (1-31)"></div>'
         +(d.type!=='Credit Card'?'<div style="position:relative"><input class="inp" type="number" placeholder="Months left" value="'+(d.term||'')+'" oninput="updDebt('+i+',\'term\',this.value)" title="Remaining months"></div>':'<div></div>')
         +'<button class="src-del" onclick="delDebt('+i+')">✕</button>'
         +jointToggleRow
+        +linkBadge
       +'</div>';
     }).join('');
   }
@@ -9415,6 +9563,273 @@ function updateRetNet(){
   calc();
 }
 
+// ── Plaid merge (Chunk 6) — KEEP IN SYNC with C:/Users/santi/pfos-engine/tools/plaid-apply.mjs ──
+// Pure merge of a Plaid normalized payload (R2) into PFOS state S. MANUAL-SAFE: never touches
+// items without _plaidAccountId. Upserts plaid items by _plaidAccountId (synced fields only;
+// preserves plan fields + the user-set owner). linkedCash[] = depository sink (the engine folds it
+// into cash totals). NOTE: does NOT set S._touched — the PFOS_PLAID_APPLY handler must, or the
+// parent section-merge + the _doSync wipe guard will revert the change.
+function _plaidApplyToState(S, payload) {
+  if (!S || !payload) return S;
+  S.linkedCash  = Array.isArray(S.linkedCash)  ? S.linkedCash  : [];
+  S.investments = Array.isArray(S.investments) ? S.investments : [];
+  S.retAccounts = Array.isArray(S.retAccounts) ? S.retAccounts : [];
+  S.debts       = Array.isArray(S.debts)       ? S.debts       : [];
+  S.spendingEntries = Array.isArray(S.spendingEntries) ? S.spendingEntries : [];
+
+  // Defaults applied ONLY on insert so the engine has sane plan/return fields; never on update.
+  var RET_DEFAULTS = { contrib: 0, matchPct: 0, grossReturn: 7, fundFee: 0.5, advFee: 0, returnPct: 6.5 };
+  var INV_DEFAULTS = { provider: '', accountLabel: '', monthlyContrib: 0, grossReturn: 7, fundFee: 0.5, advFee: 0, returnPct: 6.5 };
+  var CASH_DEFAULTS = {};
+
+  function upsert(arr, src, syncedFields, insertDefaults) {
+    if (!src || !src._plaidAccountId) return null; // never create a 'pl_undefined' / never match manual (no id)
+    var ex = null;
+    for (var i = 0; i < arr.length; i++) {
+      if (arr[i] && arr[i]._plaidAccountId && arr[i]._plaidAccountId === src._plaidAccountId) { ex = arr[i]; break; }
+    }
+    if (ex) {
+      // UPDATE: synced fields only. Plan fields (grossReturn/contrib/...) and the user-set owner are preserved.
+      syncedFields.forEach(function (f) { if (src[f] !== undefined) ex[f] = src[f]; });
+      ex._source = 'plaid';
+      return ex;
+    }
+    // INSERT: full descriptive item + defaults + stable namespaced id.
+    var nw = Object.assign({}, insertDefaults, src);
+    nw.id = 'pl_' + src._plaidAccountId;
+    nw._source = 'plaid';
+    arr.push(nw);
+    return nw;
+  }
+
+  (payload.linkedCash || []).forEach(function (c) {
+    upsert(S.linkedCash, c, ['balance', '_lastSynced'], CASH_DEFAULTS);
+  });
+  (payload.debts || []).forEach(function (d) {
+    upsert(S.debts, d, ['balance', 'rate', 'min', '_lastSynced'], { name: d.name || '', actual: 0, term: 0 });
+  });
+  (payload.retAccounts || []).forEach(function (r) {
+    upsert(S.retAccounts, r, ['balance', '_lastSynced'], RET_DEFAULTS);
+  });
+  (payload.investments || []).forEach(function (iv) {
+    upsert(S.investments, iv, ['balance', '_lastSynced'], INV_DEFAULTS);
+  });
+
+  // Removed accounts → drop ONLY plaid-sourced items with those ids. Manual items never match (no _plaidAccountId).
+  var removed = payload.removedAccountIds || [];
+  if (removed.length) {
+    var rm = function (arr) {
+      return arr.filter(function (x) {
+        return !(x && x._source === 'plaid' && x._plaidAccountId && removed.indexOf(x._plaidAccountId) >= 0);
+      });
+    };
+    S.linkedCash = rm(S.linkedCash);
+    S.debts = rm(S.debts);
+    S.retAccounts = rm(S.retAccounts);
+    S.investments = rm(S.investments);
+  }
+
+  // ── Chunk 8: Plaid transactions → S.spendingEntries (~90d actuals window). Keyed on _plaidTxnId
+  // (one account has many txns), a SEPARATE path from the account upsert above. Manual entries (no
+  // _plaidTxnId) are never matched/mutated. Upsert handles modified + pending→posted re-emits. ──
+  // If the payload carries a COMPLETE ~90d window (server snapshot), reconcile: drop plaid entries no
+  // longer in it (superseded-pending, removed, or Haiku-reclassified-as-transfer). Manual entries kept.
+  if (payload.spendingEntriesWindow && Array.isArray(payload.spendingEntries)) {
+    var _keepTxn = {};
+    payload.spendingEntries.forEach(function (e) { if (e && e._plaidTxnId) _keepTxn[e._plaidTxnId] = 1; });
+    S.spendingEntries = S.spendingEntries.filter(function (x) {
+      return !(x && x._source === 'plaid' && x._plaidTxnId && !_keepTxn[x._plaidTxnId]);
+    });
+  }
+  (payload.spendingEntries || []).forEach(function (e) {
+    if (!e || !e._plaidTxnId) return; // never match a manual entry
+    var exS = null;
+    for (var si = 0; si < S.spendingEntries.length; si++) {
+      if (S.spendingEntries[si] && S.spendingEntries[si]._plaidTxnId === e._plaidTxnId) { exS = S.spendingEntries[si]; break; }
+    }
+    if (exS) {
+      ['amount', 'description', 'category', 'category_bucket', 'date', 'pending'].forEach(function (f) { if (e[f] !== undefined) exS[f] = e[f]; });
+      exS._source = 'plaid';
+    } else {
+      var nwS = Object.assign({}, e); nwS._source = 'plaid'; S.spendingEntries.push(nwS);
+    }
+  });
+  var removedTxns = payload.removedTxnIds || [];
+  if (removedTxns.length) {
+    S.spendingEntries = S.spendingEntries.filter(function (x) {
+      return !(x && x._source === 'plaid' && x._plaidTxnId && removedTxns.indexOf(x._plaidTxnId) >= 0);
+    });
+  }
+  // ~90-day window cap (belt-and-suspenders; server already bounds): drop plaid entries older than 90d.
+  var _cutoff = new Date(Date.now() - 90 * 864e5).toISOString().slice(0, 10);
+  S.spendingEntries = S.spendingEntries.filter(function (x) {
+    return !(x && x._source === 'plaid' && x.date && x.date < _cutoff);
+  });
+  return S;
+}
+
+// ── Chunk 13: HYBRID owner-routing. After _plaidApplyToState lands every synced item in the PERSONAL arrays,
+// move owner==='joint' Plaid items (debts/investments/linkedCash) into S._jointItems so the engine weights them
+// by share_pct (the hybrid joint store). retAccounts are NOT joint-able in hybrid (per-person 401k/IRA, see
+// _hybridToggleInvJoint constraint) -> a joint-tagged one falls back to personal. JOINT households keep owner
+// inline (the merge-on-read handles spouse/joint), so this is a no-op for them. Idempotent on re-sync: updates
+// an existing _jointItems copy by _plaidAccountId (never duplicates). Kept OUT of the pure _plaidApplyToState
+// (which has an offline port) — the caller fires _postJointItemsWrite() after to persist to couple_links.
+function _plaidRouteHybridJoint(S){
+  // Guard on coupleLinkId: _jointItems is local-only + persisted ONLY via _postJointItemsWrite -> couple_links.
+  // Without a couple link the move would strip the item from the personal (saved) arrays yet never persist it
+  // to the JFD -> data loss. A real hybrid household always has a link; this is defensive (keep it personal).
+  if(!S || S.householdType !== 'hybrid' || !S.coupleLinkId) return false;
+  if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
+  var moved=false;
+  ['debts','investments','linkedCash'].forEach(function(arr){
+    if(!Array.isArray(S[arr])) return;
+    if(!Array.isArray(S._jointItems[arr])) S._jointItems[arr]=[];
+    var keep=[];
+    S[arr].forEach(function(it){
+      if(it && it._source==='plaid' && it.owner==='joint' && it._plaidAccountId){
+        var ex=null; for(var k=0;k<S._jointItems[arr].length;k++){ var ji=S._jointItems[arr][k]; if(ji && ji._plaidAccountId===it._plaidAccountId){ ex=ji; break; } }
+        if(ex){ ['balance','rate','min','_lastSynced','_instId','_mask'].forEach(function(f){ if(it[f]!==undefined) ex[f]=it[f]; }); }
+        else {
+          var j=Object.assign({}, it); delete j.owner;
+          j._jointId = j._jointId || ('j_'+Date.now()+'_'+Math.random().toString(36).slice(2,8));
+          j._addedBy = window._pfosLoadedClientId || null;
+          j.share_pct_a = (j.share_pct_a!==undefined)?j.share_pct_a:50;
+          j.share_pct_b = (j.share_pct_b!==undefined)?j.share_pct_b:50;
+          S._jointItems[arr].push(j);
+        }
+        moved=true; // dropped from the personal array (not pushed to keep)
+      } else { keep.push(it); }
+    });
+    S[arr]=keep;
+  });
+  // retAccounts: joint not allowed in hybrid (per-person) -> fall back to personal so it never orphans.
+  if(Array.isArray(S.retAccounts)){
+    S.retAccounts.forEach(function(r){ if(r && r._source==='plaid' && r.owner==='joint'){ r.owner='personal'; moved=true; } });
+  }
+  return moved;
+}
+
+// ── Plaid overlap detection (Chunk 6.7): after a link/sync apply, flag MANUAL items that look like
+// a newly-linked account (same type + balance within tolerance) and prompt to replace the manual copy
+// with the auto-updating linked one, or keep both. Heuristic only — the user decides. (Cash-scalar
+// overlap, manual aChecking/aSavings vs linked depository, is deferred — riskier to auto-zero a scalar.)
+function _plaidFindOverlaps(){
+  var out=[];
+  function scan(arr){
+    if(!Array.isArray(arr)) return;
+    var linked=arr.filter(function(x){return x && x._source==='plaid';});
+    if(!linked.length) return;
+    arr.forEach(function(m){
+      if(!m || m._source==='plaid') return; // manual items only
+      var mt=(m.type||'').toLowerCase(), mb=pf(m.balance);
+      for(var i=0;i<linked.length;i++){
+        var l=linked[i], lt=(l.type||'').toLowerCase(), lb=pf(l.balance);
+        if(mt!==lt) continue;
+        var tol=Math.max(250, mb*0.05);
+        if(Math.abs(mb-lb)<=tol){ out.push({arr:arr, manual:m, linked:l}); break; }
+      }
+    });
+  }
+  scan(S.debts); scan(S.retAccounts); scan(S.investments);
+  return out;
+}
+function _plaidMaybePromptOverlaps(){
+  try{
+    var ex=document.getElementById('plaidOverlapBanner'); if(ex)ex.remove();
+    var ov=_plaidFindOverlaps();
+    if(!ov.length){ window._plaidOverlaps=null; return; }
+    window._plaidOverlaps=ov;
+    var names=ov.map(function(o){return (o.manual.name||o.manual.type||'account');}).slice(0,3).join(', ');
+    var more=ov.length>3?(' +'+(ov.length-3)+' more'):'';
+    var plural=ov.length>1;
+    var b=document.createElement('div'); b.id='plaidOverlapBanner';
+    b.style.cssText='position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:99999;max-width:520px;width:calc(100% - 36px);background:#1a1530;border:1px solid rgba(168,85,247,.4);border-radius:8px;padding:14px 16px;box-shadow:0 8px 28px rgba(0,0,0,.45);font-family:system-ui,sans-serif';
+    b.innerHTML='<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:4px">Possible duplicate '+(plural?'accounts':'account')+'</div>'
+      +'<div style="font-size:12px;color:rgba(226,232,240,.82);line-height:1.5;margin-bottom:10px">'+ov.length+' account'+(plural?'s':'')+' you entered manually ('+escH(names)+more+') look like '+(plural?'ones':'one')+' you just linked. Replace the manual cop'+(plural?'ies':'y')+' with the auto-updating linked version? Manual entries are removed; linked balances stay current.</div>'
+      +'<div style="display:flex;gap:8px;justify-content:flex-end">'
+        +'<button onclick="_plaidDismissOverlaps()" style="padding:6px 14px;font-size:12px;font-weight:700;background:transparent;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.8);border-radius:4px;cursor:pointer">Keep both</button>'
+        +'<button onclick="_plaidReplaceOverlaps()" style="padding:6px 14px;font-size:12px;font-weight:700;background:rgba(168,85,247,.25);border:1px solid rgba(168,85,247,.5);color:#C9A8FF;border-radius:4px;cursor:pointer">Replace manual</button>'
+      +'</div>';
+    document.body.appendChild(b);
+  }catch(e){ console.warn('[PFOS] overlap prompt failed',e); }
+}
+function _plaidReplaceOverlaps(){
+  try{
+    var ov=window._plaidOverlaps||[];
+    var tD=false,tR=false,tI=false;
+    ov.forEach(function(o){
+      var i=o.arr.indexOf(o.manual); // recompute by reference — robust to prior splices
+      if(i>=0){ o.arr.splice(i,1); if(o.arr===S.debts)tD=true; else if(o.arr===S.retAccounts)tR=true; else if(o.arr===S.investments)tI=true; }
+    });
+    S._touched=S._touched||{};
+    if(tD)S._touched.debts=true; if(tR)S._touched.retAccounts=true; if(tI)S._touched.investments=true;
+    if(typeof renderDebts==='function')renderDebts();
+    if(typeof renderRetAccounts==='function')renderRetAccounts();
+    if(typeof renderInvAccounts==='function')renderInvAccounts();
+    calc();
+  }catch(e){ console.warn('[PFOS] overlap replace failed',e); }
+  window._plaidOverlaps=null;
+  var b=document.getElementById('plaidOverlapBanner'); if(b)b.remove();
+}
+function _plaidDismissOverlaps(){
+  window._plaidOverlaps=null;
+  var b=document.getElementById('plaidOverlapBanner'); if(b)b.remove();
+}
+
+// ── Plaid manual-vs-linked SPEND overlap (Chunk 9): after a transactions import, flag MANUAL spending
+// entries that match an imported Plaid transaction (≈same amount within $0.50, within 2 days) and prompt
+// to remove the manual copy so the same purchase isn't double-counted. Heuristic — the user decides.
+function _plaidFindSpendOverlaps(){
+  var out=[]; var arr=S.spendingEntries; if(!Array.isArray(arr)) return out;
+  var linked=arr.filter(function(x){return x && x._source==='plaid' && x._plaidTxnId;});
+  if(!linked.length) return out;
+  arr.forEach(function(m){
+    if(!m || m._plaidTxnId || m._source==='plaid') return; // manual entries only
+    var ma=pf(m.amount), md=m.date?Date.parse(m.date):NaN;
+    for(var i=0;i<linked.length;i++){
+      var p=linked[i];
+      if(Math.abs(ma-pf(p.amount))>0.5) continue;                                   // near-exact amount
+      if(!isNaN(md) && p.date && Math.abs((md-Date.parse(p.date))/864e5)>2) continue; // within 2 days
+      out.push({manual:m, plaid:p}); break;
+    }
+  });
+  return out;
+}
+function _plaidMaybePromptSpendOverlaps(){
+  try{
+    var ex=document.getElementById('plaidSpendOverlapBanner'); if(ex)ex.remove();
+    var ov=_plaidFindSpendOverlaps();
+    if(!ov.length){ window._plaidSpendOverlaps=null; return; }
+    window._plaidSpendOverlaps=ov;
+    var n=ov.length, plural=n>1;
+    var b=document.createElement('div'); b.id='plaidSpendOverlapBanner';
+    b.style.cssText='position:fixed;left:50%;bottom:90px;transform:translateX(-50%);z-index:99999;max-width:520px;width:calc(100% - 36px);background:#1a1530;border:1px solid rgba(168,85,247,.4);border-radius:8px;padding:14px 16px;box-shadow:0 8px 28px rgba(0,0,0,.45);font-family:system-ui,sans-serif';
+    b.innerHTML='<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:4px">Possible duplicate '+(plural?'expenses':'expense')+'</div>'
+      +'<div style="font-size:12px;color:rgba(226,232,240,.82);line-height:1.5;margin-bottom:10px">'+n+' expense'+(plural?'s':'')+' you logged manually match transaction'+(plural?'s':'')+' we just imported from your bank. Remove your manual cop'+(plural?'ies':'y')+' so the same spending isn\'t counted twice? Imported transactions stay.</div>'
+      +'<div style="display:flex;gap:8px;justify-content:flex-end">'
+        +'<button onclick="_plaidDismissSpendOverlaps()" style="padding:6px 14px;font-size:12px;font-weight:700;background:transparent;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.8);border-radius:4px;cursor:pointer">Keep both</button>'
+        +'<button onclick="_plaidReplaceSpendOverlaps()" style="padding:6px 14px;font-size:12px;font-weight:700;background:rgba(168,85,247,.25);border:1px solid rgba(168,85,247,.5);color:#C9A8FF;border-radius:4px;cursor:pointer">Remove manual</button>'
+      +'</div>';
+    document.body.appendChild(b);
+  }catch(e){ console.warn('[PFOS] spend overlap prompt failed',e); }
+}
+function _plaidReplaceSpendOverlaps(){
+  try{
+    var ov=window._plaidSpendOverlaps||[];
+    ov.forEach(function(o){ var i=S.spendingEntries.indexOf(o.manual); if(i>=0) S.spendingEntries.splice(i,1); }); // remove manual copy only
+    S._touched=S._touched||{}; S._touched.spendingEntries=true;
+    if(typeof renderHome==='function' && _currentSection==='home') renderHome();
+    calc();
+  }catch(e){ console.warn('[PFOS] spend overlap replace failed',e); }
+  window._plaidSpendOverlaps=null;
+  var b=document.getElementById('plaidSpendOverlapBanner'); if(b)b.remove();
+}
+function _plaidDismissSpendOverlaps(){
+  window._plaidSpendOverlaps=null;
+  var b=document.getElementById('plaidSpendOverlapBanner'); if(b)b.remove();
+}
+
 var _calcRunning=false;
 function calc(){
   if(_calcRunning) return;
@@ -9445,7 +9860,14 @@ function calc(){
   var noteEl=document.getElementById('savingsInterestNote');
   if(noteEl&&aSavings>0&&aSavAPY>0){ var ai=aSavings*(aSavAPY/100); noteEl.textContent='✓ Earning ~'+fmt(Math.round(ai/12))+'/mo at '+aSavAPY+'% APY'; noteEl.style.color='#22C55E'; }
   else if(noteEl) noteEl.textContent='';
-  var atd=document.getElementById('aTotalDisp'); if(atd) atd.value=_preRetAssets>0?'$'+Math.round(_preRetAssets).toLocaleString():'';
+  // Include Plaid-linked depository cash in the displayed Total Assets so the box matches the headline
+  // net worth (the engine folds linkedCash into c.aCash). exclude-at-source keeps only included accounts
+  // in S.linkedCash; the include!==false filter is belt-and-suspenders.
+  var _lcTot=(S.linkedCash||[]).reduce(function(t,lc){return (lc&&lc.include!==false)?t+(parseFloat(lc.balance)||0):t;},0);
+  var _atdVal=_preRetAssets+_lcTot;
+  var atd=document.getElementById('aTotalDisp'); if(atd) atd.value=_atdVal>0?'$'+Math.round(_atdVal).toLocaleString():'';
+  // Keep the Plaid-linked depository list in sync (cheap: early-returns when none). Display-only.
+  if(typeof renderLinkedCash==='function') renderLinkedCash();
 
   // ── Credit / age: read DOM → S ──
   S.creditScore=pi(gv('creditScore'))||S.creditScore||0; S.currentAge=pi(gv('currentAge'))||S.currentAge||0;
@@ -14327,7 +14749,8 @@ function submitAdvisorRequestFromModal(){
             investments:   Array.isArray(jfd.investments)   ? jfd.investments   : [],
             debts:         Array.isArray(jfd.debts)         ? jfd.debts         : [],
             expenses:      Array.isArray(jfd.expenses)      ? jfd.expenses      : [],
-            goals:         Array.isArray(jfd.goals)         ? jfd.goals         : []
+            goals:         Array.isArray(jfd.goals)         ? jfd.goals         : [],
+            linkedCash:    Array.isArray(jfd.linkedCash)    ? jfd.linkedCash    : []
           };
           // Phase: Hybrid joint goals — re-merge from couple_links into S.goals.
           // Drop existing joint goals first, then push the fresh copies. Matches
@@ -14608,9 +15031,11 @@ function submitAdvisorRequestFromModal(){
         if(!S.expData)S.expData={};
         msg.updates.forEach(function(u){
           if(!u||!u.category)return;
-          if(u.total==null||isNaN(parseFloat(u.total)))return;
           if(!S.expData[u.category])S.expData[u.category]={amount:'',period:'monthly',expanded:false,subs:{},leakTagged:false,essential:true,recurring:true};
-          S.expData[u.category].total=parseFloat(u.total);
+          // {category,amount} => set the canonical monthly budget (Chunk 10 auto-budget; future-edit-safe).
+          // {category,total} => lump-sum override (existing budget_realloc path). amount wins if both sent.
+          if(u.amount!=null&&!isNaN(parseFloat(u.amount))){ S.expData[u.category].amount=String(parseFloat(u.amount)); S.expData[u.category].period='monthly'; if(S.expData[u.category].total!=null)delete S.expData[u.category].total; }
+          else if(u.total!=null&&!isNaN(parseFloat(u.total))){ S.expData[u.category].total=parseFloat(u.total); }
         });
         if(!S._touched)S._touched={};
         S._touched.expData=true;
@@ -14641,6 +15066,45 @@ function submitAdvisorRequestFromModal(){
         S._touched.budgetRecommendations=true;
         clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
       }catch(e){console.warn('PFOS_WRITE_RECS:',e);}
+      return;
+    }
+    // ── PFOS_WRITE_INCOME (Chunk 12: linked income accept-only) ──
+    // Sent from pfos-client when the user ACCEPTS a detected Plaid paycheck. Seeds S.incomeSources with a
+    // DETAILED-mode source built from the linked NET (take_home_per_check + pay_frequency, deductions=0) so the
+    // engine's EXISTING gross-up (_estimateGrossFromNet via the detailed branch of _incSrcMonthlyGross) yields
+    // incGross > net automatically — no engine change, and never the simple-mode amount-as-gross trap. Manual
+    // income (rows without _plaidIncomeStreamId) is NEVER touched. Upsert keyed on _plaidIncomeStreamId
+    // (idempotent re-accept). _grossEstimated:true drives the provisional badge until the user completes W-2 detail.
+    if(msg.type==='PFOS_WRITE_INCOME'){
+      try{
+        var inc=msg.incomeSource; if(!inc||!inc._plaidIncomeStreamId)return;
+        if(!Array.isArray(S.incomeSources))S.incomeSources=[];
+        var _pfreq=({WEEKLY:'weekly',BIWEEKLY:'biweekly',SEMI_MONTHLY:'semimonthly',MONTHLY:'monthly',ANNUALLY:'monthly'})[String(inc.frequency||'').toUpperCase()]||'monthly';
+        var _mNet=Math.max(0,parseFloat(inc.monthlyNet)||0);
+        var _perCheck=Math.round(_mNet/_checksPerMonth(_pfreq));
+        var _existing=null;
+        for(var _ii=0;_ii<S.incomeSources.length;_ii++){ if(S.incomeSources[_ii]&&S.incomeSources[_ii]._plaidIncomeStreamId===inc._plaidIncomeStreamId){_existing=S.incomeSources[_ii];break;} }
+        if(_existing){
+          // Re-accept/refresh: update the net-derived fields ONLY while still provisional (never clobber a
+          // user-completed W-2), and never change owner.
+          if(_existing._grossEstimated){ _existing.pay_frequency=_pfreq; _existing.take_home_per_check=_perCheck; _existing.amount=Math.round(_mNet); if(inc.name)_existing.name=inc.name; }
+          _existing._lastSynced=new Date().toISOString();
+        } else {
+          S.incomeSources.push({
+            id:++incomeIdCtr, source:'Salary', name:(inc.name||'Linked paycheck'), owner:(inc.owner||'personal'),
+            mode:'detailed', pay_frequency:_pfreq, take_home_per_check:_perCheck,
+            deduction_401k:0, deduction_health:0, deduction_hsa:0, deduction_other:0,
+            employer_match_pct:0, employer_match_cap:0, hsaFsaType:'hsa', hsaCoverage:'self',
+            consistency:'consistent', frequency:'monthly', amount:Math.round(_mNet), next_pay_date:'',
+            _source:'plaid', _plaidIncomeStreamId:inc._plaidIncomeStreamId, _grossEstimated:true, _lastSynced:new Date().toISOString()
+          });
+        }
+        if(!S._touched)S._touched={};
+        S._touched.incomeSources=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(typeof renderIncomeRow==='function'){try{renderIncomeRow();}catch(e){}}
+      }catch(e){console.warn('PFOS_WRITE_INCOME:',e);}
       return;
     }
     // ── PFOS_DEBT_PAID_OFF ──
@@ -14892,6 +15356,48 @@ function submitAdvisorRequestFromModal(){
       }
       return;
     }
+    if(msg.type==='PFOS_PLAID_APPLY'){
+      // Receiver end of the Plaid bridge (Chunk 6). The shell posts a normalized R2 payload
+      // {linkedCash[],debts[],retAccounts[],investments[],removedAccountIds[]} after a successful
+      // link+sync. Merge into S, mark the touched sections (REQUIRED — _plaidApplyToState does not,
+      // or the parent section-merge (linkedCash/debts/retAccounts) and/or the _doSync WIPE GUARD
+      // (all four arrays) would revert linked changes/unlinks), re-render, then calc() (folds
+      // linkedCash + schedules the debounced save
+      // that emits PFOS_DATA_CHANGE — do NOT also call _doSync() here, that double-emits/races).
+      try{
+        if(typeof _plaidApplyToState==='function') _plaidApplyToState(S, msg.payload||{});
+        S._touched=S._touched||{};
+        S._touched.linkedCash=true; S._touched.debts=true; S._touched.retAccounts=true; S._touched.investments=true; S._touched.spendingEntries=true;
+        // Chunk 13: HYBRID household -> route owner='joint' linked items into S._jointItems + persist to
+        // couple_links. JOINT/separate/individual: no-op. _postJointItemsWrite is the JFD write (hybrid only).
+        if(S.householdType==='hybrid' && typeof _plaidRouteHybridJoint==='function'){
+          try{ if(_plaidRouteHybridJoint(S) && typeof _postJointItemsWrite==='function') _postJointItemsWrite(); }catch(_rh){ console.warn('[PFOS] hybrid joint route:',_rh); }
+        }
+        if(typeof renderDebts==='function')       renderDebts();
+        if(typeof renderRetAccounts==='function') renderRetAccounts();
+        if(typeof renderInvAccounts==='function') renderInvAccounts();
+        if(typeof renderLinkedCash==='function')  renderLinkedCash();
+        if(typeof renderHome==='function' && _currentSection==='home') renderHome();
+        calc();
+        if(typeof _plaidMaybePromptOverlaps==='function') _plaidMaybePromptOverlaps();
+        if(typeof _plaidMaybePromptSpendOverlaps==='function') _plaidMaybePromptSpendOverlaps();
+      }catch(err){ console.warn('[PFOS] PFOS_PLAID_APPLY failed:', err); }
+      return;
+    }
+    if(msg.type==='PFOS_PLAID_UNLINK'){
+      // Per-account freeze to MANUAL (Chunk 6.8). The shell already deleted the server mapping so sync won't
+      // re-add it. Preserve-only (no income/spending purge) — see _freezePlaidIds.
+      if(msg.plaidAccountId) _freezePlaidIds([msg.plaidAccountId], {whole:false});
+      return;
+    }
+    if(msg.type==='PFOS_PLAID_UNLINK_ITEM'){
+      // Whole-item freeze (Chunk 16). DOWNGRADE (msg.whole=true): the user is fully un-entitled → freeze the
+      // item's accounts + preserve income (strip markers, keep as manual) + purge the plaid spending window +
+      // strip hybrid joint markers. VOLUNTARY single-bank (msg.whole=false): just freeze this bank's accounts
+      // (income/spending of any OTHER still-linked bank untouched; the server purged this bank's 24mo store).
+      _freezePlaidIds(msg.plaidAccountIds||[], {whole: !!msg.whole, purgeSpending: !!msg.purgeSpending});
+      return;
+    }
     if(msg.type!=='PFOS_LOAD')return;
     if(document.getElementById('pfos-lock'))return;
     // ══ Track which client this data belongs to ══
@@ -14915,7 +15421,7 @@ function submitAdvisorRequestFromModal(){
       DE.bufferPct=0;DE.bufferAmt=0;DE.deviating=false;DE.view='flags';
       S.incomeSources=[];S.expData={};S.expSub={};S.leakTags={};S.expView='mo';
       S._touched={};
-      S.assets={};S.debts=[];S.creditScore=0;S.currentAge=0;S.hhSize=1;
+      S.assets={};S.debts=[];S.linkedCash=[];S.spendingEntries=[];S.creditScore=0;S.currentAge=0;S.hhSize=1;// linkedCash + spendingEntries reset prevents Plaid cash/transactions bleeding across a client/partner switch (Chunk 8)
       S.goals=[];S.buckets=[];
       S.ret={age:65,income:5000,balance:0,contrib:0,match:4,return_:7};S.retAccounts=[];
       S.protCalcs=null;S.eduCalcs=null;S.children=[];S.riskProfile=null;
@@ -14923,7 +15429,7 @@ function submitAdvisorRequestFromModal(){
       S.householdType='individual';S.spouseInfo={};
       S.coupleLinkId=null;S.partnerName=null;S.sharedGoals=[];S.coupleData=null;
       S._spouseAnnualGross=null;S._spouseAnnualPretax=null;S._spouseTaxUpdatedAt=null;
-      S._jointItems={incomeSources:[],retAccounts:[],investments:[],debts:[],goals:[]};// Phase 4 — reset on client switch
+      S._jointItems={incomeSources:[],retAccounts:[],investments:[],debts:[],goals:[],linkedCash:[],spendingEntries:[]};// Phase 4 — reset on client switch (linkedCash for hybrid shared cash, Chunk 13; spendingEntries Chunk 8)
       S.profile=null;S.snapshot=null;S.visitedPanels=[];
       // ── Clear all DOM inputs ──
       ['cpFirstName','cpLastName','cpEmail','cpPhone','cpDOB','cpSpouse','cpChildren',
@@ -15126,7 +15632,8 @@ function submitAdvisorRequestFromModal(){
             investments:   Array.isArray(jfd.investments)   ? jfd.investments   : [],
             debts:         Array.isArray(jfd.debts)         ? jfd.debts         : [],
             expenses:      Array.isArray(jfd.expenses)      ? jfd.expenses      : [],
-            goals:         Array.isArray(jfd.goals)         ? jfd.goals         : []
+            goals:         Array.isArray(jfd.goals)         ? jfd.goals         : [],
+            linkedCash:    Array.isArray(jfd.linkedCash)    ? jfd.linkedCash    : []
           };
           // Phase: Hybrid joint goals — couple_links.joint_financial_data.goals is
           // the source of truth for joint goals (consistent with how joint income,
@@ -26399,7 +26906,7 @@ function populateFromState(){
 </script>
 <!-- PFOS canonical engine (single source of truth). Loaded for SHADOW MODE:
      computes calcs alongside calc() and logs parity diffs; changes nothing rendered. -->
-<script src="/pfos-core.v53.js" defer></script>
+<script src="/pfos-core.v54.js" defer></script>
 <script src="/pfos-walkthrough/pfos-walkthrough.js" defer></script>
 <script>
 // Listen for theme changes from parent page
