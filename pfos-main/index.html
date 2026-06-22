@@ -15126,6 +15126,31 @@ function submitAdvisorRequestFromModal(){
       }catch(e){console.warn('PFOS_WRITE_INCOME:',e);}
       return;
     }
+    // ── PFOS_WRITE_BILL (Chunk 6 UX: linked recurring bill accept-only) ──
+    // Sent from pfos-client when the user ACCEPTS a detected Plaid recurring OUTFLOW as a plan bill. Upserts
+    // S.manualBills keyed on _plaidStreamId (idempotent re-accept). manualBills are CALENDAR-ONLY — they are
+    // never summed into calc()/baseExp (verified) — so this adds the bill's name/amount/due-date to the bill
+    // calendar + snapshot "bills paid" estimate WITHOUT double-counting the spend that already flows via
+    // transactions. Manual bills (no _plaidStreamId) are never touched.
+    if(msg.type==='PFOS_WRITE_BILL'){
+      try{
+        var bl=msg.bill; if(!bl||!bl._plaidStreamId)return;
+        if(!Array.isArray(S.manualBills))S.manualBills=[];
+        var _blAmt=Math.max(0,parseFloat(bl.amount)||0); if(_blAmt<=0)return;
+        var _blFreq=({annual:'annual',quarterly:'quarterly',semiannual:'semiannual',monthly:'monthly'})[String(bl.frequency||'monthly')]||'monthly';
+        var _blDay=Math.min(31,Math.max(1,parseInt(bl.due_day)||1));
+        var _blEx=null;
+        for(var _bi=0;_bi<S.manualBills.length;_bi++){ if(S.manualBills[_bi]&&S.manualBills[_bi]._plaidStreamId===bl._plaidStreamId){_blEx=S.manualBills[_bi];break;} }
+        if(_blEx){ _blEx.amount=Math.round(_blAmt); _blEx.due_day=_blDay; _blEx.frequency=_blFreq; if(bl.name)_blEx.name=bl.name; if(bl.icon)_blEx.icon=bl.icon; _blEx._lastSynced=new Date().toISOString(); }
+        else { S.manualBills.push({name:(bl.name||'Bill'),amount:Math.round(_blAmt),due_day:_blDay,frequency:_blFreq,is_auto_pay:!!bl.is_auto_pay,category:'misc',icon:(bl.icon||'🔁'),_source:'plaid',_plaidStreamId:String(bl._plaidStreamId),_lastSynced:new Date().toISOString()}); }
+        if(!S._touched)S._touched={};
+        S._touched.manualBills=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(typeof renderPayScheduleUI==='function'){try{renderPayScheduleUI();}catch(e){}}
+      }catch(e){console.warn('PFOS_WRITE_BILL:',e);}
+      return;
+    }
     // ── PFOS_DEBT_PAID_OFF ──
     // Sent from pfos-client when user marks a debt complete via the new debt
     // completion modal. Zeroes the matching debt balance, tags it with the

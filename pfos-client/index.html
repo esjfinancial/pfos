@@ -8143,6 +8143,33 @@ function _cpActiveSubs(){
   var arr=(typeof _cpRecurringCache!=='undefined'&&_cpRecurringCache)?_cpRecurringCache:[];
   return arr.filter(function(s){return s&&s.direction==='outflow'&&s.is_active!==false&&s.category_bucket;});
 }
+// ── #6: turn a detected recurring OUTFLOW into a plan bill (accept-only). S.manualBills is CALENDAR-ONLY in
+// the engine — never summed into calc()/baseExp — so adding one populates the bill calendar + the snapshot
+// "bills paid" estimate WITHOUT double-counting the spend that already flows via transactions. ──
+var _cpAcceptedBillStreams={};
+function _cpManualBills(){
+  var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
+  return Array.isArray(S.manualBills)?S.manualBills:[];
+}
+function _cpBillStreamAdded(streamId){
+  if(_cpAcceptedBillStreams[String(streamId)])return true;
+  return _cpManualBills().some(function(b){return b&&String(b._plaidStreamId)===String(streamId);});
+}
+function _cpStreamToBill(s){
+  var per=Math.abs(parseFloat(s.last_amount!=null?s.last_amount:s.average_amount)||0);
+  var F=String(s.frequency||'MONTHLY').toUpperCase();
+  var freq='monthly',amt=per;
+  if(F==='ANNUALLY'){freq='annual';amt=per;}
+  else if(F==='WEEKLY'){amt=per*52/12;}        // sub-monthly cadences -> monthly-equivalent amount
+  else if(F==='BIWEEKLY'){amt=per*26/12;}
+  else if(F==='SEMI_MONTHLY'){amt=per*2;}      // MONTHLY / UNKNOWN -> monthly per-occurrence
+  var dd=1,m=String(s.predicted_next_date||s.last_date||'').match(/^\d{4}-\d{2}-(\d{2})/);
+  if(m)dd=Math.min(31,Math.max(1,parseInt(m[1],10)||1));
+  return {amount:Math.round(amt),frequency:freq,due_day:dd};
+}
+function _cpBillMonthly(amount,frequency){
+  return (parseFloat(amount)||0)*({annual:1/12,semiannual:1/6,quarterly:1/3,monthly:1}[frequency]||1);
+}
 // Parse a 'YYYY-MM-DD' into "Mon D" without timezone drift (avoids new Date('YYYY-MM-DD') UTC-midnight).
 function _cpFmtShortDate(ymd){
   if(!ymd)return '';var m=String(ymd).match(/^(\d{4})-(\d{2})-(\d{2})/);if(!m)return '';
@@ -8166,7 +8193,7 @@ function _portalRenderSubscriptions(){
   var freqLabel={WEEKLY:'Weekly',BIWEEKLY:'Every 2 weeks',SEMI_MONTHLY:'Twice a month',MONTHLY:'Monthly',ANNUALLY:'Yearly',UNKNOWN:''};
   var h='<div class="sec-group" style="border:1px solid rgba(139,92,246,.25);background:rgba(139,92,246,.04)">';
   h+='<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:2px">🔁 Subscriptions &amp; recurring bills</div>';
-  h+='<div style="font-size:12px;color:rgba(226,232,240,.8);margin-bottom:10px">'+subs.length+' recurring '+(subs.length===1?'payment':'payments')+' detected from your linked accounts · about '+fmt(Math.round(totalMo))+'/mo. Already counted in your spending — shown here so nothing slips through.</div>';
+  h+='<div style="font-size:12px;color:rgba(226,232,240,.8);margin-bottom:10px">'+subs.length+' recurring '+(subs.length===1?'payment':'payments')+' detected from your linked accounts · about '+fmt(Math.round(totalMo))+'/mo. Already counted in your spending — add any to your <strong>bill calendar</strong> to track its due date (your spending total stays the same).</div>';
   subs.forEach(function(s){
     var name=esc(s.merchant_name||s.description||'Recurring payment');
     var icon=catIcon[s.category_bucket||'misc']||'🔁';
@@ -8174,13 +8201,43 @@ function _portalRenderSubscriptions(){
     var fl=freqLabel[(s.frequency||'UNKNOWN').toUpperCase()];if(fl==null)fl='';
     var nextTxt=s.predicted_next_date?('Next ~'+_cpFmtShortDate(s.predicted_next_date)):'';
     var meta=fl+(fl&&nextTxt?' · ':'')+nextTxt;
-    h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(139,92,246,.10);font-size:13px">';
-    h+='<div style="display:flex;align-items:center;gap:8px"><span style="font-size:15px">'+icon+'</span><div><div style="color:var(--wh);font-weight:600">'+name+'</div>'+(meta?'<div style="font-size:11px;color:var(--mu)">'+meta+'</div>':'')+'</div></div>';
-    h+='<span style="font-family:var(--fh);font-weight:700;color:#c4b5fd">'+fmt(Math.round(amt))+'</span>';
-    h+='</div>';
+    var sid=String(s.stream_id).replace(/'/g,"\\'");
+    var _added=_cpBillStreamAdded(s.stream_id);
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 0;border-bottom:1px solid rgba(139,92,246,.10);font-size:13px">';
+    h+='<div style="display:flex;align-items:center;gap:8px;min-width:0"><span style="font-size:15px;flex-shrink:0">'+icon+'</span><div style="min-width:0"><div style="color:var(--wh);font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+name+'</div>'+(meta?'<div style="font-size:11px;color:var(--mu)">'+meta+'</div>':'')+'</div></div>';
+    h+='<div style="display:flex;align-items:center;gap:8px;flex-shrink:0"><span style="font-family:var(--fh);font-weight:700;color:#c4b5fd">'+fmt(Math.round(amt))+'</span>';
+    h+=_added?'<span style="font-size:11px;font-weight:700;color:#86efac;white-space:nowrap">✓ In plan</span>':'<button onclick="_portalLinkedBillAccept(\''+sid+'\')" style="padding:4px 9px;font-size:11px;font-weight:700;background:rgba(139,92,246,.18);border:1px solid rgba(139,92,246,.45);color:#c4b5fd;border-radius:4px;cursor:pointer;white-space:nowrap">+ Add as bill</button>';
+    h+='</div></div>';
   });
   h+='</div>';
   return h;
+}
+async function _portalLinkedBillAccept(streamId){
+  try{
+    var subs=_cpActiveSubs();
+    var s=null; for(var i=0;i<subs.length;i++){ if(String(subs[i].stream_id)===String(streamId)){s=subs[i];break;} }
+    if(!s)return;
+    var nm=s.merchant_name||s.description||'Recurring bill';
+    var b=_cpStreamToBill(s); if(b.amount<=0)return;
+    var freqL=({monthly:'monthly',annual:'yearly',quarterly:'quarterly',semiannual:'every 6 months'})[b.frequency]||'monthly';
+    // Soft dedupe vs an existing MANUAL bill (no _plaidStreamId) at a near-equal monthly amount.
+    var dup=null, bm=_cpBillMonthly(b.amount,b.frequency);
+    _cpManualBills().forEach(function(mb){
+      if(dup||!mb||mb._plaidStreamId)return;
+      var m=_cpBillMonthly(mb.amount,mb.frequency);
+      if(m>0&&Math.abs(m-bm)<=Math.max(15,bm*0.15))dup=mb;
+    });
+    var msg=dup
+      ? 'Add <strong>'+esc(nm)+'</strong> (~'+fmt(b.amount)+' '+freqL+') to your bill calendar? <span style="color:#eab308">You already have a bill near this amount — adding this may duplicate it.</span> This only tracks the due date; your spending total is unchanged.'
+      : 'Add <strong>'+esc(nm)+'</strong> (~'+fmt(b.amount)+' '+freqL+', due around day '+b.due_day+') to your bill calendar? This only tracks the due date — your spending total is unchanged.';
+    var ok=await _cpConfirmModal({title:'Add this as a bill?',message:msg,confirmLabel:'Add bill',confirmStyle:'primary',icon:'🔁'});
+    if(!ok)return;
+    var icon=({housing:'🏠',utilities:'⚡',food:'🍽️',transportation:'🚗',insurance:'🛡️',subscriptions:'📱',discretionary:'🛍️',misc:'📦'})[s.category_bucket||'misc']||'🔁';
+    try{var fr=getPFOSFrame();if(fr&&fr.contentWindow)fr.contentWindow.postMessage({type:'PFOS_WRITE_BILL',bill:{name:nm,amount:b.amount,frequency:b.frequency,due_day:b.due_day,is_auto_pay:true,icon:icon,_plaidStreamId:String(s.stream_id)}},PFOS_ORIGIN);}catch(_e){}
+    _cpAcceptedBillStreams[String(s.stream_id)]=true; // suppress immediately (mirror updates on round-trip)
+    if(typeof _cpToast==='function')_cpToast(nm+' added to your bill calendar.');
+    if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+  }catch(e){console.warn('[PFOS] linked bill accept:',e);}
 }
 
 function _portalRenderSpendDashboard(){
