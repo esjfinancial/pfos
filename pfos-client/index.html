@@ -3572,6 +3572,15 @@ function clientHasFeature(feature){
   var tiers={none:0,core:1,trial:2,pro:2,pro_plus:3,comp:3};
   var level=tiers[tier]||0;
   var reqs={spending:1,calendar:1,payschedule:1,policies:2,estate:2,crossvalidation:2,tools_advanced:3,decision_engine:3,plaid:3};
+  // ── SANDBOX-TEST GATE (Plaid) ── While Plaid runs in PLAID_ENV=sandbox, restrict the account-linking
+  // UI to KNOWN TEST ACCOUNTS so real Pro+/comp clients don't see "Link accounts" wired to fake sandbox
+  // banks. REMOVE this entire block at the production cutover (PLAID_ENV=production), reverting Plaid to
+  // pure tier gating. Fail-closed (unknown email -> no Plaid UI) — safe by default.
+  if(feature==='plaid'){
+    var _em=((APP.currentClient&&APP.currentClient.email)||'').toLowerCase();
+    var _plaidTestAllow={'avery.stone.test@example.com':1,'tests@example.com':1,'ad-demo@pfos.test':1,'individual@email.com':1,'hybrida@email.com':1,'hybridb@email.com':1,'jointa@email.com':1,'jointb@email.com':1,'separatea@email.com':1,'separateb@email.com':1,'santiago.efrain.es@gmail.com':1};
+    if(!_plaidTestAllow[_em])return false;
+  }
   return level>=(reqs[feature]||3);
 }
 function renderTierGate(el,feature,title,desc){
@@ -29372,6 +29381,29 @@ async function _cpSelectApproachHybrid(key,aiData){
   jointCardsForBothSpouses.forEach(function(jc){
     CPLAN.allocations.push(JSON.parse(JSON.stringify(jc)));
   });
+  // HYBRID BUDGET RECONCILIATION (over-deployment guard): _cpConvertAIRecs normalized the
+  // requesting user's SELF recs to the full pool (surplus*(1-breathing)). But in a hybrid
+  // household the user ALSO funds their share (amountSelf, ~50% by default) of each joint
+  // card from the SAME surplus. Without reserving that share, self + joint-share overflows
+  // the pool (negative breathing room — measured +$1.5k over a $2.9k pool in audit). Scale
+  // ONLY the self (owner!=='joint') allocations to fit pool - Σ(joint.amountSelf); joint cards
+  // keep their agreed amounts and per-spouse splits. ASSUMPTION: the user funds amountSelf
+  // (their share) of each joint card from their own surplus (the hybrid finances-split model).
+  (function _cpHybridReserveJointShare(){
+    var _brP=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+    var _cap=Math.round((CPLAN.surplus||0)*(1-_brP));
+    var _jointSelf=0,_selfTot=0,_self=[];
+    CPLAN.allocations.forEach(function(a){
+      if(a.owner==='joint'){_jointSelf+=(parseFloat(a.amountSelf)||0);}
+      else{_selfTot+=(parseFloat(a.amount)||0);_self.push(a);}
+    });
+    var _selfBudget=Math.max(0,_cap-_jointSelf);
+    if(_selfTot>_selfBudget&&_selfTot>0){
+      var _sc=_selfBudget/_selfTot;
+      _self.forEach(function(a){a.amount=Math.round((parseFloat(a.amount)||0)*_sc);});
+      CPLAN._hybridScaledForJoint={selfFrom:Math.round(_selfTot),selfTo:Math.round(_selfBudget),jointReserve:Math.round(_jointSelf),at:Date.now()};
+    }
+  })();
   CPLAN.allocations.forEach(function(a){if(a._state==='proposed')a._state='selected';});
   CPLAN._originalAIPlan=JSON.parse(JSON.stringify(aiData.recommendations||[]));
 
@@ -31576,8 +31608,12 @@ function _cpAutoSuggestV2(){
     CPLAN.allocations.push({type:'401k',amount:matchAmt,target:0,phase:1,cascade:'',customName:'401(k) — Capture Full Employer Match',reason:_matchReason});
   }
 
-  // Phase 1: Growth — select best vehicles and fund from day 1
-  var growPool=Math.round(pool*growthPct);
+  // Phase 1: Growth — select best vehicles and fund from day 1.
+  // Growth absorbs the EXACT remainder of the pool (pool minus what debt/EF/match actually took),
+  // so the buckets re-sum to the pool exactly — avoids ±$1 rounding drift AND redeploys any
+  // IRS-capped match shortfall into growth instead of leaving it idle. (growthPct above = share intent.)
+  var _deployedSoFar=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+  var growPool=Math.max(0,pool-_deployedSoFar);
   if(growPool>0){
     var _vehicles=[
       {type:'roth',phase:1,score:50+(isAgg?10:isCon?-5:5)},
@@ -31789,8 +31825,10 @@ function _cpRenderPlanV2(){
     if(_liveS.calcs){
       var _lc=_liveS.calcs;
       var _prevIncome=CPLAN.income;
-      CPLAN.income=parseFloat(_lc.income)||CPLAN.income;
-      CPLAN.expenses=parseFloat(_lc.expenses)||CPLAN.expenses;
+      // Engine calcs expose .inc / .baseExp — NOT .income / .expenses (those were undefined, so this
+      // refresh + the income-change rescale below were silently inert). Use the real canonical fields.
+      CPLAN.income=parseFloat(_lc.inc)||CPLAN.income;
+      CPLAN.expenses=parseFloat(_lc.baseExp)||CPLAN.expenses;
       CPLAN.surplus=Math.max(0,CPLAN.income-CPLAN.expenses);
       CPLAN.efTarget=Math.max(CPLAN.expenses*(CPLAN._efMonthsTarget||3),1);
       // Income change detection — scale allocations proportionally
@@ -34955,7 +34993,9 @@ function _cpBuildTimeline(){
 // ── PHASE HANDLERS ──
 function _cpSetPhase(i,v){CPLAN.allocations[i].phase=parseInt(v)||0;_cpRenderPlanV2();}
 function _cpSetBreathingRoom(v){
-  CPLAN._breathingPct=parseInt(v)||15;
+  // Clamp to [0,50] to match the server's accepted range (index.ts) — guards against a malformed
+  // persisted value making the frontend pool diverge from the AI/server pool.
+  CPLAN._breathingPct=Math.max(0,Math.min(50,parseInt(v)||15));
   CPLAN._breathingTouched=true;
   // Targeted update — don't re-render the whole page (which would destroy the slider being dragged)
   var brPct=CPLAN._breathingPct;
@@ -36313,13 +36353,16 @@ function _cpExtractRedFlags(){
   if(d.income>0&&d.expenses>=d.income)flags.push({type:'crit',icon:'🚨',title:'Cash Flow Deficit',desc:'Spending exceeds income by '+fmt(Math.round(d.expenses-d.income))+'/mo. This must be addressed before building any plan.',action:'expenses'});
   else if(d.income>0&&(d.income-d.expenses)<200)flags.push({type:'warn',icon:'⚠️',title:'Razor-thin buffer: '+fmt(Math.round(d.income-d.expenses))+'/mo',desc:'One unexpected expense could force you into new debt.',action:'expenses'});
   // No emergency fund
+  var _efMo=d._efMonthsTarget||3;
   if(d.efBal<d.efTarget*0.25)flags.push({type:'crit',icon:'🛡️',title:'Emergency fund critically low',desc:'You have '+fmt(Math.round(d.efBal))+' of a '+fmt(Math.round(d.efTarget))+' target. Any disruption forces debt.',action:'ef'});
-  else if(d.efBal<d.efTarget)flags.push({type:'warn',icon:'🛡️',title:'Emergency fund gap: '+fmt(Math.round(d.efTarget-d.efBal)),desc:'Need '+fmt(Math.round(d.efTarget))+' for 3 months of expenses.',action:'ef'});
-  // High-interest debt
-  var hiDebts=d.debts.filter(function(x){return(parseFloat(x.rate)||0)>=15;});
+  else if(d.efBal<d.efTarget)flags.push({type:'warn',icon:'🛡️',title:'Emergency fund gap: '+fmt(Math.round(d.efTarget-d.efBal)),desc:'Need '+fmt(Math.round(d.efTarget))+' for '+_efMo+' month'+(_efMo===1?'':'s')+' of expenses.',action:'ef'});
+  // High-interest debt — honor the engine's include:false exclusion (a linked debt toggled out of
+  // the plan must not still fire a flag; the engine drops it from totalDebt/DTI the same way).
+  var _inclDebts=(d.debts||[]).filter(function(x){return !(x&&x.include===false);});
+  var hiDebts=_inclDebts.filter(function(x){return(parseFloat(x.rate)||0)>=15;});
   if(hiDebts.length>0){var hiTotal=hiDebts.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);var hiInt=hiDebts.reduce(function(t,x){return t+((parseFloat(x.balance)||0)*(parseFloat(x.rate)||0)/100/12);},0);
     flags.push({type:'crit',icon:'💳',title:'High-interest debt: '+fmtK(hiTotal),desc:hiDebts.length+' account'+(hiDebts.length>1?'s':'')+' above 15% APR costing '+fmt(Math.round(hiInt))+'/mo in interest.',action:'debt'});}
-  else if(d.totalDebt>0)flags.push({type:'warn',icon:'💳',title:'Outstanding debt: '+fmtK(d.totalDebt),desc:d.debts.length+' account'+(d.debts.length>1?'s':'')+' — a payoff strategy could save thousands in interest.',action:'debt'});
+  else if(d.totalDebt>0)flags.push({type:'warn',icon:'💳',title:'Outstanding debt: '+fmtK(d.totalDebt),desc:_inclDebts.length+' account'+(_inclDebts.length>1?'s':'')+' — a payoff strategy could save thousands in interest.',action:'debt'});
   // ── Employer match capture ─────────────────────────────────────────────
   // Fires only when there's genuine free money left on the table. Three pieces
   // of state matter:
@@ -36451,8 +36494,10 @@ function _cpExtractRedFlags(){
     var _disMonthly=Math.round((d.income||0)*0.65);
     flags.push({type:'warn',icon:'⚡',title:'No disability coverage detected',desc:'Your income ('+fmt(d.income)+'/mo) is your most valuable asset — long-term disability is statistically more likely than premature death during working years, and Social Security disability replaces only a fraction with strict eligibility. Industry-standard guidance is 60-70% income replacement (about $'+fmt(_disMonthly)+'/mo for you), own-occupation definition, benefit period to age 65. If your employer offers group LTD, verify the amount and definition. Get quotes from a licensed insurance professional.',action:'protection'});
   }
-  // Low savings rate
-  var sr=d.income>0?(d.income-d.expenses)/d.income*100:0;
+  // Low savings rate — use the CANONICAL engine savingsRate (gross active-savings basis),
+  // NOT a net (income-expenses)/income recompute (which false-flags payroll-401k/auto-invest
+  // savers; CLAUDE.md §4). CPLAN.savingsRate is seeded from c.savingsRate in initClientPlan.
+  var sr=(d.savingsRate!=null)?d.savingsRate:0;
   if(sr<5&&d.income>0)flags.push({type:'warn',icon:'📉',title:'Savings rate: '+sr.toFixed(1)+'%',desc:'Below 5% means surviving, not building. Target at least 15% for wealth growth.',action:'savings'});
   // No retirement accounts — must match the canonical _retVehicles list used
   // elsewhere in the file (line ~23136). Otherwise the flag detection and the
@@ -36716,7 +36761,7 @@ function _cpExtractRedFlags(){
   // ── Mortgage in retirement (debt with payoff date past retirement age) ──
   // Carrying a mortgage past 65 means rent-equivalent fixed costs eating retirement income.
   // Heuristic: if mortgage balance > 5x annual income AND age >= 50, flag it.
-  var mortgages=(d.debts||[]).filter(function(x){var t=(x.type||x.name||'').toLowerCase();return t.indexOf('mortgage')>=0||t.indexOf('home loan')>=0;});
+  var mortgages=_inclDebts.filter(function(x){var t=(x.type||x.name||'').toLowerCase();return t.indexOf('mortgage')>=0||t.indexOf('home loan')>=0;});
   if(mortgages.length>0&&d.age>=50){
     var mortBal=mortgages.reduce(function(t,m){return t+(parseFloat(m.balance)||0);},0);
     var annualIncomeMort=d.income*12;
@@ -38384,10 +38429,21 @@ function initClientPlan(){
   CPLAN.debts=rawS.debts||[];CPLAN.debtMin=CPLAN.debts.reduce(function(t,x){return t+(parseFloat(x.min)||parseFloat(x.payment)||0);},0);
   CPLAN.totalDebt=c.totalDebt||CPLAN.debts.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);
   CPLAN.surplus=Math.max(0,CPLAN.income-CPLAN.expenses);CPLAN.age=parseInt(rawS.currentAge)||30;
-  // EF balance: savings only, not checking. Matches the basis used in pfos-main
-  // (see comment in calc() near efMonths). Checking is for monthly bills, not
-  // emergency reserves; including it would falsely inflate coverage months.
-  CPLAN.efBal=c.efBal||(rawS.assets?(parseFloat(rawS.assets.savings)||0):0);
+  // Canonical savings rate from the engine (gross active-savings basis: activeSavings/income).
+  // NEVER recompute as net (income-expenses)/income — that shortcut falsely flags
+  // payroll-401k / auto-invest savers as "low savings" (CLAUDE.md §4 divergence trap).
+  CPLAN.savingsRate=(c.savingsRate!=null)?c.savingsRate:((typeof freshCalcs==='function'&&freshCalcs(fd).savingsRate)||0);
+  // EF balance: savings always counts. For checking, only the amount ABOVE $5,000 counts toward
+  // the emergency fund — the first $5k is operating cash for monthly bills; anything over $5k is
+  // treated as reserve/savings. aSavings/aChecking derived from the engine's linked-inclusive,
+  // include-filtered totals (efMonths = aSavings/baseExp, so aSavings = efMonths*baseExp; aChecking = aCash - aSavings).
+  CPLAN.efBal=(function(){
+    var _bx=c.baseExp||0;
+    var _aSav=(_bx>0&&c.efMonths!=null)?(c.efMonths*_bx):(rawS.assets?(parseFloat(rawS.assets.savings)||0):0);
+    var _aCash=(c.aCash!=null)?c.aCash:_aSav;
+    var _aChk=Math.max(0,_aCash-_aSav);
+    return _aSav+Math.max(0,_aChk-5000);
+  })();
   // EF months target: respect user choice if saved on the plan, default to 3.
   // 3 is the minimum baseline; 4-6+ is appropriate for single-income, sole
   // provider, irregular income, high job-risk industries, etc.
