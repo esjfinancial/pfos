@@ -6167,7 +6167,7 @@ function showSnapshotSetup(){
   var c=S.calcs||{};var now=new Date();
   var dayOfMonth=now.getDate();var monthName=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][now.getMonth()];
   var bills=getFixedBills();
-  var billsPaidSoFar=bills.filter(function(b){return b.due_day<=dayOfMonth;});
+  var billsPaidSoFar=bills.filter(function(b){return Math.min(Math.max(1,parseInt(b.due_day)||1),new Date(now.getFullYear(),now.getMonth()+1,0).getDate())<=dayOfMonth;});
   var billsPaidTotal=billsPaidSoFar.reduce(function(t,b){return t+(b.amount||0);},0);
   // ── Plaid auto-fill: prefill "where you are" from linked balances + this-month linked spend so the user
   // confirms/edits instead of re-typing what we already pulled. Snapshot is the pulse tracker (S.snapshot),
@@ -6221,6 +6221,7 @@ function renderHome(){
   var now=new Date();var curMonth=now.getMonth(),curYear=now.getFullYear();
   var daysInMonth=new Date(curYear,curMonth+1,0).getDate();
   var dayOfMonth=now.getDate();var daysLeft=daysInMonth-dayOfMonth;
+  var _effDueH=function(b){return Math.min(Math.max(1,parseInt(b&&b.due_day)||1),daysInMonth);}; // #6: clamp due_day to month length so a 31st bill still surfaces in short months
   var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
   var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
   // Money In = income source amount (user enters what hits their bank — already net)
@@ -6229,7 +6230,7 @@ function renderHome(){
   var dailyBudget=daysLeft>0?Math.round(leftToSpend/daysLeft):0;
   var pctSpent=moneyIn>0?Math.round((moneyOut/moneyIn)*100):0;
   var bills=getFixedBills();
-  var upcomingBills=bills.filter(function(b){return b.due_day>dayOfMonth&&b.due_day<=dayOfMonth+7;});
+  var upcomingBills=bills.filter(function(b){var ed=_effDueH(b);return ed>dayOfMonth&&ed<=dayOfMonth+7;});
   var weekStart=new Date(now);weekStart.setDate(now.getDate()-now.getDay());
   var lastWeekStart=new Date(weekStart);lastWeekStart.setDate(lastWeekStart.getDate()-7);
   var thisWeekTotal=entries.filter(function(e){var d=new Date(e.date);return d>=weekStart;}).reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
@@ -6308,7 +6309,7 @@ function renderHome(){
     var nextPayDates2=getPayDatesForMonth(curMonth,curYear).filter(function(pd){return pd.day>dayOfMonth;});
     if(nextPayDates2.length>0){
       var nextPay2=nextPayDates2[0];
-      var billsBeforeNext=bills.filter(function(b){return b.due_day>dayOfMonth&&b.due_day<=nextPay2.day;});
+      var billsBeforeNext=bills.filter(function(b){var ed=_effDueH(b);return ed>dayOfMonth&&ed<=nextPay2.day;});
       var billTot=billsBeforeNext.reduce(function(t,b){return t+(b.amount||0);},0);
       if(billTot>0){
         h+='<div class="sec-group"><div class="sec-group-title">💡 Before Your Next Paycheck</div>';
@@ -6341,9 +6342,10 @@ function renderHome(){
     });
   }
   // Bills due in next 3 days
-  var urgentBills=bills.filter(function(b){return b.due_day>dayOfMonth&&b.due_day<=dayOfMonth+3;});
+  var urgentBills=bills.filter(function(b){var ed=_effDueH(b);return ed>dayOfMonth&&ed<=dayOfMonth+3;});
   urgentBills.forEach(function(b){
-    alerts.push({icon:'📅',color:'var(--or)',text:b.icon+' '+b.name+' ('+fmt(Math.round(b.amount))+') due in '+(b.due_day-dayOfMonth)+' day'+(b.due_day-dayOfMonth>1?'s':'')});
+    var _ud=_effDueH(b)-dayOfMonth;
+    alerts.push({icon:'📅',color:'var(--or)',text:b.icon+' '+b.name+' ('+fmt(Math.round(b.amount))+') due in '+_ud+' day'+(_ud>1?'s':'')});
   });
   // Budget depletion prediction
   if(moneyIn>0&&moneyOut>0&&daysLeft>0){
@@ -6829,7 +6831,7 @@ function renderCalendar(month,year,bills,entries){
   // Map bills to days
   var billsByDay={};
   (bills||[]).forEach(function(b){
-    var d=b.due_day;if(d<1||d>daysInMonth)return;
+    var d=Math.min(Math.max(1,parseInt(b.due_day)||1),daysInMonth); // #6: clamp (was: skip when d>daysInMonth)
     if(!billsByDay[d])billsByDay[d]=[];
     billsByDay[d].push(b);
   });
@@ -9660,7 +9662,10 @@ function _plaidApplyToState(S, payload) {
       if (S.spendingEntries[si] && S.spendingEntries[si]._plaidTxnId === e._plaidTxnId) { exS = S.spendingEntries[si]; break; }
     }
     if (exS) {
-      ['amount', 'description', 'category', 'category_bucket', 'date', 'pending'].forEach(function (f) { if (e[f] !== undefined) exS[f] = e[f]; });
+      // #3: if the user recategorized this linked txn (_userCat), preserve their category/bucket across re-syncs;
+      // otherwise the server payload's category wins. amount/date/pending always refresh from the bank.
+      var _ofields = exS._userCat ? ['amount', 'description', 'date', 'pending'] : ['amount', 'description', 'category', 'category_bucket', 'date', 'pending'];
+      _ofields.forEach(function (f) { if (e[f] !== undefined) exS[f] = e[f]; });
       exS._source = 'plaid';
     } else {
       var nwS = Object.assign({}, e); nwS._source = 'plaid'; S.spendingEntries.push(nwS);
@@ -15055,6 +15060,52 @@ function submitAdvisorRequestFromModal(){
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
         else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
       }catch(e){console.warn('PFOS_QUICK_ADD:',e);}
+      return;
+    }
+    // Portal delete: remove a spending entry from the CANONICAL store (the portal only removed it from its
+    // optimistic mirror + posted here). Without this, the next PFOS_DATA_CHANGE re-pushes S and the entry
+    // reappears. Match by String id (manual ids are numeric, linked ids are 'plx_' strings). For linked
+    // entries the shell first calls plaid-txn-edit to exclude server-side so a re-sync won't re-import it.
+    if(msg.type==='PFOS_DELETE_ENTRY'){
+      try{
+        var _delId=msg.entryId; if(_delId==null)return;
+        if(!Array.isArray(S.spendingEntries))return;
+        var _before=S.spendingEntries.length;
+        S.spendingEntries=S.spendingEntries.filter(function(e){return !(e&&String(e.id)===String(_delId));});
+        if(S.spendingEntries.length===_before)return; // nothing matched — no spurious save
+        if(!S._touched)S._touched={};
+        S._touched.spendingEntries=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+        else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+      }catch(e){console.warn('PFOS_DELETE_ENTRY:',e);}
+      return;
+    }
+    // Portal edit: replace an existing spending entry's editable fields in the CANONICAL store (match by id).
+    // For a LINKED entry (existing _plaidTxnId), the portal rebuild hardcodes _source:'portal' and drops the
+    // Plaid id — so preserve the linked identity from the CURRENT entry, and when the category changed stamp
+    // _userCat so the next plaid re-sync (_plaidApplyToState) won't clobber the user's category (Chunk 5).
+    if(msg.type==='PFOS_EDIT_ENTRY'){
+      try{
+        var _ed=msg.entry||{}; if(_ed.id==null||isNaN(parseFloat(_ed.amount)))return;
+        if(!Array.isArray(S.spendingEntries))return;
+        var _eidx=-1;
+        for(var _ei=0;_ei<S.spendingEntries.length;_ei++){ if(S.spendingEntries[_ei]&&String(S.spendingEntries[_ei].id)===String(_ed.id)){_eidx=_ei;break;} }
+        if(_eidx<0)return;
+        var _cur=S.spendingEntries[_eidx];
+        var _wasPlaid=!!_cur._plaidTxnId;
+        var _catChanged=(_ed.category!=null&&_ed.category!==_cur.category)||(_ed.category_bucket!=null&&_ed.category_bucket!==_cur.category_bucket);
+        ['amount','description','category','category_bucket','expense_type','payment_method','payment_detail','couple_owner','is_recurring','recurrence_freq','date'].forEach(function(f){ if(_ed[f]!==undefined)_cur[f]=_ed[f]; });
+        if(_ed.amount!==undefined)_cur.amount=parseFloat(_ed.amount)||0;
+        if(_wasPlaid){ _cur._source='plaid'; if(_catChanged)_cur._userCat=true; } // never let an edit strip the linked identity
+        if(!S._touched)S._touched={};
+        S._touched.spendingEntries=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+        else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+      }catch(e){console.warn('PFOS_EDIT_ENTRY:',e);}
       return;
     }
     // ── PFOS_WRITE_EXP_BUDGET ──

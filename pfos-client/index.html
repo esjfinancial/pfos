@@ -5897,7 +5897,7 @@ function _portalRenderCalendar(month,year,bills,entries,recurring){
   // Map bills by day
   var billsByDay={};
   (bills||[]).forEach(function(b){
-    var d=parseInt(b.due_day);if(d<1||d>daysInMonth)return;
+    var d=Math.min(Math.max(1,parseInt(b.due_day)||1),daysInMonth); // #6: clamp (was: skip when d>daysInMonth)
     if(!billsByDay[d])billsByDay[d]=[];
     billsByDay[d].push(b);
   });
@@ -7910,8 +7910,9 @@ function _portalSmartAlertsBlock(status,bills,monthEntries){
     }
   });
   // Urgent bills (next 3 days)
-  (bills||[]).filter(function(b){return b.due_day>dayOfMonth&&b.due_day<=dayOfMonth+3;}).forEach(function(b){
-    alerts.push({icon:'📅',color:'var(--or)',text:b.icon+' '+b.name+' ('+fmt(Math.round(b.amount))+') due in '+(b.due_day-dayOfMonth)+' day'+(b.due_day-dayOfMonth>1?'s':'')});
+  (bills||[]).filter(function(b){var ed=Math.min(Math.max(1,parseInt(b.due_day)||1),daysInMonth);return ed>dayOfMonth&&ed<=dayOfMonth+3;}).forEach(function(b){
+    var _ud=Math.min(Math.max(1,parseInt(b.due_day)||1),daysInMonth)-dayOfMonth;
+    alerts.push({icon:'📅',color:'var(--or)',text:b.icon+' '+b.name+' ('+fmt(Math.round(b.amount))+') due in '+_ud+' day'+(_ud>1?'s':'')});
   });
   // Budget depletion prediction
   if(moneyIn>0&&moneyOut>0&&daysLeft>0&&dayOfMonth>0){
@@ -7952,7 +7953,7 @@ function _portalShowSnapshotSetup(){
   var dayOfMonth=now.getDate();
   var monthName=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][now.getMonth()];
   var bills=_portalGetFixedBills();
-  var billsPaid=bills.filter(function(b){return b.due_day<=dayOfMonth;});
+  var billsPaid=bills.filter(function(b){return Math.min(Math.max(1,parseInt(b.due_day)||1),new Date(now.getFullYear(),now.getMonth()+1,0).getDate())<=dayOfMonth;});
   var billsPaidTot=billsPaid.reduce(function(t,b){return t+(b.amount||0);},0);
   var existing=S.snapshot||{};
   var isThisMonth=existing.month===now.getMonth()&&existing.year===now.getFullYear();
@@ -8046,7 +8047,7 @@ function _portalEditEntry(entryId){
   var fd=APP._portalFd||{};
   var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
   var entry=null;
-  (S.spendingEntries||[]).some(function(e){if(e.id===entryId){entry=e;return true;}return false;});
+  (S.spendingEntries||[]).some(function(e){if(String(e.id)===String(entryId)){entry=e;return true;}return false;});
   if(!entry){console.warn('Portal edit: entry not found',entryId);return;}
   // Re-use the existing add modal in edit mode
   _portalOpenAddExpense({
@@ -8059,7 +8060,9 @@ function _portalEditEntry(entryId){
     recurrence_freq:entry.recurrence_freq,
     _title:'Edit Expense',
     _editId:entry.id,
-    _editDate:entry.date
+    _editDate:entry.date,
+    _plaidTxnId:entry._plaidTxnId,
+    _source:entry._source
   });
 }
 async function _portalDeleteEntry(entryId){
@@ -8071,18 +8074,24 @@ async function _portalDeleteEntry(entryId){
     icon: '🗑'
   });
   if(!ok) return;
+  // Detect a linked (bank) transaction — deleting one EXCLUDES it server-side so it stops re-importing.
+  var _dS=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
+  var _dEnt=(_dS.spendingEntries||[]).filter(function(e){return String(e.id)===String(entryId);})[0];
+  var _dTxn=_dEnt&&_dEnt._plaidTxnId;
   // Optimistic local removal so the UI updates instantly — also set _touched on both
   // mirrors so the beforeunload keepalive flush will fire if the user closes within 300ms.
   if(_lastPfosState&&_lastPfosState.state&&_lastPfosState.state.spendingEntries){
-    _lastPfosState.state.spendingEntries=_lastPfosState.state.spendingEntries.filter(function(e){return e.id!==entryId;});
+    _lastPfosState.state.spendingEntries=_lastPfosState.state.spendingEntries.filter(function(e){return String(e.id)!==String(entryId);});
     if(!_lastPfosState.state._touched)_lastPfosState.state._touched={};
     _lastPfosState.state._touched.spendingEntries=true;
   }
   if(APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.spendingEntries){
-    APP._portalFd.S.spendingEntries=APP._portalFd.S.spendingEntries.filter(function(e){return e.id!==entryId;});
+    APP._portalFd.S.spendingEntries=APP._portalFd.S.spendingEntries.filter(function(e){return String(e.id)!==String(entryId);});
     if(!APP._portalFd.S._touched)APP._portalFd.S._touched={};
     APP._portalFd.S._touched.spendingEntries=true;
   }
+  // Linked txn: exclude server-side (stops re-import) before the canonical delete. Manual entries skip this.
+  if(_dTxn){ try{ await db.functions.invoke('plaid-txn-edit',{body:{action:'exclude',transaction_id:String(_dTxn)}}); }catch(_e){} }
   // Canonical write
   try{
     var frame=getPFOSFrame();
@@ -8092,6 +8101,29 @@ async function _portalDeleteEntry(entryId){
   }catch(e){console.warn('Portal delete postMessage:',e);}
   if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
   if(typeof _clientRenderSpendPulse==='function'){try{_clientRenderSpendPulse();}catch(e){}}
+}
+// #4/#5: exclude a linked transaction (a one-click "this is a duplicate / not mine") — hides it from spending
+// server-side so it stops re-importing, and removes it from the local mirror + engine immediately.
+async function _cpExcludeTxn(txnId){
+  if(!txnId)return;
+  try{ await db.functions.invoke('plaid-txn-edit',{body:{action:'exclude',transaction_id:String(txnId)}}); }
+  catch(_e){ if(typeof _cpToast==='function')_cpToast('Could not exclude — try again.'); return; }
+  var _xid='plx_'+txnId;
+  [(_lastPfosState&&_lastPfosState.state),(APP._portalFd&&APP._portalFd.S)].forEach(function(st){
+    if(st&&Array.isArray(st.spendingEntries)){
+      st.spendingEntries=st.spendingEntries.filter(function(e){return String(e.id)!==_xid&&String(e._plaidTxnId)!==String(txnId);});
+      st._touched=st._touched||{}; st._touched.spendingEntries=true;
+    }
+  });
+  try{var fr=getPFOSFrame();if(fr&&fr.contentWindow)fr.contentWindow.postMessage({type:'PFOS_DELETE_ENTRY',entryId:_xid},'https://pfos.esjfinancial.com');}catch(_e){}
+  if(typeof _cpToast==='function')_cpToast('Transaction excluded.');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+// #3: persist a recategorization of a linked txn server-side (category_overrides) so it survives every re-sync.
+async function _cpRecategorizeTxn(txnId,category){
+  if(!txnId||!category)return false;
+  try{ var r=await db.functions.invoke('plaid-txn-edit',{body:{action:'recategorize',transaction_id:String(txnId),category:String(category)}}); return !!(r&&r.data&&r.data.ok); }
+  catch(_e){ return false; }
 }
 
 // ── My Spending dashboard — the rich, live, color-coordinated view ──
@@ -8473,11 +8505,13 @@ function _portalRenderSpendDashboard(){
 
   // ── 9. Upcoming Bills (Next 7 Days) ──
   var dayOfMonth=status.dayOfMonth;
-  var upcomingBills=bills.filter(function(b){return b.due_day>dayOfMonth&&b.due_day<=dayOfMonth+7;}).sort(function(a,b){return a.due_day-b.due_day;});
+  var _dimUp=new Date(curYear,curMonth+1,0).getDate();
+  var _effDue=function(b){return Math.min(Math.max(1,parseInt(b&&b.due_day)||1),_dimUp);}; // #6: clamp due_day to current month length
+  var upcomingBills=bills.filter(function(b){var ed=_effDue(b);return ed>dayOfMonth&&ed<=dayOfMonth+7;}).sort(function(a,b){return _effDue(a)-_effDue(b);});
   if(upcomingBills.length>0){
     h+='<div class="sec-group"><div class="sec-group-title">Coming Up (Next 7 Days)</div>';
     upcomingBills.forEach(function(b){
-      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><div style="display:flex;align-items:center;gap:8px"><span style="font-family:var(--fh);font-size:12px;color:var(--mu);font-weight:700;min-width:50px">'+monthNames[curMonth].slice(0,3)+' '+b.due_day+'</span><span style="color:var(--wh)">'+b.icon+' '+esc(b.name)+'</span></div><span style="font-family:var(--fh);font-weight:700;color:var(--or)">'+fmt(Math.round(b.amount))+'</span></div>';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:9px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><div style="display:flex;align-items:center;gap:8px"><span style="font-family:var(--fh);font-size:12px;color:var(--mu);font-weight:700;min-width:50px">'+monthNames[curMonth].slice(0,3)+' '+_effDue(b)+'</span><span style="color:var(--wh)">'+b.icon+' '+esc(b.name)+'</span></div><span style="font-family:var(--fh);font-weight:700;color:var(--or)">'+fmt(Math.round(b.amount))+'</span></div>';
     });
     h+='</div>';
   }
@@ -8488,7 +8522,7 @@ function _portalRenderSpendDashboard(){
     var nextPayDates=_portalGetPayDates(curMonth,curYear).filter(function(pd){return pd.day>dayOfMonth;});
     if(nextPayDates.length>0){
       var nextPay=nextPayDates[0];
-      var billsBeforeNext=bills.filter(function(b){return b.due_day>dayOfMonth&&b.due_day<=nextPay.day;});
+      var billsBeforeNext=bills.filter(function(b){var ed=_effDue(b);return ed>dayOfMonth&&ed<=nextPay.day;});
       var billTot=billsBeforeNext.reduce(function(t,b){return t+(b.amount||0);},0);
       if(billTot>0){
         h+='<div class="sec-group"><div class="sec-group-title">💡 Before Your Next Paycheck</div>';
@@ -8550,6 +8584,7 @@ function _portalRenderSpendDashboard(){
       try{var d=new Date(e.date);dateStr=monthNames[d.getMonth()].slice(0,3)+' '+d.getDate();}catch(_){}
       var et=e.expense_type||'regular';
       var borderCol=et==='emergency'?'var(--rd)':et==='big_purchase'?'var(--yl)':'var(--bd)';
+      var _amt=parseFloat(e.amount)||0,_isCredit=_amt<0; // #4: negative = refund/credit (nets against spend)
       h+='<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--bg-card);border:1px solid '+borderCol+';border-radius:3px;margin-bottom:5px">';
       h+='<span style="font-size:16px;flex-shrink:0">'+ic+'</span>';
       h+='<div style="flex:1;min-width:0">';
@@ -8560,10 +8595,12 @@ function _portalRenderSpendDashboard(){
       else if(et==='big_purchase')h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:10px">💰 Big Purchase</span>';
       if(e.is_recurring)h+='<span style="color:#5B9BFF;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">🔁 Recurring</span>';
       if(e._source==='plaid')h+='<span style="color:#A855F7;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Imported from your linked bank">🔗 Linked</span>';
+      if(_isCredit)h+='<span style="color:var(--gr);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Refund/credit — reduces your spending">↩ Refund</span>';
+      if(e._possibleDuplicate)h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">⚠ Possible duplicate'+(e._plaidTxnId?' · <a onclick="_cpExcludeTxn(\''+e._plaidTxnId+'\')" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Exclude</a>':'')+'</span>';
       h+='</div></div>';
-      h+='<div style="font-family:var(--fd);font-size:14px;color:var(--or);font-weight:700;flex-shrink:0">'+fmt(parseFloat(e.amount)||0)+'</div>';
-      h+='<button onclick="_portalEditEntry('+e.id+')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Edit" aria-label="Edit expense">✏️</button>';
-      h+='<button onclick="_portalDeleteEntry('+e.id+')" style="background:none;border:none;color:var(--rd);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Delete" aria-label="Delete expense">✕</button>';
+      h+='<div style="font-family:var(--fd);font-size:14px;color:'+(_isCredit?'var(--gr)':'var(--or)')+';font-weight:700;flex-shrink:0">'+(_isCredit?'+'+fmt(Math.abs(_amt)):fmt(_amt))+'</div>';
+      h+='<button onclick="_portalEditEntry(\''+e.id+'\')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Edit" aria-label="Edit expense">✏️</button>';
+      h+='<button onclick="_portalDeleteEntry(\''+e.id+'\')" style="background:none;border:none;color:var(--rd);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Delete" aria-label="Delete expense">✕</button>';
       h+='</div>';
     });
     h+='</div>';
@@ -8991,14 +9028,16 @@ function _portalOpenAddExpense(prefill){
   h+='<button class="modal-close" onclick="APP._portalQaPrefill=null;closeModal(\'portalAddExpenseModal\')" aria-label="Close">✕</button>';
   h+='<div class="modal-hdr"><div class="modal-title">'+title+'</div></div>';
   h+='<div style="padding:0 4px 8px">';
-  // Amount + Date
+  // Amount + Date — for a linked (bank) txn, amount & date are bank truth: read-only, only category is editable.
+  var _linkedEdit=!!(prefill&&prefill._plaidTxnId);
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Amount</div>';
-  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="text" inputmode="decimal" id="portalQaAmount" placeholder="0.00" value="'+(prefill.amount||'')+'" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:18px;font-weight:700;border-radius:4px;box-sizing:border-box" oninput="autoComma(this);this.style.borderColor=pf(this.value)>0?\'rgba(91,155,255,.35)\':\'var(--bd)\'"></div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="text" inputmode="decimal" id="portalQaAmount"'+(_linkedEdit?' readonly':'')+' placeholder="0.00" value="'+(prefill.amount||'')+'" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:18px;font-weight:700;border-radius:4px;box-sizing:border-box" oninput="autoComma(this);this.style.borderColor=pf(this.value)>0?\'rgba(91,155,255,.35)\':\'var(--bd)\'"></div>';
   h+='</div>';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Date</div>';
-  h+='<input type="date" id="portalQaDate" value="'+dateValue+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  h+='<input type="date" id="portalQaDate"'+(_linkedEdit?' readonly':'')+' value="'+dateValue+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
   h+='</div></div>';
+  if(_linkedEdit)h+='<div style="font-size:11px;color:#A855F7;margin:-4px 0 10px">🔗 Synced from your bank — amount &amp; date are locked; you can change the category.</div>';
   // Description
   h+='<div style="margin-bottom:10px"><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Description</div>';
   h+='<input type="text" id="portalQaDesc" placeholder="e.g. Groceries, Gas, Coffee" value="'+esc(prefill.description||'')+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box" oninput="_portalQaAutoCat(this.value)">';
@@ -9259,17 +9298,18 @@ function _portalSubmitAddExpense(){
   if(isEdit){
     entry.id=prefillCheck._editId;
     if(prefillCheck._editDate&&!date)entry.date=prefillCheck._editDate;
+    if(prefillCheck._plaidTxnId){ entry._plaidTxnId=prefillCheck._plaidTxnId; entry._source='plaid'; } // #5: linked edits stay linked
     // Replace optimistically in both mirrors + set _touched so beforeunload keepalive flush picks it up
     if(_lastPfosState&&_lastPfosState.state&&_lastPfosState.state.spendingEntries){
       for(var ei=0;ei<_lastPfosState.state.spendingEntries.length;ei++){
-        if(_lastPfosState.state.spendingEntries[ei].id===entry.id){_lastPfosState.state.spendingEntries[ei]=entry;break;}
+        if(String(_lastPfosState.state.spendingEntries[ei].id)===String(entry.id)){_lastPfosState.state.spendingEntries[ei]=entry;break;}
       }
       if(!_lastPfosState.state._touched)_lastPfosState.state._touched={};
       _lastPfosState.state._touched.spendingEntries=true;
     }
     if(APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.spendingEntries){
       for(var ei2=0;ei2<APP._portalFd.S.spendingEntries.length;ei2++){
-        if(APP._portalFd.S.spendingEntries[ei2].id===entry.id){APP._portalFd.S.spendingEntries[ei2]=entry;break;}
+        if(String(APP._portalFd.S.spendingEntries[ei2].id)===String(entry.id)){APP._portalFd.S.spendingEntries[ei2]=entry;break;}
       }
       if(!APP._portalFd.S._touched)APP._portalFd.S._touched={};
       APP._portalFd.S._touched.spendingEntries=true;
@@ -9297,6 +9337,8 @@ function _portalSubmitAddExpense(){
       frame.contentWindow.postMessage({type:msgType,entry:entry},'https://pfos.esjfinancial.com');
     }
   }catch(e){console.warn('Portal add-expense postMessage:',e);}
+  // #3: a linked recategorization must persist server-side (survives re-sync) — fire-and-forget.
+  if(isEdit&&prefillCheck._plaidTxnId&&entry.category_bucket){ try{ _cpRecategorizeTxn(prefillCheck._plaidTxnId, entry.category_bucket); }catch(_e){} }
   // 3. Close modal + clear prefill state
   var prefill=APP._portalQaPrefill||{};
   APP._portalQaPrefill=null;
