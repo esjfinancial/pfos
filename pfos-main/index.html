@@ -9744,6 +9744,20 @@ function _plaidFindOverlaps(){
     });
   }
   scan(S.debts); scan(S.retAccounts); scan(S.investments);
+  // Cash scalar vs linked depository (the case Chunk 6.7 deferred). Prompt ONLY when the MANUAL
+  // aChecking/aSavings closely matches the linked cash total for that subtype — so we never zero a manual
+  // entry that represents a DIFFERENT, unlinked bank. The user still confirms (Replace manual / Keep both).
+  try{
+    var _lcAll=(S.linkedCash||[]).filter(function(x){return x&&x.include!==false;});
+    if(_lcAll.length){
+      ['checking','savings'].forEach(function(field){
+        var lv=_lcAll.filter(function(x){return (x.subtype||'')===field;}).reduce(function(t,x){return t+pf(x.balance);},0);
+        if(lv<=0)return;
+        var mv=pf(S.assets&&S.assets[field]); if(mv<=0)return;
+        if(Math.abs(mv-lv)<=Math.max(250,lv*0.05)) out.push({cash:true,field:field,manualVal:mv,linkedVal:lv});
+      });
+    }
+  }catch(_ce){}
   return out;
 }
 function _plaidMaybePromptOverlaps(){
@@ -9752,7 +9766,7 @@ function _plaidMaybePromptOverlaps(){
     var ov=_plaidFindOverlaps();
     if(!ov.length){ window._plaidOverlaps=null; return; }
     window._plaidOverlaps=ov;
-    var names=ov.map(function(o){return (o.manual.name||o.manual.type||'account');}).slice(0,3).join(', ');
+    var names=ov.map(function(o){return o.cash?(o.field.charAt(0).toUpperCase()+o.field.slice(1)+' (manual)'):(o.manual.name||o.manual.type||'account');}).slice(0,3).join(', ');
     var more=ov.length>3?(' +'+(ov.length-3)+' more'):'';
     var plural=ov.length>1;
     var b=document.createElement('div'); b.id='plaidOverlapBanner';
@@ -9769,13 +9783,20 @@ function _plaidMaybePromptOverlaps(){
 function _plaidReplaceOverlaps(){
   try{
     var ov=window._plaidOverlaps||[];
-    var tD=false,tR=false,tI=false;
+    var tD=false,tR=false,tI=false,tA=false;
     ov.forEach(function(o){
+      if(o.cash){
+        // Zero the manual cash scalar AND its DOM input — calc() reads the DOM first (pf(gv('aChecking'))),
+        // so clearing only the scalar would be overwritten on the next calc.
+        if(S.assets)S.assets[o.field]=0;
+        var _el=document.getElementById(o.field==='checking'?'aChecking':'aSavings'); if(_el)_el.value='';
+        tA=true; return;
+      }
       var i=o.arr.indexOf(o.manual); // recompute by reference — robust to prior splices
       if(i>=0){ o.arr.splice(i,1); if(o.arr===S.debts)tD=true; else if(o.arr===S.retAccounts)tR=true; else if(o.arr===S.investments)tI=true; }
     });
     S._touched=S._touched||{};
-    if(tD)S._touched.debts=true; if(tR)S._touched.retAccounts=true; if(tI)S._touched.investments=true;
+    if(tD)S._touched.debts=true; if(tR)S._touched.retAccounts=true; if(tI)S._touched.investments=true; if(tA)S._touched.assets=true;
     if(typeof renderDebts==='function')renderDebts();
     if(typeof renderRetAccounts==='function')renderRetAccounts();
     if(typeof renderInvAccounts==='function')renderInvAccounts();
