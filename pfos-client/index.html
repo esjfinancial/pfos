@@ -8461,10 +8461,13 @@ function _portalRenderSpendDashboard(){
   // Past month: uncapped — past months are review-only, user wants the full
   // record. Label changes to "All [Month] Expenses" to set expectations.
   if(monthEntries.length>0){
-    var recentCap=isCurrentMonth?10:monthEntries.length;
+    // When bank-linked transactions are present, show the FULL month (don't cap at 10) so the user can
+    // actually see their imported spending history; otherwise keep the at-a-glance 10 most-recent.
+    var _linkedN=monthEntries.filter(function(e){return e&&e._source==='plaid';}).length;
+    var recentCap=(isCurrentMonth&&_linkedN===0)?10:monthEntries.length;
     var recent=monthEntries.slice().sort(function(a,b){return new Date(b.date)-new Date(a.date);}).slice(0,recentCap);
     var recentTitle=isCurrentMonth?'Recent Expenses':'All '+monthNames[curMonth]+' Expenses';
-    var recentCountLabel=isCurrentMonth?(monthEntries.length+' this month'):(monthEntries.length+' total');
+    var recentCountLabel=(isCurrentMonth?(monthEntries.length+' this month'):(monthEntries.length+' total'))+(_linkedN>0?' · 🔗 '+_linkedN+' synced':'');
     h+='<div class="sec-group"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px"><div class="sec-group-title" style="margin-bottom:0">'+recentTitle+'</div><span style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:600">'+recentCountLabel+'</span></div>';
     var icMap={food:'🍽️',housing:'🏠',transportation:'🚗',discretionary:'🎬',subscriptions:'📱',utilities:'⚡',insurance:'🛡️',misc:'📦',activeSavings:'📈'};
     recent.forEach(function(e){
@@ -8483,6 +8486,7 @@ function _portalRenderSpendDashboard(){
       if(et==='emergency')h+='<span style="color:var(--rd);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:10px">🚨 Emergency</span>';
       else if(et==='big_purchase')h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;font-size:10px">💰 Big Purchase</span>';
       if(e.is_recurring)h+='<span style="color:#5B9BFF;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">🔁 Recurring</span>';
+      if(e._source==='plaid')h+='<span style="color:#A855F7;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Imported from your linked bank">🔗 Linked</span>';
       h+='</div></div>';
       h+='<div style="font-family:var(--fd);font-size:14px;color:var(--or);font-weight:700;flex-shrink:0">'+fmt(parseFloat(e.amount)||0)+'</div>';
       h+='<button onclick="_portalEditEntry('+e.id+')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Edit" aria-label="Edit expense">✏️</button>';
@@ -10758,6 +10762,8 @@ window.addEventListener('message',async function(e){
         console.warn('[PFOS] ⛔ NaN detected in calcs — skipping save');return;
       }
       _lastPfosState={state:state,calcs:calcs};
+      // Keep the home Plaid card's linked-state rollup in sync as balances/accounts change.
+      if(typeof _cpUpdateLinkCard==='function')_cpUpdateLinkCard();
       // Save target. Joint households share ONE row (client_a) by design; every other
       // type writes the loaded client's OWN row. Read type from the authoritative
       // couple_links record (getCoupleForClient), never a drift-prone S.householdType.
@@ -22385,9 +22391,46 @@ function _cpUpdateAdvisoryNav(){
       var sn=document.getElementById('schedAdvisorName');if(sn)sn.textContent=APP._advisorName||'your advisor';
     } else {schedCard.style.display='none';}
   }
-  // Plaid "Link accounts" card — Pro+/comp only (functional tier via clientHasFeature), independent of advisory status
-  var lc=document.getElementById('linkAccountsCard');
-  if(lc) lc.style.display=clientHasFeature('plaid')?'':'none';
+  // Plaid "Link accounts" card — Pro+/comp only; _cpUpdateLinkCard handles show/hide + linked-vs-unlinked state.
+  if(typeof _cpUpdateLinkCard==='function')_cpUpdateLinkCard();
+}
+
+// Render the home Plaid card in its correct state: the invite ("Link your accounts / Link Now") when nothing
+// is linked, or a persistent SUCCESS rollup ("N accounts linked · $X in cash · synced X ago · Add more") once
+// accounts exist — so the user can confirm, on the page they actually see, that linking worked and the data is
+// live. Reads linked rows from the live engine state (_lastPfosState.state) — no extra query.
+function _cpUpdateLinkCard(){
+  try{
+    var card=document.getElementById('linkAccountsCard'); if(!card)return;
+    var inner=card.querySelector('.info-card'); if(!inner)return;
+    if(typeof clientHasFeature!=='function'||!clientHasFeature('plaid')){ card.style.display='none'; return; }
+    card.style.display='';
+    var pf=function(v){var n=parseFloat(v);return isFinite(n)?n:0;};
+    var st=(_lastPfosState&&_lastPfosState.state)||{};
+    var lc=Array.isArray(st.linkedCash)?st.linkedCash:[];
+    var ld=(Array.isArray(st.debts)?st.debts:[]).filter(function(x){return x&&x._source==='plaid';});
+    var lr=(Array.isArray(st.retAccounts)?st.retAccounts:[]).filter(function(x){return x&&x._source==='plaid';});
+    var li=(Array.isArray(st.investments)?st.investments:[]).filter(function(x){return x&&x._source==='plaid';});
+    var n=lc.length+ld.length+lr.length+li.length;
+    if(n===0){
+      inner.style.borderColor='rgba(168,85,247,.25)';inner.style.background='rgba(168,85,247,.04)';
+      inner.innerHTML='<div style="width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,rgba(168,85,247,.15),rgba(168,85,247,.05));display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">🔗</div>'
+        +'<div style="flex:1"><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">Link your accounts</div>'
+        +'<div style="font-size:13px;color:var(--mu);margin-top:2px">Securely connect banks, cards &amp; investments for real-time tracking · <a onclick="_cpOpenManageAccounts()" style="color:#A855F7;cursor:pointer;text-decoration:underline">Manage</a></div></div>'
+        +'<button id="linkAccountsBtn" onclick="_cpStartPlaidLink()" style="padding:8px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.25);color:#A855F7;cursor:pointer;border-radius:2px;white-space:nowrap">Link Now →</button>';
+      return;
+    }
+    var cashTot=lc.reduce(function(t,x){return t+pf(x.balance);},0);
+    var _m=(typeof fmt==='function')?fmt:function(v){return '$'+Math.round(pf(v)).toLocaleString();};
+    var lastSync=null;[].concat(lc,ld,lr,li).forEach(function(x){if(x&&x._lastSynced){var d=new Date(x._lastSynced);if(!isNaN(d.getTime())&&(!lastSync||d>lastSync))lastSync=d;}});
+    var syncTxt='';if(lastSync){var days=Math.floor((Date.now()-lastSync.getTime())/86400000);syncTxt=days<=0?'synced today':(days===1?'synced yesterday':'synced '+days+'d ago');}
+    var sub=(cashTot>0?_m(cashTot)+' in cash · ':'')+(syncTxt?syncTxt+' · ':'')+'<a onclick="_cpOpenManageAccounts()" style="color:#34D399;cursor:pointer;text-decoration:underline">Manage</a>';
+    inner.style.borderColor='rgba(34,197,94,.28)';inner.style.background='rgba(34,197,94,.05)';
+    inner.innerHTML='<div style="width:44px;height:44px;border-radius:12px;background:rgba(34,197,94,.15);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">✅</div>'
+      +'<div style="flex:1"><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">'+n+' account'+(n===1?'':'s')+' linked</div>'
+      +'<div style="font-size:13px;color:var(--mu);margin-top:2px">'+sub+'</div></div>'
+      +'<button onclick="_cpStartPlaidLink()" style="padding:8px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;white-space:nowrap">+ Add more</button>';
+  }catch(e){}
 }
 
 function _clientOpenScheduling(){
