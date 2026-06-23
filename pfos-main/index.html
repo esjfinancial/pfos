@@ -7058,11 +7058,29 @@ function _reverseSpendSideEffects(e){
   else if(e.payment_method==='emergency_fund'){ var sv=parseFloat(typeof gv==='function'?gv('aSavings'):0)||0; var se=document.getElementById('aSavings'); if(se)se.value=sv+amt; }
   else if(e.payment_method==='policy_loan'&&pd.policy_idx!=null){ var pli2=parseInt(pd.policy_idx)||0; var pols2=(S.ibcPolicies&&S.ibcPolicies.length>0)?S.ibcPolicies:(S.policies||[]).filter(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('whole')>=0||t.indexOf('wl')>=0||t.indexOf('iul')>=0;}); if(pols2[pli2]){var pol2=pols2[pli2]; pol2.loanBalance=Math.max(0,(parseFloat(pol2.loanBalance)||0)-amt); if(Array.isArray(pol2.loans)){for(var j=pol2.loans.length-1;j>=0;j--){if(pol2.loans[j]&&pol2.loans[j].spendingEntryId===e.id){pol2.loans.splice(j,1);break;}}}} }
 }
+// Delta-adjust an EXISTING entry's side effect when only the AMOUNT changed (same payment method). Used by
+// the edit paths instead of reverse+apply, because apply needs the modal staging flags (_createNewDebt/
+// _incrementLoanBalance) which a canonical/edited entry doesn't carry — reverse+apply would destroy the
+// debt/loan. Delta keeps the same debt_id / loans[] record and just shifts the balance by (new-old).
+function _adjustSpendSideEffects(e,oldAmt,newAmt){
+  if(!e)return; var d=(parseFloat(newAmt)||0)-(parseFloat(oldAmt)||0); if(!d)return; var pd=e.payment_detail||{};
+  if(e.payment_method==='credit_card'&&pd.card_idx!=null&&S.debts&&S.debts[pd.card_idx]){ S.debts[pd.card_idx].balance=Math.max(0,(parseFloat(S.debts[pd.card_idx].balance)||0)+d); }
+  else if(e.payment_method==='financed'&&pd.debt_id!=null&&Array.isArray(S.debts)){ for(var i=0;i<S.debts.length;i++){ if(S.debts[i]&&S.debts[i].id===pd.debt_id){ S.debts[i].balance=Math.max(0,(parseFloat(S.debts[i].balance)||0)+d); break; } } }
+  else if(e.payment_method==='emergency_fund'){ var sv=parseFloat(typeof gv==='function'?gv('aSavings'):0)||0; var se=document.getElementById('aSavings'); if(se)se.value=Math.max(0,sv-d); }
+  else if(e.payment_method==='policy_loan'&&pd.policy_idx!=null){ var pli=parseInt(pd.policy_idx)||0; var pols=(S.ibcPolicies&&S.ibcPolicies.length>0)?S.ibcPolicies:(S.policies||[]).filter(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('whole')>=0||t.indexOf('wl')>=0||t.indexOf('iul')>=0;}); if(pols[pli]){ var pol=pols[pli]; pol.loanBalance=Math.max(0,(parseFloat(pol.loanBalance)||0)+d); if(Array.isArray(pol.loans)){ for(var j=0;j<pol.loans.length;j++){ if(pol.loans[j]&&pol.loans[j].spendingEntryId===e.id){ pol.loans[j].amount=(parseFloat(pol.loans[j].amount)||0)+d; break; } } } } }
+}
 function saveSpendingEntry(){
   var amt=pf((document.getElementById('qaAmount')||{}).value);
   if(amt<=0){var ae=document.getElementById('qaAmount');if(ae){ae.style.borderColor='var(--rd)';ae.focus();}return;}
   var entry={id:Date.now(),amount:amt,description:(document.getElementById('qaDesc')||{}).value||'',category:(document.getElementById('qaCat')||{}).value||'misc',category_bucket:simplifyCategory((document.getElementById('qaCat')||{}).value||'misc'),expense_type:(document.getElementById('qaType')||{}).value||'regular',payment_method:(document.getElementById('qaPayMethod')||{}).value||'debit',payment_detail:{},couple_owner:(document.getElementById('qaOwner')||{}).value||'self',is_recurring:!!(document.getElementById('qaRecurring')||{}).checked,recurrence_freq:(document.getElementById('qaRecurFreq')||{}).value||'monthly',date:(document.getElementById('qaDate')||{}).value||new Date().toISOString().split('T')[0],created_at:new Date().toISOString()};
-  if(_qaEditIdx>=0&&S.spendingEntries&&S.spendingEntries[_qaEditIdx])_reverseSpendSideEffects(S.spendingEntries[_qaEditIdx]); // #3 MF: reverse the OLD entry's side effects before re-applying (edit was double-applying)
+  // #3 MF (re-audit): the quick-add modal does NOT repopulate the side-effect pickers on edit-open, so the
+  // inline DOM apply is only valid for an ADD or a method-CHANGE edit (which renders the new picker). For a
+  // SAME-method edit, preserve the canonical payment_detail and delta-adjust — reverse+blind-reapply would
+  // drop the card balance / mis-target the policy / mint a zero-term debt.
+  var _qaOld=(_qaEditIdx>=0&&S.spendingEntries&&S.spendingEntries[_qaEditIdx])||null;
+  var _qaMethodChanged=!!(_qaOld&&_qaOld.payment_method!==entry.payment_method);
+  if(_qaOld&&_qaMethodChanged)_reverseSpendSideEffects(_qaOld);
+  if(!_qaOld||_qaMethodChanged){
   if(entry.payment_method==='credit_card'){var ci=parseInt((document.getElementById('qaCardIdx')||{}).value);if(!isNaN(ci)&&S.debts&&S.debts[ci]){entry.payment_detail={card_idx:ci,card_name:S.debts[ci].name,apr:S.debts[ci].rate};S.debts[ci].balance=(parseFloat(S.debts[ci].balance)||0)+amt;}}
   if(entry.payment_method==='financed'){
     if(!S.debts)S.debts=[];
@@ -7101,6 +7119,10 @@ function saveSpendingEntry(){
     }
   }
   if(entry.payment_method==='emergency_fund'){var sv=parseFloat(gv('aSavings'))||0;var se=document.getElementById('aSavings');if(se)se.value=Math.max(0,sv-amt);}
+  } else {
+    entry.payment_detail=_qaOld.payment_detail||{}; // same-method edit: keep canonical card_idx/debt_id/policy_idx
+    if((parseFloat(_qaOld.amount)||0)!==amt)_adjustSpendSideEffects(entry,_qaOld.amount,amt);
+  }
   if(!S.spendingEntries)S.spendingEntries=[];
   if(_qaEditIdx>=0)S.spendingEntries[_qaEditIdx]=entry;else S.spendingEntries.push(entry);
   if(!S._touched)S._touched={};S._touched.spendingEntries=true; // #2 MF: mark touched so the section-merge save doesn't drop the new/edited entry
@@ -15122,13 +15144,17 @@ function submitAdvisorRequestFromModal(){
         var _oldAmt=parseFloat(_cur.amount)||0,_oldMethod=_cur.payment_method;
         var _newAmt=(_ed.amount!==undefined)?(parseFloat(_ed.amount)||0):_oldAmt;
         var _newMethod=(_ed.payment_method!==undefined)?_ed.payment_method:_oldMethod;
-        var _sideChanged=(_newAmt!==_oldAmt)||(_newMethod!==_oldMethod);
-        if(_sideChanged)_reverseSpendSideEffects(_cur);
+        var _methodChanged=_newMethod!==_oldMethod;
+        // method change: reverse the OLD (canonical) before overwrite, apply the NEW after (no-op if the new
+        // method's staging flags are absent — never destructive). same-method amount change: delta-adjust the
+        // existing debt/savings/loan AFTER overwrite (no reverse → no debt/loan churn or destruction).
+        if(_methodChanged)_reverseSpendSideEffects(_cur);
         var _efields=['amount','description','category','category_bucket','expense_type','payment_method','couple_owner','is_recurring','recurrence_freq','date'];
-        if(_newMethod!==_oldMethod)_efields.push('payment_detail'); // only adopt the modal's payment_detail on a method change — else keep the canonical card_idx/debt_id/policy_idx (the edit modal doesn't repopulate those pickers)
+        if(_methodChanged)_efields.push('payment_detail'); // adopt the modal's payment_detail (staging flags) only on a method change — else keep the canonical card_idx/debt_id/policy_idx
         _efields.forEach(function(f){ if(_ed[f]!==undefined)_cur[f]=_ed[f]; });
         if(_ed.amount!==undefined)_cur.amount=parseFloat(_ed.amount)||0;
-        if(_sideChanged)_applySpendSideEffects(_cur);
+        if(_methodChanged)_applySpendSideEffects(_cur);
+        else if(_newAmt!==_oldAmt)_adjustSpendSideEffects(_cur,_oldAmt,_newAmt);
         if(_wasPlaid){ _cur._source='plaid'; if(_catChanged)_cur._userCat=true; } // never let an edit strip the linked identity
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
