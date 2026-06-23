@@ -8114,7 +8114,8 @@ function _portalEditEntry(entryId){
     _editDate:entry.date,
     _plaidTxnId:entry._plaidTxnId,
     _source:entry._source,
-    splits:entry.splits
+    splits:entry.splits,
+    tags:entry.tags
   });
 }
 async function _portalDeleteEntry(entryId){
@@ -8658,7 +8659,7 @@ function _portalRenderSpendDashboard(){
 // by the default month list (so the flag-OFF path is byte-identical) and the
 // filtered view. _spendRegMatch/_spendRegSorted are pure (unit-tested).
 // ─────────────────────────────────────────────────────────────────────────────
-var _spendRegFilter={q:'',cat:'',src:'',type:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'};
+var _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'};
 var _spendRegSearchTimer=null;
 var _spendRegMonthTitle='Recent Expenses';   // set per dashboard render; restored when filters clear
 var _spendRegMonthCountText='';              // inactive month count label (e.g. "8 this month · 🔗 3 synced")
@@ -8666,6 +8667,20 @@ var _spendRegSelMode=false;                  // §1.2 bulk-edit mode: rows show 
 var _spendRegSel={};                         // selected entry ids, keyed {String(id):true}
 var _SPEND_ICMAP={food:'🍽️',housing:'🏠',transportation:'🚗',discretionary:'🎬',subscriptions:'📱',utilities:'⚡',insurance:'🛡️',misc:'📦',activeSavings:'📈'};
 var _SPEND_MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
+// ── §1.5a free-form tags ──
+// _normTag/_normTags MUST stay byte-identical to the pfos-main engine mirror (the canonical writer
+// re-normalizes; this client copy keeps the optimistic mirror + UI in lockstep). _allEntryTags collects
+// the user's existing tags (sorted, deduped) for filter chips + the add-expense datalist suggestions.
+function _normTag(t){ return String(t==null?'':t).trim().toLowerCase().replace(/\s+/g,' ').replace(/[^a-z0-9 _\-]/g,'').slice(0,24).trim(); }
+function _normTags(arr){ var out=[],seen={}; (Array.isArray(arr)?arr:[]).forEach(function(t){ var n=_normTag(t); if(n&&!seen[n]&&out.length<12){seen[n]=1;out.push(n);} }); return out; }
+function _allEntryTags(S){ var seen={},out=[]; ((S&&S.spendingEntries)||[]).forEach(function(e){ if(e&&Array.isArray(e.tags))e.tags.forEach(function(t){ var n=_normTag(t); if(n&&!seen[n]){seen[n]=1;out.push(n);} }); }); out.sort(); return out; }
+// Add-expense tag chip editor state + handlers. _qaTags is the working set while the modal is open.
+var _qaTags=[];
+function _qaTagRenderChips(){ var box=document.getElementById('portalQaTagChips'); if(!box)return; box.innerHTML=_qaTags.map(function(t,i){ return '<span style="display:inline-flex;align-items:center;gap:4px;background:rgba(91,155,255,.14);border:1px solid rgba(91,155,255,.35);color:#9CC3FF;border-radius:12px;padding:3px 8px;font-size:12px;font-family:var(--fh)">#'+esc(t)+'<button type="button" onclick="_qaTagRemove('+i+')" aria-label="Remove tag" style="background:none;border:none;color:#9CC3FF;cursor:pointer;font-size:13px;line-height:1;padding:0">×</button></span>'; }).join(''); }
+function _qaTagAddRaw(v){ var n=_normTag(v); if(!n)return; if(_qaTags.indexOf(n)>=0)return; if(_qaTags.length>=12){ if(typeof _cpToast==='function')_cpToast('Up to 12 tags per expense.'); return; } _qaTags.push(n); _qaTagRenderChips(); }
+function _qaTagRemove(i){ _qaTags.splice(i,1); _qaTagRenderChips(); }
+function _qaTagKey(ev){ if(!ev)return; if(ev.key==='Enter'||ev.key===','){ ev.preventDefault(); var el=document.getElementById('portalQaTagInput'); if(el){ _qaTagAddRaw(el.value); el.value=''; } } else if(ev.key==='Backspace'){ var el2=document.getElementById('portalQaTagInput'); if(el2&&!el2.value&&_qaTags.length){ _qaTags.pop(); _qaTagRenderChips(); } } }
+function _qaTagInputChange(el){ if(!el)return; if(el.value.indexOf(',')>=0){ el.value.split(',').forEach(function(p){_qaTagAddRaw(p);}); el.value=''; } }
 // One transaction row — byte-identical to the legacy inline markup so the flag-off path is unchanged.
 function _spendRegRowHtml(e){
   var bk=e.category||e.category_bucket||'misc';
@@ -8689,6 +8704,7 @@ function _spendRegRowHtml(e){
   if(_isCredit)h+='<span style="color:var(--gr);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Refund/credit — reduces your spending">↩ Refund</span>';
   if(e._possibleDuplicate)h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">⚠ Possible duplicate'+(e._plaidTxnId?' · <a onclick="_cpExcludeTxn(\''+e._plaidTxnId+'\')" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Exclude</a>':'')+'</span>';
   if(e.splits&&e.splits.length)h+='<span style="color:#8B5CF6;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Split across multiple categories">✂️ Split ('+e.splits.length+')</span>';
+  if(e.tags&&e.tags.length){ for(var _tgi=0;_tgi<e.tags.length;_tgi++){ h+='<span style="color:#9CC3FF;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Tag">#'+esc(e.tags[_tgi])+'</span>'; } } // §1.5a tag chips (esc: user-controlled)
   h+='</div></div>';
   h+='<div style="font-family:var(--fd);font-size:14px;color:'+(_isCredit?'var(--gr)':'var(--or)')+';font-weight:700;flex-shrink:0">'+(_isCredit?'+'+fmt(Math.abs(_amt)):fmt(_amt))+'</div>';
   h+='<button onclick="_portalEditEntry(\''+e.id+'\')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Edit" aria-label="Edit expense">✏️</button>';
@@ -8700,17 +8716,18 @@ function _spendRegRowHtml(e){
 // count as active — it re-sorts the current (month) scope in place.
 function _spendRegActive(){
   var f=_spendRegFilter;
-  return !!(f.q||f.cat||f.src||f.type||f.amtMin!==''||f.amtMax!==''||f.dateFrom||f.dateTo);
+  return !!(f.q||f.cat||f.src||f.type||f.tags||f.amtMin!==''||f.amtMax!==''||f.dateFrom||f.dateTo);
 }
 // Pure predicate — does entry e pass filter f? (amount range is on ABSOLUTE value so refunds match.)
 function _spendRegMatch(e,f){
   if(!e) return false;
   var q=(f.q||'').trim().toLowerCase();
-  if(q){ var hay=((e.description||'')+' '+(e.category||'')+' '+(e.category_bucket||'')).toLowerCase(); if(hay.indexOf(q)<0) return false; }
+  if(q){ var hay=((e.description||'')+' '+(e.category||'')+' '+(e.category_bucket||'')+' '+((e.tags||[]).join(' '))).toLowerCase(); if(hay.indexOf(q)<0) return false; } // §1.5a: tags searchable
   if(f.cat && (e.category||e.category_bucket||'misc')!==f.cat) return false;
   if(f.src==='linked' && e._source!=='plaid') return false;
   if(f.src==='manual' && e._source==='plaid') return false;
   if(f.type && (e.expense_type||'regular')!==f.type) return false;
+  if(f.tags && !(Array.isArray(e.tags)&&e.tags.indexOf(f.tags)>=0)) return false; // §1.5a: tag filter (entry must carry the selected tag)
   var amt=Math.abs(parseFloat(e.amount)||0);
   if(f.amtMin!==''&&f.amtMin!=null&&!isNaN(parseFloat(f.amtMin)) && amt<parseFloat(f.amtMin)) return false;
   if(f.amtMax!==''&&f.amtMax!=null&&!isNaN(parseFloat(f.amtMax)) && amt>parseFloat(f.amtMax)) return false;
@@ -8796,6 +8813,8 @@ function _spendRegControlsHtml(S,reg){
   h+='<select onchange="_spendRegSet(\'cat\',this.value)" style="'+inS+'">'+opts(cats,f.cat)+'</select>';
   h+='<select onchange="_spendRegSet(\'src\',this.value)" style="'+inS+'">'+opts(srcs,f.src)+'</select>';
   h+='<select onchange="_spendRegSet(\'type\',this.value)" style="'+inS+'">'+opts(types,f.type)+'</select>';
+  var _tagList=_allEntryTags(S); // §1.5a: only show the tag filter once the user has created tags
+  if(_tagList.length){ var _tagOpts=[['','🏷 All tags']].concat(_tagList.map(function(t){return [t,'# '+t];})); h+='<select onchange="_spendRegSet(\'tags\',this.value)" style="'+inS+'">'+opts(_tagOpts,f.tags)+'</select>'; }
   h+='<input type="number" inputmode="decimal" value="'+esc(f.amtMin)+'" oninput="_spendRegOnNum(\'amtMin\',this.value)" placeholder="Min $" style="width:78px;'+inS+'">';
   h+='<input type="number" inputmode="decimal" value="'+esc(f.amtMax)+'" oninput="_spendRegOnNum(\'amtMax\',this.value)" placeholder="Max $" style="width:78px;'+inS+'">';
   h+='<input type="date" value="'+esc(f.dateFrom)+'" onchange="_spendRegSet(\'dateFrom\',this.value)" title="From date" style="'+inS+'">';
@@ -8819,6 +8838,8 @@ function _spendRegToolbarHtml(){
   h+='<button onclick="_spendRegSelectAll()" style="'+inS+';cursor:pointer;color:#5B9BFF">Select all matching</button>';
   h+='<select id="_spendRegBulkCat" style="'+inS+'">'+cats.map(function(o){return '<option value="'+esc(o[0])+'">'+esc(o[1])+'</option>';}).join('')+'</select>';
   h+='<button onclick="_spendRegBulkRecat()" style="'+inS+';cursor:pointer;color:#22C55E">Apply</button>';
+  h+='<input id="_spendRegBulkTagInput" type="text" placeholder="tag…" style="width:96px;'+inS+'">'; // §1.5a bulk tag
+  h+='<button onclick="_spendRegBulkTag()" style="'+inS+';cursor:pointer;color:#9CC3FF">🏷 Tag</button>';
   h+='<button onclick="_spendRegBulkDelete()" style="'+inS+';cursor:pointer;color:#EF4444">🗑 Delete</button>';
   h+='</div>';
   return h;
@@ -8828,7 +8849,7 @@ function _spendRegOnNum(field,v){ _spendRegFilter[field]=v; clearTimeout(_spendR
 function _spendRegSet(field,v){ _spendRegFilter[field]=v; _spendRegApply(); }
 // Clear is an explicit action → reset the filter (sort kept at default) and full-render so every
 // input control visibly resets. (Typing-to-empty does NOT pass through here; it stays list-only.)
-function _spendRegClear(){ _spendRegFilter={q:'',cat:'',src:'',type:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
+function _spendRegClear(){ _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
 // LIST-ONLY update — never a full dashboard re-render (so the search box keeps focus and the chosen
 // sort always applies, active OR not). Computes the working set ONCE and reuses it for rows + the
 // live title/count/Clear toggle. Falls back to a full render only if the list container is gone.
@@ -8848,6 +8869,7 @@ function _spendRegToggleSelMode(){ _spendRegSelMode=!_spendRegSelMode; if(!_spen
 function _spendRegSelToggle(id,checked){ if(checked)_spendRegSel[String(id)]=true; else delete _spendRegSel[String(id)]; var c=document.getElementById('_spendRegSelCount'); if(c)c.textContent=Object.keys(_spendRegSel).length+' selected'; }
 function _spendRegSelectAll(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; _spendRegWorkingSet(S).list.forEach(function(e){_spendRegSel[String(e.id)]=true;}); _spendRegApply(); }
 function _spendRegBulkRecat(){ var sel=document.getElementById('_spendRegBulkCat'); var v=sel?sel.value:''; if(!v){ if(typeof _cpToast==='function')_cpToast('Pick a category to apply.'); return; } _spendRegBulkApply('recategorize',v); }
+function _spendRegBulkTag(){ var el=document.getElementById('_spendRegBulkTagInput'); var t=_normTag(el?el.value:''); if(!t){ if(typeof _cpToast==='function')_cpToast('Type a tag to add.'); return; } if(el)el.value=''; _spendRegBulkApply('addTags',[t]); } // §1.5a
 function _spendRegBulkDelete(){ _spendRegBulkApply('delete',null); }
 // Apply a bulk op to the selected rows. LINKED rows get the server-side edge write FIRST
 // (plaid-txn-edit recategorize/exclude → sticks across re-sync, IDOR-scoped to the caller by the
@@ -8881,6 +8903,8 @@ async function _spendRegBulkApply(op,value){
     } else if(op==='delete'){
       if(linked) tasks.push(db.functions.invoke('plaid-txn-edit',{body:{action:'exclude',transaction_id:String(e._plaidTxnId)}}).then(function(r){ if(r&&r.data&&r.data.ok&&r.data.excluded>0)ops.push({id:e.id,op:'delete'}); else fail++; }).catch(function(){fail++;}));
       else ops.push({id:e.id,op:'delete'});
+    } else if(op==='addTags'){
+      ops.push({id:e.id,op:'addTags',value:value}); // §1.5a: tags are local attribution — no edge write for linked OR manual
     }
   });
   await Promise.all(tasks);
@@ -8888,7 +8912,7 @@ async function _spendRegBulkApply(op,value){
   _spendRegApplyOpsToMirror(ops);
   try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_BULK_ENTRY',ops:ops},PFOS_ORIGIN); }catch(_e){}
   _spendRegSel={}; _spendRegSelMode=false;
-  if(typeof _cpToast==='function'){ var verb=(op==='delete')?'removed':'recategorized'; _cpToast(ops.length+' transaction'+(ops.length===1?'':'s')+' '+verb+(fail?(' · '+fail+' linked could not be updated'):'')+'.'); }
+  if(typeof _cpToast==='function'){ var verb=(op==='delete')?'removed':(op==='addTags'?'tagged':'recategorized'); _cpToast(ops.length+' transaction'+(ops.length===1?'':'s')+' '+verb+(fail?(' · '+fail+' linked could not be updated'):'')+'.'); }
   if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis();
 }
 // Apply ops to the in-memory mirrors (both shell copies) so the list reflects the change before the
@@ -8900,6 +8924,7 @@ function _spendRegApplyOpsToMirror(ops){
     ops.forEach(function(o){
       if(o.op==='delete'){ del[String(o.id)]=true; }
       else if(o.op==='recategorize'){ for(var i=0;i<st.spendingEntries.length;i++){ var e=st.spendingEntries[i]; if(e&&String(e.id)===String(o.id)){ if(e._plaidTxnId&&e.category!==o.value)e._userCat=true; e.category=o.value; break; } } }
+      else if(o.op==='addTags'||o.op==='removeTags'){ for(var j=0;j<st.spendingEntries.length;j++){ var e2=st.spendingEntries[j]; if(e2&&String(e2.id)===String(o.id)){ var cur=_normTags(e2.tags), vals=_normTags(Array.isArray(o.value)?o.value:[o.value]); if(o.op==='addTags'){ vals.forEach(function(t){ if(cur.indexOf(t)<0&&cur.length<12)cur.push(t); }); } else { cur=cur.filter(function(t){return vals.indexOf(t)<0;}); } if(cur.length)e2.tags=cur; else delete e2.tags; break; } } } // §1.5a mirror (matches engine PFOS_BULK_ENTRY)
     });
     if(Object.keys(del).length) st.spendingEntries=st.spendingEntries.filter(function(e){return !(e&&del[String(e.id)]);});
     st._touched=st._touched||{}; st._touched.spendingEntries=true;
@@ -9466,6 +9491,18 @@ function _portalOpenAddExpense(prefill){
     h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px"><button type="button" onclick="_portalQaAddSplitRow()" style="background:none;border:1px solid var(--bd);color:#5B9BFF;border-radius:4px;padding:5px 10px;font-size:12px;cursor:pointer;font-family:var(--fh)">+ Add category</button><span id="portalQaSplitRemain" style="font-size:12px;font-family:var(--fh);font-weight:700"></span></div>';
     h+='</div></div>';
   }
+  // §1.5a tags editor (budget_v2): free-form tags on an entry. Chips + native datalist suggestions from
+  // the user's existing tags. _qaTags is seeded from the prefill (edit mode) and read back on submit.
+  if(typeof budgetV2Enabled==='function'&&budgetV2Enabled()){
+    _qaTags=_normTags(prefill&&prefill.tags);
+    var _allTags=_allEntryTags((APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{});
+    h+='<div style="margin-bottom:10px">';
+    h+='<div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Tags <span style="text-transform:none;font-weight:400">(optional)</span></div>';
+    h+='<div id="portalQaTagChips" style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:5px"></div>';
+    h+='<input id="portalQaTagInput" list="portalQaTagList" type="text" autocomplete="off" oninput="_qaTagInputChange(this)" onkeydown="_qaTagKey(event)" placeholder="Add a tag, press Enter" style="width:100%;padding:9px 10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:13px;border-radius:4px;box-sizing:border-box">';
+    h+='<datalist id="portalQaTagList">'+_allTags.map(function(t){return '<option value="'+esc(t)+'"></option>';}).join('')+'</datalist>';
+    h+='</div>';
+  } else { _qaTags=[]; }
   // How Did You Pay?
   h+='<div style="margin-bottom:10px"><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">How Did You Pay?</div>';
   h+='<select id="portalQaPayMethod" onchange="_portalQaPayMethodChange()" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
@@ -9514,6 +9551,7 @@ function _portalOpenAddExpense(prefill){
   h+='</div></div>';
   el.innerHTML=h;
   openModal('portalAddExpenseModal');
+  if(typeof _qaTagRenderChips==='function')_qaTagRenderChips(); // §1.5a: paint any prefilled tag chips
   if(typeof _portalQaSplitRemaining==='function')_portalQaSplitRemaining();
   // Trigger payment-method-change once so any prefill that selects credit_card or financed
   // populates the conditional sub-fields immediately.
@@ -9719,6 +9757,16 @@ function _portalSubmitAddExpense(){
   // Replace the existing entry locally and route through PFOS_EDIT_ENTRY (canonical handler in pfos-main).
   var prefillCheck=APP._portalQaPrefill||{};
   var isEdit=!!prefillCheck._editId;
+  // §1.5a: read the tag chips → entry.tags (normalized). Set the field ONLY when non-empty so the STORED
+  // entry (optimistic mirror) is byte-equal to the canonical engine result (which deletes an empty tags
+  // field). On an EDIT that removed all tags, flag _clearTags so the MESSAGE (not the stored entry) carries
+  // tags:[] to tell the engine to delete the field — keeps mirror == canonical and never persists tags:[].
+  var _clearTags=false;
+  if(typeof budgetV2Enabled==='function'&&budgetV2Enabled()){
+    var _et=_normTags(_qaTags);
+    if(_et.length)entry.tags=_et;
+    else if(isEdit)_clearTags=true;
+  }
   if(isEdit){
     entry.id=prefillCheck._editId;
     if(prefillCheck._editDate&&!date)entry.date=prefillCheck._editDate;
@@ -9758,7 +9806,10 @@ function _portalSubmitAddExpense(){
     var frame=getPFOSFrame();
     if(frame&&frame.contentWindow){
       var msgType=isEdit?'PFOS_EDIT_ENTRY':'PFOS_QUICK_ADD';
-      frame.contentWindow.postMessage({type:msgType,entry:entry},'https://pfos.esjfinancial.com');
+      // §1.5a: clear-all-tags edit → send tags:[] in the MESSAGE only (engine deletes the field); the stored
+      // mirror entry stays clean (no tags key) so the optimistic mirror equals the canonical engine state.
+      var _msgEntry=_clearTags?Object.assign({},entry,{tags:[]}):entry;
+      frame.contentWindow.postMessage({type:msgType,entry:_msgEntry},'https://pfos.esjfinancial.com');
     }
   }catch(e){console.warn('Portal add-expense postMessage:',e);}
   // #3: a linked recategorization must persist server-side (survives re-sync). Send entry.category — the RAW

@@ -7071,6 +7071,11 @@ function _spendSplitParts(e){
   }
   return [{category:(e?e.category:undefined),category_bucket:(e?e.category_bucket:undefined),amount:(e?(parseFloat(e.amount)||0):0)}];
 }
+// §1.5a free-form tags: canonical normalization (engine is the source of truth — never trust the client).
+// Lowercase, collapse whitespace, strip everything but [a-z0-9 _-] (kills markup + the comma/# separators),
+// dedupe, cap 24 chars/tag and 12 tags/entry. MUST stay byte-identical to the pfos-client _normTags mirror.
+function _normTag(t){ return String(t==null?'':t).trim().toLowerCase().replace(/\s+/g,' ').replace(/[^a-z0-9 _\-]/g,'').slice(0,24).trim(); }
+function _normTags(arr){ var out=[],seen={}; (Array.isArray(arr)?arr:[]).forEach(function(t){ var n=_normTag(t); if(n&&!seen[n]&&out.length<12){seen[n]=1;out.push(n);} }); return out; }
 function _applySpendSideEffects(e){
   if(!e)return; var amt=parseFloat(e.amount)||0; var pd=e.payment_detail||{};
   if(e.payment_method==='credit_card'){ var _cd=_cardDebt(pd); if(_cd)_cd.balance=(parseFloat(_cd.balance)||0)+amt; }
@@ -15072,6 +15077,8 @@ function submitAdvisorRequestFromModal(){
           var _qsum=0; for(var _qsi=0;_qsi<entry.splits.length;_qsi++){_qsum+=parseFloat(entry.splits[_qsi].amount)||0;}
           if(Math.abs(_qsum-(parseFloat(normalized.amount)||0))<0.01) normalized.splits=entry.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0,note:s.note||''};});
         }
+        // §1.5a: persist normalized free-form tags — only when present, so a no-tag entry stays byte-identical.
+        var _qt=_normTags(entry.tags); if(_qt.length)normalized.tags=_qt;
         // Side effects matching saveSpendingEntry — keeps the portal path at full parity
         // with the pfos-main quickAddModal path.
         // 1) credit_card → increment the chosen card's balance
@@ -15198,6 +15205,8 @@ function submitAdvisorRequestFromModal(){
           else delete _cur.splits;
         }
         if(_cur.splits&&_cur.splits.length){ var _cs=0;for(var _ci=0;_ci<_cur.splits.length;_ci++){_cs+=parseFloat(_cur.splits[_ci].amount)||0;} if(Math.abs(_cs-(parseFloat(_cur.amount)||0))>=0.01)delete _cur.splits; }
+        // §1.5a: set/clear normalized tags. undefined → leave as-is; [] (or all-invalid) → clear the field.
+        if(_ed.tags!==undefined){ var _et2=_normTags(_ed.tags); if(_et2.length)_cur.tags=_et2; else delete _cur.tags; }
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
         try{if(typeof calc==='function')calc();}catch(e){}
@@ -15219,7 +15228,7 @@ function submitAdvisorRequestFromModal(){
         var _bops=msg.ops; if(!Array.isArray(_bops)||!_bops.length)return;
         if(!Array.isArray(S.spendingEntries))return;
         var _bIdx={}; for(var _bi=0;_bi<S.spendingEntries.length;_bi++){ var _be=S.spendingEntries[_bi]; if(_be)_bIdx[String(_be.id)]=_be; }
-        var _bDel={}, _bChanged=false;
+        var _bDel={}, _bChanged=false, _bNeedCalc=false;
         _bops.forEach(function(op){
           if(!op||op.id==null)return;
           var ent=_bIdx[String(op.id)]; if(!ent)return; // unknown id — skip, no spurious save
@@ -15229,10 +15238,18 @@ function submitAdvisorRequestFromModal(){
             ent.category=op.value;
             if(typeof simplifyCategory==='function'){try{ent.category_bucket=simplifyCategory(op.value);}catch(_se){}}
             if(_wp&&_cc)ent._userCat=true; // linked recategorize must survive the next plaid re-sync (Chunk 5)
-            _bChanged=true;
+            _bChanged=true; _bNeedCalc=true;
           } else if(op.op==='delete'){
             _reverseSpendSideEffects(ent); // no-op for linked (debit/no detail); reverses card/financed/EF/policy for manual
             _bDel[String(op.id)]=true;
+            _bChanged=true; _bNeedCalc=true;
+          } else if(op.op==='addTags'||op.op==='removeTags'){
+            // §1.5a tag-only op — pure attribution; computeCalcs never reads tags, so NO calc() needed.
+            var _tv=_normTags(Array.isArray(op.value)?op.value:[op.value]); if(!_tv.length)return;
+            var _cu=_normTags(ent.tags);
+            if(op.op==='addTags'){ _tv.forEach(function(t){ if(_cu.indexOf(t)<0&&_cu.length<12)_cu.push(t); }); }
+            else { _cu=_cu.filter(function(t){return _tv.indexOf(t)<0;}); }
+            if(_cu.length)ent.tags=_cu; else delete ent.tags;
             _bChanged=true;
           }
         });
@@ -15240,7 +15257,7 @@ function submitAdvisorRequestFromModal(){
         if(!_bChanged)return; // nothing matched — no spurious save
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
-        try{if(typeof calc==='function')calc();}catch(e){}
+        if(_bNeedCalc){try{if(typeof calc==='function')calc();}catch(e){}} // tag-only batch skips the metric recompute
         clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
         else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
