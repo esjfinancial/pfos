@@ -8662,7 +8662,8 @@ function _portalRenderSpendDashboard(){
 // by the default month list (so the flag-OFF path is byte-identical) and the
 // filtered view. _spendRegMatch/_spendRegSorted are pure (unit-tested).
 // ─────────────────────────────────────────────────────────────────────────────
-var _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'};
+var _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',review:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'};
+var _spendDupIds={}; // §1.6a: transient possible-duplicate entry-id set, recomputed each render by _computeDupIds
 var _spendRegSearchTimer=null;
 var _spendRegMonthTitle='Recent Expenses';   // set per dashboard render; restored when filters clear
 var _spendRegMonthCountText='';              // inactive month count label (e.g. "8 this month · 🔗 3 synced")
@@ -8693,6 +8694,7 @@ function _spendRegRowHtml(e){
   var et=e.expense_type||'regular';
   var borderCol=et==='emergency'?'var(--rd)':et==='big_purchase'?'var(--yl)':'var(--bd)';
   var _amt=parseFloat(e.amount)||0,_isCredit=_amt<0; // #4: negative = refund/credit (nets against spend)
+  var _bv2=(typeof budgetV2Enabled==='function'&&budgetV2Enabled()); // §1.6a: gate the new review affordances so this SHARED renderer stays byte-identical on the flag-OFF legacy month list (Plaid is tier-gated, not budgetV2-gated, so flag-off users DO have linked entries)
   var h='<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--bg-card);border:1px solid '+borderCol+';border-radius:3px;margin-bottom:5px">';
   if(_spendRegSelMode)h+='<input type="checkbox" onclick="_spendRegSelToggle(\''+e.id+'\',this.checked)"'+(_spendRegSel[String(e.id)]?' checked':'')+' style="flex-shrink:0;width:16px;height:16px;cursor:pointer;accent-color:#5B9BFF" aria-label="Select transaction">';
   h+='<span style="font-size:16px;flex-shrink:0">'+ic+'</span>';
@@ -8705,11 +8707,14 @@ function _spendRegRowHtml(e){
   if(e.is_recurring)h+='<span style="color:#5B9BFF;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">🔁 Recurring</span>';
   if(e._source==='plaid')h+='<span style="color:#A855F7;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Imported from your linked bank">🔗 Linked</span>';
   if(_isCredit)h+='<span style="color:var(--gr);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Refund/credit — reduces your spending">↩ Refund</span>';
-  if(e._possibleDuplicate)h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">⚠ Possible duplicate'+(e._plaidTxnId?' · <a onclick="_cpExcludeTxn(\''+e._plaidTxnId+'\')" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Exclude</a>':'')+'</span>';
+  if(e._possibleDuplicate)h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">⚠ Possible duplicate'+(e._plaidTxnId?' · <a onclick="_cpExcludeTxn(\''+e._plaidTxnId+'\')" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Exclude</a>':'')+'</span>'; // legacy flag (unchanged → byte-identical on the flag-off path)
+  else if(_bv2&&_spendDupIds[String(e.id)])h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Same amount within 3 days of a manually-logged expense">⚠ Possible duplicate'+(e._plaidTxnId?' · <a onclick="_cpExcludeTxn(\''+e._plaidTxnId+'\')" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Exclude</a>':'')+'</span>'; // §1.6a dup detector (flag-gated)
   if(e.splits&&e.splits.length)h+='<span style="color:#8B5CF6;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Split across multiple categories">✂️ Split ('+e.splits.length+')</span>';
   if(e.tags&&e.tags.length){ for(var _tgi=0;_tgi<e.tags.length;_tgi++){ h+='<span style="color:#9CC3FF;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Tag">#'+esc(e.tags[_tgi])+'</span>'; } } // §1.5a tag chips (esc: user-controlled)
+  if(_bv2&&_needsReview(e)){ h+='<span style="color:#F59E0B;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="New linked transaction — review it">🆕 Review</span>'; if(_isUncatReview(e))h+='<span style="color:#F59E0B;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Landed in Other — pick a category">📦 Uncategorized</span>'; } // §1.6a review badges (flag-gated)
   h+='</div></div>';
   h+='<div style="font-family:var(--fd);font-size:14px;color:'+(_isCredit?'var(--gr)':'var(--or)')+';font-weight:700;flex-shrink:0">'+(_isCredit?'+'+fmt(Math.abs(_amt)):fmt(_amt))+'</div>';
+  if(_bv2&&_needsReview(e))h+='<button onclick="_reviewApproveOne(\''+e.id+'\')" style="background:none;border:none;color:#22C55E;cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Mark reviewed" aria-label="Mark reviewed">✓</button>'; // §1.6a per-row approve (flag-gated)
   h+='<button onclick="_portalEditEntry(\''+e.id+'\')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Edit" aria-label="Edit expense">✏️</button>';
   h+='<button onclick="_portalDeleteEntry(\''+e.id+'\')" style="background:none;border:none;color:var(--rd);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Delete" aria-label="Delete expense">✕</button>';
   h+='</div>';
@@ -8719,7 +8724,7 @@ function _spendRegRowHtml(e){
 // count as active — it re-sorts the current (month) scope in place.
 function _spendRegActive(){
   var f=_spendRegFilter;
-  return !!(f.q||f.cat||f.src||f.type||f.tags||f.amtMin!==''||f.amtMax!==''||f.dateFrom||f.dateTo);
+  return !!(f.q||f.cat||f.src||f.type||f.tags||f.review||f.amtMin!==''||f.amtMax!==''||f.dateFrom||f.dateTo);
 }
 // Pure predicate — does entry e pass filter f? (amount range is on ABSOLUTE value so refunds match.)
 function _spendRegMatch(e,f){
@@ -8731,6 +8736,8 @@ function _spendRegMatch(e,f){
   if(f.src==='manual' && e._source==='plaid') return false;
   if(f.type && (e.expense_type||'regular')!==f.type) return false;
   if(f.tags && !(Array.isArray(e.tags)&&e.tags.indexOf(f.tags)>=0)) return false; // §1.5a: tag filter (entry must carry the selected tag)
+  if(f.review==='needs' && !_needsReview(e)) return false; // §1.6a: needs-review inbox = unreviewed linked txns
+  if(f.review==='reviewed' && !(e._source==='plaid'&&e._reviewed===true)) return false; // §1.6a
   var amt=Math.abs(parseFloat(e.amount)||0);
   if(f.amtMin!==''&&f.amtMin!=null&&!isNaN(parseFloat(f.amtMin)) && amt<parseFloat(f.amtMin)) return false;
   if(f.amtMax!==''&&f.amtMax!=null&&!isNaN(parseFloat(f.amtMax)) && amt>parseFloat(f.amtMax)) return false;
@@ -8768,6 +8775,7 @@ function _spendRegWorkingSet(S){
 function _spendRegCountText(count,active){ return active?(count+' matching transaction'+(count===1?'':'s')+' (all time)'):_spendRegMonthCountText; }
 // Render the register list (rows + cap + empty state) ONCE. Returns {html,count,active}.
 function _spendRegListInner(S){
+  _spendDupIds=_computeDupIds((S&&S.spendingEntries)||[]); // §1.6a: refresh possible-duplicate ids for this render
   var ws=_spendRegWorkingSet(S),list=ws.list,active=ws.active;
   if(_spendRegSelMode){
     // §1.2: prune the selection to the currently-visible working set on EVERY render, so a filter /
@@ -8826,6 +8834,9 @@ function _spendRegControlsHtml(S,reg){
   h+='<button onclick="_spendRegToggleSelMode()" style="'+inS+';cursor:pointer'+(_spendRegSelMode?';color:#5B9BFF;border-color:#5B9BFF':'')+'">'+(_spendRegSelMode?'✕ Done':'☑ Select')+'</button>';
   h+='<button onclick="_catMgrOpen()" style="'+inS+';cursor:pointer" title="Add, rename, or reorder your spending categories">⚙ Categories</button>';
   if(typeof _rulesEnabled==='function'&&_rulesEnabled())h+='<button onclick="_ruleMgrOpen()" style="'+inS+';cursor:pointer" title="View and delete your merchant auto-categorization rules">⚙ Rules</button>'; // §1.5b
+  var _revN=_reviewCount(S); // §1.6a: needs-review inbox chip (linked txns not yet reviewed)
+  if(_revN>0||f.review==='needs')h+='<button onclick="_spendRegSet(\'review\',\''+(f.review==='needs'?'':'needs')+'\')" style="'+inS+';cursor:pointer'+(f.review==='needs'?';color:#22C55E;border-color:#22C55E':';color:#F59E0B;border-color:#F59E0B')+'" title="New linked transactions to review">🔔 Review'+(_revN?' ('+_revN+')':'')+'</button>';
+  if(f.review==='needs')h+='<button onclick="_reviewApproveAll()" style="'+inS+';cursor:pointer;color:#22C55E" title="Mark all shown transactions reviewed">✓ Approve all</button>';
   h+='</div>';
   if(_spendRegSelMode) h+=_spendRegToolbarHtml();
   h+='</div>';
@@ -8845,6 +8856,7 @@ function _spendRegToolbarHtml(){
   if(typeof _rulesEnabled==='function'&&_rulesEnabled())h+='<label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#5B9BFF;font-family:var(--fh);cursor:pointer" title="Also create a merchant rule for each selected linked transaction"><input type="checkbox" id="_spendRegBulkMerchant" style="accent-color:#5B9BFF">make a rule</label>'; // §1.5b
   h+='<input id="_spendRegBulkTagInput" type="text" placeholder="tag…" style="width:96px;'+inS+'">'; // §1.5a bulk tag
   h+='<button onclick="_spendRegBulkTag()" style="'+inS+';cursor:pointer;color:#9CC3FF">🏷 Tag</button>';
+  h+='<button onclick="_spendRegBulkApprove()" style="'+inS+';cursor:pointer;color:#22C55E" title="Mark selected transactions reviewed">✓ Approve</button>'; // §1.6a
   h+='<button onclick="_spendRegBulkDelete()" style="'+inS+';cursor:pointer;color:#EF4444">🗑 Delete</button>';
   h+='</div>';
   return h;
@@ -8854,7 +8866,7 @@ function _spendRegOnNum(field,v){ _spendRegFilter[field]=v; clearTimeout(_spendR
 function _spendRegSet(field,v){ _spendRegFilter[field]=v; _spendRegApply(); }
 // Clear is an explicit action → reset the filter (sort kept at default) and full-render so every
 // input control visibly resets. (Typing-to-empty does NOT pass through here; it stays list-only.)
-function _spendRegClear(){ _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
+function _spendRegClear(){ _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',review:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
 // LIST-ONLY update — never a full dashboard re-render (so the search box keeps focus and the chosen
 // sort always applies, active OR not). Computes the working set ONCE and reuses it for rows + the
 // live title/count/Clear toggle. Falls back to a full render only if the list container is gone.
@@ -8930,12 +8942,48 @@ function _spendRegApplyOpsToMirror(ops){
       if(o.op==='delete'){ del[String(o.id)]=true; }
       else if(o.op==='recategorize'){ for(var i=0;i<st.spendingEntries.length;i++){ var e=st.spendingEntries[i]; if(e&&String(e.id)===String(o.id)){ if(e._plaidTxnId&&e.category!==o.value)e._userCat=true; e.category=o.value; break; } } }
       else if(o.op==='addTags'||o.op==='removeTags'){ for(var j=0;j<st.spendingEntries.length;j++){ var e2=st.spendingEntries[j]; if(e2&&String(e2.id)===String(o.id)){ var cur=_normTags(e2.tags), vals=_normTags(Array.isArray(o.value)?o.value:[o.value]); if(o.op==='addTags'){ vals.forEach(function(t){ if(cur.indexOf(t)<0&&cur.length<12)cur.push(t); }); } else { cur=cur.filter(function(t){return vals.indexOf(t)<0;}); } if(cur.length)e2.tags=cur; else delete e2.tags; break; } } } // §1.5a mirror (matches engine PFOS_BULK_ENTRY)
+      else if(o.op==='approve'||o.op==='unapprove'){ for(var k=0;k<st.spendingEntries.length;k++){ var e3=st.spendingEntries[k]; if(e3&&String(e3.id)===String(o.id)){ if(o.op==='approve')e3._reviewed=true; else delete e3._reviewed; break; } } } // §1.6a mirror (matches engine PFOS_BULK_ENTRY)
     });
     if(Object.keys(del).length) st.spendingEntries=st.spendingEntries.filter(function(e){return !(e&&del[String(e.id)]);});
     st._touched=st._touched||{}; st._touched.spendingEntries=true;
   });
 }
 
+// ── §1.6a review queue ──────────────────────────────────────────────────────────────────────────
+// A "needs review" inbox over LINKED transactions: NEW (not yet reviewed), UNCATEGORIZED (landed in misc),
+// and likely DUPLICATES of a manually-logged expense. Approve sets _reviewed=true via PFOS_BULK_ENTRY
+// (pure attribution — never feeds calc(); survives Plaid re-sync since it's not in _plaidApplyToState's
+// _ofields). Manual entries are user-categorized at entry, so they never enter the queue (linked-only).
+function _isUncatReview(e){ return !!(e && (e.category||e.category_bucket||'misc')==='misc'); }
+function _needsReview(e){ return !!(e && e._source==='plaid' && e._reviewed!==true); }
+function _reviewCount(S){ var n=0,a=(S&&S.spendingEntries)||[]; for(var i=0;i<a.length;i++){ if(_needsReview(a[i]))n++; } return n; }
+function _reviewDt(s){ var t=Date.parse(String(s||'').slice(0,10)); return isNaN(t)?0:t; }
+// Conservative possible-duplicate detector: flag a LINKED entry that shares an absolute amount (to the cent)
+// with a MANUAL entry within ±3 days — the classic "I logged it AND the bank imported it." Requiring a
+// MANUAL twin keeps false positives low (two legit same-price linked purchases are NOT flagged). Pure +
+// transient (recomputed per render, never persisted). Returns {id:true}.
+function _computeDupIds(entries){
+  var byCents={}, dup={}, i, e, v, amt;
+  // Only POSITIVE outflows are dup candidates — a linked refund (negative) is never a "duplicate expense"
+  // of a positive manual entry (manual amounts are guarded > 0), so abs() can't collapse opposite signs.
+  for(i=0;i<entries.length;i++){ e=entries[i]; if(!e)continue; v=parseFloat(e.amount)||0; if(v<=0)continue; (byCents[Math.round(v*100)]=byCents[Math.round(v*100)]||[]).push(e); }
+  for(i=0;i<entries.length;i++){ e=entries[i]; if(!e||e._source!=='plaid')continue; v=parseFloat(e.amount)||0; if(v<=0)continue;
+    var grp=byCents[Math.round(v*100)]||[], d0=_reviewDt(e.date); if(!d0)continue; // dateless linked entry → cannot time-match (avoids a 0===0 false positive)
+    for(var j=0;j<grp.length;j++){ var o=grp[j]; if(o===e||o._source==='plaid')continue; var od=_reviewDt(o.date); if(!od)continue; if(Math.abs(od-d0)<=3*86400000){ dup[String(e.id)]=true; break; } } }
+  return dup;
+}
+// Mark entries reviewed: optimistic-mirror both shells + ONE PFOS_BULK_ENTRY (no edge call, no calc).
+function _reviewApplyIds(ids){
+  ids=(ids||[]).map(String).filter(Boolean); if(!ids.length)return;
+  var ops=ids.map(function(id){return {id:id,op:'approve'};});
+  _spendRegApplyOpsToMirror(ops);
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_BULK_ENTRY',ops:ops},PFOS_ORIGIN); }catch(_e){}
+  if(typeof _cpToast==='function')_cpToast(ids.length+' transaction'+(ids.length===1?'':'s')+' marked reviewed.');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+function _reviewApproveOne(id){ _reviewApplyIds([id]); }
+function _reviewApproveAll(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; var ids=_spendRegWorkingSet(S).list.filter(_needsReview).map(function(e){return e.id;}); if(!ids.length){ if(typeof _cpToast==='function')_cpToast("You're all caught up — nothing to review."); return; } _reviewApplyIds(ids); }
+function _spendRegBulkApprove(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; var by={}; _spendRegWorkingSet(S).list.forEach(function(e){by[String(e.id)]=e;}); var ids=Object.keys(_spendRegSel).filter(function(id){return by[id];}); if(!ids.length){ if(typeof _cpToast==='function')_cpToast('No transactions selected.'); return; } _spendRegSel={}; _spendRegSelMode=false; _reviewApplyIds(ids); }
 // Tiny ordinal-suffix helper used by the smart routing widget. Mirrors pfos-main's ordSuffix.
 function _ordSuffix(n){var s=['th','st','nd','rd'];var v=n%100;return s[(v-20)%10]||s[v]||s[0];}
 
