@@ -6329,7 +6329,7 @@ function renderHome(){
   // Category budget alerts (80% threshold)
   if(monthEntries.length>0){
     var catTotalsAlert={};
-    monthEntries.forEach(function(e){var bk=e.category||'misc';if(!catTotalsAlert[bk])catTotalsAlert[bk]=0;catTotalsAlert[bk]+=parseFloat(e.amount)||0;});
+    monthEntries.forEach(function(e){_spendSplitParts(e).forEach(function(p){var bk=p.category||'misc';if(!catTotalsAlert[bk])catTotalsAlert[bk]=0;catTotalsAlert[bk]+=parseFloat(p.amount)||0;});});
     L1_CATS.forEach(function(cat){
       var spent=catTotalsAlert[cat.key]||0;
       var budget=getMonthlyExp(cat.key);
@@ -6386,7 +6386,7 @@ function renderHome(){
   // Category Breakdown
   if(monthEntries.length>0){
     var bucketMap={food:'🍽️ Food',housing:'🏠 Housing',transportation:'🚗 Transport',discretionary:'🎬 Entertainment',subscriptions:'📱 Subscriptions',misc:'📦 Other'};
-    var catTotals={};monthEntries.forEach(function(e){var bk=e.category_bucket||e.category||'misc';if(!catTotals[bk])catTotals[bk]=0;catTotals[bk]+=parseFloat(e.amount)||0;});
+    var catTotals={};monthEntries.forEach(function(e){_spendSplitParts(e).forEach(function(p){var bk=p.category_bucket||p.category||'misc';if(!catTotals[bk])catTotals[bk]=0;catTotals[bk]+=parseFloat(p.amount)||0;});});
     h+='<div class="sec-group"><div class="sec-group-title">Where Your Money Went</div>';
     Object.keys(bucketMap).forEach(function(bk){
       var spent=catTotals[bk]||0;if(spent<=0)return;
@@ -6480,8 +6480,10 @@ function _acctSpendStatus(){
   var bucketMap={food:'Food',housing:'Housing',transportation:'Transport',discretionary:'Entertainment',subscriptions:'Subscriptions',misc:'Other',utilities:'Utilities',insurance:'Insurance'};
   var catSpend={};
   monthEntries.forEach(function(e){
-    var bk=e.category_bucket||e.category||'misc';
-    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(e.amount)||0);
+    _spendSplitParts(e).forEach(function(p){
+    var bk=p.category_bucket||p.category||'misc';
+    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(p.amount)||0);
+    });
   });
   var categories=[];
   Object.keys(bucketMap).forEach(function(bk){
@@ -7047,6 +7049,20 @@ function simplifyCategory(cat){var map={housing:'housing',utilities:'housing',fo
 // Resolve a credit-card debt by STABLE id (splice-safe) so a financed-debt splice elsewhere can't shift the
 // raw card_idx onto the wrong card. Falls back to the index for entries logged before card_id existed.
 function _cardDebt(pd){ if(!pd||!Array.isArray(S.debts))return null; if(pd.card_id!=null){ for(var i=0;i<S.debts.length;i++){ if(S.debts[i]&&S.debts[i].id===pd.card_id)return S.debts[i]; } return null; } return (pd.card_idx!=null)?(S.debts[pd.card_idx]||null):null; }
+// §1.3 transaction splits: expand an entry into its category-attribution PARTS. A split entry
+// (entry.splits=[{category,category_bucket,amount}] whose amounts sum to entry.amount within 1¢)
+// attributes to its parts; everything else — and any invalid/partial split — falls back to the
+// entry's OWN {category, category_bucket, amount}, so NON-SPLIT entries are byte-identical at every
+// call site and the TOTAL across parts always equals the entry amount. Use wherever spend is summed
+// BY category (never for total-spend sums, which must stay on the whole entry amount).
+function _spendSplitParts(e){
+  if(e&&e.splits&&e.splits.length){
+    var amt=parseFloat(e.amount)||0,sum=0;
+    for(var i=0;i<e.splits.length;i++){sum+=parseFloat(e.splits[i].amount)||0;}
+    if(Math.abs(sum-amt)<0.01) return e.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0};});
+  }
+  return [{category:(e?e.category:undefined),category_bucket:(e?e.category_bucket:undefined),amount:(e?(parseFloat(e.amount)||0):0)}];
+}
 function _applySpendSideEffects(e){
   if(!e)return; var amt=parseFloat(e.amount)||0; var pd=e.payment_detail||{};
   if(e.payment_method==='credit_card'){ var _cd=_cardDebt(pd); if(_cd)_cd.balance=(parseFloat(_cd.balance)||0)+amt; }
@@ -15043,6 +15059,11 @@ function submitAdvisorRequestFromModal(){
           created_at:entry.created_at||new Date().toISOString(),
           _source:entry._source||'portal'
         };
+        // §1.3: persist a validated split array (Σ amount === entry.amount within 1¢) if present.
+        if(Array.isArray(entry.splits)&&entry.splits.length){
+          var _qsum=0; for(var _qsi=0;_qsi<entry.splits.length;_qsi++){_qsum+=parseFloat(entry.splits[_qsi].amount)||0;}
+          if(Math.abs(_qsum-(parseFloat(normalized.amount)||0))<0.01) normalized.splits=entry.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0,note:s.note||''};});
+        }
         // Side effects matching saveSpendingEntry — keeps the portal path at full parity
         // with the pfos-main quickAddModal path.
         // 1) credit_card → increment the chosen card's balance
@@ -15162,6 +15183,13 @@ function submitAdvisorRequestFromModal(){
         if(_methodChanged)_applySpendSideEffects(_cur);
         else if(_newAmt!==_oldAmt)_adjustSpendSideEffects(_cur,_oldAmt,_newAmt);
         if(_wasPlaid){ _cur._source='plaid'; if(_catChanged)_cur._userCat=true; } // never let an edit strip the linked identity
+        // §1.3: accept a validated splits array (Σ==amount) or clear it; and drop any splits left
+        // stale by an amount change, so an entry never carries splits that don't sum to its amount.
+        if(_ed.splits!==undefined){
+          if(Array.isArray(_ed.splits)&&_ed.splits.length){ var _es=0; for(var _esi=0;_esi<_ed.splits.length;_esi++){_es+=parseFloat(_ed.splits[_esi].amount)||0;} if(Math.abs(_es-(parseFloat(_cur.amount)||0))<0.01) _cur.splits=_ed.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0,note:s.note||''};}); else delete _cur.splits; }
+          else delete _cur.splits;
+        }
+        if(_cur.splits&&_cur.splits.length){ var _cs=0;for(var _ci=0;_ci<_cur.splits.length;_ci++){_cs+=parseFloat(_cur.splits[_ci].amount)||0;} if(Math.abs(_cs-(parseFloat(_cur.amount)||0))>=0.01)delete _cur.splits; }
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
         try{if(typeof calc==='function')calc();}catch(e){}

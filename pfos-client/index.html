@@ -5690,8 +5690,10 @@ function _portalSpendStatus(viewCtx){
   var bucketMap={food:'Food',housing:'Housing',transportation:'Transport',discretionary:'Entertainment',subscriptions:'Subscriptions',misc:'Other',utilities:'Utilities',insurance:'Insurance'};
   var catSpend={};
   monthEntries.forEach(function(e){
-    var bk=e.category_bucket||e.category||'misc';
-    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(e.amount)||0);
+    _spendSplitParts(e).forEach(function(p){
+    var bk=p.category_bucket||p.category||'misc';
+    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(p.amount)||0);
+    });
   });
   var categories=[];
   var expData=S.expData||{};
@@ -6239,8 +6241,10 @@ function _portalSpendHistoricalAggregate(windowKey){
   };
   var catTotals={};
   windowEntries.forEach(function(e){
-    var k=e.category||e.category_bucket||'misc';
-    catTotals[k]=(catTotals[k]||0)+(parseFloat(e.amount)||0);
+    _spendSplitParts(e).forEach(function(p){
+    var k=p.category||p.category_bucket||'misc';
+    catTotals[k]=(catTotals[k]||0)+(parseFloat(p.amount)||0);
+    });
   });
   var byCategory=Object.keys(catTotals).map(function(k){
     var info=catMap[k]||{label:k,icon:'📦',color:'#94A3B8'};
@@ -6641,8 +6645,7 @@ function _portalRecsDetect(){
     for(var mi=0;mi<months.length;mi++){
       if(months[mi].key===k){
         months[mi].total+=parseFloat(e.amount)||0;
-        var cat=e.category||e.category_bucket||'misc';
-        months[mi].byCat[cat]=(months[mi].byCat[cat]||0)+(parseFloat(e.amount)||0);
+        _spendSplitParts(e).forEach(function(p){var cat=p.category||p.category_bucket||'misc';months[mi].byCat[cat]=(months[mi].byCat[cat]||0)+(parseFloat(p.amount)||0);});
         break;
       }
     }
@@ -6850,9 +6853,8 @@ function _portalAutoBudgetSuggestions(){
       if(k>=curKey)return;            // exclude current (partial) month + future
       if(curKey-k>6)return;           // last 6 completed months
       var amt=parseFloat(e.amount)||0; if(amt<=0)return;
-      var cat=e.category||e.category_bucket||'misc'; if(_AB_L1.indexOf(cat)<0)cat='misc';
-      byCat[cat]=(byCat[cat]||0)+amt; monthsSeen[k]=true;
-      (byCatMonths[cat]=byCatMonths[cat]||{})[k]=true;
+      monthsSeen[k]=true;
+      _spendSplitParts(e).forEach(function(p){var cat=p.category||p.category_bucket||'misc'; if(_AB_L1.indexOf(cat)<0)cat='misc'; var pa=parseFloat(p.amount)||0; if(pa<=0)return; byCat[cat]=(byCat[cat]||0)+pa; (byCatMonths[cat]=byCatMonths[cat]||{})[k]=true;});
     });
     var nMonths=Object.keys(monthsSeen).length;
     // Need enough completed months for a stable run-rate. Manual loggers: >=3. But linked users' S.spendingEntries
@@ -7515,11 +7517,26 @@ var _SPENDING_CATS=[
   {key:'activeSavings', label:'Active Savings',  icon:'📈', color:'#10B981'},
   {key:'misc',          label:'Other',           icon:'📦', color:'#94A3B8'}
 ];
+// §1.3 transaction splits: expand an entry into its category-attribution PARTS. A split entry
+// (entry.splits=[{category,category_bucket,amount}] whose amounts sum to entry.amount within 1¢)
+// attributes to its parts; everything else — and any invalid/partial split — falls back to the
+// entry's OWN {category, category_bucket, amount}, so NON-SPLIT entries are byte-identical at every
+// per-category call site and the TOTAL across parts always equals the entry amount.
+function _spendSplitParts(e){
+  if(e&&e.splits&&e.splits.length){
+    var amt=parseFloat(e.amount)||0,sum=0;
+    for(var i=0;i<e.splits.length;i++){sum+=parseFloat(e.splits[i].amount)||0;}
+    if(Math.abs(sum-amt)<0.01) return e.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0};});
+  }
+  return [{category:(e?e.category:undefined),category_bucket:(e?e.category_bucket:undefined),amount:(e?(parseFloat(e.amount)||0):0)}];
+}
 function _spendingCategoryAggregates(monthEntries){
   var totals={};
   (monthEntries||[]).forEach(function(e){
-    var k=e.category||e.category_bucket||'misc';
-    totals[k]=(totals[k]||0)+(parseFloat(e.amount)||0);
+    _spendSplitParts(e).forEach(function(p){
+    var k=p.category||p.category_bucket||'misc';
+    totals[k]=(totals[k]||0)+(parseFloat(p.amount)||0);
+    });
   });
   var slices=_SPENDING_CATS.map(function(c){
     return{key:c.key,label:c.label,icon:c.icon,color:c.color,amount:totals[c.key]||0};
@@ -7905,7 +7922,7 @@ function _portalSmartAlertsBlock(status,bills,monthEntries){
   // Category-budget alerts — read budgets from S.expData using portal's existing logic
   var expData=S.expData||{};
   var catTotals={};
-  (monthEntries||[]).forEach(function(e){var bk=e.category||'misc';catTotals[bk]=(catTotals[bk]||0)+(parseFloat(e.amount)||0);});
+  (monthEntries||[]).forEach(function(e){_spendSplitParts(e).forEach(function(p){var bk=p.category||'misc';catTotals[bk]=(catTotals[bk]||0)+(parseFloat(p.amount)||0);});});
   _SPENDING_CATS.forEach(function(cat){
     var spent=catTotals[cat.key]||0;
     var ed=expData[cat.key];if(!ed)return;
@@ -8074,7 +8091,8 @@ function _portalEditEntry(entryId){
     _editId:entry.id,
     _editDate:entry.date,
     _plaidTxnId:entry._plaidTxnId,
-    _source:entry._source
+    _source:entry._source,
+    splits:entry.splits
   });
 }
 async function _portalDeleteEntry(entryId){
@@ -8463,9 +8481,11 @@ function _portalRenderSpendDashboard(){
     };
     var catTotals={};
     monthEntries.forEach(function(e){
-      var bk=e.category||e.category_bucket||'misc';
+      _spendSplitParts(e).forEach(function(p){
+      var bk=p.category||p.category_bucket||'misc';
       if(!catTotals[bk])catTotals[bk]=0;
-      catTotals[bk]+=parseFloat(e.amount)||0;
+      catTotals[bk]+=parseFloat(p.amount)||0;
+      });
     });
     var expData=S.expData||{};
     var catList=Object.keys(bucketMap).map(function(bk){
@@ -8656,6 +8676,7 @@ function _spendRegRowHtml(e){
   if(e._source==='plaid')h+='<span style="color:#A855F7;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Imported from your linked bank">🔗 Linked</span>';
   if(_isCredit)h+='<span style="color:var(--gr);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Refund/credit — reduces your spending">↩ Refund</span>';
   if(e._possibleDuplicate)h+='<span style="color:var(--yl);font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px">⚠ Possible duplicate'+(e._plaidTxnId?' · <a onclick="_cpExcludeTxn(\''+e._plaidTxnId+'\')" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Exclude</a>':'')+'</span>';
+  if(e.splits&&e.splits.length)h+='<span style="color:#8B5CF6;font-family:var(--fh);font-weight:700;letter-spacing:.04em;font-size:11px" title="Split across multiple categories">✂️ Split ('+e.splits.length+')</span>';
   h+='</div></div>';
   h+='<div style="font-family:var(--fd);font-size:14px;color:'+(_isCredit?'var(--gr)':'var(--or)')+';font-weight:700;flex-shrink:0">'+(_isCredit?'+'+fmt(Math.abs(_amt)):fmt(_amt))+'</div>';
   h+='<button onclick="_portalEditEntry(\''+e.id+'\')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:14px;padding:6px;min-height:32px;min-width:32px" title="Edit" aria-label="Edit expense">✏️</button>';
@@ -9259,6 +9280,38 @@ function _portalPlanVsRealityIncome(){
 // expense_type, payment_method, is_recurring, recurrence_freq, _onSubmit, _title}.
 // `_onSubmit` is a callback invoked with the saved entry after a successful write,
 // so the caller can mark a plan card complete or do other follow-up work.
+// §1.3 split editor helpers (budget_v2). Split rows live in #portalQaSplitRows; each = a category
+// select + amount input that must sum to the entry amount. _portalSubmitAddExpense reads them into
+// entry.splits. Non-flag users never see the toggle, so their entries never gain splits.
+function _portalQaSplitRowHtml(cat,amt){
+  var catOpts=[['food','🍽️ Food'],['housing','🏠 Housing'],['transportation','🚗 Transport'],['utilities','⚡ Utilities'],['insurance','🛡️ Insurance'],['discretionary','🛍️ Entertainment/Shopping'],['subscriptions','📱 Subscriptions'],['activeSavings','📈 Savings'],['estate','📜 Estate'],['misc','📦 Other']];
+  var sel=(cat||'food');
+  var opts=catOpts.map(function(o){return '<option value="'+o[0]+'"'+(sel===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
+  var aV=(amt||amt===0)?String(amt):'';
+  return '<div class="qa-split-row" style="display:flex;gap:6px;margin-bottom:5px;align-items:center">'
+    +'<select class="qa-split-cat" style="flex:1;padding:7px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:12px;font-family:var(--fh)">'+opts+'</select>'
+    +'<input type="number" inputmode="decimal" class="qa-split-amt" value="'+esc(aV)+'" oninput="_portalQaSplitRemaining()" placeholder="$" style="width:92px;padding:7px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:12px;font-family:var(--fh);box-sizing:border-box">'
+    +'<button type="button" onclick="_portalQaRemoveSplitRow(this)" title="Remove" aria-label="Remove split" style="background:none;border:none;color:var(--rd);cursor:pointer;font-size:14px;padding:4px">✕</button>'
+    +'</div>';
+}
+function _portalQaToggleSplit(){
+  var t=document.getElementById('portalQaSplitToggle'),box=document.getElementById('portalQaSplitBox'); if(!t||!box)return;
+  box.style.display=t.checked?'':'none';
+  if(t.checked){ var rows=document.querySelectorAll('#portalQaSplitRows .qa-split-row'); if(!rows.length){ _portalQaAddSplitRow('food'); _portalQaAddSplitRow('misc'); } }
+  _portalQaSplitRemaining();
+}
+function _portalQaAddSplitRow(cat,amt){ var box=document.getElementById('portalQaSplitRows'); if(!box)return; box.insertAdjacentHTML('beforeend',_portalQaSplitRowHtml(cat,amt)); _portalQaSplitRemaining(); }
+function _portalQaRemoveSplitRow(btn){ var row=(btn&&btn.closest)?btn.closest('.qa-split-row'):null; if(row&&row.parentNode)row.parentNode.removeChild(row); _portalQaSplitRemaining(); }
+function _portalQaSplitRemaining(){
+  var el=document.getElementById('portalQaSplitRemain'); if(!el)return;
+  var amtEl=document.getElementById('portalQaAmount'); var total=pf(amtEl&&amtEl.value)||0;
+  var rows=document.querySelectorAll('#portalQaSplitRows .qa-split-amt'); var sum=0;
+  for(var i=0;i<rows.length;i++){ sum+=parseFloat(rows[i].value)||0; }
+  var rem=Math.round((total-sum)*100)/100;
+  if(Math.abs(rem)<0.01){ el.textContent='✓ Balanced'; el.style.color='var(--gr)'; }
+  else if((total>=0&&rem>0)||(total<0&&rem<0)){ el.textContent='Unassigned: $'+Math.abs(rem).toFixed(2); el.style.color='var(--or)'; }
+  else { el.textContent='Over by $'+Math.abs(rem).toFixed(2); el.style.color='var(--rd)'; }
+}
 function _portalOpenAddExpense(prefill){
   prefill=prefill||{};
   // Stash callback + extra metadata on a portal-scoped slot so _portalSubmitAddExpense
@@ -9293,7 +9346,7 @@ function _portalOpenAddExpense(prefill){
   var _linkedEdit=!!(prefill&&prefill._plaidTxnId);
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Amount</div>';
-  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="text" inputmode="decimal" id="portalQaAmount"'+(_linkedEdit?' readonly':'')+' placeholder="0.00" value="'+(prefill.amount||'')+'" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:18px;font-weight:700;border-radius:4px;box-sizing:border-box" oninput="autoComma(this);this.style.borderColor=pf(this.value)>0?\'rgba(91,155,255,.35)\':\'var(--bd)\'"></div>';
+  h+='<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:14px">$</span><input type="text" inputmode="decimal" id="portalQaAmount"'+(_linkedEdit?' readonly':'')+' placeholder="0.00" value="'+(prefill.amount||'')+'" style="width:100%;padding:10px 10px 10px 22px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:18px;font-weight:700;border-radius:4px;box-sizing:border-box" oninput="autoComma(this);this.style.borderColor=pf(this.value)>0?\'rgba(91,155,255,.35)\':\'var(--bd)\';if(typeof _portalQaSplitRemaining===\'function\')_portalQaSplitRemaining()"></div>';
   h+='</div>';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Date</div>';
   h+='<input type="date" id="portalQaDate"'+(_linkedEdit?' readonly':'')+' value="'+dateValue+'" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
@@ -9323,6 +9376,17 @@ function _portalOpenAddExpense(prefill){
     h+='<option value="'+t+'"'+(pType===t?' selected':'')+'>'+lbl+'</option>';
   });
   h+='</select></div></div>';
+  // §1.3 split editor (budget_v2): split one expense across categories that must sum to the amount.
+  if(typeof budgetV2Enabled==='function'&&budgetV2Enabled()){
+    var _pSplits=(prefill&&Array.isArray(prefill.splits))?prefill.splits:null;
+    var _splitOn=!!(_pSplits&&_pSplits.length);
+    h+='<div style="margin-bottom:10px">';
+    h+='<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#5B9BFF;cursor:pointer;font-family:var(--fh);font-weight:700"><input type="checkbox" id="portalQaSplitToggle"'+(_splitOn?' checked':'')+' onchange="_portalQaToggleSplit()" style="accent-color:#5B9BFF">✂️ Split across categories</label>';
+    h+='<div id="portalQaSplitBox" style="margin-top:8px'+(_splitOn?'':';display:none')+'">';
+    h+='<div id="portalQaSplitRows">'+(_splitOn?_pSplits.map(function(s){return _portalQaSplitRowHtml(s.category,s.amount);}).join(''):'')+'</div>';
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px"><button type="button" onclick="_portalQaAddSplitRow()" style="background:none;border:1px solid var(--bd);color:#5B9BFF;border-radius:4px;padding:5px 10px;font-size:12px;cursor:pointer;font-family:var(--fh)">+ Add category</button><span id="portalQaSplitRemain" style="font-size:12px;font-family:var(--fh);font-weight:700"></span></div>';
+    h+='</div></div>';
+  }
   // How Did You Pay?
   h+='<div style="margin-bottom:10px"><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">How Did You Pay?</div>';
   h+='<select id="portalQaPayMethod" onchange="_portalQaPayMethodChange()" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
@@ -9371,6 +9435,7 @@ function _portalOpenAddExpense(prefill){
   h+='</div></div>';
   el.innerHTML=h;
   openModal('portalAddExpenseModal');
+  if(typeof _portalQaSplitRemaining==='function')_portalQaSplitRemaining();
   // Trigger payment-method-change once so any prefill that selects credit_card or financed
   // populates the conditional sub-fields immediately.
   setTimeout(function(){
@@ -9556,6 +9621,21 @@ function _portalSubmitAddExpense(){
     created_at:new Date().toISOString(),
     _source:'portal'
   };
+  // §1.3: if Split is on, read the split rows → entry.splits (Σ must equal the amount). If the
+  // toggle exists but is off, send splits:null to clear any prior split (un-split on edit).
+  var _splitTog=document.getElementById('portalQaSplitToggle');
+  if(_splitTog){
+    if(_splitTog.checked){
+      var _srows=document.querySelectorAll('#portalQaSplitRows .qa-split-row');
+      var _splits=[];
+      for(var _sri=0;_sri<_srows.length;_sri++){ var _sc=((_srows[_sri].querySelector('.qa-split-cat')||{}).value)||'misc'; var _sa=pf((_srows[_sri].querySelector('.qa-split-amt')||{}).value); if(_sa===0)continue; _splits.push({category:_sc,category_bucket:(bucketMap[_sc]||'other'),amount:_sa,note:''}); }
+      var _sdist={}; for(var _sdi=0;_sdi<_splits.length;_sdi++){_sdist[_splits[_sdi].category]=1;}
+      if(Object.keys(_sdist).length<2){ if(typeof _cpToast==='function')_cpToast('Split across at least two different categories (or turn off Split).'); return; }
+      var _ssum=0; for(var _ssi=0;_ssi<_splits.length;_ssi++){_ssum+=_splits[_ssi].amount;}
+      if(Math.abs(_ssum-amt)>=0.01){ if(typeof _cpToast==='function')_cpToast('Split must add up to '+fmt(amt)+' — currently '+fmt(_ssum)+'.'); return; }
+      entry.splits=_splits; entry.category=_splits[0].category; entry.category_bucket=_splits[0].category_bucket;
+    } else { entry.splits=null; }
+  }
   // Edit-mode detection — if prefill contains _editId, this is an edit not a new entry.
   // Replace the existing entry locally and route through PFOS_EDIT_ENTRY (canonical handler in pfos-main).
   var prefillCheck=APP._portalQaPrefill||{};
