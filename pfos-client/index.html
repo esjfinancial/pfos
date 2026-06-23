@@ -5687,7 +5687,7 @@ function _portalSpendStatus(viewCtx){
     reasons.push('On pace to overspend by $'+overspend.toLocaleString()+' this month.');
   }
   // Per-category check
-  var bucketMap={food:'Food',housing:'Housing',transportation:'Transport',discretionary:'Entertainment',subscriptions:'Subscriptions',misc:'Other',utilities:'Utilities',insurance:'Insurance'};
+  var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]=c.label;}); // §1.4 dynamic — custom categories get pace-checked
   var catSpend={};
   monthEntries.forEach(function(e){
     _spendSplitParts(e).forEach(function(p){
@@ -6842,6 +6842,10 @@ function _portalAutoBudgetSuggestions(){
     var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
     var entries=S.spendingEntries||[]; if(!entries.length)return [];
     var expData=S.expData||{};
+    // §1.4: effective auto-budget keys/labels from the editable categories (excludes activeSavings —
+    // savings isn't auto-budgeted). Legacy → the 8 default expense keys (byte-identical to _AB_L1).
+    var _abKeys=getL1Cats().map(function(c){return c.key;}).filter(function(k){return k!=='activeSavings';});
+    var _abLabel={}; getL1Cats().forEach(function(c){_abLabel[c.key]=c.label;});
     var dismissed={};
     var recs=(typeof _portalRecsList==='function')?_portalRecsList():(S.budgetRecommendations||[]);
     (recs||[]).forEach(function(r){ if(r&&r.type==='auto_budget'&&r.status==='dismissed'&&r.payload&&r.payload.category)dismissed[r.payload.category]=true; });
@@ -6854,7 +6858,7 @@ function _portalAutoBudgetSuggestions(){
       if(curKey-k>6)return;           // last 6 completed months
       var amt=parseFloat(e.amount)||0; if(amt<=0)return;
       monthsSeen[k]=true;
-      _spendSplitParts(e).forEach(function(p){var cat=p.category||p.category_bucket||'misc'; if(_AB_L1.indexOf(cat)<0)cat='misc'; var pa=parseFloat(p.amount)||0; if(pa<=0)return; byCat[cat]=(byCat[cat]||0)+pa; (byCatMonths[cat]=byCatMonths[cat]||{})[k]=true;});
+      _spendSplitParts(e).forEach(function(p){var cat=p.category||p.category_bucket||'misc'; if(_abKeys.indexOf(cat)<0)cat='misc'; var pa=parseFloat(p.amount)||0; if(pa<=0)return; byCat[cat]=(byCat[cat]||0)+pa; (byCatMonths[cat]=byCatMonths[cat]||{})[k]=true;});
     });
     var nMonths=Object.keys(monthsSeen).length;
     // Need enough completed months for a stable run-rate. Manual loggers: >=3. But linked users' S.spendingEntries
@@ -6868,13 +6872,13 @@ function _portalAutoBudgetSuggestions(){
     // budget — a category bought every other month gets averaged, not spiked to its active-month mean).
     function curBudget(cat){var ed=expData[cat];if(!ed)return 0;if(ed.total!=null&&!isNaN(parseFloat(ed.total)))return parseFloat(ed.total);var a=parseFloat(ed.amount)||0;if(ed.period==='annual')a/=12;var sub=0;if(ed.subs)Object.keys(ed.subs).forEach(function(sk){var s=ed.subs[sk];var sv=parseFloat(s&&s.amount)||0;sub+=(s&&s.period==='annual')?sv/12:sv;});return sub>0?sub:a;}
     var out=[];
-    _AB_L1.forEach(function(cat){
+    _abKeys.forEach(function(cat){
       if(dismissed[cat])return;
       if(curBudget(cat)>0)return;     // EMPTY buckets only (never clobber a set budget)
       if(!byCat[cat])return;
       if(Object.keys(byCatMonths[cat]||{}).length<2)return;  // recurrence gate: don't budget a one-off (needs spend in >=2 of its own months)
       var suggested=Math.round((byCat[cat]/nMonths)/25)*25; if(suggested<=0)return;
-      out.push({category:cat,label:_AB_LABELS[cat]||cat,suggested:suggested,months:nMonths});
+      out.push({category:cat,label:_abLabel[cat]||cat,suggested:suggested,months:nMonths});
     });
     return out;
   }catch(e){console.warn('[PFOS] auto-budget suggest:',e);return [];}
@@ -6897,7 +6901,8 @@ function _portalRenderAutoBudget(){
 }
 async function _portalAutoBudgetAccept(cat,amt){
   try{
-    var label=_AB_LABELS[cat]||cat;
+    var _alc=getL1Cats().filter(function(c){return c.key===cat;})[0];
+    var label=(_alc&&_alc.label)||_AB_LABELS[cat]||cat; // §1.4 custom-category-aware label
     var ok=await _cpConfirmModal({title:'Set your '+label+' budget?',message:'Set <strong>'+esc(label)+'</strong> to <strong>'+fmt(amt)+'/mo</strong>, based on your linked spending. You can change it anytime in My Financial Data.',confirmLabel:'Set '+fmt(amt)+' budget',confirmStyle:'primary',icon:'💡'});
     if(!ok)return;
     function wm(St){if(!St)return;if(!St.expData)St.expData={};if(!St.expData[cat])St.expData[cat]={amount:'',period:'monthly',subs:{}};St.expData[cat].amount=String(amt);St.expData[cat].period='monthly';if(St.expData[cat].total!=null)delete St.expData[cat].total;if(!St._touched)St._touched={};St._touched.expData=true;}
@@ -7517,6 +7522,25 @@ var _SPENDING_CATS=[
   {key:'activeSavings', label:'Active Savings',  icon:'📈', color:'#10B981'},
   {key:'misc',          label:'Other',           icon:'📦', color:'#94A3B8'}
 ];
+// §1.4: effective category accessors for the portal. Read the user-editable taxonomy from
+// APP._portalFd.S.categories when present, else fall back to the static _SPENDING_CATS default
+// (so legacy users with no S.categories are byte-identical). Every returned entry carries
+// {key,label,icon,color}: custom entries inherit a matching default's color/icon by key, else a
+// rotating palette colour so donut slices stay distinct. getL2Cats() returns the sub-cat map.
+var _CAT_PALETTE=['#5B9BFF','#22C55E','#A855F7','#EAB308','#06B6D4','#EC4899','#8B5CF6','#10B981','#F97316','#F43F5E','#0EA5E9','#94A3B8'];
+function getL1Cats(){
+  var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
+  var l1=(S.categories&&Array.isArray(S.categories.l1)&&S.categories.l1.length)?S.categories.l1:null;
+  if(!l1) return _SPENDING_CATS;
+  var byKey={}; _SPENDING_CATS.forEach(function(c){byKey[c.key]=c;});
+  var out=l1.map(function(c,i){ var d=byKey[c.key]||{}; return {key:c.key,label:c.label||d.label||c.key,icon:c.icon||d.icon||'📦',color:c.color||d.color||_CAT_PALETTE[i%_CAT_PALETTE.length]}; });
+  // activeSavings is a SPECIAL non-editable display slice (savings, not an expense category — the engine
+  // excludes it from baseExp). S.categories.l1 holds editable EXPENSE categories only, so ensure the
+  // activeSavings slice stays present for portal display parity even when the editable list omits it.
+  if(!out.some(function(c){return c.key==='activeSavings';})){ var _as=byKey['activeSavings']; out.push(_as||{key:'activeSavings',label:'Active Savings',icon:'📈',color:'#10B981'}); }
+  return out;
+}
+function getL2Cats(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; return (S.categories&&S.categories.l2)?S.categories.l2:{}; }
 // §1.3 transaction splits: expand an entry into its category-attribution PARTS. A split entry
 // (entry.splits=[{category,category_bucket,amount}] whose amounts sum to entry.amount within 1¢)
 // attributes to its parts; everything else — and any invalid/partial split — falls back to the
@@ -7538,7 +7562,7 @@ function _spendingCategoryAggregates(monthEntries){
     totals[k]=(totals[k]||0)+(parseFloat(p.amount)||0);
     });
   });
-  var slices=_SPENDING_CATS.map(function(c){
+  var slices=getL1Cats().map(function(c){
     return{key:c.key,label:c.label,icon:c.icon,color:c.color,amount:totals[c.key]||0};
   }).filter(function(s){return s.amount>0;});
   slices.sort(function(a,b){return b.amount-a.amount;});
@@ -7752,7 +7776,7 @@ function _portalWhereEveryDollarGoesBlock(){
   // Build per-category expense slices (budget-based, mirrors Home)
   var catColors=['#5B9BFF','#22C55E','#F97316','#EF4444','#A855F7','#EAB308','#EC4899','#14B8A6','#6366F1','#64748B'];
   var expData=[];
-  _portalCatList.forEach(function(cat,i){
+  getL1Cats().forEach(function(cat,i){
     var amt=Math.round(_portalGetMonthlyExp(cat.key));
     if(amt>0)expData.push({l:cat.icon+' '+cat.label,v:amt,c:catColors[i%catColors.length]});
   });
@@ -7923,7 +7947,7 @@ function _portalSmartAlertsBlock(status,bills,monthEntries){
   var expData=S.expData||{};
   var catTotals={};
   (monthEntries||[]).forEach(function(e){_spendSplitParts(e).forEach(function(p){var bk=p.category||'misc';catTotals[bk]=(catTotals[bk]||0)+(parseFloat(p.amount)||0);});});
-  _SPENDING_CATS.forEach(function(cat){
+  getL1Cats().forEach(function(cat){
     var spent=catTotals[cat.key]||0;
     var ed=expData[cat.key];if(!ed)return;
     var budget=0;
@@ -8468,17 +8492,7 @@ function _portalRenderSpendDashboard(){
 
   // ── 7. Where Your Money Went — categorical bars with budgets, sorted desc ──
   if(monthEntries.length>0){
-    var bucketMap={
-      food:{label:'Food',icon:'🍽️',color:'#22C55E'},
-      housing:{label:'Housing',icon:'🏠',color:'#5B9BFF'},
-      transportation:{label:'Transportation',icon:'🚗',color:'#A855F7'},
-      utilities:{label:'Utilities',icon:'⚡',color:'#EAB308'},
-      insurance:{label:'Insurance',icon:'🛡️',color:'#06B6D4'},
-      discretionary:{label:'Entertainment',icon:'🎬',color:'#EC4899'},
-      subscriptions:{label:'Subscriptions',icon:'📱',color:'#8B5CF6'},
-      activeSavings:{label:'Active Savings',icon:'📈',color:'#10B981'},
-      misc:{label:'Other',icon:'📦',color:'#94A3B8'}
-    };
+    var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]={label:c.label,icon:c.icon,color:c.color};}); // §1.4 dynamic — custom categories appear in the bars
     var catTotals={};
     monthEntries.forEach(function(e){
       _spendSplitParts(e).forEach(function(p){
@@ -8769,7 +8783,7 @@ function _spendRegListInner(S){
 // _spendRegListInner result (so we don't filter twice); falls back to _spendRegActive() if absent.
 function _spendRegControlsHtml(S,reg){
   var f=_spendRegFilter, active=reg?reg.active:_spendRegActive();
-  var cats=[['','All categories'],['food','🍽️ Food'],['housing','🏠 Housing'],['transportation','🚗 Transportation'],['utilities','⚡ Utilities'],['insurance','🛡️ Insurance'],['subscriptions','📱 Subscriptions'],['discretionary','🎬 Discretionary'],['activeSavings','📈 Savings'],['misc','📦 Misc']];
+  var cats=[['','All categories']].concat(getL1Cats().map(function(c){return [c.key,c.icon+' '+c.label];})); // §1.4 dynamic categories
   var srcs=[['','All sources'],['manual','✍️ Manual'],['linked','🔗 Linked']];
   var types=[['','All types'],['regular','Regular'],['emergency','🚨 Emergency'],['big_purchase','💰 Big purchase']];
   var sorts=[['date_desc','Newest first'],['date_asc','Oldest first'],['amt_desc','Highest $'],['amt_asc','Lowest $'],['merchant','A → Z']];
@@ -8799,7 +8813,7 @@ function _spendRegControlsHtml(S,reg){
 // plus "select all matching" (the whole working set, not just the capped display).
 function _spendRegToolbarHtml(){
   var n=Object.keys(_spendRegSel).length;
-  var cats=[['','Recategorize to…'],['food','🍽️ Food'],['housing','🏠 Housing'],['transportation','🚗 Transportation'],['utilities','⚡ Utilities'],['insurance','🛡️ Insurance'],['subscriptions','📱 Subscriptions'],['discretionary','🎬 Discretionary'],['activeSavings','📈 Savings'],['misc','📦 Misc']];
+  var cats=[['','Recategorize to…']].concat(getL1Cats().map(function(c){return [c.key,c.icon+' '+c.label];})); // §1.4 dynamic categories
   var inS='padding:7px 9px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:12px;font-family:var(--fh)';
   var h='<div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center;padding:8px;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);border-radius:4px">';
   h+='<span id="_spendRegSelCount" style="font-size:12px;font-weight:700;color:var(--wh);font-family:var(--fh)">'+n+' selected</span>';
@@ -9284,7 +9298,7 @@ function _portalPlanVsRealityIncome(){
 // select + amount input that must sum to the entry amount. _portalSubmitAddExpense reads them into
 // entry.splits. Non-flag users never see the toggle, so their entries never gain splits.
 function _portalQaSplitRowHtml(cat,amt){
-  var catOpts=[['food','🍽️ Food'],['housing','🏠 Housing'],['transportation','🚗 Transport'],['utilities','⚡ Utilities'],['insurance','🛡️ Insurance'],['discretionary','🛍️ Entertainment/Shopping'],['subscriptions','📱 Subscriptions'],['activeSavings','📈 Savings'],['estate','📜 Estate'],['misc','📦 Other']];
+  var catOpts=getL1Cats().map(function(c){return [c.key,c.icon+' '+c.label];}); // §1.4 dynamic categories
   var sel=(cat||'food');
   var opts=catOpts.map(function(o){return '<option value="'+o[0]+'"'+(sel===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
   var aV=(amt||amt===0)?String(amt):'';
@@ -9360,11 +9374,7 @@ function _portalOpenAddExpense(prefill){
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px">';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Category</div>';
   h+='<select id="portalQaCat" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
-  var catOpts=[
-    {v:'food',l:'🍽️ Food'},{v:'housing',l:'🏠 Housing'},{v:'transportation',l:'🚗 Transport'},
-    {v:'utilities',l:'⚡ Utilities'},{v:'insurance',l:'🛡️ Insurance'},{v:'discretionary',l:'🛍️ Entertainment/Shopping'},
-    {v:'subscriptions',l:'📱 Subscriptions'},{v:'activeSavings',l:'📈 Active Savings'},{v:'estate',l:'📜 Estate Planning'},{v:'misc',l:'📦 Other'}
-  ];
+  var catOpts=getL1Cats().map(function(c){return {v:c.key,l:c.icon+' '+c.label};}); // §1.4 dynamic categories
   var pCat=prefill.category||'food';
   catOpts.forEach(function(o){h+='<option value="'+o.v+'"'+(pCat===o.v?' selected':'')+'>'+o.l+'</option>';});
   h+='</select></div>';
