@@ -8630,6 +8630,8 @@ var _spendRegFilter={q:'',cat:'',src:'',type:'',amtMin:'',amtMax:'',dateFrom:'',
 var _spendRegSearchTimer=null;
 var _spendRegMonthTitle='Recent Expenses';   // set per dashboard render; restored when filters clear
 var _spendRegMonthCountText='';              // inactive month count label (e.g. "8 this month · 🔗 3 synced")
+var _spendRegSelMode=false;                  // §1.2 bulk-edit mode: rows show a checkbox + a bulk toolbar
+var _spendRegSel={};                         // selected entry ids, keyed {String(id):true}
 var _SPEND_ICMAP={food:'🍽️',housing:'🏠',transportation:'🚗',discretionary:'🎬',subscriptions:'📱',utilities:'⚡',insurance:'🛡️',misc:'📦',activeSavings:'📈'};
 var _SPEND_MONTHS=['January','February','March','April','May','June','July','August','September','October','November','December'];
 // One transaction row — byte-identical to the legacy inline markup so the flag-off path is unchanged.
@@ -8642,6 +8644,7 @@ function _spendRegRowHtml(e){
   var borderCol=et==='emergency'?'var(--rd)':et==='big_purchase'?'var(--yl)':'var(--bd)';
   var _amt=parseFloat(e.amount)||0,_isCredit=_amt<0; // #4: negative = refund/credit (nets against spend)
   var h='<div style="display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--bg-card);border:1px solid '+borderCol+';border-radius:3px;margin-bottom:5px">';
+  if(_spendRegSelMode)h+='<input type="checkbox" onclick="_spendRegSelToggle(\''+e.id+'\',this.checked)"'+(_spendRegSel[String(e.id)]?' checked':'')+' style="flex-shrink:0;width:16px;height:16px;cursor:pointer;accent-color:#5B9BFF" aria-label="Select transaction">';
   h+='<span style="font-size:16px;flex-shrink:0">'+ic+'</span>';
   h+='<div style="flex:1;min-width:0">';
   h+='<div style="font-size:13px;color:var(--wh);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(e.description||'(no description)')+'</div>';
@@ -8713,6 +8716,12 @@ function _spendRegCountText(count,active){ return active?(count+' matching trans
 // Render the register list (rows + cap + empty state) ONCE. Returns {html,count,active}.
 function _spendRegListInner(S){
   var ws=_spendRegWorkingSet(S),list=ws.list,active=ws.active;
+  if(_spendRegSelMode){
+    // §1.2: prune the selection to the currently-visible working set on EVERY render, so a filter /
+    // month / search change can never leave stale, off-screen rows selected and bulk-acted on.
+    var _vis={}; list.forEach(function(e){_vis[String(e.id)]=true;});
+    Object.keys(_spendRegSel).forEach(function(id){ if(!_vis[id]) delete _spendRegSel[id]; });
+  }
   if(!list.length){
     var msg=active
       ?'No transactions match your search/filters. <a onclick="_spendRegClear()" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Clear search</a>'
@@ -8759,7 +8768,24 @@ function _spendRegControlsHtml(S,reg){
   h+='<input type="date" value="'+esc(f.dateFrom)+'" onchange="_spendRegSet(\'dateFrom\',this.value)" title="From date" style="'+inS+'">';
   h+='<input type="date" value="'+esc(f.dateTo)+'" onchange="_spendRegSet(\'dateTo\',this.value)" title="To date" style="'+inS+'">';
   h+='<button id="_spendRegClearBtn" onclick="_spendRegClear()" style="'+inS+';cursor:pointer;color:#5B9BFF'+(active?'':';display:none')+'">✕ Clear</button>';
+  h+='<button onclick="_spendRegToggleSelMode()" style="'+inS+';cursor:pointer'+(_spendRegSelMode?';color:#5B9BFF;border-color:#5B9BFF':'')+'">'+(_spendRegSelMode?'✕ Done':'☑ Select')+'</button>';
   h+='</div>';
+  if(_spendRegSelMode) h+=_spendRegToolbarHtml();
+  h+='</div>';
+  return h;
+}
+// §1.2 bulk-edit toolbar (only rendered in select mode). Recategorize-to + Delete over the selection,
+// plus "select all matching" (the whole working set, not just the capped display).
+function _spendRegToolbarHtml(){
+  var n=Object.keys(_spendRegSel).length;
+  var cats=[['','Recategorize to…'],['food','🍽️ Food'],['housing','🏠 Housing'],['transportation','🚗 Transportation'],['utilities','⚡ Utilities'],['insurance','🛡️ Insurance'],['subscriptions','📱 Subscriptions'],['discretionary','🎬 Discretionary'],['activeSavings','📈 Savings'],['misc','📦 Misc']];
+  var inS='padding:7px 9px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:12px;font-family:var(--fh)';
+  var h='<div style="display:flex;gap:7px;flex-wrap:wrap;align-items:center;padding:8px;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);border-radius:4px">';
+  h+='<span id="_spendRegSelCount" style="font-size:12px;font-weight:700;color:var(--wh);font-family:var(--fh)">'+n+' selected</span>';
+  h+='<button onclick="_spendRegSelectAll()" style="'+inS+';cursor:pointer;color:#5B9BFF">Select all matching</button>';
+  h+='<select id="_spendRegBulkCat" style="'+inS+'">'+cats.map(function(o){return '<option value="'+esc(o[0])+'">'+esc(o[1])+'</option>';}).join('')+'</select>';
+  h+='<button onclick="_spendRegBulkRecat()" style="'+inS+';cursor:pointer;color:#22C55E">Apply</button>';
+  h+='<button onclick="_spendRegBulkDelete()" style="'+inS+';cursor:pointer;color:#EF4444">🗑 Delete</button>';
   h+='</div>';
   return h;
 }
@@ -8781,6 +8807,69 @@ function _spendRegApply(){
   var t=document.getElementById('_spendRegTitle'); if(t) t.textContent=reg.active?'Search results':_spendRegMonthTitle;
   var c=document.getElementById('_spendRegCount'); if(c) c.textContent=_spendRegCountText(reg.count,reg.active);
   var cb=document.getElementById('_spendRegClearBtn'); if(cb) cb.style.display=reg.active?'':'none';
+  if(_spendRegSelMode){ var sc=document.getElementById('_spendRegSelCount'); if(sc) sc.textContent=Object.keys(_spendRegSel).length+' selected'; }
+}
+// ── §1.2 bulk-edit selection + apply ──
+function _spendRegToggleSelMode(){ _spendRegSelMode=!_spendRegSelMode; if(!_spendRegSelMode)_spendRegSel={}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
+function _spendRegSelToggle(id,checked){ if(checked)_spendRegSel[String(id)]=true; else delete _spendRegSel[String(id)]; var c=document.getElementById('_spendRegSelCount'); if(c)c.textContent=Object.keys(_spendRegSel).length+' selected'; }
+function _spendRegSelectAll(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; _spendRegWorkingSet(S).list.forEach(function(e){_spendRegSel[String(e.id)]=true;}); _spendRegApply(); }
+function _spendRegBulkRecat(){ var sel=document.getElementById('_spendRegBulkCat'); var v=sel?sel.value:''; if(!v){ if(typeof _cpToast==='function')_cpToast('Pick a category to apply.'); return; } _spendRegBulkApply('recategorize',v); }
+function _spendRegBulkDelete(){ _spendRegBulkApply('delete',null); }
+// Apply a bulk op to the selected rows. LINKED rows get the server-side edge write FIRST
+// (plaid-txn-edit recategorize/exclude → sticks across re-sync, IDOR-scoped to the caller by the
+// edge fn), then ALL successful ops post ONCE as PFOS_BULK_ENTRY (single calc()+_doSync). MANUAL
+// rows never hit the edge fn. Optimistic-mirrors both shell copies so the list updates immediately.
+async function _spendRegBulkApply(op,value){
+  var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
+  // Scope the action to the CURRENT working set (visible/matched rows) so a stale selection from a
+  // prior filter/month can never act on off-screen rows. _spendRegListInner also prunes _spendRegSel
+  // to this set on every render; this is the belt-and-suspenders enforcement at apply time.
+  var byId={}; _spendRegWorkingSet(S).list.forEach(function(e){byId[String(e.id)]=e;});
+  var sel=Object.keys(_spendRegSel).map(function(id){return byId[id];}).filter(Boolean);
+  if(!sel.length){ if(typeof _cpToast==='function')_cpToast('No transactions selected.'); return; }
+  var _linkedN=sel.filter(function(e){return !!e._plaidTxnId;}).length;
+  if(op==='delete'){
+    var _dmsg=_linkedN
+      ? (_linkedN===sel.length?'These are linked transactions — they will be excluded and stop re-importing. This cannot be undone.':'Linked transactions will be excluded (they stop re-importing); manually-added ones are removed. This cannot be undone.')
+      : 'These transactions will be permanently removed. This cannot be undone.';
+    var ok=await _cpConfirmModal({title:'Delete '+sel.length+' transaction'+(sel.length===1?'':'s')+'?',message:_dmsg,confirmLabel:'Delete',confirmStyle:'danger',icon:'🗑'});
+    if(!ok)return;
+  } else if(op==='recategorize'){
+    var ok2=await _cpConfirmModal({title:'Recategorize '+sel.length+' transaction'+(sel.length===1?'':'s')+'?',message:'The selected transactions will be moved to the chosen category.'+(_linkedN?' Linked ones keep this category across future bank syncs.':''),confirmLabel:'Recategorize',confirmStyle:'primary',icon:'🏷'});
+    if(!ok2)return;
+  }
+  var ops=[], fail=0, tasks=[];
+  sel.forEach(function(e){
+    var linked=!!e._plaidTxnId;
+    if(op==='recategorize'){
+      if(linked) tasks.push(_cpRecategorizeTxn(e._plaidTxnId,value).then(function(okk){ if(okk)ops.push({id:e.id,op:'recategorize',value:value}); else fail++; }).catch(function(){fail++;}));
+      else ops.push({id:e.id,op:'recategorize',value:value});
+    } else if(op==='delete'){
+      if(linked) tasks.push(db.functions.invoke('plaid-txn-edit',{body:{action:'exclude',transaction_id:String(e._plaidTxnId)}}).then(function(r){ if(r&&r.data&&r.data.ok&&r.data.excluded>0)ops.push({id:e.id,op:'delete'}); else fail++; }).catch(function(){fail++;}));
+      else ops.push({id:e.id,op:'delete'});
+    }
+  });
+  await Promise.all(tasks);
+  if(!ops.length){ if(typeof _cpToast==='function')_cpToast('Could not update the selected transactions — try again.'); return; }
+  _spendRegApplyOpsToMirror(ops);
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_BULK_ENTRY',ops:ops},PFOS_ORIGIN); }catch(_e){}
+  _spendRegSel={}; _spendRegSelMode=false;
+  if(typeof _cpToast==='function'){ var verb=(op==='delete')?'removed':'recategorized'; _cpToast(ops.length+' transaction'+(ops.length===1?'':'s')+' '+verb+(fail?(' · '+fail+' linked could not be updated'):'')+'.'); }
+  if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis();
+}
+// Apply ops to the in-memory mirrors (both shell copies) so the list reflects the change before the
+// engine round-trip persists. recategorize → set category (+ _userCat on linked); delete → remove.
+function _spendRegApplyOpsToMirror(ops){
+  [(_lastPfosState&&_lastPfosState.state),(APP._portalFd&&APP._portalFd.S)].forEach(function(st){
+    if(!st||!Array.isArray(st.spendingEntries))return;
+    var del={};
+    ops.forEach(function(o){
+      if(o.op==='delete'){ del[String(o.id)]=true; }
+      else if(o.op==='recategorize'){ for(var i=0;i<st.spendingEntries.length;i++){ var e=st.spendingEntries[i]; if(e&&String(e.id)===String(o.id)){ if(e._plaidTxnId&&e.category!==o.value)e._userCat=true; e.category=o.value; break; } } }
+    });
+    if(Object.keys(del).length) st.spendingEntries=st.spendingEntries.filter(function(e){return !(e&&del[String(e.id)]);});
+    st._touched=st._touched||{}; st._touched.spendingEntries=true;
+  });
 }
 
 // Tiny ordinal-suffix helper used by the smart routing widget. Mirrors pfos-main's ordSuffix.

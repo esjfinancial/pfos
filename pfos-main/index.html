@@ -15171,6 +15171,46 @@ function submitAdvisorRequestFromModal(){
       }catch(e){console.warn('PFOS_EDIT_ENTRY:',e);}
       return;
     }
+    // ── PFOS_BULK_ENTRY (§1.2) ──
+    // Apply an array of register bulk ops to S.spendingEntries in ONE calc()+_doSync cycle (vs N
+    // PFOS_EDIT/DELETE round-trips). Mirrors the canonical single handlers: 'recategorize' = a
+    // category-only edit (stamps _userCat on linked rows so the next plaid re-sync keeps it,
+    // exactly like PFOS_EDIT_ENTRY); 'delete' = reverse side effects then remove (like
+    // PFOS_DELETE_ENTRY). The shell performs any server-side edge writes (plaid-txn-edit
+    // recategorize/exclude) BEFORE posting this, so the handler only touches local state.
+    if(msg.type==='PFOS_BULK_ENTRY'){
+      try{
+        var _bops=msg.ops; if(!Array.isArray(_bops)||!_bops.length)return;
+        if(!Array.isArray(S.spendingEntries))return;
+        var _bIdx={}; for(var _bi=0;_bi<S.spendingEntries.length;_bi++){ var _be=S.spendingEntries[_bi]; if(_be)_bIdx[String(_be.id)]=_be; }
+        var _bDel={}, _bChanged=false;
+        _bops.forEach(function(op){
+          if(!op||op.id==null)return;
+          var ent=_bIdx[String(op.id)]; if(!ent)return; // unknown id — skip, no spurious save
+          if(op.op==='recategorize'){
+            if(op.value==null||op.value==='')return;
+            var _wp=!!ent._plaidTxnId, _cc=(ent.category!==op.value);
+            ent.category=op.value;
+            if(typeof simplifyCategory==='function'){try{ent.category_bucket=simplifyCategory(op.value);}catch(_se){}}
+            if(_wp&&_cc)ent._userCat=true; // linked recategorize must survive the next plaid re-sync (Chunk 5)
+            _bChanged=true;
+          } else if(op.op==='delete'){
+            _reverseSpendSideEffects(ent); // no-op for linked (debit/no detail); reverses card/financed/EF/policy for manual
+            _bDel[String(op.id)]=true;
+            _bChanged=true;
+          }
+        });
+        if(Object.keys(_bDel).length){ S.spendingEntries=S.spendingEntries.filter(function(e){return !(e&&_bDel[String(e.id)]);}); }
+        if(!_bChanged)return; // nothing matched — no spurious save
+        if(!S._touched)S._touched={};
+        S._touched.spendingEntries=true;
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+        else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+      }catch(e){console.warn('PFOS_BULK_ENTRY:',e);}
+      return;
+    }
     // ── PFOS_WRITE_EXP_BUDGET ──
     // Sent from pfos-client when the user accepts a budget_realloc
     // recommendation. Writes a .total override to one or more categories in
