@@ -23425,30 +23425,41 @@ async function _cpOpenManageAccounts(){
   try{
     var res=await db.from('plaid_accounts').select('plaid_account_id,name,mask,type,subtype,balance_current,mapped_section,include');
     if(res.error) throw res.error;
-    var itemsRes=await db.from('plaid_items').select('item_id,institution_name,status').eq('status','active');
+    var itemsRes=await db.from('plaid_items').select('item_id,institution_name,status,error_code,error_message,needs_refresh,last_sync_at,has_new_accounts').in('status',['active','error']); // §1.6c: health fields + include error (re-auth) banks
     _cpRenderManageList(res.data||[], (itemsRes&&itemsRes.data)||[]);
   }catch(e){ console.warn('[plaid] manage list failed',e); if(el)el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">Could not load your accounts. Please try again.</div>'; }
 }
+// §1.6c per-institution sync health (read-only; the server owns plaid_items). Maps a plaid_items row → a
+// status chip; reuses the existing one-tap reconnect (_cpStartPlaidUpdateMode) + the _CP_PLAID_ERR copy.
+function _cpPlaidHealth(it){ it=it||{}; if(it.status==='error')return {level:'reauth',label:'Reconnect needed',color:'#EF4444',reconnect:true}; if(it.status==='archived')return {level:'archived',label:'Disconnected',color:'var(--mu)',reconnect:false}; if(it.needs_refresh)return {level:'attention',label:'Refreshing…',color:'#F59E0B',reconnect:false}; return {level:'healthy',label:'Connected',color:'#22C55E',reconnect:false}; }
+function _cpSyncedAgo(ts){ if(!ts)return ''; var d=new Date(ts); if(isNaN(d.getTime()))return ''; var days=Math.floor((Date.now()-d.getTime())/86400000); return days<=0?'synced today':(days===1?'synced yesterday':'synced '+days+'d ago'); }
 function _cpRenderManageList(accounts, items){
   var el=document.getElementById('plaidManageList'); if(!el) return;
   var supported=(accounts||[]).filter(function(a){return a&&a.mapped_section&&a.mapped_section!=='ignore';});
-  if(!supported.length){ el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">No linked accounts yet. Use “Link your accounts” to connect one.</div>'; return; }
-  // Chunk 16: per-bank "Disconnect bank" (whole-item voluntary unlink) above the per-account list.
-  var banks=(items||[]).filter(function(i){return i&&i.status==='active'&&i.item_id;});
+  // Chunk 16 + §1.6c: per-bank health (status chip + last-synced) with one-tap Reconnect + Disconnect. Compute
+  // banks BEFORE the empty check so a connection whose accounts are ALL unsupported (card/loan-only,
+  // mapped_section 'ignore') still shows its health + Reconnect row instead of a misleading "No linked accounts".
+  var banks=(items||[]).filter(function(i){return i&&(i.status==='active'||i.status==='error')&&i.item_id;});
+  if(!supported.length && !banks.length){ el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px 0">No linked accounts yet. Use “Link your accounts” to connect one.</div>'; return; }
   var banksHtml='';
   if(banks.length){
     banksHtml='<div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:2px 0 8px">Connected banks</div>'
       +banks.map(function(b){
         var bn=_cpEsc(b.institution_name||'Bank');
         var iidJs=_cpEsc(String(b.item_id).replace(/\\/g,'\\\\').replace(/'/g,"\\'")); // JS-escape THEN HTML-attr escape
+        var hh=_cpPlaidHealth(b); // §1.6c
+        var sub=(hh.level==='reauth')?(_cpEsc(b.error_message||_CP_PLAID_ERR[b.error_code]||'Reconnect to resume syncing.')):(_cpSyncedAgo(b.last_sync_at)||hh.label);
         return '<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:10px;border:1px solid rgba(168,85,247,.2);background:rgba(168,85,247,.03);border-radius:4px;margin-bottom:8px">'
-          +'<div style="font-size:13px;font-weight:700;color:var(--wh)">'+bn+'</div>'
-          +'<button class="btn btn-gh" style="padding:4px 10px;font-size:11px;width:auto" onclick="_cpUnlinkItem(\''+iidJs+'\')">Disconnect bank</button>'
-        +'</div>';
+          +'<div style="min-width:0"><div style="font-size:13px;font-weight:700;color:var(--wh);display:flex;align-items:center;gap:6px"><span title="'+_cpEsc(hh.label)+'" style="width:8px;height:8px;border-radius:50%;background:'+hh.color+';flex-shrink:0"></span>'+bn+'</div>'
+          +'<div style="font-size:12px;color:'+(hh.level==='reauth'?'#EF4444':'var(--mu)')+';margin-top:2px;overflow:hidden;text-overflow:ellipsis">'+sub+'</div></div>'
+          +'<div style="display:flex;align-items:center;gap:8px;flex-shrink:0">'
+          +(hh.reconnect?'<button class="btn" style="padding:4px 10px;font-size:11px;width:auto;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.35);color:#EF4444" onclick="_cpStartPlaidUpdateMode(\''+iidJs+'\',false)">Reconnect →</button>':'')
+          +'<button class="btn btn-gh" style="padding:4px 10px;font-size:11px;width:auto" onclick="_cpUnlinkItem(\''+iidJs+'\')">Disconnect</button>'
+        +'</div></div>';
       }).join('')
-      +'<div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:14px 0 8px">Individual accounts</div>';
+      +(supported.length?'<div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.08em;text-transform:uppercase;margin:14px 0 8px">Individual accounts</div>':'');
   }
-  el.innerHTML=banksHtml+supported.map(function(a){
+  el.innerHTML=banksHtml+(supported.length?supported.map(function(a){
     var inc=a.include!==false;
     var label=_cpEsc(a.name||'Account')+(a.mask?(' ••'+_cpEsc(a.mask)):'');
     var sub=_cpEsc((a.type||'')+(a.subtype?(' / '+a.subtype):''));
@@ -23461,7 +23472,7 @@ function _cpRenderManageList(accounts, items){
         +'<button class="btn btn-gh" style="padding:4px 10px;font-size:11px;width:auto" onclick="_cpUnlinkAccount(\''+idJs+'\')">Unlink</button>'
       +'</div>'
     +'</div>';
-  }).join('');
+  }).join(''):(banks.length?'<div style="color:var(--mu);font-size:12px;padding:4px 0 2px">No supported accounts on this connection yet.</div>':''));
 }
 var _cpManageBusy=false;
 async function _cpToggleAccountInclude(plaidAccountId, includeBool){
