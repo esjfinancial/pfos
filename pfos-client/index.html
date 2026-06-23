@@ -8177,9 +8177,12 @@ async function _cpExcludeTxn(txnId){
   if(typeof _clientRenderSpendPulse==='function'){try{_clientRenderSpendPulse();}catch(_e){}}
 }
 // #3: persist a recategorization of a linked txn server-side (category_overrides) so it survives every re-sync.
-async function _cpRecategorizeTxn(txnId,category){
+async function _cpRecategorizeTxn(txnId,category,applyToMerchant){
   if(!txnId||!category)return false;
-  try{ var r=await db.functions.invoke('plaid-txn-edit',{body:{action:'recategorize',transaction_id:String(txnId),category:String(category)}}); return !!(r&&r.data&&r.data.ok); }
+  // §1.5b: applyToMerchant=true makes the edge fn create a MERCHANT RULE (+ backfill past txns) so every
+  // transaction from this merchant categorizes here. Returns the response DATA on success (callers read
+  // .merchantRule / .appliedToExisting) or false; the data object is truthy so existing if(ok) checks hold.
+  try{ var b={action:'recategorize',transaction_id:String(txnId),category:String(category)}; if(applyToMerchant)b.applyToMerchant=true; var r=await db.functions.invoke('plaid-txn-edit',{body:b}); return (r&&r.data&&r.data.ok)?r.data:false; }
   catch(_e){ return false; }
 }
 
@@ -8822,6 +8825,7 @@ function _spendRegControlsHtml(S,reg){
   h+='<button id="_spendRegClearBtn" onclick="_spendRegClear()" style="'+inS+';cursor:pointer;color:#5B9BFF'+(active?'':';display:none')+'">✕ Clear</button>';
   h+='<button onclick="_spendRegToggleSelMode()" style="'+inS+';cursor:pointer'+(_spendRegSelMode?';color:#5B9BFF;border-color:#5B9BFF':'')+'">'+(_spendRegSelMode?'✕ Done':'☑ Select')+'</button>';
   h+='<button onclick="_catMgrOpen()" style="'+inS+';cursor:pointer" title="Add, rename, or reorder your spending categories">⚙ Categories</button>';
+  if(typeof _rulesEnabled==='function'&&_rulesEnabled())h+='<button onclick="_ruleMgrOpen()" style="'+inS+';cursor:pointer" title="View and delete your merchant auto-categorization rules">⚙ Rules</button>'; // §1.5b
   h+='</div>';
   if(_spendRegSelMode) h+=_spendRegToolbarHtml();
   h+='</div>';
@@ -8838,6 +8842,7 @@ function _spendRegToolbarHtml(){
   h+='<button onclick="_spendRegSelectAll()" style="'+inS+';cursor:pointer;color:#5B9BFF">Select all matching</button>';
   h+='<select id="_spendRegBulkCat" style="'+inS+'">'+cats.map(function(o){return '<option value="'+esc(o[0])+'">'+esc(o[1])+'</option>';}).join('')+'</select>';
   h+='<button onclick="_spendRegBulkRecat()" style="'+inS+';cursor:pointer;color:#22C55E">Apply</button>';
+  if(typeof _rulesEnabled==='function'&&_rulesEnabled())h+='<label style="display:flex;align-items:center;gap:4px;font-size:11px;color:#5B9BFF;font-family:var(--fh);cursor:pointer" title="Also create a merchant rule for each selected linked transaction"><input type="checkbox" id="_spendRegBulkMerchant" style="accent-color:#5B9BFF">make a rule</label>'; // §1.5b
   h+='<input id="_spendRegBulkTagInput" type="text" placeholder="tag…" style="width:96px;'+inS+'">'; // §1.5a bulk tag
   h+='<button onclick="_spendRegBulkTag()" style="'+inS+';cursor:pointer;color:#9CC3FF">🏷 Tag</button>';
   h+='<button onclick="_spendRegBulkDelete()" style="'+inS+';cursor:pointer;color:#EF4444">🗑 Delete</button>';
@@ -8868,14 +8873,14 @@ function _spendRegApply(){
 function _spendRegToggleSelMode(){ _spendRegSelMode=!_spendRegSelMode; if(!_spendRegSelMode)_spendRegSel={}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
 function _spendRegSelToggle(id,checked){ if(checked)_spendRegSel[String(id)]=true; else delete _spendRegSel[String(id)]; var c=document.getElementById('_spendRegSelCount'); if(c)c.textContent=Object.keys(_spendRegSel).length+' selected'; }
 function _spendRegSelectAll(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; _spendRegWorkingSet(S).list.forEach(function(e){_spendRegSel[String(e.id)]=true;}); _spendRegApply(); }
-function _spendRegBulkRecat(){ var sel=document.getElementById('_spendRegBulkCat'); var v=sel?sel.value:''; if(!v){ if(typeof _cpToast==='function')_cpToast('Pick a category to apply.'); return; } _spendRegBulkApply('recategorize',v); }
+function _spendRegBulkRecat(){ var sel=document.getElementById('_spendRegBulkCat'); var v=sel?sel.value:''; if(!v){ if(typeof _cpToast==='function')_cpToast('Pick a category to apply.'); return; } var am=!!((document.getElementById('_spendRegBulkMerchant')||{}).checked); _spendRegBulkApply('recategorize',v,am); } // §1.5b: am=also create a merchant rule
 function _spendRegBulkTag(){ var el=document.getElementById('_spendRegBulkTagInput'); var t=_normTag(el?el.value:''); if(!t){ if(typeof _cpToast==='function')_cpToast('Type a tag to add.'); return; } if(el)el.value=''; _spendRegBulkApply('addTags',[t]); } // §1.5a
 function _spendRegBulkDelete(){ _spendRegBulkApply('delete',null); }
 // Apply a bulk op to the selected rows. LINKED rows get the server-side edge write FIRST
 // (plaid-txn-edit recategorize/exclude → sticks across re-sync, IDOR-scoped to the caller by the
 // edge fn), then ALL successful ops post ONCE as PFOS_BULK_ENTRY (single calc()+_doSync). MANUAL
 // rows never hit the edge fn. Optimistic-mirrors both shell copies so the list updates immediately.
-async function _spendRegBulkApply(op,value){
+async function _spendRegBulkApply(op,value,applyToMerchant){
   var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
   // Scope the action to the CURRENT working set (visible/matched rows) so a stale selection from a
   // prior filter/month can never act on off-screen rows. _spendRegListInner also prunes _spendRegSel
@@ -8898,7 +8903,7 @@ async function _spendRegBulkApply(op,value){
   sel.forEach(function(e){
     var linked=!!e._plaidTxnId;
     if(op==='recategorize'){
-      if(linked) tasks.push(_cpRecategorizeTxn(e._plaidTxnId,value).then(function(okk){ if(okk)ops.push({id:e.id,op:'recategorize',value:value}); else fail++; }).catch(function(){fail++;}));
+      if(linked) tasks.push(_cpRecategorizeTxn(e._plaidTxnId,value,applyToMerchant).then(function(okk){ if(okk)ops.push({id:e.id,op:'recategorize',value:value}); else fail++; }).catch(function(){fail++;})); // §1.5b: applyToMerchant makes a rule per merchant
       else ops.push({id:e.id,op:'recategorize',value:value});
     } else if(op==='delete'){
       if(linked) tasks.push(db.functions.invoke('plaid-txn-edit',{body:{action:'exclude',transaction_id:String(e._plaidTxnId)}}).then(function(r){ if(r&&r.data&&r.data.ok&&r.data.excluded>0)ops.push({id:e.id,op:'delete'}); else fail++; }).catch(function(){fail++;}));
@@ -9318,6 +9323,52 @@ function _portalPlanVsRealityIncome(){
 // expense_type, payment_method, is_recurring, recurrence_freq, _onSubmit, _title}.
 // `_onSubmit` is a callback invoked with the saved entry after a successful write,
 // so the caller can mark a plan card complete or do other follow-up work.
+// ── §1.5b merchant rules manager (budget_v2 + plaid) ───────────────────────
+// Lists the user's merchant→category rules (category_overrides rows with transaction_id NULL, read via the
+// plaid-txn-edit 'list_rules' action) and deletes one ('delete_rule'). A rule auto-categorizes every linked
+// transaction from a merchant — past (backfilled on creation) and future (the sync hierarchy). Rules are a
+// Pro+/plaid feature: _rulesEnabled() gates the "⚙ Rules" button + the single-edit/bulk merchant toggles.
+var _ruleMgr={rules:[],loading:false};
+function _rulesEnabled(){ try{ return (typeof budgetV2Enabled==='function'&&budgetV2Enabled())&&(typeof clientHasFeature==='function'&&clientHasFeature('plaid')); }catch(_e){ return false; } }
+function _ruleCatLabel(key){ var c=getL1Cats().filter(function(x){return x.key===key;})[0]; return c?(c.icon+' '+c.label):String(key||''); }
+async function _ruleMgrOpen(){
+  var el=document.getElementById('ruleMgrModal');
+  if(!el){ el=document.createElement('div'); el.id='ruleMgrModal'; el.className='modal-bg'; el.setAttribute('role','dialog'); el.setAttribute('aria-modal','true'); el.onclick=function(ev){ if(ev.target===el)closeModal('ruleMgrModal'); }; document.body.appendChild(el); }
+  _ruleMgr={rules:[],loading:true}; _ruleMgrRender(el); openModal('ruleMgrModal');
+  try{ var r=await db.functions.invoke('plaid-txn-edit',{body:{action:'list_rules'}}); _ruleMgr.rules=(r&&r.data&&r.data.ok&&Array.isArray(r.data.rules))?r.data.rules:[]; }
+  catch(_e){ _ruleMgr.rules=[]; }
+  _ruleMgr.loading=false; _ruleMgrRender(el);
+}
+function _ruleMgrRender(el){
+  el=el||document.getElementById('ruleMgrModal'); if(!el)return;
+  var body;
+  if(_ruleMgr.loading) body='<div style="font-size:13px;color:var(--mu);padding:18px 0;text-align:center">Loading your rules…</div>';
+  else if(!_ruleMgr.rules.length) body='<div style="font-size:13px;color:var(--mu);line-height:1.6;padding:6px 0 4px">No rules yet. When you recategorize a linked transaction, tick <strong>“Always categorize transactions from this merchant”</strong> to create one — it applies to past and future transactions from that merchant.</div>';
+  else body=_ruleMgr.rules.map(function(rule,i){
+    return '<div style="display:flex;gap:8px;align-items:center;justify-content:space-between;padding:9px 10px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:6px">'
+      +'<div style="min-width:0"><div style="font-size:13px;color:var(--wh);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(rule.merchant_name||'(unknown merchant)')+'</div>'
+      +'<div style="font-size:12px;color:var(--mu);margin-top:2px">→ '+esc(_ruleCatLabel(rule.override_category))+'</div></div>'
+      +'<button type="button" onclick="_ruleMgrDelete('+i+')" title="Delete rule" aria-label="Delete rule" style="background:none;border:1px solid var(--bd);color:var(--rd);cursor:pointer;padding:5px 10px;border-radius:4px;font-size:12px;font-family:var(--fh);font-weight:700;flex-shrink:0">Delete</button>'
+      +'</div>';
+  }).join('');
+  el.innerHTML='<div style="max-width:480px;width:92%;max-height:85vh;overflow:auto;background:#0d0d2b;border:1px solid var(--bd);border-radius:12px;padding:20px;margin:auto">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div style="font-family:var(--fh);font-size:17px;font-weight:800;color:var(--wh)">Merchant rules</div><button onclick="closeModal(\'ruleMgrModal\')" aria-label="Close" style="background:none;border:none;color:var(--mu);font-size:18px;cursor:pointer">✕</button></div>'
+    +'<div style="font-size:12px;color:var(--mu);line-height:1.6;margin-bottom:12px">Rules auto-categorize every linked transaction from a merchant. Deleting a rule only stops it applying to future transactions — already-categorized ones keep their category.</div>'
+    +body
+    +'<div style="display:flex;margin-top:16px"><button onclick="closeModal(\'ruleMgrModal\')" style="flex:1;padding:11px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:6px;cursor:pointer;font-family:var(--fh);font-weight:700">Done</button></div>'
+    +'</div>';
+}
+async function _ruleMgrDelete(i){
+  var rule=_ruleMgr.rules[i]; if(!rule)return;
+  var merchant=String(rule.merchant_name||''); if(!merchant)return;
+  var ok=await _cpConfirmModal({title:'Delete this rule?',message:'New transactions from <strong>'+esc(merchant)+'</strong> will no longer be auto-categorized. Already-categorized transactions keep their category.',confirmLabel:'Delete rule',confirmStyle:'danger',icon:'🏷'});
+  if(!ok)return;
+  try{ var r=await db.functions.invoke('plaid-txn-edit',{body:{action:'delete_rule',merchant_name:merchant}}); if(!(r&&r.data&&r.data.ok)){ if(typeof _cpToast==='function')_cpToast('Could not delete the rule — try again.'); return; } }
+  catch(_e){ if(typeof _cpToast==='function')_cpToast('Could not delete the rule — try again.'); return; }
+  _ruleMgr.rules=_ruleMgr.rules.filter(function(x){return String(x.merchant_name||'')!==merchant;});
+  _ruleMgrRender();
+  if(typeof _cpToast==='function')_cpToast('Rule deleted.');
+}
 // ── §1.4 category manager (budget_v2) ──────────────────────────────────────
 // Lets a user add / rename / reorder / remove spending categories. Writes S.categories.l1 (editable
 // EXPENSE categories — never activeSavings) via PFOS_EDIT_CATEGORIES. The 8 built-in categories are
@@ -9480,6 +9531,12 @@ function _portalOpenAddExpense(prefill){
     h+='<option value="'+t+'"'+(pType===t?' selected':'')+'>'+lbl+'</option>';
   });
   h+='</select></div></div>';
+  // §1.5b: merchant-rule toggle — ONLY when editing a LINKED transaction (Pro+/plaid + budget_v2). Ticking it
+  // makes the save create a rule so ALL of this merchant's transactions (past, via backfill, + future, via the
+  // sync hierarchy) categorize to the chosen bucket. Hidden for manual entries (no bank merchant) and non-plaid.
+  if(prefill._plaidTxnId && typeof _rulesEnabled==='function' && _rulesEnabled()){
+    h+='<label style="display:flex;align-items:center;gap:6px;font-size:12px;color:#5B9BFF;cursor:pointer;font-family:var(--fh);font-weight:700;margin-bottom:10px"><input type="checkbox" id="portalQaApplyMerchant" style="accent-color:#5B9BFF">🏷 Always categorize transactions from this merchant this way</label>';
+  }
   // §1.3 split editor (budget_v2): split one expense across categories that must sum to the amount.
   if(typeof budgetV2Enabled==='function'&&budgetV2Enabled()){
     var _pSplits=(prefill&&Array.isArray(prefill.splits))?prefill.splits:null;
@@ -9815,7 +9872,15 @@ function _portalSubmitAddExpense(){
   // #3: a linked recategorization must persist server-side (survives re-sync). Send entry.category — the RAW
   // 8-bucket value the categorizer + plaid_transactions.category_bucket use — NOT the simplified
   // category_bucket (which maps to only 5 values and 400s the edge fn for 7 of 10 categories).
-  if(isEdit&&prefillCheck._plaidTxnId&&entry.category){ _cpRecategorizeTxn(prefillCheck._plaidTxnId, entry.category).then(function(okk){ if(!okk&&typeof _cpToast==='function')_cpToast('Could not save the category change — try again.'); }).catch(function(){}); }
+  if(isEdit&&prefillCheck._plaidTxnId&&entry.category){
+    // §1.5b: read the merchant-rule checkbox NOW (before closeModal removes it). applyToMerchant=true →
+    // the edge fn creates the rule + backfills; the toast reports the server's appliedToExisting count.
+    var _applyMerch=!!((document.getElementById('portalQaApplyMerchant')||{}).checked);
+    _cpRecategorizeTxn(prefillCheck._plaidTxnId, entry.category, _applyMerch).then(function(rr){
+      if(!rr){ if(typeof _cpToast==='function')_cpToast('Could not save the category change — try again.'); return; }
+      if(_applyMerch&&rr.merchantRule&&typeof _cpToast==='function'){ var _n=rr.appliedToExisting||0; _cpToast('Rule saved — applied to '+_n+' past transaction'+(_n===1?'':'s')+' and all future ones from this merchant.'); }
+    }).catch(function(){});
+  }
   // 3. Close modal + clear prefill state
   var prefill=APP._portalQaPrefill||{};
   APP._portalQaPrefill=null;
