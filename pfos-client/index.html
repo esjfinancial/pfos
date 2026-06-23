@@ -8391,6 +8391,7 @@ function _portalRenderSpendDashboard(){
   }
 
   var h='';
+  h+=(typeof _portalReconcileBlock==='function'?_portalReconcileBlock(S,calcs):''); // §1.6b cash & reconcile (gated; '' when off / no cash → byte-identical)
 
   // ── 1. Header (month picker) + Add Expense + Savings Goal action row ──
   // Month picker replaces the static month label. Built from
@@ -8662,7 +8663,7 @@ function _portalRenderSpendDashboard(){
 // by the default month list (so the flag-OFF path is byte-identical) and the
 // filtered view. _spendRegMatch/_spendRegSorted are pure (unit-tested).
 // ─────────────────────────────────────────────────────────────────────────────
-var _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',review:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'};
+var _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',review:'',cleared:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'};
 var _spendDupIds={}; // §1.6a: transient possible-duplicate entry-id set, recomputed each render by _computeDupIds
 var _spendRegSearchTimer=null;
 var _spendRegMonthTitle='Recent Expenses';   // set per dashboard render; restored when filters clear
@@ -8724,7 +8725,7 @@ function _spendRegRowHtml(e){
 // count as active — it re-sorts the current (month) scope in place.
 function _spendRegActive(){
   var f=_spendRegFilter;
-  return !!(f.q||f.cat||f.src||f.type||f.tags||f.review||f.amtMin!==''||f.amtMax!==''||f.dateFrom||f.dateTo);
+  return !!(f.q||f.cat||f.src||f.type||f.tags||f.review||f.cleared||f.amtMin!==''||f.amtMax!==''||f.dateFrom||f.dateTo);
 }
 // Pure predicate — does entry e pass filter f? (amount range is on ABSOLUTE value so refunds match.)
 function _spendRegMatch(e,f){
@@ -8738,6 +8739,8 @@ function _spendRegMatch(e,f){
   if(f.tags && !(Array.isArray(e.tags)&&e.tags.indexOf(f.tags)>=0)) return false; // §1.5a: tag filter (entry must carry the selected tag)
   if(f.review==='needs' && !_needsReview(e)) return false; // §1.6a: needs-review inbox = unreviewed linked txns
   if(f.review==='reviewed' && !(e._source==='plaid'&&e._reviewed===true)) return false; // §1.6a
+  if(f.cleared==='uncleared' && e._cleared===true) return false; // §1.6b: "since last reconcile" = not yet cleared
+  if(f.cleared==='cleared' && e._cleared!==true) return false; // §1.6b
   var amt=Math.abs(parseFloat(e.amount)||0);
   if(f.amtMin!==''&&f.amtMin!=null&&!isNaN(parseFloat(f.amtMin)) && amt<parseFloat(f.amtMin)) return false;
   if(f.amtMax!==''&&f.amtMax!=null&&!isNaN(parseFloat(f.amtMax)) && amt>parseFloat(f.amtMax)) return false;
@@ -8857,6 +8860,7 @@ function _spendRegToolbarHtml(){
   h+='<input id="_spendRegBulkTagInput" type="text" placeholder="tag…" style="width:96px;'+inS+'">'; // §1.5a bulk tag
   h+='<button onclick="_spendRegBulkTag()" style="'+inS+';cursor:pointer;color:#9CC3FF">🏷 Tag</button>';
   h+='<button onclick="_spendRegBulkApprove()" style="'+inS+';cursor:pointer;color:#22C55E" title="Mark selected transactions reviewed">✓ Approve</button>'; // §1.6a
+  h+='<button onclick="_spendRegBulkClear()" style="'+inS+';cursor:pointer;color:#22C55E" title="Mark selected transactions cleared (reconciliation)">☑ Cleared</button>'; // §1.6b
   h+='<button onclick="_spendRegBulkDelete()" style="'+inS+';cursor:pointer;color:#EF4444">🗑 Delete</button>';
   h+='</div>';
   return h;
@@ -8866,7 +8870,7 @@ function _spendRegOnNum(field,v){ _spendRegFilter[field]=v; clearTimeout(_spendR
 function _spendRegSet(field,v){ _spendRegFilter[field]=v; _spendRegApply(); }
 // Clear is an explicit action → reset the filter (sort kept at default) and full-render so every
 // input control visibly resets. (Typing-to-empty does NOT pass through here; it stays list-only.)
-function _spendRegClear(){ _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',review:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
+function _spendRegClear(){ _spendRegFilter={q:'',cat:'',src:'',type:'',tags:'',review:'',cleared:'',amtMin:'',amtMax:'',dateFrom:'',dateTo:'',sort:'date_desc'}; if(typeof renderSpendingAnalysis==='function') renderSpendingAnalysis(); }
 // LIST-ONLY update — never a full dashboard re-render (so the search box keeps focus and the chosen
 // sort always applies, active OR not). Computes the working set ONCE and reuses it for rows + the
 // live title/count/Clear toggle. Falls back to a full render only if the list container is gone.
@@ -8943,6 +8947,7 @@ function _spendRegApplyOpsToMirror(ops){
       else if(o.op==='recategorize'){ for(var i=0;i<st.spendingEntries.length;i++){ var e=st.spendingEntries[i]; if(e&&String(e.id)===String(o.id)){ if(e._plaidTxnId&&e.category!==o.value)e._userCat=true; e.category=o.value; break; } } }
       else if(o.op==='addTags'||o.op==='removeTags'){ for(var j=0;j<st.spendingEntries.length;j++){ var e2=st.spendingEntries[j]; if(e2&&String(e2.id)===String(o.id)){ var cur=_normTags(e2.tags), vals=_normTags(Array.isArray(o.value)?o.value:[o.value]); if(o.op==='addTags'){ vals.forEach(function(t){ if(cur.indexOf(t)<0&&cur.length<12)cur.push(t); }); } else { cur=cur.filter(function(t){return vals.indexOf(t)<0;}); } if(cur.length)e2.tags=cur; else delete e2.tags; break; } } } // §1.5a mirror (matches engine PFOS_BULK_ENTRY)
       else if(o.op==='approve'||o.op==='unapprove'){ for(var k=0;k<st.spendingEntries.length;k++){ var e3=st.spendingEntries[k]; if(e3&&String(e3.id)===String(o.id)){ if(o.op==='approve')e3._reviewed=true; else delete e3._reviewed; break; } } } // §1.6a mirror (matches engine PFOS_BULK_ENTRY)
+      else if(o.op==='clear'||o.op==='unclear'){ for(var m=0;m<st.spendingEntries.length;m++){ var e4=st.spendingEntries[m]; if(e4&&String(e4.id)===String(o.id)){ if(o.op==='clear')e4._cleared=true; else delete e4._cleared; break; } } } // §1.6b mirror
     });
     if(Object.keys(del).length) st.spendingEntries=st.spendingEntries.filter(function(e){return !(e&&del[String(e.id)]);});
     st._touched=st._touched||{}; st._touched.spendingEntries=true;
@@ -8973,17 +8978,75 @@ function _computeDupIds(entries){
   return dup;
 }
 // Mark entries reviewed: optimistic-mirror both shells + ONE PFOS_BULK_ENTRY (no edge call, no calc).
-function _reviewApplyIds(ids){
+// Generic bulk pure-attribution flag op (no edge call, no calc) — mirror + ONE PFOS_BULK_ENTRY + toast.
+function _bulkFlagIds(ids,op,verb){
   ids=(ids||[]).map(String).filter(Boolean); if(!ids.length)return;
-  var ops=ids.map(function(id){return {id:id,op:'approve'};});
+  var ops=ids.map(function(id){return {id:id,op:op};});
   _spendRegApplyOpsToMirror(ops);
   try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_BULK_ENTRY',ops:ops},PFOS_ORIGIN); }catch(_e){}
-  if(typeof _cpToast==='function')_cpToast(ids.length+' transaction'+(ids.length===1?'':'s')+' marked reviewed.');
+  if(typeof _cpToast==='function')_cpToast(ids.length+' transaction'+(ids.length===1?'':'s')+' '+verb+'.');
   if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
 }
+function _spendRegSelectedIds(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; var by={}; _spendRegWorkingSet(S).list.forEach(function(e){by[String(e.id)]=e;}); return Object.keys(_spendRegSel).filter(function(id){return by[id];}); } // scope to the visible working set (no stale off-screen ids)
+function _reviewApplyIds(ids){ _bulkFlagIds(ids,'approve','marked reviewed'); } // §1.6a
 function _reviewApproveOne(id){ _reviewApplyIds([id]); }
 function _reviewApproveAll(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; var ids=_spendRegWorkingSet(S).list.filter(_needsReview).map(function(e){return e.id;}); if(!ids.length){ if(typeof _cpToast==='function')_cpToast("You're all caught up — nothing to review."); return; } _reviewApplyIds(ids); }
-function _spendRegBulkApprove(){ var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{}; var by={}; _spendRegWorkingSet(S).list.forEach(function(e){by[String(e.id)]=e;}); var ids=Object.keys(_spendRegSel).filter(function(id){return by[id];}); if(!ids.length){ if(typeof _cpToast==='function')_cpToast('No transactions selected.'); return; } _spendRegSel={}; _spendRegSelMode=false; _reviewApplyIds(ids); }
+function _spendRegBulkApprove(){ var ids=_spendRegSelectedIds(); if(!ids.length){ if(typeof _cpToast==='function')_cpToast('No transactions selected.'); return; } _spendRegSel={}; _spendRegSelMode=false; _bulkFlagIds(ids,'approve','marked reviewed'); }
+function _spendRegBulkClear(){ var ids=_spendRegSelectedIds(); if(!ids.length){ if(typeof _cpToast==='function')_cpToast('No transactions selected.'); return; } _spendRegSel={}; _spendRegSelMode=false; _bulkFlagIds(ids,'clear','marked cleared'); } // §1.6b (engine also supports an 'unclear' op via PFOS_BULK_ENTRY for symmetry / future un-clear UI)
+// ── §1.6b snapshot cash-flow reconciliation ──────────────────────────────────────────────────────
+// PFOS has no inflow ledger, so reconcile at the CASH level: actual cash on hand (linked checking/savings,
+// authoritative from Plaid, + manual S.assets scalars) vs an EXPECTED figure = last verified baseline
+// (S.reconcile) + take-home income since then − ALL recorded spending since then. The drift is a sanity
+// check (unrecorded spending / pending / sync lag), NOT a byte-perfect proof (per the model). "Reconcile"
+// records the current actual balance as the new baseline (PFOS_RECONCILE) + clears the period. _cleared is
+// the reconcile checkpoint mark (uncleared = activity since the last reconcile). All gated by budgetV2Enabled().
+function _reconcileCash(S){ var lk=0; ((S&&S.linkedCash)||[]).forEach(function(c){ if(c&&c.include!==false&&(c.subtype==='checking'||c.subtype==='savings'))lk+=(parseFloat(c.balance)||0); }); var a=(S&&S.assets)||{}; return lk+(parseFloat(a.checking)||0)+(parseFloat(a.savings)||0); }
+function _reconcileSummary(S,calcs,nowMs){
+  S=S||{}; calcs=calcs||{};
+  var actual=_reconcileCash(S);
+  var rec=(S.reconcile&&S.reconcile.date!=null)?S.reconcile:null;
+  var hasBaseline=!!rec, baseDate=hasBaseline?String(rec.date).slice(0,10):'', baseBal=hasBaseline?(parseFloat(rec.balance)||0):0;
+  var spendSince=0, unclearedCount=0;
+  // "Since the last reconcile" = the still-UNCLEARED entries (reconcile clears the whole period, so cleared
+  // ones are already baked into the baseline balance). Using _cleared!==true — not a date compare — keeps
+  // spendSince consistent with unclearedCount and makes drift≈0 the instant you reconcile. Refunds (negative
+  // amount) net correctly.
+  ((S.spendingEntries)||[]).forEach(function(e){ if(!e)return; if(e._cleared!==true){ unclearedCount++; if(hasBaseline)spendSince+=(parseFloat(e.amount)||0); } });
+  var monthlyInc=parseFloat(calcs.inc)||0, now=(typeof nowMs==='number')?nowMs:Date.now(), daysSince=0, income=0;
+  if(hasBaseline){ var t0=Date.parse(baseDate); if(!isNaN(t0)){ daysSince=Math.max(0,(now-t0)/86400000); income=monthlyInc*(daysSince/30.44); } }
+  var expected=hasBaseline?(baseBal+income-spendSince):null, drift=hasBaseline?(actual-expected):null;
+  var hasCash=actual>0||((S.linkedCash||[]).some(function(c){return c&&c.include!==false&&(c.subtype==='checking'||c.subtype==='savings');}));
+  return {actual:actual,hasCash:hasCash,hasBaseline:hasBaseline,baseline:baseBal,baselineDate:baseDate,daysSince:Math.round(daysSince),income:income,spendSince:spendSince,unclearedCount:unclearedCount,expected:expected,drift:drift};
+}
+function _portalReconcileBlock(S,calcs){
+  if(!(typeof budgetV2Enabled==='function'&&budgetV2Enabled()))return ''; // §1.6b dark-launch gate
+  var r=_reconcileSummary(S,calcs); if(!r.hasCash)return '';
+  var fm=function(v){return '$'+Math.round(v).toLocaleString('en-US');};
+  var h='<div class="sec-group"><div class="sec-group-title" style="margin-bottom:10px">💳 Cash & reconcile</div>';
+  h+='<div style="padding:12px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px">';
+  h+='<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:8px"><span style="font-size:13px;color:var(--mu)">Cash on hand</span><span style="font-family:var(--fd);font-size:18px;font-weight:800;color:var(--wh)">'+fm(r.actual)+'</span></div>';
+  if(r.hasBaseline){
+    var driftAbs=Math.abs(r.drift), tol=Math.max(25,r.actual*0.01); var okk=driftAbs<=tol;
+    h+='<div style="font-size:12px;color:var(--mu);margin-top:6px;line-height:1.6">Last reconciled <strong style="color:var(--wh)">'+esc(r.baselineDate)+'</strong> ('+r.daysSince+'d ago). With ~'+fm(r.income)+' income and '+fm(r.spendSince)+' spending since, we expected ~<strong style="color:var(--wh)">'+fm(r.expected)+'</strong>.</div>';
+    h+='<div style="font-size:12px;margin-top:6px;font-weight:700;color:'+(okk?'var(--gr)':'var(--yl)')+'">'+(okk?'✓ Looks reconciled (within '+fm(tol)+').':'⚠ '+fm(driftAbs)+(r.drift<0?' below':' above')+' expected — check for an unrecorded '+(r.drift<0?'expense':'deposit')+' or a pending item.')+'</div>';
+  } else {
+    h+='<div style="font-size:12px;color:var(--mu);margin-top:6px;line-height:1.6">Reconcile to record this as your verified balance — we\'ll then flag any drift between your recorded activity and your actual balance.</div>';
+  }
+  h+='<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">';
+  h+='<button onclick="_doReconcile()" style="padding:8px 16px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.35);color:var(--gr);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:34px">✓ Reconcile to '+fm(r.actual)+'</button>';
+  if(r.hasBaseline&&r.unclearedCount>0)h+='<button onclick="_spendRegSet(\'cleared\',\'uncleared\')" style="padding:8px 16px;background:transparent;border:1px solid var(--bd);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:4px;cursor:pointer;min-height:34px">Review '+r.unclearedCount+' since last reconcile</button>'; // §1.6b: only meaningful once a baseline exists
+  h+='</div></div></div>';
+  return h;
+}
+function _doReconcile(){
+  var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
+  var bal=_reconcileCash(S), date=new Date().toISOString().slice(0,10);
+  // optimistic mirror: set the baseline + clear the period on BOTH shells (matches the engine PFOS_RECONCILE).
+  [(_lastPfosState&&_lastPfosState.state),(APP._portalFd&&APP._portalFd.S)].forEach(function(st){ if(!st)return; st.reconcile={balance:bal,date:date}; if(Array.isArray(st.spendingEntries))st.spendingEntries.forEach(function(e){ if(e)e._cleared=true; }); st._touched=st._touched||{}; st._touched.reconcile=true; st._touched.spendingEntries=true; });
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_RECONCILE',reconcile:{balance:bal,date:date}},PFOS_ORIGIN); }catch(_e){}
+  if(typeof _cpToast==='function')_cpToast('Reconciled — $'+Math.round(bal).toLocaleString('en-US')+' set as your verified balance.');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
 // Tiny ordinal-suffix helper used by the smart routing widget. Mirrors pfos-main's ordSuffix.
 function _ordSuffix(n){var s=['th','st','nd','rd'];var v=n%100;return s[(v-20)%10]||s[v]||s[0];}
 
@@ -11525,7 +11588,7 @@ window.addEventListener('message',async function(e){
             exS=_mergeJointState(exS,_exBrS);
           }catch(_eMx){ console.warn('[jm] preserve-baseline merge failed, using primary-only:',_eMx&&_eMx.message); }
         }
-        var _protectedSections=['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash','budget','categories'];
+        var _protectedSections=['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash','budget','categories','reconcile'];
         _protectedSections.forEach(function(sec){
           if(!touched[sec]){
             var exVal=exS[sec];
