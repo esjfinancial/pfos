@@ -7857,6 +7857,141 @@ function _portalWhereEveryDollarGoesBlock(){
 }
 
 // ═══════════════════════════════════════════════════
+// §1.7b — UNIFIED BUDGET LEDGER (the 3-tier compute; budget = plan)
+// ═══════════════════════════════════════════════════
+// Pure compute (NO UI yet — the Every-Dollar screen + the bridge are §1.9; NO engine
+// change; NO persistence). Merges the three envelope tiers into one view that reconciles
+// EXACTLY to the existing "WHERE EVERY DOLLAR GOES" donut above, so no dollar is invented
+// or double-counted. The donut's three authoritative buckets:
+//   • Spending  = calcs.baseExp — NOTE the engine's getTotalMonthlyExp ALREADY folds in
+//       debt minimums (getDebtPaymentsAuto, EXCL Mortgage/Auto Loan), existing invest/edu
+//       contributions, insurance premiums + the hybrid joint share — NOT just the L1
+//       spending categories. (This is the trap: S.debts[].min is already inside baseExp.)
+//   • Plan Deployed = planTotal = Σ CPLAN.allocations.amount>0.
+//   • Unallocated   = max(0, round(income − baseExp − planTotal)).
+// To make Future + Debt first-class envelopes (the budget=plan vision + §1.7c's
+// "debt = min + extra") WITHOUT double-counting, we PARTITION baseExp+planTotal across the
+// three tiers: Tier-3 Debt = debt-minimums (already in baseExp) + CPLAN debt-extra; Tier-2
+// Future = existing invest/edu contributions (already in baseExp) + CPLAN non-debt; Tier-1
+// Spending = the RESIDUAL baseExp − debtAuto − investAuto − eduAuto (so it absorbs the L1
+// spending categories + the insurance/hybrid auto-pulls). Defining Tier-1 as the residual
+// makes Σtiers ≡ baseExp + planTotal hold EXACTLY no matter how the re-derived auto
+// components round — reconciliation cannot drift. activeSavings is the dead pseudo-field
+// (#148: excluded from baseExp + savingsRate) → excluded here too.
+
+// pf/pnum mirror (comma-strip superset; identical to the engine for numeric inputs).
+function _lnum(v){ var n=parseFloat(String(v==null?'':v).replace(/,/g,'')); return isFinite(n)?n:0; }
+// Engine getMonthlyExp mirror (HONORS .total — unlike _portalGetMonthlyExp): .total > amount(annual→/12) > subs sum.
+function _ledgerMonthlyExp(S,key){
+  var d=(S&&S.expData)?S.expData[key]:null; if(!d)return 0;
+  if(d.total!=null&&!isNaN(parseFloat(String(d.total))))return parseFloat(String(d.total));
+  var v=_lnum(d.amount); if(d.period==='annual')v=v/12;
+  var sub=0; if(d.subs)Object.keys(d.subs).forEach(function(sk){var s=d.subs[sk]||{};var sv=_lnum(s.amount);sub+=s.period==='annual'?sv/12:sv;});
+  return sub>0?sub:v;
+}
+function _ledgerIsPayroll(type){ var t=String(type||'').toLowerCase(); if(!t)return false; if(t==='pension')return true; if(t.indexOf('401k')===0)return true; if(t.indexOf('roth401k')===0)return true; if(t==='roth_401k')return true; if(t.indexOf('403b')===0)return true; if(t.indexOf('tsp')===0)return true; return false; }
+var _lInclOK=function(x){ return !!x && x.include!==false; };
+// Which hybrid share field is "mine". Mirrors the engine EXACTLY (util.ts _hybridShareField ∘
+// _hybridIsClientA): PURE from S.coupleData.isPrimary (boolean; absent/non-bool → client A →
+// share_pct_a). No global/APP reads, so the ledger stays a pure function of S.
+function _ledgerHybridField(S){
+  var cd=(S&&S.coupleData)||null;
+  var isClientA=(!cd||typeof cd.isPrimary!=='boolean')?true:cd.isPrimary;
+  return isClientA?'share_pct_a':'share_pct_b';
+}
+// getDebtPaymentsAuto mirror: Σ debts[].min EXCLUDING Mortgage/Auto Loan (+ hybrid joint share).
+function _ledgerDebtAuto(S){
+  var t=(S.debts||[]).filter(_lInclOK).reduce(function(s,d){ return s+((d.type!=='Mortgage'&&d.type!=='Auto Loan')?_lnum(d.min):0); },0);
+  if(S.householdType==='hybrid'&&S._jointItems&&Array.isArray(S._jointItems.debts)){
+    var f=_ledgerHybridField(S);
+    t+=S._jointItems.debts.filter(_lInclOK).reduce(function(s,d){ if(!d||d.type==='Mortgage'||d.type==='Auto Loan')return s; var pct=(d[f]!==undefined)?(_lnum(d[f])||0):50; return s+(_lnum(d.min)*pct/100); },0);
+  }
+  return t;
+}
+// getInvestContribAuto mirror: non-payroll retAccounts contrib + investments monthlyContrib (+ hybrid joint share).
+function _ledgerInvestAuto(S){
+  var ret=(S.retAccounts||[]).filter(_lInclOK).reduce(function(t,a){ return _ledgerIsPayroll(a.type)?t:t+_lnum(a.contrib); },0);
+  var brok=(S.investments||[]).filter(_lInclOK).reduce(function(t,a){ return t+_lnum(a.monthlyContrib); },0);
+  if(S.householdType==='hybrid'&&S._jointItems){
+    var f=_ledgerHybridField(S);
+    if(Array.isArray(S._jointItems.investments))brok+=S._jointItems.investments.filter(_lInclOK).reduce(function(t,a){ var pct=(a&&a[f]!==undefined)?(_lnum(a[f])||0):50; return t+(_lnum(a.monthlyContrib)*pct/100); },0);
+    if(Array.isArray(S._jointItems.retAccounts))ret+=S._jointItems.retAccounts.filter(_lInclOK).reduce(function(t,a){ if(!a||_ledgerIsPayroll(a.type))return t; var pct=(a[f]!==undefined)?(_lnum(a[f])||0):50; return t+(_lnum(a.contrib)*pct/100); },0);
+  }
+  return ret+brok;
+}
+function _ledgerEduAuto(S){ return (S.children||[]).reduce(function(t,ch){ return t+_lnum(ch&&ch.contrib); },0); }
+// Per-category activity for a month, EXPANDING §1.3 splits (mirrors _spendingCategoryAggregates attribution
+// key: p.category||p.category_bucket||'misc'). Month match mirrors the existing bars (new Date(e.date) Y/M).
+function _ledgerActivityMap(S,ym){
+  var y=parseInt(ym.slice(0,4),10), m=parseInt(ym.slice(5,7),10)-1, map={};
+  (S.spendingEntries||[]).forEach(function(e){
+    if(!e)return; var d=new Date(e.date); if(d.getFullYear()!==y||d.getMonth()!==m)return;
+    _spendSplitParts(e).forEach(function(p){ var k=p.category||p.category_bucket||'misc'; map[k]=(map[k]||0)+(parseFloat(p.amount)||0); });
+  });
+  return map;
+}
+// THE LEDGER — pure (S, calcs, plan, month) → reconciling 3-tier view.
+function _buildBudgetLedger(S,calcs,plan,month){
+  S=S||{}; calcs=calcs||{}; plan=plan||{};
+  var ym=(typeof month==='string'&&/^\d{4}-\d{2}$/.test(month))?month:((typeof _budgetMonthKey==='function')?_budgetMonthKey():new Date().toISOString().slice(0,7));
+  var income=_lnum(calcs.inc), baseExp=_lnum(calcs.baseExp);
+  // Plan allocations — filtered EXACTLY like the donut so planTotal matches byte-for-byte.
+  var allocs=(Array.isArray(plan.allocations)?plan.allocations:[]).filter(function(a){ return a&&_lnum(a.amount)>0; });
+  var planTotal=allocs.reduce(function(t,a){ return t+_lnum(a.amount); },0);
+  var cplanDebt=allocs.filter(function(a){ return a.type==='debt'; });
+  var cplanFuture=allocs.filter(function(a){ return a.type!=='debt'; });
+  var cplanDebtTotal=cplanDebt.reduce(function(t,a){ return t+_lnum(a.amount); },0);
+  var cplanFutureTotal=cplanFuture.reduce(function(t,a){ return t+_lnum(a.amount); },0);
+  // baseExp auto components (engine-faithful) — for ATTRIBUTION only; the Tier-1 residual guarantees the sum.
+  var debtAuto=_ledgerDebtAuto(S), investAuto=_ledgerInvestAuto(S), eduAuto=_ledgerEduAuto(S);
+  var tier1Total=baseExp-debtAuto-investAuto-eduAuto;     // spending cats + insurance/hybrid auto remainder
+  var tier2Total=investAuto+eduAuto+cplanFutureTotal;      // Future
+  var tier3Total=debtAuto+cplanDebtTotal;                  // Debt (minimum + extra)
+  var readyToAssign=income-baseExp-planTotal;              // raw (YNAB-style; can be negative = over-assigned)
+  var unallocated=Math.max(0,Math.round(income-baseExp-planTotal)); // donut-faithful clamp
+  // Tier-1 per-category envelope rows (the spending envelopes; activeSavings excluded).
+  var bm=(typeof _budgetMonth==='function')?_budgetMonth(S,ym):{assigned:{},rolloverIn:{}};
+  var act=_ledgerActivityMap(S,ym);
+  var cats=(typeof getL1Cats==='function')?getL1Cats():[];
+  var rows=[],rowsSum=0;
+  cats.forEach(function(c){
+    if(!c||c.key==='activeSavings')return; // dead pseudo-field — excluded from baseExp + this tier
+    var def=_ledgerMonthlyExp(S,c.key);
+    var assigned=(bm.assigned&&bm.assigned[c.key]!=null)?_lnum(bm.assigned[c.key]):def;
+    var roll=(bm.rolloverIn&&bm.rolloverIn[c.key]!=null)?_lnum(bm.rolloverIn[c.key]):0;
+    var activity=act[c.key]||0;
+    rowsSum+=assigned;
+    rows.push({key:c.key,label:c.label,icon:c.icon,assigned:assigned,defaultBudget:def,rolloverIn:roll,activity:activity,available:roll+assigned-activity,overspent:activity>roll+assigned+0.005});
+  });
+  var autoRemainder=tier1Total-rowsSum; // insurance premiums + hybrid joint share (+ any custom-category delta)
+  var cpName=(typeof CP_NM!=='undefined')?CP_NM:{}, cpIcon=(typeof CP_IC!=='undefined')?CP_IC:{};
+  var futureRows=cplanFuture.map(function(a){ return {type:a.type,label:a.customName||cpName[a.type]||a.type||'Allocation',icon:cpIcon[a.type]||'•',amount:_lnum(a.amount)}; });
+  var debtRows=cplanDebt.map(function(a){ return {type:a.type,label:a.customName||cpName[a.type]||'Pay off debt',icon:cpIcon[a.type]||'•',amount:_lnum(a.amount)}; });
+  // Reconciliation self-check (the §1.7b STOP invariant): Σtiers == baseExp+planTotal (no dollar invented/lost,
+  // no double-count) AND the residual is non-negative for the default (un-overridden) breakdown.
+  var sumTiers=tier1Total+tier2Total+tier3Total;
+  var reconciles=Math.abs(sumTiers-(baseExp+planTotal))<0.01;
+  return {
+    month:ym, income:income, baseExp:baseExp, planTotal:planTotal,
+    readyToAssign:readyToAssign, unallocated:unallocated,
+    tiers:{
+      spending:{ total:tier1Total, rowsSum:rowsSum, autoRemainder:autoRemainder, rows:rows },
+      future:{ total:tier2Total, autoContrib:investAuto+eduAuto, rows:futureRows },
+      debt:{ total:tier3Total, minAuto:debtAuto, extra:cplanDebtTotal, rows:debtRows }
+    },
+    reconciles:reconciles
+  };
+}
+// Thin wrapper reading the live globals the spending dashboard uses (S / calcs / CPLAN).
+function _budgetLedger(month){
+  var fd=(typeof APP!=='undefined'&&APP._portalFd)||{};
+  var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
+  var plan=(typeof CPLAN!=='undefined')?CPLAN:{};
+  return _buildBudgetLedger(S,calcs,plan,month);
+}
+
+// ═══════════════════════════════════════════════════
 // PLAN ALIGNMENT CARD — portal-only (CPLAN lives here)
 // ═══════════════════════════════════════════════════
 // Reads CPLAN.allocations + _cpTracking via _cpGetActualContribution to surface
