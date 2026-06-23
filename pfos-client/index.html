@@ -8058,6 +8058,7 @@ function _portalEditEntry(entryId){
     payment_method:entry.payment_method,
     is_recurring:entry.is_recurring,
     recurrence_freq:entry.recurrence_freq,
+    couple_owner:entry.couple_owner,
     _title:'Edit Expense',
     _editId:entry.id,
     _editDate:entry.date,
@@ -8078,8 +8079,10 @@ async function _portalDeleteEntry(entryId){
   var _dS=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
   var _dEnt=(_dS.spendingEntries||[]).filter(function(e){return String(e.id)===String(entryId);})[0];
   var _dTxn=_dEnt&&_dEnt._plaidTxnId;
-  // Optimistic local removal so the UI updates instantly — also set _touched on both
-  // mirrors so the beforeunload keepalive flush will fire if the user closes within 300ms.
+  // Linked txn: exclude server-side FIRST (a failure must NOT leave it deleted-locally-but-still-re-importing).
+  // _cpExcludeTxn awaits the exclude, then removes it from the mirrors + engine on success, or toasts on failure.
+  if(_dTxn){ await _cpExcludeTxn(_dTxn); return; }
+  // Manual entry: optimistic local removal (both mirrors + _touched) then the canonical delete.
   if(_lastPfosState&&_lastPfosState.state&&_lastPfosState.state.spendingEntries){
     _lastPfosState.state.spendingEntries=_lastPfosState.state.spendingEntries.filter(function(e){return String(e.id)!==String(entryId);});
     if(!_lastPfosState.state._touched)_lastPfosState.state._touched={};
@@ -8090,8 +8093,6 @@ async function _portalDeleteEntry(entryId){
     if(!APP._portalFd.S._touched)APP._portalFd.S._touched={};
     APP._portalFd.S._touched.spendingEntries=true;
   }
-  // Linked txn: exclude server-side (stops re-import) before the canonical delete. Manual entries skip this.
-  if(_dTxn){ try{ await db.functions.invoke('plaid-txn-edit',{body:{action:'exclude',transaction_id:String(_dTxn)}}); }catch(_e){} }
   // Canonical write
   try{
     var frame=getPFOSFrame();
@@ -9082,9 +9083,10 @@ function _portalOpenAddExpense(prefill){
   h+='<div id="portalQaCoupleOwner" style="display:'+(isJoint?'block':'none')+';margin-bottom:10px">';
   h+='<div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Whose Expense?</div>';
   h+='<select id="portalQaOwner" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
+  var _pOwner=prefill.couple_owner||'self';
   ['self','spouse','shared'].forEach(function(o){
     var lbl=o==='self'?'Mine':o==='spouse'?'Spouse':'Shared';
-    h+='<option value="'+o+'">'+lbl+'</option>';
+    h+='<option value="'+o+'"'+(_pOwner===o?' selected':'')+'>'+lbl+'</option>';
   });
   h+='</select></div>';
   // Recurring — checkbox + frequency dropdown (frequency hidden until checked)
@@ -9232,7 +9234,10 @@ function _portalQaAutoCat(desc){
 function _portalSubmitAddExpense(){
   var amtEl=document.getElementById('portalQaAmount');
   var amt=pf(amtEl&&amtEl.value);
-  if(isNaN(amt)||amt<=0){
+  // #6/linked: a linked edit has a readonly, bank-authoritative amount that may be a negative refund —
+  // skip the amount>0 guard so its category can still be changed/recategorized.
+  var _isLinkedEdit=!!((APP._portalQaPrefill||{})._plaidTxnId);
+  if(!_isLinkedEdit&&(isNaN(amt)||amt<=0)){
     if(amtEl){amtEl.style.borderColor='var(--rd)';amtEl.focus();}
     return;
   }
@@ -9337,8 +9342,10 @@ function _portalSubmitAddExpense(){
       frame.contentWindow.postMessage({type:msgType,entry:entry},'https://pfos.esjfinancial.com');
     }
   }catch(e){console.warn('Portal add-expense postMessage:',e);}
-  // #3: a linked recategorization must persist server-side (survives re-sync) — fire-and-forget.
-  if(isEdit&&prefillCheck._plaidTxnId&&entry.category_bucket){ try{ _cpRecategorizeTxn(prefillCheck._plaidTxnId, entry.category_bucket); }catch(_e){} }
+  // #3: a linked recategorization must persist server-side (survives re-sync). Send entry.category — the RAW
+  // 8-bucket value the categorizer + plaid_transactions.category_bucket use — NOT the simplified
+  // category_bucket (which maps to only 5 values and 400s the edge fn for 7 of 10 categories).
+  if(isEdit&&prefillCheck._plaidTxnId&&entry.category){ _cpRecategorizeTxn(prefillCheck._plaidTxnId, entry.category).then(function(okk){ if(!okk&&typeof _cpToast==='function')_cpToast('Could not save the category change — try again.'); }).catch(function(){}); }
   // 3. Close modal + clear prefill state
   var prefill=APP._portalQaPrefill||{};
   APP._portalQaPrefill=null;

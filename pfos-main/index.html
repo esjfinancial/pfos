@@ -6411,7 +6411,7 @@ function renderHome(){
       if(dateStr!==lastDate){h+='<div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-top:10px;margin-bottom:4px">'+dateStr+'</div>';lastDate=dateStr;}
       var catIcon={food:'🛒',housing:'🏠',transportation:'⛽',utilities:'⚡',insurance:'🛡️',discretionary:'🛍️',subscriptions:'📱',activeSavings:'📈',misc:'📦'};
       var origIdx=entries.indexOf(e);
-      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,68,191,.06)"><div style="display:flex;align-items:center;gap:8px"><span>'+(catIcon[e.category]||'📦')+'</span><span style="font-size:12px;color:var(--wh)">'+escH(e.description||e.category)+'</span></div><div style="display:flex;align-items:center;gap:8px"><span style="font-family:var(--fh);font-weight:700;color:var(--or);font-size:13px">'+fmt(parseFloat(e.amount)||0)+'</span><button onclick="editSpendingEntry('+origIdx+')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:12px;padding:4px">✏️</button><button onclick="deleteSpendingEntry('+origIdx+')" style="background:none;border:none;color:var(--rd);cursor:pointer;font-size:12px;padding:4px">✕</button></div></div>';
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,68,191,.06)"><div style="display:flex;align-items:center;gap:8px"><span>'+(catIcon[e.category]||'📦')+'</span><span style="font-size:12px;color:var(--wh)">'+escH(e.description||e.category)+'</span></div><div style="display:flex;align-items:center;gap:8px"><span style="font-family:var(--fh);font-weight:700;color:var(--or);font-size:13px">'+fmt(parseFloat(e.amount)||0)+'</span>'+(e._source==='plaid'?'':'<button onclick="editSpendingEntry('+origIdx+')" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:12px;padding:4px">✏️</button><button onclick="deleteSpendingEntry('+origIdx+')" style="background:none;border:none;color:var(--rd);cursor:pointer;font-size:12px;padding:4px">✕</button>')+'</div></div>';
     });
   }
   h+='</div>';
@@ -7040,10 +7040,29 @@ function qaPayMethodChange(){
   detail.innerHTML='';detail.style.display='none';
 }
 function simplifyCategory(cat){var map={housing:'housing',utilities:'housing',food:'food',transportation:'transportation',insurance:'housing',subscriptions:'entertainment',discretionary:'entertainment',activeSavings:'other',misc:'other'};return map[cat]||'other';}
+// Spend-entry side effects (credit_card -> card debt balance, financed -> new debt, emergency_fund -> savings,
+// policy_loan -> IBC loan). Apply on ADD, reverse on DELETE, reverse-old-then-apply-new on EDIT — so balances
+// never desync from the ledger when an entry is edited or deleted. (#3 MF: portal/native delete previously
+// reversed nothing → card debt / EF / policy stayed permanently shifted.)
+function _applySpendSideEffects(e){
+  if(!e)return; var amt=parseFloat(e.amount)||0; var pd=e.payment_detail||{};
+  if(e.payment_method==='credit_card'&&pd.card_idx!=null&&S.debts&&S.debts[pd.card_idx]){ S.debts[pd.card_idx].balance=(parseFloat(S.debts[pd.card_idx].balance)||0)+amt; }
+  else if(e.payment_method==='financed'&&pd._createNewDebt){ if(!S.debts)S.debts=[]; var nd={id:Date.now(),name:pd.lender||e.description||'Financed Purchase',type:pd.type||'Personal Loan',balance:amt,rate:parseFloat(pd.rate)||0,min:parseFloat(pd.min)||0,actual:parseFloat(pd.min)||0}; S.debts.push(nd); e.payment_detail={debt_id:nd.id,debt_name:nd.name,rate:nd.rate,type:nd.type}; }
+  else if(e.payment_method==='emergency_fund'){ var sv=parseFloat(typeof gv==='function'?gv('aSavings'):0)||0; var se=document.getElementById('aSavings'); if(se)se.value=Math.max(0,sv-amt); }
+  else if(e.payment_method==='policy_loan'&&pd._incrementLoanBalance){ if(!S.ibcPolicies)S.ibcPolicies=[]; var pli=parseInt(pd.policy_idx)||0; var pols=S.ibcPolicies.length>0?S.ibcPolicies:(S.policies||[]).filter(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('whole')>=0||t.indexOf('wl')>=0||t.indexOf('iul')>=0;}); if(pols[pli]){var pol=pols[pli]; pol.loanBalance=(parseFloat(pol.loanBalance)||0)+amt; if(!pol.loans)pol.loans=[]; pol.loans.push({id:Date.now(),amount:amt,purpose:pd.purpose||e.description||'Policy loan',originationDate:e.date||new Date().toISOString().split('T')[0],rate:pol.loanRate||0.05,spendingEntryId:e.id}); e.payment_detail={policy_idx:pli,purpose:pd.purpose,policy_name:(pol.company||pol.carrier||'Policy')};} }
+}
+function _reverseSpendSideEffects(e){
+  if(!e)return; var amt=parseFloat(e.amount)||0; var pd=e.payment_detail||{};
+  if(e.payment_method==='credit_card'&&pd.card_idx!=null&&S.debts&&S.debts[pd.card_idx]){ S.debts[pd.card_idx].balance=Math.max(0,(parseFloat(S.debts[pd.card_idx].balance)||0)-amt); }
+  else if(e.payment_method==='financed'&&pd.debt_id!=null&&Array.isArray(S.debts)){ for(var i=S.debts.length-1;i>=0;i--){ if(S.debts[i]&&S.debts[i].id===pd.debt_id){S.debts.splice(i,1);break;} } }
+  else if(e.payment_method==='emergency_fund'){ var sv=parseFloat(typeof gv==='function'?gv('aSavings'):0)||0; var se=document.getElementById('aSavings'); if(se)se.value=sv+amt; }
+  else if(e.payment_method==='policy_loan'&&pd.policy_idx!=null){ var pli2=parseInt(pd.policy_idx)||0; var pols2=(S.ibcPolicies&&S.ibcPolicies.length>0)?S.ibcPolicies:(S.policies||[]).filter(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('whole')>=0||t.indexOf('wl')>=0||t.indexOf('iul')>=0;}); if(pols2[pli2]){var pol2=pols2[pli2]; pol2.loanBalance=Math.max(0,(parseFloat(pol2.loanBalance)||0)-amt); if(Array.isArray(pol2.loans)){for(var j=pol2.loans.length-1;j>=0;j--){if(pol2.loans[j]&&pol2.loans[j].spendingEntryId===e.id){pol2.loans.splice(j,1);break;}}}} }
+}
 function saveSpendingEntry(){
   var amt=pf((document.getElementById('qaAmount')||{}).value);
   if(amt<=0){var ae=document.getElementById('qaAmount');if(ae){ae.style.borderColor='var(--rd)';ae.focus();}return;}
   var entry={id:Date.now(),amount:amt,description:(document.getElementById('qaDesc')||{}).value||'',category:(document.getElementById('qaCat')||{}).value||'misc',category_bucket:simplifyCategory((document.getElementById('qaCat')||{}).value||'misc'),expense_type:(document.getElementById('qaType')||{}).value||'regular',payment_method:(document.getElementById('qaPayMethod')||{}).value||'debit',payment_detail:{},couple_owner:(document.getElementById('qaOwner')||{}).value||'self',is_recurring:!!(document.getElementById('qaRecurring')||{}).checked,recurrence_freq:(document.getElementById('qaRecurFreq')||{}).value||'monthly',date:(document.getElementById('qaDate')||{}).value||new Date().toISOString().split('T')[0],created_at:new Date().toISOString()};
+  if(_qaEditIdx>=0&&S.spendingEntries&&S.spendingEntries[_qaEditIdx])_reverseSpendSideEffects(S.spendingEntries[_qaEditIdx]); // #3 MF: reverse the OLD entry's side effects before re-applying (edit was double-applying)
   if(entry.payment_method==='credit_card'){var ci=parseInt((document.getElementById('qaCardIdx')||{}).value);if(!isNaN(ci)&&S.debts&&S.debts[ci]){entry.payment_detail={card_idx:ci,card_name:S.debts[ci].name,apr:S.debts[ci].rate};S.debts[ci].balance=(parseFloat(S.debts[ci].balance)||0)+amt;}}
   if(entry.payment_method==='financed'){
     if(!S.debts)S.debts=[];
@@ -7084,14 +7103,14 @@ function saveSpendingEntry(){
   if(entry.payment_method==='emergency_fund'){var sv=parseFloat(gv('aSavings'))||0;var se=document.getElementById('aSavings');if(se)se.value=Math.max(0,sv-amt);}
   if(!S.spendingEntries)S.spendingEntries=[];
   if(_qaEditIdx>=0)S.spendingEntries[_qaEditIdx]=entry;else S.spendingEntries.push(entry);
+  if(!S._touched)S._touched={};S._touched.spendingEntries=true; // #2 MF: mark touched so the section-merge save doesn't drop the new/edited entry
   _qaEditIdx=-1;calc();closeModal('quickAddModal');if(_currentSection==='home')renderHome();
 }
 function editSpendingEntry(idx){openQuickAdd(idx);}
 function deleteSpendingEntry(idx){
   if(!S.spendingEntries||!S.spendingEntries[idx])return;var e=S.spendingEntries[idx];
-  if(e.payment_method==='credit_card'&&e.payment_detail&&e.payment_detail.card_idx!==undefined){var ci=e.payment_detail.card_idx;if(S.debts&&S.debts[ci])S.debts[ci].balance=Math.max(0,(parseFloat(S.debts[ci].balance)||0)-(parseFloat(e.amount)||0));}
-  if(e.payment_method==='emergency_fund'){var sv=parseFloat(gv('aSavings'))||0;var se=document.getElementById('aSavings');if(se)se.value=sv+(parseFloat(e.amount)||0);}
-  S.spendingEntries.splice(idx,1);calc();if(_currentSection==='home')renderHome();
+  _reverseSpendSideEffects(e); // #3 MF: full reversal (was card+EF only — financed debt & policy loan leaked)
+  S.spendingEntries.splice(idx,1);if(!S._touched)S._touched={};S._touched.spendingEntries=true;calc();if(_currentSection==='home')renderHome();
 }
 function updateProfileSidebar(){
   var nm=getFullName();
@@ -15053,6 +15072,7 @@ function submitAdvisorRequestFromModal(){
           }
         }
         S.spendingEntries.push(normalized);
+        if(!S._touched)S._touched={};S._touched.spendingEntries=true; // #2 MF: mark touched so the section-merge save doesn't drop the new entry
         // Recalc + persist (debounced to coalesce with any other changes)
         try{if(typeof calc==='function')calc();}catch(e){}
         clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
@@ -15070,9 +15090,10 @@ function submitAdvisorRequestFromModal(){
       try{
         var _delId=msg.entryId; if(_delId==null)return;
         if(!Array.isArray(S.spendingEntries))return;
-        var _before=S.spendingEntries.length;
+        var _delCur=null; for(var _di=0;_di<S.spendingEntries.length;_di++){ if(S.spendingEntries[_di]&&String(S.spendingEntries[_di].id)===String(_delId)){_delCur=S.spendingEntries[_di];break;} }
+        if(!_delCur)return; // nothing matched — no spurious save
+        _reverseSpendSideEffects(_delCur); // #3 MF: reverse card/financed/EF/policy side effects so balances don't desync
         S.spendingEntries=S.spendingEntries.filter(function(e){return !(e&&String(e.id)===String(_delId));});
-        if(S.spendingEntries.length===_before)return; // nothing matched — no spurious save
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
         try{if(typeof calc==='function')calc();}catch(e){}
@@ -15096,8 +15117,18 @@ function submitAdvisorRequestFromModal(){
         var _cur=S.spendingEntries[_eidx];
         var _wasPlaid=!!_cur._plaidTxnId;
         var _catChanged=(_ed.category!=null&&_ed.category!==_cur.category)||(_ed.category_bucket!=null&&_ed.category_bucket!==_cur.category_bucket);
-        ['amount','description','category','category_bucket','expense_type','payment_method','payment_detail','couple_owner','is_recurring','recurrence_freq','date'].forEach(function(f){ if(_ed[f]!==undefined)_cur[f]=_ed[f]; });
+        // #3 MF: reconcile side effects (card/financed/EF/policy) when amount or payment_method changed —
+        // reverse the OLD values then apply the NEW; a category-only/recategorize edit is a no-op here.
+        var _oldAmt=parseFloat(_cur.amount)||0,_oldMethod=_cur.payment_method;
+        var _newAmt=(_ed.amount!==undefined)?(parseFloat(_ed.amount)||0):_oldAmt;
+        var _newMethod=(_ed.payment_method!==undefined)?_ed.payment_method:_oldMethod;
+        var _sideChanged=(_newAmt!==_oldAmt)||(_newMethod!==_oldMethod);
+        if(_sideChanged)_reverseSpendSideEffects(_cur);
+        var _efields=['amount','description','category','category_bucket','expense_type','payment_method','couple_owner','is_recurring','recurrence_freq','date'];
+        if(_newMethod!==_oldMethod)_efields.push('payment_detail'); // only adopt the modal's payment_detail on a method change — else keep the canonical card_idx/debt_id/policy_idx (the edit modal doesn't repopulate those pickers)
+        _efields.forEach(function(f){ if(_ed[f]!==undefined)_cur[f]=_ed[f]; });
         if(_ed.amount!==undefined)_cur.amount=parseFloat(_ed.amount)||0;
+        if(_sideChanged)_applySpendSideEffects(_cur);
         if(_wasPlaid){ _cur._source='plaid'; if(_catChanged)_cur._userCat=true; } // never let an edit strip the linked identity
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
