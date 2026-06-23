@@ -7938,8 +7938,11 @@ function _buildBudgetLedger(S,calcs,plan,month){
   // Plan allocations — filtered EXACTLY like the donut so planTotal matches byte-for-byte.
   var allocs=(Array.isArray(plan.allocations)?plan.allocations:[]).filter(function(a){ return a&&_lnum(a.amount)>0; });
   var planTotal=allocs.reduce(function(t,a){ return t+_lnum(a.amount); },0);
-  var cplanDebt=allocs.filter(function(a){ return a.type==='debt'; });
-  var cplanFuture=allocs.filter(function(a){ return a.type!=='debt'; });
+  // §1.7c: an _ibcDebtStrategy "debt" allocation is an IBC policy (insurance growth) housed in the
+  // debt type for back-compat — it is NOT real debt, so route it to Future, not the Debt tier
+  // (matches _ledgerFindAllocIdx). Reconciliation holds either way (each alloc lands in one tier).
+  var cplanDebt=allocs.filter(function(a){ return a.type==='debt'&&!a._ibcDebtStrategy; });
+  var cplanFuture=allocs.filter(function(a){ return a.type!=='debt'||a._ibcDebtStrategy; });
   var cplanDebtTotal=cplanDebt.reduce(function(t,a){ return t+_lnum(a.amount); },0);
   var cplanFutureTotal=cplanFuture.reduce(function(t,a){ return t+_lnum(a.amount); },0);
   // baseExp auto components (engine-faithful) — for ATTRIBUTION only; the Tier-1 residual guarantees the sum.
@@ -7989,6 +7992,108 @@ function _budgetLedger(month){
   var calcs=fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{};
   var plan=(typeof CPLAN!=='undefined')?CPLAN:{};
   return _buildBudgetLedger(S,calcs,plan,month);
+}
+
+// ═══════════════════════════════════════════════════
+// §1.7c — THE BINDING (envelope ⇄ CPLAN / S.debts) + debt validation
+// ═══════════════════════════════════════════════════
+// Editing a Tier-2/3 budget envelope writes the EXISTING plan field — NOT a parallel store — so
+// funding an envelope funds the PLAN (and moves the bridge). All writes go to CPLAN.allocations[].amount
+// via the SAME canonical chain the plan slider uses (_cpSlideEnd): mutate → _cpEnforce (IRS/budget caps)
+// → _cpMarkModified → _cpRunSimulation (re-project for the bridge) → _syncPlanToMain (PFOS_PLAN_SYNC →
+// engine home donut) → cplanSave (persist shell-owned client_profiles.allocation_plan). CPLAN is
+// METRIC-INERT — the engine never reads it (guard 5b) — so these writes never move baseExp/savingsRate;
+// that is WHY we bind to CPLAN, not to retAccount.contrib (which WOULD change baseExp). Tier-1 spending
+// binds via PFOS_BUDGET_ASSIGN (§1.7a). NO UI yet — §1.9 wires these to the envelope inputs.
+function _ledgerActiveS(){ var fd=(typeof APP!=='undefined'&&APP._portalFd)||{}; return fd.S||(typeof _lastPfosState!=='undefined'&&_lastPfosState&&_lastPfosState.state)||{}; }
+function _ledgerFmtMoney(v){ return (typeof fmt==='function')?fmt(Math.round(v)):('$'+Math.round(v)); }
+// Find the bind-target allocation index for a tier type. For 'debt' the REAL-debt allocation only —
+// an _ibcDebtStrategy "debt" alloc is an IBC policy (a Future envelope), never the debt one.
+function _ledgerFindAllocIdx(type){
+  if(typeof CPLAN==='undefined'||!Array.isArray(CPLAN.allocations))return -1;
+  for(var i=0;i<CPLAN.allocations.length;i++){ var a=CPLAN.allocations[i]; if(!a)continue;
+    if(type==='debt'){ if(a.type==='debt'&&!a._ibcDebtStrategy)return i; }
+    else if(a.type===type)return i;
+  }
+  return -1;
+}
+// Set an allocation's .amount, keeping a couples (owner==='joint') split consistent: amountSelf/amountSpouse
+// are rescaled to preserve the prior self ratio (50/50 default) so amountSelf+amountSpouse stays == amount
+// (mirrors how _cpSlide keeps the dual-slider split coherent). Single-person allocs just set .amount.
+function _ledgerSetAllocAmount(a,newAmt){
+  if(!a)return;
+  newAmt=Math.max(0,_lnum(newAmt));
+  if(a.owner==='joint'){
+    var prev=_lnum(a.amount), rS=prev>0?(_lnum(a.amountSelf)/prev):0.5; if(!(rS>=0&&rS<=1))rS=0.5;
+    a.amountSelf=Math.round(newAmt*rS); a.amountSpouse=Math.round((newAmt-a.amountSelf)*100)/100;
+  }
+  a.amount=newAmt;
+}
+// The canonical plan-write chain (mirrors _cpSlideEnd minus the chart renders — those are §1.9 UI).
+// _cpEnforce may CAP the amount (IRS limits), so callers re-read the stored value afterward.
+function _ledgerPersistPlan(){
+  try{ if(typeof _cpEnforce==='function')_cpEnforce(); }catch(e){}
+  try{ if(typeof _cpMarkModified==='function')_cpMarkModified(); }catch(e){}
+  try{ if(typeof _cpRunSimulation==='function')_cpRunSimulation(); }catch(e){}
+  try{ if(typeof _syncPlanToMain==='function')_syncPlanToMain(); }catch(e){}
+  try{ if(typeof cplanSave==='function')cplanSave(); }catch(e){}
+}
+// Bind a Tier-2 FUTURE envelope to its CPLAN allocation: set the matching allocation .amount (the
+// plan deployment shown in the Tier-2 row), creating one if none exists. amount IS the plan figure
+// (NOT total-minus-currentContrib — that conversion is a slider display concern).
+function _ledgerAssignFuture(type,amount,opts){
+  opts=opts||{};
+  if(typeof CPLAN==='undefined'||!Array.isArray(CPLAN.allocations))return {ok:false,reason:'no-plan'};
+  var amt=Math.max(0,_lnum(amount)), idx=_ledgerFindAllocIdx(type), created=false;
+  if(idx<0){
+    if(amt<=0)return {ok:true,amount:0,created:false,idx:-1}; // nothing to fund, nothing to create
+    CPLAN.allocations.push({type:String(type),amount:amt,target:0,phase:0,cascade:'',customName:opts.customName||'',owner:'self',_state:'proposed',_ledgerCreated:true});
+    idx=CPLAN.allocations.length-1; created=true;
+  } else { _ledgerSetAllocAmount(CPLAN.allocations[idx],amt); }
+  if(!opts.noPersist)_ledgerPersistPlan();
+  return {ok:true,amount:(CPLAN.allocations[idx]?_lnum(CPLAN.allocations[idx].amount):amt),created:created,idx:idx};
+}
+// Pure validator for a Tier-3 DEBT envelope total (min + extra). The minimum is READ-ONLY — the real
+// consumer-debt minimum from S.debts via _ledgerDebtAuto (excl Mortgage/Auto, already inside baseExp).
+// Assigning below the minimum is BLOCKED: you must service the minimum (kills the silent over-allocation).
+function _ledgerValidateDebt(requestedTotal,S){
+  var min=_ledgerDebtAuto(S||_ledgerActiveS());
+  var total=Math.max(0,_lnum(requestedTotal));
+  if(total<min-0.005)return {ok:false,min:min,extra:0,message:'Your required minimum debt payment is '+_ledgerFmtMoney(min)+'/mo — you can’t budget the debt envelope below it.'};
+  return {ok:true,min:min,extra:Math.round((total-min)*100)/100,message:''};
+}
+// Bind a Tier-3 DEBT envelope: total = min(read-only) + extra. Validates total >= min (blocks with a
+// message otherwise), then writes the EXTRA to the real-debt CPLAN allocation (creating it if needed).
+function _ledgerAssignDebt(requestedTotal,opts){
+  opts=opts||{};
+  var S=opts.S||_ledgerActiveS();
+  var v=_ledgerValidateDebt(requestedTotal,S);
+  if(!v.ok)return {ok:false,blocked:true,min:v.min,extra:0,message:v.message};
+  if(typeof CPLAN==='undefined'||!Array.isArray(CPLAN.allocations))return {ok:false,reason:'no-plan'};
+  // Single-source the debt envelope: collect ALL real-debt allocations (an _ibcDebtStrategy "debt" alloc
+  // is an IBC policy → skip). Write the extra to the FIRST and ZERO any others, so the debt extra can never
+  // be split across orphaned allocations (which would make the ledger's cplanDebtTotal disagree with the assign).
+  var idxs=[]; for(var i=0;i<CPLAN.allocations.length;i++){ var a=CPLAN.allocations[i]; if(a&&a.type==='debt'&&!a._ibcDebtStrategy)idxs.push(i); }
+  var idx=-1, created=false;
+  if(!idxs.length){
+    if(v.extra>0){ CPLAN.allocations.push({type:'debt',amount:v.extra,target:0,phase:0,cascade:'',customName:'',owner:'self',_state:'proposed',_ledgerCreated:true}); idx=CPLAN.allocations.length-1; created=true; }
+  } else {
+    idx=idxs[0];
+    _ledgerSetAllocAmount(CPLAN.allocations[idx],v.extra);
+    for(var k=1;k<idxs.length;k++)_ledgerSetAllocAmount(CPLAN.allocations[idxs[k]],0); // consolidate duplicates
+  }
+  if(!opts.noPersist)_ledgerPersistPlan();
+  var stored=(idx>=0&&CPLAN.allocations[idx])?_lnum(CPLAN.allocations[idx].amount):v.extra; // re-read (enforce may cap)
+  return {ok:true,blocked:false,min:v.min,extra:stored,total:v.min+stored,created:created,idx:idx};
+}
+// Unified dispatcher the §1.9 envelope inputs call. tier: 'spending' | 'future' | 'debt'.
+//   spending → PFOS_BUDGET_ASSIGN (§1.7a, S.budget, month-scoped); future/debt → the CPLAN binding above.
+function _ledgerAssign(tier,key,amount,opts){
+  opts=opts||{};
+  if(tier==='spending'){ if(typeof _budgetAssign==='function')_budgetAssign(key,amount,opts.month); return {ok:true,tier:'spending'}; }
+  if(tier==='future')return _ledgerAssignFuture(key,amount,opts);
+  if(tier==='debt')return _ledgerAssignDebt(amount,opts);
+  return {ok:false,reason:'unknown-tier'};
 }
 
 // ═══════════════════════════════════════════════════
