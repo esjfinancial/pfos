@@ -6665,12 +6665,10 @@ function _portalRecsDetect(){
     if(ed.subs){var t=0;Object.keys(ed.subs).forEach(function(sk){var sub=ed.subs[sk];t+=(parseFloat(sub&&sub.amount)||parseFloat(sub)||0);});return t;}
     return 0;
   }
-  var bucketLabels={
-    food:'Food',housing:'Housing',transportation:'Transportation',
-    utilities:'Utilities',insurance:'Insurance',discretionary:'Entertainment',
-    subscriptions:'Subscriptions',activeSavings:'Active Savings',
-    estate:'Estate',misc:'Other'
-  };
+  // §1.4-S5 dynamic — custom categories get budget-realloc recs (mirrors the converted advisor twin in
+  // pfos-client-profile). The detector gates on _catBudget(c)>0, so the appended budget-less activeSavings
+  // slice is harmless.
+  var bucketLabels={}; getL1Cats().forEach(function(c){bucketLabels[c.key]=c.label;});
   var catStats={};
   Object.keys(bucketLabels).forEach(function(c){
     var budget=_catBudget(c);
@@ -9323,7 +9321,7 @@ function _catMgrRenderRows(){
   box.innerHTML=_catMgr.rows.map(function(r,i){
     return '<div class="cat-mgr-row" data-i="'+i+'" style="display:flex;gap:6px;align-items:center;margin-bottom:6px">'
       +'<input class="cm-icon" value="'+esc(r.icon||'📦')+'" maxlength="2" aria-label="Icon" style="width:40px;text-align:center;padding:7px 4px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:15px">'
-      +'<input class="cm-label" value="'+esc(r.label||'')+'" placeholder="Category name" aria-label="Category name" style="flex:1;padding:7px 9px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:13px;font-family:var(--fh)">'
+      +'<input class="cm-label" value="'+esc(r.label||'')+'" maxlength="40" placeholder="Category name" aria-label="Category name" style="flex:1;padding:7px 9px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:13px;font-family:var(--fh)">'
       +'<button type="button" onclick="_catMgrMove('+i+',-1)" title="Move up" aria-label="Move up" style="background:none;border:none;color:var(--mu);cursor:pointer;padding:4px;font-size:12px">▲</button>'
       +'<button type="button" onclick="_catMgrMove('+i+',1)" title="Move down" aria-label="Move down" style="background:none;border:none;color:var(--mu);cursor:pointer;padding:4px;font-size:12px">▼</button>'
       +(r.system?'<span title="Built-in — cannot be removed" style="width:26px;text-align:center;font-size:12px">🔒</span>':'<button type="button" onclick="_catMgrRemove('+i+')" title="Remove (moves its budget &amp; transactions to Other)" aria-label="Remove category" style="background:none;border:none;color:var(--rd);cursor:pointer;padding:4px;font-size:13px;width:26px">✕</button>')
@@ -9340,11 +9338,17 @@ function _catMgrRemove(i){ _catMgrSyncFromDom(); var r=_catMgr.rows[i]; if(!r||r
 function _catMgrSave(){
   _catMgrSyncFromDom();
   var l1=[], keys={}, err=null;
+  // §1.4-S5: reserve built-in keys up front so a custom row named like a built-in (e.g. "Food") and moved
+  // above it can never claim/displace the built-in's key (and silently inherit its budget/attribution).
+  _catMgr.rows.forEach(function(r){ if(r.system&&r.key)keys[r.key]=1; });
+  var _sanL=function(s){return String(s==null?'':s).replace(/[<>]/g,'').slice(0,40);};
+  var _sanI=function(s){return String(s==null?'':s).replace(/[<>]/g,'').slice(0,8)||'📦';};
   _catMgr.rows.forEach(function(r){
     var label=(r.label||'').trim(); if(!label){ if(!err)err='Every category needs a name.'; return; }
-    var key=r.key||_catMgrSlug(label); if(!key)key='cat';
-    if(keys[key]){ var n=2; while(keys[key+'_'+n])n++; key=key+'_'+n; }
-    keys[key]=1; l1.push({key:key,label:label,icon:(r.icon||'📦'),sub:''});
+    var key;
+    if(r.system&&r.key){ key=r.key; }                                   // built-ins keep their fixed key — never re-slugged or suffixed
+    else { key=r.key||_catMgrSlug(label); if(!key)key='cat'; if(keys[key]){ var n=2; while(keys[key+'_'+n])n++; key=key+'_'+n; } }
+    keys[key]=1; l1.push({key:key,label:_sanL(label),icon:_sanI(r.icon),sub:''}); // strip <> so the optimistic-mirror render is XSS-safe pre-round-trip
   });
   if(err){ if(typeof _cpToast==='function')_cpToast(err); return; }
   if(!keys['misc']){ if(typeof _cpToast==='function')_cpToast('The Other category is required.'); return; } // safety net
@@ -9364,7 +9368,7 @@ function _catMgrSave(){
 function _portalQaSplitRowHtml(cat,amt){
   var catOpts=getL1Cats().map(function(c){return [c.key,c.icon+' '+c.label];}); // §1.4 dynamic categories
   var sel=(cat||'food');
-  var opts=catOpts.map(function(o){return '<option value="'+o[0]+'"'+(sel===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
+  var opts=catOpts.map(function(o){return '<option value="'+esc(o[0])+'"'+(sel===o[0]?' selected':'')+'>'+esc(o[1])+'</option>';}).join(''); // §1.4-S5 esc: label/icon are user-controlled
   var aV=(amt||amt===0)?String(amt):'';
   return '<div class="qa-split-row" style="display:flex;gap:6px;margin-bottom:5px;align-items:center">'
     +'<select class="qa-split-cat" style="flex:1;padding:7px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:12px;font-family:var(--fh)">'+opts+'</select>'
@@ -9440,7 +9444,8 @@ function _portalOpenAddExpense(prefill){
   h+='<select id="portalQaCat" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
   var catOpts=getL1Cats().map(function(c){return {v:c.key,l:c.icon+' '+c.label};}); // §1.4 dynamic categories
   var pCat=prefill.category||'food';
-  catOpts.forEach(function(o){h+='<option value="'+o.v+'"'+(pCat===o.v?' selected':'')+'>'+o.l+'</option>';});
+  if(pCat&&!catOpts.some(function(o){return o.v===pCat;})){ catOpts.unshift({v:pCat,l:(prefill.categoryLabel||pCat)}); } // §1.4-S5: preserve a prefill category (e.g. estate) not in the editable list so it isn't silently miscategorized
+  catOpts.forEach(function(o){h+='<option value="'+esc(o.v)+'"'+(pCat===o.v?' selected':'')+'>'+esc(o.l)+'</option>';}); // §1.4-S5 esc: label/icon are user-controlled
   h+='</select></div>';
   h+='<div><div style="font-size:12px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;text-transform:uppercase;margin-bottom:4px">Expense Type</div>';
   h+='<select id="portalQaType" style="width:100%;padding:10px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);font-family:var(--fh);font-size:14px;border-radius:4px;box-sizing:border-box">';
@@ -44694,7 +44699,7 @@ function _cpStartActionExpense(idx){
   var a=CPLAN.allocations[idx];if(!a)return;
   var typeConfig={
     umbrella:{desc:'Umbrella policy premium',cat:'insurance',expType:'regular',recurring:true,freq:'monthly',title:'Log Umbrella Premium'},
-    estate:{desc:'Estate plan / legal fees',cat:'estate',expType:'big_purchase',recurring:false,freq:'monthly',title:'Log Estate Plan Cost'},
+    estate:{desc:'Estate plan / legal fees',cat:'estate',catLabel:'📜 Estate Planning',expType:'big_purchase',recurring:false,freq:'monthly',title:'Log Estate Plan Cost'},
     annuity_research:{desc:'Annuity premium',cat:'activeSavings',expType:'big_purchase',recurring:false,freq:'monthly',title:'Log Annuity Cost'}
   };
   var cfg=typeConfig[a.type];
@@ -44704,6 +44709,7 @@ function _cpStartActionExpense(idx){
   _portalOpenAddExpense({
     description:cfg.desc,
     category:cfg.cat,
+    categoryLabel:cfg.catLabel, // §1.4-S5: estate isn't an editable L1 key; supply its display label for the injected option
     expense_type:cfg.expType,
     is_recurring:cfg.recurring,
     recurrence_freq:cfg.freq,
