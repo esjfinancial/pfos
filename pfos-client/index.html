@@ -8804,6 +8804,7 @@ function _spendRegControlsHtml(S,reg){
   h+='<input type="date" value="'+esc(f.dateTo)+'" onchange="_spendRegSet(\'dateTo\',this.value)" title="To date" style="'+inS+'">';
   h+='<button id="_spendRegClearBtn" onclick="_spendRegClear()" style="'+inS+';cursor:pointer;color:#5B9BFF'+(active?'':';display:none')+'">✕ Clear</button>';
   h+='<button onclick="_spendRegToggleSelMode()" style="'+inS+';cursor:pointer'+(_spendRegSelMode?';color:#5B9BFF;border-color:#5B9BFF':'')+'">'+(_spendRegSelMode?'✕ Done':'☑ Select')+'</button>';
+  h+='<button onclick="_catMgrOpen()" style="'+inS+';cursor:pointer" title="Add, rename, or reorder your spending categories">⚙ Categories</button>';
   h+='</div>';
   if(_spendRegSelMode) h+=_spendRegToolbarHtml();
   h+='</div>';
@@ -9294,6 +9295,69 @@ function _portalPlanVsRealityIncome(){
 // expense_type, payment_method, is_recurring, recurrence_freq, _onSubmit, _title}.
 // `_onSubmit` is a callback invoked with the saved entry after a successful write,
 // so the caller can mark a plan card complete or do other follow-up work.
+// ── §1.4 category manager (budget_v2) ──────────────────────────────────────
+// Lets a user add / rename / reorder / remove spending categories. Writes S.categories.l1 (editable
+// EXPENSE categories — never activeSavings) via PFOS_EDIT_CATEGORIES. The 8 built-in categories are
+// permanent (rename/reorder only, marked 🔒); custom categories can be removed (their budget + txns
+// merge into Other). _catMgr holds the working copy while the modal is open.
+var _catMgr=null;
+var _CAT_MGR_SYS={housing:1,utilities:1,food:1,transportation:1,insurance:1,subscriptions:1,discretionary:1,misc:1};
+function _catMgrSlug(label){ return String(label||'').toLowerCase().replace(/[^a-z0-9]+/g,'_').replace(/^_+|_+$/g,'').slice(0,32); }
+function _catMgrOpen(){
+  var cats=getL1Cats().filter(function(c){return c.key!=='activeSavings';}); // edit expense cats only
+  _catMgr={ rows: cats.map(function(c){return {key:c.key,label:c.label,icon:c.icon,system:!!_CAT_MGR_SYS[c.key]};}), remap:{} };
+  var el=document.getElementById('catMgrModal');
+  if(!el){ el=document.createElement('div'); el.id='catMgrModal'; el.className='modal-bg'; el.setAttribute('role','dialog'); el.setAttribute('aria-modal','true'); el.onclick=function(ev){ if(ev.target===el)closeModal('catMgrModal'); }; document.body.appendChild(el); }
+  el.innerHTML='<div style="max-width:480px;width:92%;max-height:85vh;overflow:auto;background:#0d0d2b;border:1px solid var(--bd);border-radius:12px;padding:20px;margin:auto">'
+    +'<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px"><div style="font-family:var(--fh);font-size:17px;font-weight:800;color:var(--wh)">Manage categories</div><button onclick="closeModal(\'catMgrModal\')" aria-label="Close" style="background:none;border:none;color:var(--mu);font-size:18px;cursor:pointer">✕</button></div>'
+    +'<div style="font-size:12px;color:var(--mu);line-height:1.6;margin-bottom:12px">Rename, reorder, or add your own categories. Custom categories get budgets and feed your plan just like the built-ins. Built-in categories (🔒) can be renamed but not removed; removing a custom one moves its budget &amp; transactions to <strong>Other</strong>.</div>'
+    +'<div id="catMgrRows"></div>'
+    +'<button type="button" onclick="_catMgrAddRow()" style="margin-top:8px;width:100%;background:none;border:1px dashed var(--bd);color:#5B9BFF;border-radius:6px;padding:9px 12px;font-size:13px;cursor:pointer;font-family:var(--fh);font-weight:700">+ Add a category</button>'
+    +'<div style="display:flex;gap:8px;margin-top:16px"><button onclick="closeModal(\'catMgrModal\')" style="flex:1;padding:11px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:6px;cursor:pointer;font-family:var(--fh);font-weight:700">Cancel</button><button onclick="_catMgrSave()" style="flex:1;padding:11px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;border-radius:6px;cursor:pointer;font-family:var(--fh);font-weight:700">Save</button></div>'
+    +'</div>';
+  _catMgrRenderRows();
+  openModal('catMgrModal');
+}
+function _catMgrRenderRows(){
+  var box=document.getElementById('catMgrRows'); if(!box)return;
+  box.innerHTML=_catMgr.rows.map(function(r,i){
+    return '<div class="cat-mgr-row" data-i="'+i+'" style="display:flex;gap:6px;align-items:center;margin-bottom:6px">'
+      +'<input class="cm-icon" value="'+esc(r.icon||'📦')+'" maxlength="2" aria-label="Icon" style="width:40px;text-align:center;padding:7px 4px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:15px">'
+      +'<input class="cm-label" value="'+esc(r.label||'')+'" placeholder="Category name" aria-label="Category name" style="flex:1;padding:7px 9px;background:var(--bg-card);border:1px solid var(--bd);color:var(--wh);border-radius:4px;font-size:13px;font-family:var(--fh)">'
+      +'<button type="button" onclick="_catMgrMove('+i+',-1)" title="Move up" aria-label="Move up" style="background:none;border:none;color:var(--mu);cursor:pointer;padding:4px;font-size:12px">▲</button>'
+      +'<button type="button" onclick="_catMgrMove('+i+',1)" title="Move down" aria-label="Move down" style="background:none;border:none;color:var(--mu);cursor:pointer;padding:4px;font-size:12px">▼</button>'
+      +(r.system?'<span title="Built-in — cannot be removed" style="width:26px;text-align:center;font-size:12px">🔒</span>':'<button type="button" onclick="_catMgrRemove('+i+')" title="Remove (moves its budget &amp; transactions to Other)" aria-label="Remove category" style="background:none;border:none;color:var(--rd);cursor:pointer;padding:4px;font-size:13px;width:26px">✕</button>')
+      +'</div>';
+  }).join('');
+}
+function _catMgrSyncFromDom(){
+  var rows=document.querySelectorAll('#catMgrRows .cat-mgr-row');
+  for(var i=0;i<rows.length;i++){ var idx=parseInt(rows[i].getAttribute('data-i')); if(isNaN(idx)||!_catMgr.rows[idx])continue; var lab=rows[i].querySelector('.cm-label'), ic=rows[i].querySelector('.cm-icon'); if(lab)_catMgr.rows[idx].label=lab.value; if(ic)_catMgr.rows[idx].icon=ic.value||'📦'; }
+}
+function _catMgrAddRow(){ _catMgrSyncFromDom(); _catMgr.rows.push({key:'',label:'',icon:'🏷️',system:false}); _catMgrRenderRows(); }
+function _catMgrMove(i,dir){ _catMgrSyncFromDom(); var j=i+dir; if(j<0||j>=_catMgr.rows.length)return; var t=_catMgr.rows[i];_catMgr.rows[i]=_catMgr.rows[j];_catMgr.rows[j]=t; _catMgrRenderRows(); }
+function _catMgrRemove(i){ _catMgrSyncFromDom(); var r=_catMgr.rows[i]; if(!r||r.system)return; if(r.key){ _catMgr.remap=_catMgr.remap||{}; _catMgr.remap[r.key]='misc'; } _catMgr.rows.splice(i,1); _catMgrRenderRows(); }
+function _catMgrSave(){
+  _catMgrSyncFromDom();
+  var l1=[], keys={}, err=null;
+  _catMgr.rows.forEach(function(r){
+    var label=(r.label||'').trim(); if(!label){ if(!err)err='Every category needs a name.'; return; }
+    var key=r.key||_catMgrSlug(label); if(!key)key='cat';
+    if(keys[key]){ var n=2; while(keys[key+'_'+n])n++; key=key+'_'+n; }
+    keys[key]=1; l1.push({key:key,label:label,icon:(r.icon||'📦'),sub:''});
+  });
+  if(err){ if(typeof _cpToast==='function')_cpToast(err); return; }
+  if(!keys['misc']){ if(typeof _cpToast==='function')_cpToast('The Other category is required.'); return; } // safety net
+  var S=(APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{};
+  var l2=(S.categories&&S.categories.l2)||{};
+  var remap=_catMgr.remap||{};
+  // optimistic mirror (engine re-validates + remaps authoritatively)
+  [(_lastPfosState&&_lastPfosState.state),(APP._portalFd&&APP._portalFd.S)].forEach(function(st){ if(st){ st.categories={l1:l1.slice(),l2:l2}; st._touched=st._touched||{}; st._touched.categories=true; } });
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_EDIT_CATEGORIES',categories:{l1:l1,l2:l2},remap:remap},PFOS_ORIGIN); }catch(_e){}
+  closeModal('catMgrModal');
+  if(typeof _cpToast==='function')_cpToast('Categories updated.');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
 // §1.3 split editor helpers (budget_v2). Split rows live in #portalQaSplitRows; each = a category
 // select + amount input that must sum to the entry amount. _portalSubmitAddExpense reads them into
 // entry.splits. Non-flag users never see the toggle, so their entries never gain splits.
