@@ -15292,6 +15292,48 @@ function submitAdvisorRequestFromModal(){
       }catch(e){console.warn('PFOS_RECONCILE:',e);}
       return;
     }
+    // ── PFOS_BUDGET_ASSIGN (§1.7a) ──
+    // Writes per-month envelope assignments into the unified-budget ledger
+    // S.budget.months['YYYY-MM'].assigned[catKey]=amt — the DISPLAY-LAYER "give every
+    // dollar a job" envelope state. S.budget is NOT a field of the engine's
+    // FinancialState and is NEVER read by computeCalcs/calc() (metric guard 5b), so —
+    // exactly like PFOS_RECONCILE / PFOS_WRITE_RECS — this runs NO calc(): set state →
+    // _touched.budget → debounced _doSync (the shell owns the budget surface; the engine
+    // only stores + flushes it so the parent's section-merge carries it back).
+    // LAZY-INIT: untouched users have no S.budget (byte-identical) — it is created only
+    // on the first real assignment; a no-op message (no assigned/settings) never creates
+    // it. msg.assigned {catKey:amt}: amt>0 sets (rounded to cents); amt<=0/invalid DELETES
+    // the key (an unset envelope leaves no zero residue → assign-then-clear returns to a
+    // clean state) and an emptied month is pruned. msg.settings merges a sanitized
+    // whitelist (style/rolloverDefault/firstMonth). msg.month defaults to the current month.
+    if(msg.type==='PFOS_BUDGET_ASSIGN'){
+      try{
+        var _bHasA=msg.assigned&&typeof msg.assigned==='object';
+        var _bHasSet=msg.settings&&typeof msg.settings==='object';
+        if(!_bHasA&&!_bHasSet)return; // nothing to write — never create S.budget on a no-op (untouched users stay byte-identical)
+        var _bNow=new Date().toISOString().slice(0,7);
+        var _bm=(typeof msg.month==='string'&&/^\d{4}-\d{2}$/.test(msg.month))?msg.month:_bNow;
+        if(!S.budget||typeof S.budget!=='object')S.budget={settings:{style:'flexible',rolloverDefault:false,firstMonth:_bNow},months:{}};
+        if(!S.budget.settings||typeof S.budget.settings!=='object')S.budget.settings={style:'flexible',rolloverDefault:false,firstMonth:_bNow};
+        if(!S.budget.months||typeof S.budget.months!=='object')S.budget.months={};
+        if(_bHasSet){
+          if(msg.settings.style==='flexible'||msg.settings.style==='envelope'||msg.settings.style==='auto')S.budget.settings.style=msg.settings.style;
+          if(typeof msg.settings.rolloverDefault==='boolean')S.budget.settings.rolloverDefault=msg.settings.rolloverDefault;
+          if(typeof msg.settings.firstMonth==='string'&&/^\d{4}-\d{2}$/.test(msg.settings.firstMonth))S.budget.settings.firstMonth=msg.settings.firstMonth;
+        }
+        if(_bHasA){
+          var _mo=S.budget.months[_bm]; if(!_mo||typeof _mo!=='object'){_mo={assigned:{},rolloverIn:{}};S.budget.months[_bm]=_mo;}
+          if(!_mo.assigned||typeof _mo.assigned!=='object')_mo.assigned={};
+          if(!_mo.rolloverIn||typeof _mo.rolloverIn!=='object')_mo.rolloverIn={};
+          Object.keys(msg.assigned).forEach(function(k){ if(!k)return; var v=parseFloat(msg.assigned[k]); if(!isFinite(v)||v<=0){ delete _mo.assigned[k]; } else { _mo.assigned[k]=Math.round(v*100)/100; } });
+          if(!Object.keys(_mo.assigned).length&&!Object.keys(_mo.rolloverIn).length)delete S.budget.months[_bm];
+        }
+        if(!S._touched)S._touched={};
+        S._touched.budget=true;
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+      }catch(e){console.warn('PFOS_BUDGET_ASSIGN:',e);}
+      return;
+    }
     // ── PFOS_EDIT_CATEGORIES (§1.4) ──
     // Sets the user-editable category taxonomy S.categories={l1:[{key,label,icon,sub}],l2:{...}}.
     // l1 holds EDITABLE EXPENSE categories only (never activeSavings — the engine excludes it from

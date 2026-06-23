@@ -9047,6 +9047,46 @@ function _doReconcile(){
   if(typeof _cpToast==='function')_cpToast('Reconciled — $'+Math.round(bal).toLocaleString('en-US')+' set as your verified balance.');
   if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
 }
+// ── §1.7a: unified-budget data layer (the S.budget month ledger) ──
+// The display-layer envelope budget ("give every dollar a job"). It is NEVER read by
+// computeCalcs (S.budget isn't even a field of the engine's FinancialState — metric
+// guard 5b): writes go to the engine via PFOS_BUDGET_ASSIGN and are optimistically
+// mirrored on BOTH shell copies, exactly like _doReconcile, so the next reload /
+// section-merge matches the engine's canonical write. §1.7a is the DATA LAYER ONLY —
+// no UI yet (the Every-Dollar screen + the bridge are §1.9). The pure readers below
+// are the API §1.7b/c/1.9 consume.
+function _budgetMonthKey(d){ return (d instanceof Date?d:new Date()).toISOString().slice(0,7); }
+function _budgetMonth(S,ym){ // read-only accessor: a month's envelope state, with safe defaults (never throws)
+  var b=(S&&S.budget)||{}, m=(b.months&&b.months[ym])||{};
+  return {assigned:(m.assigned&&typeof m.assigned==='object')?m.assigned:{}, rolloverIn:(m.rolloverIn&&typeof m.rolloverIn==='object')?m.rolloverIn:{}};
+}
+function _budgetAssigned(S,ym,catKey){ var v=parseFloat(_budgetMonth(S,ym).assigned[catKey]); return isFinite(v)?v:0; }
+// Optimistic mirror of the PFOS_BUDGET_ASSIGN handler — IDENTICAL lazy-init / round /
+// prune logic on BOTH shell copies (keeps the mirror byte-equal to the engine write, so
+// the section-merge never reintroduces drift). A parallel of the engine handler above.
+function _budgetApplyAssignToMirror(month,assigned){
+  var now=new Date().toISOString().slice(0,7);
+  [(_lastPfosState&&_lastPfosState.state),(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)].forEach(function(st){ if(!st)return;
+    if(!st.budget||typeof st.budget!=='object')st.budget={settings:{style:'flexible',rolloverDefault:false,firstMonth:now},months:{}};
+    if(!st.budget.settings||typeof st.budget.settings!=='object')st.budget.settings={style:'flexible',rolloverDefault:false,firstMonth:now};
+    if(!st.budget.months||typeof st.budget.months!=='object')st.budget.months={};
+    var mo=st.budget.months[month]; if(!mo||typeof mo!=='object'){mo={assigned:{},rolloverIn:{}};st.budget.months[month]=mo;}
+    if(!mo.assigned||typeof mo.assigned!=='object')mo.assigned={};
+    if(!mo.rolloverIn||typeof mo.rolloverIn!=='object')mo.rolloverIn={};
+    Object.keys(assigned).forEach(function(k){ if(!k)return; var v=parseFloat(assigned[k]); if(!isFinite(v)||v<=0){ delete mo.assigned[k]; } else { mo.assigned[k]=Math.round(v*100)/100; } });
+    if(!Object.keys(mo.assigned).length&&!Object.keys(mo.rolloverIn).length)delete st.budget.months[month];
+    st._touched=st._touched||{}; st._touched.budget=true;
+  });
+}
+// Write one envelope's assignment for a month (defaults to current). The engine is the
+// canonical writer; this mirrors locally + posts. No UI in §1.7a — this is the write API
+// §1.9 will wire to the envelope inputs.
+function _budgetAssign(catKey,amt,month){
+  var ym=(typeof month==='string'&&/^\d{4}-\d{2}$/.test(month))?month:_budgetMonthKey();
+  var assigned={}; assigned[String(catKey)]=amt;
+  _budgetApplyAssignToMirror(ym,assigned);
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_BUDGET_ASSIGN',month:ym,assigned:assigned},PFOS_ORIGIN); }catch(_e){}
+}
 // Tiny ordinal-suffix helper used by the smart routing widget. Mirrors pfos-main's ordSuffix.
 function _ordSuffix(n){var s=['th','st','nd','rd'];var v=n%100;return s[(v-20)%10]||s[v]||s[0];}
 
