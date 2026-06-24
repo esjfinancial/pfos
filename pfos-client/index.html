@@ -7990,6 +7990,77 @@ function _budgetRolloverChain(S,targetYm){
   cats.forEach(function(c){ if(_budgetRolloverOn(S,c.key))out[c.key]=Math.round((avail[c.key]||0)*100)/100; });
   return out;
 }
+// ── §1.8b — funding targets (monthly / by-date / refill-to-X) + smart-adaptive ──
+// A per-category target (S.budget.targets[cat]={type,amount,byDate,pinned}) is ADVISORY metadata — it does
+// NOT change reconciliation (rowsSum still sums .assigned, never targets). An UNPINNED/absent target auto-tunes
+// to the trailing spend trend (the _portalAutoBudgetSuggestions algorithm: last-6-completed-month run-rate,
+// $25 bins, ≥2-month recurrence); a PINNED target is never overridden. Metric-inert (display-only, guard 5b).
+function _budgetMonthsUntil(fromYm,toDate){ // # contribution months from fromYm THROUGH the target month (incl)
+  if(!/^\d{4}-\d{2}/.test(fromYm||'')||!/^\d{4}-\d{2}/.test(toDate||''))return 1;
+  var ci=parseInt(fromYm.slice(0,4),10)*12+(parseInt(fromYm.slice(5,7),10)-1);
+  var ti=parseInt(toDate.slice(0,4),10)*12+(parseInt(toDate.slice(5,7),10)-1);
+  return Math.max(1,ti-ci+1);
+}
+// The last `win` COMPLETED months strictly before ym, with split-expanded activity bucketed once, plus the
+// auto-budget month-count + min-month threshold (linked users 2, manual 3).
+function _budgetActivityWindow(S,ym,win){
+  win=win||6; var months=[]; var y=parseInt(ym.slice(0,4),10), m=parseInt(ym.slice(5,7),10)-1;
+  for(var i=0;i<win;i++){ m--; if(m<0){m=11;y--;} months.unshift(y+'-'+('0'+(m+1)).slice(-2)); }
+  var byMonth=_ledgerActivityByMonth(S,months), n=0;
+  months.forEach(function(mm){ if(byMonth[mm]&&Object.keys(byMonth[mm]).length)n++; });
+  var linked=((S&&S.spendingEntries)||[]).some(function(e){return e&&e._source==='plaid';});
+  return {months:months, byMonth:byMonth, nMonths:n, minMonths:linked?2:3};
+}
+// Trailing monthly average for a category (auto-budget-faithful: catSum / global-completed-months; needs the
+// category present in ≥2 of its own months — the recurrence gate). w = a precomputed _budgetActivityWindow.
+function _budgetTrailingAvg(S,catKey,win,ym,w){
+  w=w||_budgetActivityWindow(S,ym||((typeof _budgetMonthKey==='function')?_budgetMonthKey():new Date().toISOString().slice(0,7)),win||6);
+  if(w.nMonths<w.minMonths)return {avg:0,nMonths:w.nMonths,catMonths:0,hasData:false};
+  var sum=0,cm=0; w.months.forEach(function(mm){ var mp=w.byMonth[mm]; if(mp&&mp[catKey]>0){sum+=mp[catKey];cm++;} });
+  return {avg:w.nMonths>0?sum/w.nMonths:0, nMonths:w.nMonths, catMonths:cm, hasData:cm>=2};
+}
+// Smart-adaptive monthly target from the trend ($25 bins, $25 floor); flags a leakTagged category + a trim hint.
+function _budgetAdaptiveTarget(S,catKey,opts){
+  opts=opts||{};
+  var ta=_budgetTrailingAvg(S,catKey,opts.win||6,opts.ym,opts.window);
+  var leaked=((S&&S.expData&&S.expData[catKey])||{}).leakTagged===true;
+  if(!ta.hasData)return {hasData:false,amount:0,basedOnMonths:ta.nMonths,leaked:leaked,trimSuggestion:null};
+  // $25 bins, NO artificial floor — match _portalAutoBudgetSuggestions exactly: a sub-$12.50 average rounds to
+  // $0 → no adaptive target (don't over-budget a trivial category). A trim hint shows only when meaningfully below.
+  var amt=Math.round(ta.avg/25)*25;
+  if(amt<=0)return {hasData:false,amount:0,basedOnMonths:ta.nMonths,leaked:leaked,trimSuggestion:null};
+  var trim=leaked?Math.round((amt*0.85)/25)*25:null; if(trim!=null&&(trim<=0||trim>=amt))trim=null;
+  return {hasData:true,type:'monthly',amount:amt,basedOnMonths:ta.nMonths,catMonths:ta.catMonths,leaked:leaked,trimSuggestion:trim};
+}
+// Resolve the EFFECTIVE target for a category: pinned → the user's frozen target; unpinned-stored → adapt the
+// amount (keep the user's type/byDate); no stored target → the adaptive monthly suggestion (only when there's
+// enough trend). Returns null when there's nothing to suggest.
+function _budgetEffectiveTarget(S,catKey,opts){
+  var t=(S&&S.budget&&S.budget.targets&&S.budget.targets[catKey])||null;
+  var leaked=((S&&S.expData&&S.expData[catKey])||{}).leakTagged===true;
+  if(t&&t.pinned===true)return {type:t.type||'monthly',amount:_lnum(t.amount),byDate:t.byDate||null,pinned:true,source:'pinned',leaked:leaked,trimSuggestion:null};
+  var ad=_budgetAdaptiveTarget(S,catKey,opts);
+  if(t){ if(!ad.hasData)return {type:t.type||'monthly',amount:_lnum(t.amount),byDate:t.byDate||null,pinned:false,source:'stored',leaked:leaked,trimSuggestion:null};
+    return {type:t.type||'monthly',amount:ad.amount,byDate:t.byDate||null,pinned:false,source:'adaptive',leaked:leaked,trimSuggestion:ad.trimSuggestion}; }
+  if(!ad.hasData)return null;
+  return {type:'monthly',amount:ad.amount,byDate:null,pinned:false,source:'adaptive',leaked:leaked,trimSuggestion:ad.trimSuggestion};
+}
+// How much this category still needs THIS month to hit its target. monthly → target − assigned; refill-to-X →
+// X − available; by-date → remaining/months-left (sinking fund). funded when toGo ≈ 0.
+function _budgetTargetNeeded(S,eff,ym,available,assigned){
+  if(!eff)return null;
+  var monthlyTarget=0,toGo=0,overdue=false;
+  if(eff.type==='refill'){ monthlyTarget=_lnum(eff.amount); toGo=Math.max(0,monthlyTarget-_lnum(available)); }
+  else if(eff.type==='by_date'){
+    var goal=_lnum(eff.amount), ml=_budgetMonthsUntil(ym,eff.byDate||ym), rem=Math.max(0,goal-_lnum(available));
+    monthlyTarget=rem/ml; toGo=monthlyTarget;
+    // a deadline already in the past → fund the remainder now, but FLAG it (don't masquerade as routine urgency)
+    if(eff.byDate&&/^\d{4}-\d{2}/.test(eff.byDate)&&/^\d{4}-\d{2}/.test(ym)){ var ci=parseInt(ym.slice(0,4),10)*12+(parseInt(ym.slice(5,7),10)-1), ti=parseInt(eff.byDate.slice(0,4),10)*12+(parseInt(eff.byDate.slice(5,7),10)-1); overdue=ti<ci; }
+  }
+  else { monthlyTarget=_lnum(eff.amount); toGo=Math.max(0,monthlyTarget-_lnum(assigned)); }
+  monthlyTarget=Math.round(monthlyTarget*100)/100; toGo=Math.round(toGo*100)/100;
+  return {monthlyTarget:monthlyTarget,toGo:toGo,funded:toGo<=0.005,overdue:overdue};
+}
 // THE LEDGER — pure (S, calcs, plan, month) → reconciling 3-tier view.
 function _buildBudgetLedger(S,calcs,plan,month){
   S=S||{}; calcs=calcs||{}; plan=plan||{};
@@ -8016,6 +8087,7 @@ function _buildBudgetLedger(S,calcs,plan,month){
   var bm=(typeof _budgetMonth==='function')?_budgetMonth(S,ym):{assigned:{},rolloverIn:{}};
   var act=_ledgerActivityMap(S,ym);
   var rollMap=_budgetRolloverChain(S,ym); // §1.8a: computed carry-in (0 unless rollover opted in)
+  var targWin=_budgetActivityWindow(S,ym,6); // §1.8b: one trailing-trend window, shared across the adaptive targets
   var cats=(typeof getL1Cats==='function')?getL1Cats():[];
   var rows=[],rowsSum=0;
   cats.forEach(function(c){
@@ -8024,8 +8096,12 @@ function _buildBudgetLedger(S,calcs,plan,month){
     var assigned=(bm.assigned&&bm.assigned[c.key]!=null)?_lnum(bm.assigned[c.key]):def;
     var roll=(rollMap&&rollMap[c.key]!=null)?rollMap[c.key]:0;
     var activity=act[c.key]||0;
-    rowsSum+=assigned;
-    rows.push({key:c.key,label:c.label,icon:c.icon,assigned:assigned,defaultBudget:def,rolloverIn:roll,activity:activity,available:roll+assigned-activity,overspent:activity>roll+assigned+0.005});
+    var available=roll+assigned-activity;
+    rowsSum+=assigned; // ADVISORY targets are NOT summed — reconciliation depends only on .assigned
+    var eff=_budgetEffectiveTarget(S,c.key,{ym:ym,window:targWin});
+    var tn=eff?_budgetTargetNeeded(S,eff,ym,available,assigned):null;
+    rows.push({key:c.key,label:c.label,icon:c.icon,assigned:assigned,defaultBudget:def,rolloverIn:roll,activity:activity,available:available,overspent:activity>roll+assigned+0.005,
+      target:eff?{type:eff.type,amount:eff.amount,monthlyTarget:tn.monthlyTarget,toGo:tn.toGo,funded:tn.funded,overdue:tn.overdue,pinned:eff.pinned,source:eff.source,leaked:eff.leaked,trimSuggestion:eff.trimSuggestion||null,byDate:eff.byDate||null}:null});
   });
   var autoRemainder=tier1Total-rowsSum; // insurance premiums + hybrid joint share (+ any custom-category delta)
   var cpName=(typeof CP_NM!=='undefined')?CP_NM:{}, cpIcon=(typeof CP_IC!=='undefined')?CP_IC:{};
@@ -8076,6 +8152,39 @@ function _budgetSetSettings(patch){
 }
 function _budgetSetRolloverDefault(on){ _budgetSetSettings({rolloverDefault:!!on}); }
 function _budgetSetRollover(catKey,on){ var rc={}; rc[String(catKey)]=(on===null?null:!!on); _budgetSetSettings({rolloverCats:rc}); }
+// §1.8b target writers — merge S.budget.targets on BOTH shell mirrors + post PFOS_BUDGET_ASSIGN {targets}
+// (the engine sanitizes IDENTICALLY). null clears a category's target. Metric-inert; the UI is §1.9.
+function _budgetApplyTargetsToMirror(patch){
+  var now=new Date().toISOString().slice(0,7);
+  [(_lastPfosState&&_lastPfosState.state),(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)].forEach(function(st){ if(!st)return;
+    if(!st.budget||typeof st.budget!=='object')st.budget={settings:{style:'flexible',rolloverDefault:false,firstMonth:now},months:{}};
+    if(!st.budget.targets||typeof st.budget.targets!=='object')st.budget.targets={};
+    Object.keys(patch).forEach(function(k){ if(!k)return; var t=patch[k];
+      if(t===null){ delete st.budget.targets[k]; return; }
+      if(typeof t!=='object')return;
+      var ty=(t.type==='monthly'||t.type==='refill'||t.type==='by_date')?t.type:'monthly';
+      var amt=_lnum(t.amount); if(amt<0)amt=0;
+      var rec={type:ty,amount:Math.round(amt*100)/100,pinned:t.pinned===true};
+      if(ty==='by_date'&&typeof t.byDate==='string'&&/^\d{4}-\d{2}(-\d{2})?$/.test(t.byDate))rec.byDate=t.byDate;
+      st.budget.targets[k]=rec;
+    });
+    st._touched=st._touched||{}; st._touched.budget=true;
+  });
+}
+function _budgetSetTarget(catKey,target){ // target = {type,amount,byDate?,pinned} or null to clear
+  var patch={}; patch[String(catKey)]=target;
+  _budgetApplyTargetsToMirror(patch);
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_BUDGET_ASSIGN',targets:patch},PFOS_ORIGIN); }catch(_e){}
+}
+// Pin/unpin a category's target. Pinning with no stored target FREEZES the effective target the user is seeing
+// for the VIEWING month `ym` (so the frozen amount matches the ledger exactly — not a current-month recompute).
+function _budgetPinTarget(catKey,on,ym){
+  var S=(typeof _ledgerActiveS==='function')?_ledgerActiveS():((typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)||(_lastPfosState&&_lastPfosState.state)||{});
+  var cur=(S&&S.budget&&S.budget.targets&&S.budget.targets[catKey])||null;
+  var eff=cur||_budgetEffectiveTarget(S,catKey,{ym:(typeof ym==='string'&&/^\d{4}-\d{2}$/.test(ym))?ym:undefined});
+  if(!eff){ if(!on)return; eff={type:'monthly',amount:0}; }
+  _budgetSetTarget(catKey,{type:eff.type||'monthly',amount:_lnum(eff.amount),byDate:eff.byDate||undefined,pinned:!!on});
+}
 
 // ═══════════════════════════════════════════════════
 // §1.7c — THE BINDING (envelope ⇄ CPLAN / S.debts) + debt validation
