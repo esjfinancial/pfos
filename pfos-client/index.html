@@ -3281,6 +3281,70 @@ function _cpTrendDiff(cur, prior, idField){
     return { key:x.key, name:x.name, count:x.count, total:c, priorTotal:p, deltaPct:d, dir:(d==null?'new':(d>0?'up':(d<0?'down':'flat'))) }; }).sort(function(a,b){ return b.total-a.total; });
 }
 
+// ── §2.6 (M2) CSV export ─────────────────────────────────────────────────────
+// PURE RFC-4180 cell: quote when the value contains a comma/quote/newline (doubling
+// internal quotes); and neutralize a CSV-injection formula (a leading =,+,-,@,TAB,CR)
+// by prefixing a single quote — but ONLY when the value isn't a (signed) number, so a
+// legitimate negative amount like -50.00 stays numeric.
+function _cpCsvCell(v){
+  var s=(v==null)?'':String(v);
+  // Guard a leading formula char (allowing leading whitespace before it — Excel trims) UNLESS the
+  // WHOLE cell is a plain number with an optional MINUS — so a real amount like -50.00 stays numeric,
+  // but "-5+HYPERLINK(..)" / "+1+cmd" / " =SUM(A:A)" (numeric-looking or space-prefixed yet a formula
+  // to Excel) are all neutralized.
+  if(/^\s*[=+\-@\t\r]/.test(s) && !/^-?\d+(\.\d+)?$/.test(s)) s="'"+s;
+  if(/[",\n\r]/.test(s)) s='"'+s.replace(/"/g,'""')+'"';
+  return s;
+}
+// PURE: rows (objects) + columns [{key,label}] → an RFC-4180 CSV string (CRLF rows).
+function _cpToCsv(rows, columns){
+  var head=columns.map(function(c){ return _cpCsvCell(c.label); }).join(',');
+  var body=(rows||[]).map(function(r){ return columns.map(function(c){ return _cpCsvCell(r?r[c.key]:''); }).join(','); }).join('\r\n');
+  return head + (body ? '\r\n'+body : '');
+}
+// PURE: flatten in-range transactions to export rows (Amount = positive magnitude + a Type column
+// for direction). Same source-merge as the cash-flow report (txns + non-plaid manual; else
+// spendEntries). tz-safe bucketing.
+function _cpExportRows(opts){
+  opts=opts||{};
+  var startKey=opts.startKey, endKey=opts.endKey, txns=opts.txns||[], spendEntries=opts.spendEntries||[];
+  function mkey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
+  function inRange(k){ return k!=null && k>=startKey && k<=endKey; }
+  // Amount = positive MAGNITUDE (matches the in-app positive-expense display); the Type column gives
+  // the direction (Expense / Income / Transfer) — avoids the signed-export surprise.
+  var rows=[], txnsInRange=txns.filter(function(t){ return t&&!t.removed&&inRange(mkey(t.date)); });
+  if(txnsInRange.length){
+    txnsInRange.forEach(function(t){ var amt=parseFloat(t.amount)||0;
+      rows.push({date:(t.date||''), description:(t.name||''), merchant:(t.merchant||''), category:(t.category||t.bucket||''), amount:Math.abs(amt).toFixed(2), type:(t.isTransfer?'Transfer':(amt<0?'Income':'Expense')), status:(t.excluded?'excluded':(t.pending?'pending':''))}); });
+    spendEntries.forEach(function(e){ if(!e||e._source==='plaid'||!inRange(mkey(e.date))) return; var amt=parseFloat(e.amount)||0;
+      rows.push({date:(e.date||''), description:(e.description||''), merchant:'', category:(e.category||e.category_bucket||''), amount:Math.abs(amt).toFixed(2), type:(amt<0?'Income':'Expense'), status:''}); });
+  } else {
+    spendEntries.forEach(function(e){ if(!e||!inRange(mkey(e.date))) return; var amt=parseFloat(e.amount)||0;
+      rows.push({date:(e.date||''), description:(e.description||''), merchant:'', category:(e.category||e.category_bucket||''), amount:Math.abs(amt).toFixed(2), type:(amt<0?'Income':'Expense'), status:''}); });
+  }
+  rows.sort(function(a,b){ return String(a.date).localeCompare(String(b.date)); });
+  return rows;
+}
+var _CP_CSV_COLS=[{key:'date',label:'Date'},{key:'description',label:'Description'},{key:'merchant',label:'Merchant'},{key:'category',label:'Category'},{key:'amount',label:'Amount'},{key:'type',label:'Type'},{key:'status',label:'Status'}];
+// LIVE: export the current Reports range's transactions as a CSV download (reuses the Blob pattern). Read-only.
+function _cpExportTransactionsCsv(){
+  try{
+    var S=(_lastPfosState&&_lastPfosState.state)||{};
+    var now=new Date(), curKey=now.getFullYear()*12+now.getMonth();
+    var rng=_cpReportRange, startKey, endKey;
+    if(typeof rng==='object'){ startKey=rng.startKey; endKey=rng.endKey; } else { var nn=parseInt(String(rng),10)||12; endKey=curKey; startKey=curKey-(nn-1); }
+    var rows=_cpExportRows({txns:APP._txns||[], spendEntries:S.spendingEntries||[], startKey:startKey, endKey:endKey});
+    if(!rows.length){ if(typeof _cpToast==='function')_cpToast('No transactions to export in this range.'); return; }
+    var csv=_cpToCsv(rows, _CP_CSV_COLS);
+    var blob=new Blob([csv],{type:'text/csv;charset=utf-8;'});
+    var url=URL.createObjectURL(blob);
+    var _rngLbl=(typeof rng==='object')?'custom':String(rng); // range in the filename so same-day exports of different windows don't collide
+    var a=document.createElement('a');a.href=url;a.download='pfos-transactions-'+new Date().toISOString().split('T')[0]+'-'+_rngLbl+'.csv';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    setTimeout(function(){URL.revokeObjectURL(url);},1000);
+  }catch(e){ console.warn('CSV export:',e); if(typeof _cpToast==='function')_cpToast('Export failed.'); }
+}
+
 var _cpReportRange='12mo';
 function _cpSetReportRange(rng){ _cpReportRange=rng; if(typeof renderReportsView==='function')renderReportsView(); }
 function _cpSetReportCustom(){
@@ -3313,6 +3377,7 @@ function renderReportsView(){
   h+='<input type="month" id="rptCustomStart" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(startKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
   h+='<span style="color:var(--mu)">→</span>';
   h+='<input type="month" id="rptCustomEnd" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(endKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
+  h+='<button onclick="_cpExportTransactionsCsv()" aria-label="Export transactions as CSV" style="margin-left:auto;padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬇ Export CSV</button>';
   var _plaidLinked=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'));
   var _srcNote=(rep.source==='manual'&&_plaidLinked)?' · <span style="color:#EAB308">Plaid not yet synced — showing manual expenses</span>':'';
   var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile).</div>':'';
