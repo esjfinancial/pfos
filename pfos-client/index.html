@@ -3204,6 +3204,62 @@ function _cpCashFlowBars(months,W,H){
   svg+='</svg>'; return svg;
 }
 
+// ── §2.4b (M2) income→category Sankey ────────────────────────────────────────
+// PURE model: a balanced 2-column flow. Left = Income (+ Deficit when overspent);
+// Right = top-8 categories (+ Other remainder + Saved when net>0). Conservation:
+// Σleft == Σright == total (income+max(0,-net) == expense+max(0,net)). Null when
+// there's nothing to show. The testable seam (reads only the report object).
+function _cpSankeyModel(rep){
+  if(!rep) return null;
+  var income=Math.round(rep.totalIncome||0), expense=Math.round(rep.totalExpense||0);
+  var net=(rep.net==null?(income-expense):Math.round(rep.net)), saved=Math.max(0,net);
+  var cats=(rep.byCategory||[]).slice(0,8).filter(function(c){ return c&&(c.total||0)>0; });
+  var shown=cats.reduce(function(s,c){ return s+Math.round(c.total||0); },0);
+  var rights=cats.map(function(c){ var m=_cpSpendCatMeta(c.key); return {label:m.l,value:Math.round(c.total),color:m.c}; });
+  var other=expense-shown;
+  if(other>0.5) rights.push({label:'Other',value:Math.round(other),color:'#94A3B8'});
+  if(saved>0.5) rights.push({label:'Saved',value:Math.round(saved),color:'#10B981'});
+  if(!rights.length) return null;
+  // CONSERVATION by construction: total = Σrights (the actual drawn sum), then the LEFT side is DERIVED to
+  // match — Income covers what it can, the remainder is the Deficit. This stays balanced regardless of the
+  // independent ±$ rounding of category/income/expense (e.g. cats summing slightly above expense).
+  var total=rights.reduce(function(s,r){ return s+r.value; },0);
+  if(!(total>0)) return null;
+  var incL=Math.min(income,total), lefts=[{label:'Income',value:incL,color:'#22C55E'}], defL=total-incL;
+  if(defL>0.5) lefts.push({label:'Deficit',value:defL,color:'#EF4444'});
+  return { lefts:lefts, rights:rights, total:total };
+}
+// SVG flow renderer: left source bars + bezier ribbons (colored by destination) + right category bars + legend.
+function _cpRenderSankey(model,W,H){
+  if(!model||!model.rights||!model.rights.length||!(model.total>0)) return '';
+  var padT=12,padX=2,nodeW=8,plotH=H-padT-6,total=model.total;
+  var leftX=padX, rightX=W-padX-nodeW, midX=(leftX+nodeW+rightX)/2;
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto" role="img" aria-label="Income to category flow">';
+  // flows (contiguous, one per right node), colored by destination. toFixed(2): enough precision that a sub-1%
+  // ribbon doesn't collapse to a degenerate path (top==bottom). Bars below use the SAME raw heights (no
+  // Math.max inflation) so a destination bar never visually outsizes the ribbon feeding it.
+  var lCur=padT, rCur=padT, flows=[];
+  model.rights.forEach(function(nd){ var fh=(nd.value/total)*plotH; flows.push({nd:nd, lt:lCur, lb:lCur+fh, rt:rCur, rb:rCur+fh}); lCur+=fh; rCur+=fh; });
+  flows.forEach(function(f){
+    var p='M'+(leftX+nodeW)+','+f.lt.toFixed(2)+' C'+midX+','+f.lt.toFixed(2)+' '+midX+','+f.rt.toFixed(2)+' '+rightX+','+f.rt.toFixed(2)+' L'+rightX+','+f.rb.toFixed(2)+' C'+midX+','+f.rb.toFixed(2)+' '+midX+','+f.lb.toFixed(2)+' '+(leftX+nodeW)+','+f.lb.toFixed(2)+' Z';
+    svg+='<path d="'+p+'" fill="'+f.nd.color+'" opacity="0.4"><title>'+_cpEscHtml(f.nd.label)+': '+fmt(Math.round(f.nd.value))+'</title></path>';
+  });
+  // left source bars (Income green / Deficit red) — raw heights, aligned with the flow stack
+  var lY=padT;
+  model.lefts.forEach(function(nd){ var nh=(nd.value/total)*plotH; svg+='<rect x="'+leftX+'" y="'+lY.toFixed(2)+'" width="'+nodeW+'" height="'+nh.toFixed(2)+'" fill="'+nd.color+'" rx="1"><title>'+_cpEscHtml(nd.label)+': '+fmt(Math.round(nd.value))+'</title></rect>'; lY+=nh; });
+  // right destination bars (category colors) — same raw heights as their ribbons
+  flows.forEach(function(f){ svg+='<rect x="'+rightX+'" y="'+f.rt.toFixed(2)+'" width="'+nodeW+'" height="'+(f.rb-f.rt).toFixed(2)+'" fill="'+f.nd.color+'" rx="1"></rect>'; });
+  // source/destination axis labels (the Sankey had none)
+  svg+='<text x="'+leftX+'" y="8" fill="var(--mu)" font-size="8" font-weight="700" text-anchor="start" font-family="var(--fh)">INCOME</text>';
+  svg+='<text x="'+(rightX+nodeW)+'" y="8" fill="var(--mu)" font-size="8" font-weight="700" text-anchor="end" font-family="var(--fh)">SPENDING</text>';
+  svg+='</svg>';
+  // legend: LEFT sources (Income/Deficit) + RIGHT destinations
+  var leg='<div style="display:flex;flex-wrap:wrap;gap:4px 10px;margin-top:6px;justify-content:center">';
+  model.lefts.concat(model.rights).forEach(function(nd){ leg+='<div style="font-size:11px;color:var(--mu);display:flex;align-items:center;gap:3px"><span style="width:8px;height:8px;border-radius:1px;background:'+nd.color+'"></span>'+_cpEscHtml(nd.label)+' '+fmt(Math.round(nd.value))+'</div>'; });
+  leg+='</div>';
+  return svg+leg;
+}
+
 var _cpReportRange='12mo';
 function _cpSetReportRange(rng){ _cpReportRange=rng; if(typeof renderReportsView==='function')renderReportsView(); }
 function _cpSetReportCustom(){
@@ -3249,6 +3305,8 @@ function renderReportsView(){
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Monthly Net Cash Flow</div>'+_cpCashFlowBars(rep.months,600,200)+'</div>';
   h+='<div class="info-card" style="padding:14px"><div class="info-card-title" style="margin-bottom:8px">Where It Went</div>';
   if(rep.byCategory.length){
+    var _sankey=(rep.totalIncome>0&&rep.totalExpense>0)?_cpSankeyModel(rep):null; // §2.4b income→category flow
+    if(_sankey) h+='<div style="margin-bottom:10px">'+_cpRenderSankey(_sankey,600,180)+'</div>';
     var maxCat=rep.byCategory[0].total||1;
     rep.byCategory.slice(0,10).forEach(function(c){ var meta=_cpSpendCatMeta(c.key), pct=rep.totalExpense>0?Math.round(c.total/rep.totalExpense*100):0;
       h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px"><span style="color:var(--wh)">'+ev(meta.l)+'</span><span style="color:var(--mu)">'+fmt(c.total)+' · '+pct+'%</span></div><div style="height:5px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+Math.round(c.total/maxCat*100)+'%;background:'+meta.c+';border-radius:2px"></div></div></div>'; });
