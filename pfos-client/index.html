@@ -8388,6 +8388,105 @@ function _budgetCoverExecute(source,targetKey,amount,ym){
 }
 
 // ═══════════════════════════════════════════════════
+// §1.8d — PREDICTIVE CASH-FLOW FORECAST
+// ═══════════════════════════════════════════════════
+// Walk forward from CURRENT CASH to the next payday, subtracting scheduled bills (on their due dates) + the
+// typical daily variable run-rate, to surface a shortfall BEFORE it happens ("~$230 short before payday on the
+// 14th") with the offending bills + a one-tap fix. Degrades without Plaid (manual bills/cash/pay schedule); no
+// false alarm when buffered. Pure / metric-inert (read-only). External reads are injectable via opts (tests).
+function _fcDateISO(d){ return d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2)+'-'+('0'+d.getDate()).slice(-2); }
+// Parse a date input as LOCAL (a date-only ISO string parses as UTC midnight via the Date ctor, which shifts the
+// day in negative-offset zones) — split YYYY-MM-DD into local components. Date objects pass through.
+function _fcParseDate(v){
+  if(v instanceof Date)return v;
+  if(typeof v==='string'){ var m=v.match(/^(\d{4})-(\d{2})-(\d{2})/); if(m)return new Date(parseInt(m[1],10),parseInt(m[2],10)-1,parseInt(m[3],10)); }
+  return new Date(v);
+}
+// Typical daily VARIABLE spend (excludes recurring bills — the forecast subtracts those separately) over the
+// trailing 30 days. A fixed /30 denominator under-counts sparse manual logs → conservative (fewer false alarms).
+function _forecastDailyRunRate(S,asOf){
+  var now=asOf?new Date(asOf):new Date(), cut=now.getTime()-30*86400000, sum=0;
+  ((S&&S.spendingEntries)||[]).forEach(function(e){
+    if(!e||e.is_recurring===true)return;
+    var d=new Date(e.date); if(isNaN(d.getTime())||d.getTime()<cut||d.getTime()>now.getTime())return;
+    _spendSplitParts(e).forEach(function(p){ var a=parseFloat(p.amount)||0; if(a>0)sum+=a; });
+  });
+  return Math.round((sum/30)*100)/100;
+}
+// The next payday strictly after fromDate as {date,amount,label}, walking this + the next two months via
+// _portalGetPayDates (reads paySchedules; falls back to 1st/15th when calcs.inc>0). Null if none derivable.
+function _forecastNextPayday(S,calcs,fromDate){
+  if(typeof _portalGetPayDates!=='function')return null;
+  var from=new Date(fromDate.getFullYear(),fromDate.getMonth(),fromDate.getDate()), cands=[];
+  [0,1,2].forEach(function(mo){ var m=from.getMonth()+mo, y=from.getFullYear()+Math.floor(m/12), mm=((m%12)+12)%12, dim=new Date(y,mm+1,0).getDate();
+    (_portalGetPayDates(mm,y)||[]).forEach(function(pd){ var dt=new Date(y,mm,Math.min(parseInt(pd.day,10)||1,dim)); if(dt>=from)cands.push({date:dt,amount:_lnum(pd.amount),label:pd.label||'Paycheck'}); }); // >= : today's payday counts (else a payday-today forecasts a spurious full-period shortfall)
+  });
+  cands.sort(function(a,b){return a.date-b.date;});
+  return cands.length?cands[0]:null;
+}
+// Scheduled bills due in (fromDate, toDate], placed on their concrete due DATE (day-of-month → this/next month,
+// clamped to month length). Reuses _portalGetFixedBills (manual bills + debt minimums + recurring expenses).
+function _forecastBillsDue(S,fromDate,toDate){
+  var src=(typeof _portalGetFixedBills==='function')?(_portalGetFixedBills()||[]):[];
+  var from=new Date(fromDate.getFullYear(),fromDate.getMonth(),fromDate.getDate()), to=new Date(toDate.getFullYear(),toDate.getMonth(),toDate.getDate()), out=[];
+  src.forEach(function(b){ var amt=_lnum(b.amount); if(amt<=0)return; var dd=parseInt(b.due_day,10)||1;
+    [0,1].forEach(function(mo){ var m=from.getMonth()+mo, y=from.getFullYear()+Math.floor(m/12), mm=((m%12)+12)%12, dim=new Date(y,mm+1,0).getDate(); var dt=new Date(y,mm,Math.min(dd,dim)); if(dt>from&&dt<=to)out.push({name:b.name||'Bill',icon:b.icon||'📋',amount:amt,dueDate:dt}); });
+  });
+  out.sort(function(a,b){return a.dueDate-b.dueDate;});
+  return out;
+}
+// THE FORECAST — forward day-walk from current cash to next payday. opts inject {now,cash,runRate,nextPay,bills,buffer}.
+function _forecastCashFlow(S,calcs,opts){
+  opts=opts||{}; S=S||{}; calcs=calcs||{};
+  var now=opts.now?_fcParseDate(opts.now):new Date();
+  var nextPay=opts.nextPay||_forecastNextPayday(S,calcs,now);
+  if(!nextPay||!nextPay.date)return {ok:false,reason:'no-payday'};
+  var npDate=_fcParseDate(nextPay.date);
+  var cash=opts.cash!=null?_lnum(opts.cash):((typeof _reconcileCash==='function')?_reconcileCash(S):0);
+  var runRate=opts.runRate!=null?_lnum(opts.runRate):_forecastDailyRunRate(S,now);
+  var buffer=opts.buffer!=null?_lnum(opts.buffer):0;
+  var bills=opts.bills||_forecastBillsDue(S,now,npDate);
+  var start=new Date(now.getFullYear(),now.getMonth(),now.getDate());
+  var end=new Date(npDate.getFullYear(),npDate.getMonth(),npDate.getDate());
+  var daysToPay=Math.max(0,Math.round((end-start)/86400000));
+  var dayBill={}, billList=[];
+  bills.forEach(function(b){ var due=_fcParseDate(b.dueDate); if(isNaN(due.getTime()))return; var dd=new Date(due.getFullYear(),due.getMonth(),due.getDate()); var off=Math.round((dd-start)/86400000); if(off>=1&&off<=daysToPay){ dayBill[off]=(dayBill[off]||0)+_lnum(b.amount); billList.push({name:b.name||'Bill',icon:b.icon||'📋',amount:_lnum(b.amount),dueDate:dd,dayOffset:off}); } });
+  var balance=cash, trough=cash, troughOff=0, firstNegOff=-1;
+  for(var d=1;d<=daysToPay;d++){ balance-=runRate; balance-=(dayBill[d]||0); if(balance<buffer-0.005&&firstNegOff<0)firstNegOff=d; if(balance<trough){trough=balance;troughOff=d;} }
+  var shortfall=trough<buffer-0.005;
+  var shortfallAmount=shortfall?Math.round(buffer-trough):0;
+  var sfDate=new Date(start.getTime()+(firstNegOff>0?firstNegOff:troughOff)*86400000); // first day below the buffer
+  // offending = every bill draining this pay period (all are within the window), largest first → the "Upcoming
+  // bills" list + the defer candidate. (Reported as the period's bills; the shortfall DATE is the first-negative day.)
+  var offending=billList.slice().sort(function(a,b){return b.amount-a.amount;});
+  var biggest=offending.length?offending[0]:null;
+  var fix=shortfall?{needed:shortfallAmount, perDayTrim:daysToPay>0?Math.ceil(shortfallAmount/daysToPay):shortfallAmount, biggestBill:biggest?{name:biggest.name,amount:biggest.amount,dueDate:_fcDateISO(biggest.dueDate)}:null}:null;
+  return {ok:true, shortfall:shortfall, shortfallAmount:shortfallAmount, shortfallDate:shortfall?_fcDateISO(sfDate):null,
+    nextPayday:{date:_fcDateISO(end),amount:Math.round(_lnum(nextPay.amount)),label:nextPay.label||'Paycheck'}, daysToPay:daysToPay,
+    startCash:Math.round(cash*100)/100, runRate:runRate, trough:Math.round(trough),
+    bills:billList.map(function(b){return {name:b.name,icon:b.icon,amount:b.amount,dueDate:_fcDateISO(b.dueDate)};}),
+    offendingBills:offending.map(function(b){return {name:b.name,amount:b.amount,dueDate:_fcDateISO(b.dueDate)};}), fix:fix};
+}
+// Render card — shows ONLY on a genuine shortfall (no clutter / no false alarm); gated by budgetV2. UI is §1.9-ready.
+function _portalCashForecastBlock(S,calcs){
+  if(!(typeof budgetV2Enabled==='function'&&budgetV2Enabled()))return '';
+  var f; try{ f=_forecastCashFlow(S,calcs); }catch(e){ return ''; }
+  if(!f||!f.ok||!f.shortfall)return '';
+  var fm=function(v){return '$'+Math.round(v).toLocaleString('en-US');};
+  var dl=function(iso){ try{ return new Date(iso+'T12:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}); }catch(e){ return iso; } };
+  // LOCAL escaper — `esc` is not a reliable global in this scope (it's a function-local elsewhere); this keeps the
+  // card self-contained, so a bill name can never break the dashboard render OR inject markup (escapes user input).
+  var ev=function(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+  var h='<div class="sec-group"><div class="sec-group-title" style="margin-bottom:10px">⚠️ Heads up — cash gets tight</div>';
+  h+='<div style="padding:12px 14px;background:rgba(249,115,22,.08);border:1px solid rgba(249,115,22,.28);border-radius:6px">';
+  h+='<div style="font-size:14px;color:var(--wh);line-height:1.6">You\'re on track to be ~<strong style="color:var(--or)">'+fm(f.shortfallAmount)+' short</strong> around <strong>'+ev(dl(f.shortfallDate))+'</strong> — before your next paycheck ('+fm(f.nextPayday.amount)+' on '+ev(dl(f.nextPayday.date))+').</div>';
+  if(f.offendingBills&&f.offendingBills.length)h+='<div style="font-size:12px;color:var(--mu);margin-top:8px">Upcoming bills: '+f.offendingBills.slice(0,3).map(function(b){return ev(b.name)+' '+fm(b.amount);}).join(' · ')+'</div>';
+  if(f.fix)h+='<div style="font-size:12px;color:var(--wh);margin-top:8px;font-weight:700">Fix: trim ~'+fm(f.fix.perDayTrim)+'/day'+(f.fix.biggestBill?', or defer '+ev(f.fix.biggestBill.name)+' ('+fm(f.fix.biggestBill.amount)+')':'')+'.</div>';
+  h+='</div></div>';
+  return h;
+}
+
+// ═══════════════════════════════════════════════════
 // PLAN ALIGNMENT CARD — portal-only (CPLAN lives here)
 // ═══════════════════════════════════════════════════
 // Reads CPLAN.allocations + _cpTracking via _cpGetActualContribution to surface
@@ -8922,6 +9021,7 @@ function _portalRenderSpendDashboard(){
   }
 
   var h='';
+  h+=(typeof _portalCashForecastBlock==='function'?_portalCashForecastBlock(S,calcs):''); // §1.8d predictive shortfall (gated; '' unless a genuine shortfall → byte-identical otherwise)
   h+=(typeof _portalReconcileBlock==='function'?_portalReconcileBlock(S,calcs):''); // §1.6b cash & reconcile (gated; '' when off / no cash → byte-identical)
 
   // ── 1. Header (month picker) + Add Expense + Savings Goal action row ──
@@ -9102,7 +9202,7 @@ function _portalRenderSpendDashboard(){
 
   // ── 10. Smart Money Routing — "Before your next paycheck" ──
   var paySchedules=S.paySchedules||[];
-  if(paySchedules.length>0&&bills.length>0){
+  if(paySchedules.length>0&&bills.length>0&&!(typeof budgetV2Enabled==='function'&&budgetV2Enabled())){ // §1.8d: budgetV2 users get the richer predictive forecast card instead (no dual shortfall banners)
     var nextPayDates=_portalGetPayDates(curMonth,curYear).filter(function(pd){return pd.day>dayOfMonth;});
     if(nextPayDates.length>0){
       var nextPay=nextPayDates[0];
