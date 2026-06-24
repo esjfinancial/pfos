@@ -8289,6 +8289,105 @@ function _ledgerAssign(tier,key,amount,opts){
 }
 
 // ═══════════════════════════════════════════════════
+// §1.8c — COVER-OVERSPEND + smart (lowest-plan-impact) source
+// ═══════════════════════════════════════════════════
+// When a Tier-1 spending envelope is overspent (available<0), cover it by moving money from a source, ranked
+// by LOWEST PLAN IMPACT: Ready-to-Assign and other spending surpluses cost the plan NOTHING; raiding a Tier-2
+// Future or Tier-3 Debt envelope DELAYS FI / debt payoff — measured by re-running the cascade sim (the ref-E
+// delta the §1.9 bridge also uses). NO UI yet (§1.9). Logic-layer; all writes reuse §1.7a/§1.7c.
+
+// Overspent spending envelopes (available<0) from a ledger → [{key,label,overspend}] (overspend is positive $).
+function _budgetOverspent(ledger){
+  var rows=(ledger&&ledger.tiers&&ledger.tiers.spending&&ledger.tiers.spending.rows)||[];
+  return rows.filter(function(r){ return r&&_lnum(r.available)<-0.005; }).map(function(r){ return {key:r.key,label:r.label,overspend:Math.round((-_lnum(r.available))*100)/100}; });
+}
+// Ready-to-Assign status (envelope-style "every dollar a job" → fullyAssigned when raw RTA ≈ 0).
+function _budgetReadyToAssign(ledger){
+  var raw=_lnum(ledger&&ledger.readyToAssign), un=_lnum(ledger&&ledger.unallocated);
+  return {raw:Math.round(raw*100)/100, unallocated:un, fullyAssigned:Math.abs(raw)<0.5, underAssigned:raw>0.5, overAssigned:raw<-0.5};
+}
+// THE PLAN-IMPACT DELTA: reduce a CPLAN allocation (by type) and re-run the cascade sim to measure the cost
+// (FI pushed later, retirement value lost, debt-free pushed later). The sim MUTATES CPLAN.allocations (pushes
+// overflow absorbers), so we deep-clone + restore the WHOLE array + _sim in try/finally. fiNumber from calcs.
+function _budgetPlanImpactOfReducing(allocType,reduceBy,calcs){
+  if(typeof CPLAN==='undefined'||!Array.isArray(CPLAN.allocations)||typeof _cpRunSimulation!=='function')return null;
+  var reduce=Math.max(0,_lnum(reduceBy));
+  var fiNumber=_lnum((calcs&&calcs.fiNumber)||CPLAN.fiNumber||0), age=_lnum(CPLAN.age);
+  var fiYearOf=function(sim){ if(!sim||!Array.isArray(sim.retirement)||fiNumber<=0)return -1; return sim.retirement.findIndex(function(v){return _lnum(v)>=fiNumber;}); };
+  // Keep the ORIGINAL references (matches the existing snapshot/restore pattern at ~31336/~32809) — the sim
+  // REASSIGNS CPLAN._sim/CPLAN.allocations to new objects, so restoring the originals returns exact prior state.
+  var savedAllocs=CPLAN.allocations, savedSim=CPLAN._sim;
+  try{
+    CPLAN.allocations=JSON.parse(JSON.stringify(savedAllocs)); // experiment on a clone so the original is untouched
+    var idx=(typeof _ledgerFindAllocIdx==='function')?_ledgerFindAllocIdx(allocType):-1;
+    if(idx<0)return null;
+    _cpRunSimulation(); var b=CPLAN._sim||{};
+    var fiB=fiYearOf(b), prvB=_lnum(b.projRetValue), dfB=_lnum(b.debtFreeMonth), H=(Array.isArray(b.retirement)?b.retirement.length:31);
+    CPLAN.allocations=JSON.parse(JSON.stringify(savedAllocs));
+    CPLAN.allocations[idx].amount=Math.max(0,_lnum(CPLAN.allocations[idx].amount)-reduce);
+    _cpRunSimulation(); var a=CPLAN._sim||{};
+    var fiA=fiYearOf(a), prvA=_lnum(a.projRetValue), dfA=_lnum(a.debtFreeMonth);
+    // years FI pushed LATER (positive = worse). If FI fell OFF the horizon (fiA=-1) the cost is at least the
+    // full remaining horizon (worst case). If FI wasn't reached even before, there is no FI date to delay (0).
+    var fiYD; if(fiB>=0&&fiA>=0)fiYD=fiA-fiB; else if(fiB>=0&&fiA<0)fiYD=H-fiB; else fiYD=0;
+    return {fiYearsDelta:fiYD, fiMonthsDelta:fiYD*12, projRetValueDelta:Math.round(prvA-prvB), debtFreeMonthsDelta:Math.round(dfA-dfB),
+      fiAgeBefore:(fiB>=0&&age>0)?(age+fiB):null, fiAgeAfter:(fiA>=0&&age>0)?(age+fiA):null, fiComputable:(fiNumber>0)};
+  }catch(e){ return null; }
+  finally{ CPLAN.allocations=savedAllocs; CPLAN._sim=savedSim; }
+}
+// Rank candidate cover sources for an overspent envelope, LOWEST plan impact first. RTA + spending surpluses
+// are free (planCostMonths 0); Future/Debt sources get the real sim-delta (so a suggestion never raids a
+// committed envelope without flagging the cost). opts.computeImpact:false skips the (sim-heavy) delta.
+function _budgetCoverSources(ledger,calcs,overspentKey,coverAmt,opts){
+  opts=opts||{}; ledger=ledger||{}; var amt=Math.max(0,_lnum(coverAmt)), out=[];
+  var rta=_lnum(ledger.unallocated);
+  if(rta>0.005)out.push({kind:'rta',key:'__rta__',label:'Ready to Assign',capacity:Math.round(rta*100)/100,planImpact:null,planCostMonths:0});
+  ((ledger.tiers&&ledger.tiers.spending&&ledger.tiers.spending.rows)||[]).forEach(function(r){ if(!r||r.key===overspentKey)return; var av=_lnum(r.available); if(av>0.005)out.push({kind:'spending',key:r.key,label:r.label,capacity:Math.round(av*100)/100,planImpact:null,planCostMonths:0}); });
+  var committed=[];
+  ((ledger.tiers&&ledger.tiers.future&&ledger.tiers.future.rows)||[]).forEach(function(r){ if(r&&_lnum(r.amount)>0)committed.push({kind:'future',key:r.type,label:r.label,capacity:Math.round(_lnum(r.amount)*100)/100}); });
+  ((ledger.tiers&&ledger.tiers.debt&&ledger.tiers.debt.rows)||[]).forEach(function(r){ if(r&&_lnum(r.amount)>0)committed.push({kind:'debt',key:r.type,label:r.label,capacity:Math.round(_lnum(r.amount)*100)/100}); });
+  committed.forEach(function(s){
+    var reduceBy=Math.min(amt,s.capacity); // reduce by the cover amount (NOT the whole envelope)
+    var imp=(opts.computeImpact===false||reduceBy<=0)?null:_budgetPlanImpactOfReducing(s.key,reduceBy,calcs);
+    s.planImpact=imp;
+    s.costUnknown=!imp; // committed source whose plan cost we couldn't compute — must never read as "free"
+    s.planCostMonths=imp?Math.max(0,_lnum(imp.fiMonthsDelta),_lnum(imp.debtFreeMonthsDelta)):999999; // unknown ranks last
+    out.push(s);
+  });
+  // A FREE source (RTA / spending surplus) ALWAYS ranks before a committed Future/Debt envelope — never raid the
+  // plan when a free source exists, even if the committed source's computed month-cost rounds to 0. Then lower
+  // plan-cost first; then larger capacity (covers more in one move).
+  out.sort(function(x,y){
+    var xf=(x.kind==='rta'||x.kind==='spending')?0:1, yf=(y.kind==='rta'||y.kind==='spending')?0:1;
+    return (xf-yf)||(x.planCostMonths-y.planCostMonths)||(y.capacity-x.capacity);
+  });
+  return out;
+}
+// Execute a cover: give the overspent envelope `amount` more, drawn from the chosen source. Reuses §1.7a/§1.7c
+// writers (each persists). RTA → just fund the target; spending → also reduce the source envelope; Future/Debt
+// → also reduce the CPLAN allocation (debt stays ≥ its minimum via _ledgerAssignDebt's validation).
+function _budgetCoverExecute(source,targetKey,amount,ym){
+  if(!source||typeof targetKey!=='string'||!targetKey)return {ok:false,reason:'bad-args'};
+  amount=Math.max(0,_lnum(amount)); if(amount<=0.005)return {ok:false,reason:'zero'};
+  // never over-draw the chosen source (clamp the move to its capacity so no money is created)
+  var cap=(source.capacity!=null)?_lnum(source.capacity):amount; if(amount>cap+0.005)amount=cap;
+  if(amount<=0.005)return {ok:false,reason:'no-source-capacity'};
+  var S=(typeof _ledgerActiveS==='function')?_ledgerActiveS():{};
+  if(source.kind==='debt'){ // reduce the debt extra FIRST (it can be validated/blocked) before funding the target
+    var min=(typeof _ledgerDebtAuto==='function')?_ledgerDebtAuto(S):0;
+    var extra=_lnum(((typeof CPLAN!=='undefined'&&CPLAN.allocations||[]).filter(function(a){return a&&a.type==='debt'&&!a._ibcDebtStrategy;})[0]||{}).amount);
+    var dr=(typeof _ledgerAssignDebt==='function')?_ledgerAssignDebt(min+Math.max(0,extra-amount)):{ok:true};
+    if(dr&&dr.ok===false)return {ok:false,reason:'debt-cover-blocked',message:dr.message};
+  }
+  var curT=(typeof _budgetAssigned==='function')?_budgetAssigned(S,ym,targetKey):0;
+  if(typeof _budgetAssign==='function')_budgetAssign(targetKey,curT+amount,ym); // fund the overspent envelope
+  if(source.kind==='spending'){ var curS=(typeof _budgetAssigned==='function')?_budgetAssigned(S,ym,source.key):0; if(typeof _budgetAssign==='function')_budgetAssign(source.key,Math.max(0,curS-amount),ym); }
+  else if(source.kind==='future'){ var fa=_lnum(((typeof CPLAN!=='undefined'&&CPLAN.allocations||[]).filter(function(a){return a&&a.type===source.key&&!a._ibcDebtStrategy;})[0]||{}).amount); if(typeof _ledgerAssignFuture==='function')_ledgerAssignFuture(source.key,Math.max(0,fa-amount)); }
+  // kind==='rta' → nothing else (drawn from unallocated income); kind==='debt' already reduced above
+  return {ok:true,source:source.kind,amount:amount};
+}
+
+// ═══════════════════════════════════════════════════
 // PLAN ALIGNMENT CARD — portal-only (CPLAN lives here)
 // ═══════════════════════════════════════════════════
 // Reads CPLAN.allocations + _cpTracking via _cpGetActualContribution to surface
