@@ -2007,6 +2007,11 @@ var L2_CATS = {
   insurance:     ['Health Insurance','Dental','Vision'],
   subscriptions: ['Streaming Services','Software / Apps','Gym / Fitness','Magazines / News','Other Memberships']
 };
+// §1.4: effective category accessors — read user-editable S.categories when present, else the static
+// L1_CATS/L2_CATS defaults (so any state without S.categories is byte-identical). Single read path for
+// every category consumer below; mirrors the engine bundle's _l1Cats (pfos-core v55). Lazy on S.
+function getL1Cats(){ return (S&&S.categories&&Array.isArray(S.categories.l1)&&S.categories.l1.length)?S.categories.l1:L1_CATS; }
+function getL2Cats(){ return (S&&S.categories&&S.categories.l2)?S.categories.l2:L2_CATS; }
 var DEBT_TYPES = ['Credit Card','Student Loan','Auto Loan','Personal Loan','Mortgage','Medical Debt','HELOC','Other'];
 var HH_DESCS = {
   individual: '<strong style="color:var(--wh)">Individual:</strong> Single profile. One set of finances tracked holistically.',
@@ -6151,7 +6156,7 @@ function buildOneActionHTML(){
 function buildTCOLHTML(){
   var c=S.calcs; if(!c||!c.inc) return '';
   var annNorm=0;
-  if(S.expData) L1_CATS.forEach(function(cat){var d=S.expData[cat.key]; if(d&&d.period==='annual') annNorm+=(parseFloat(d.amount)||0)/12;});
+  if(S.expData) getL1Cats().forEach(function(cat){var d=S.expData[cat.key]; if(d&&d.period==='annual') annNorm+=(parseFloat(d.amount)||0)/12;});
   if(c.baseExp<=0) return '';
   return '<div style="padding:10px;background:rgba(249,115,22,.04);border:1px solid rgba(249,115,22,.12);border-radius:2px;margin-top:10px">'
     +'<div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:var(--fh);font-size:11px;font-weight:700;color:var(--or)">True Cost of Living</span><span style="font-family:var(--fd);font-size:18px;color:var(--or)">'+fmt(c.baseExp)+'/mo</span></div>'
@@ -6329,8 +6334,8 @@ function renderHome(){
   // Category budget alerts (80% threshold)
   if(monthEntries.length>0){
     var catTotalsAlert={};
-    monthEntries.forEach(function(e){var bk=e.category||'misc';if(!catTotalsAlert[bk])catTotalsAlert[bk]=0;catTotalsAlert[bk]+=parseFloat(e.amount)||0;});
-    L1_CATS.forEach(function(cat){
+    monthEntries.forEach(function(e){_spendSplitParts(e).forEach(function(p){var bk=p.category||'misc';if(!catTotalsAlert[bk])catTotalsAlert[bk]=0;catTotalsAlert[bk]+=parseFloat(p.amount)||0;});});
+    getL1Cats().forEach(function(cat){
       var spent=catTotalsAlert[cat.key]||0;
       var budget=getMonthlyExp(cat.key);
       if(budget>0&&spent>=budget*0.8&&spent<budget){
@@ -6385,8 +6390,8 @@ function renderHome(){
   }
   // Category Breakdown
   if(monthEntries.length>0){
-    var bucketMap={food:'🍽️ Food',housing:'🏠 Housing',transportation:'🚗 Transport',discretionary:'🎬 Entertainment',subscriptions:'📱 Subscriptions',misc:'📦 Other'};
-    var catTotals={};monthEntries.forEach(function(e){var bk=e.category_bucket||e.category||'misc';if(!catTotals[bk])catTotals[bk]=0;catTotals[bk]+=parseFloat(e.amount)||0;});
+    var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]=(c.icon?c.icon+' ':'')+(c.label||c.key);}); // §1.4: dynamic so custom categories appear in the breakdown
+    var catTotals={};monthEntries.forEach(function(e){_spendSplitParts(e).forEach(function(p){var bk=p.category_bucket||p.category||'misc';if(!catTotals[bk])catTotals[bk]=0;catTotals[bk]+=parseFloat(p.amount)||0;});});
     h+='<div class="sec-group"><div class="sec-group-title">Where Your Money Went</div>';
     Object.keys(bucketMap).forEach(function(bk){
       var spent=catTotals[bk]||0;if(spent<=0)return;
@@ -6477,11 +6482,13 @@ function _acctSpendStatus(){
 
   // Per-category check — flag any category at >50% of budget by middle of month, or
   // any category that has already exceeded its monthly budget.
-  var bucketMap={food:'Food',housing:'Housing',transportation:'Transport',discretionary:'Entertainment',subscriptions:'Subscriptions',misc:'Other',utilities:'Utilities',insurance:'Insurance'};
+  var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]=c.label||c.key;}); // §1.4: dynamic so custom categories are pace-checked
   var catSpend={};
   monthEntries.forEach(function(e){
-    var bk=e.category_bucket||e.category||'misc';
-    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(e.amount)||0);
+    _spendSplitParts(e).forEach(function(p){
+    var bk=p.category_bucket||p.category||'misc';
+    catSpend[bk]=(catSpend[bk]||0)+(parseFloat(p.amount)||0);
+    });
   });
   var categories=[];
   Object.keys(bucketMap).forEach(function(bk){
@@ -6968,6 +6975,9 @@ function qaAutoCategory(desc){var lower=(desc||'').toLowerCase();var sel=documen
 function openQuickAdd(editIdx){
   _qaEditIdx=editIdx!==undefined?editIdx:-1;
   var t=document.getElementById('qaTitle');if(t)t.textContent=_qaEditIdx>=0?'Edit Expense':'Add Expense';
+  // §1.4: populate the category <select> from the effective categories so custom categories are
+  // selectable. Legacy (no S.categories) → the same default options as the static markup.
+  var _qc=document.getElementById('qaCat'); if(_qc){ var _qcv=_qc.value; _qc.innerHTML=getL1Cats().map(function(c){return '<option value="'+c.key+'">'+((c.icon?c.icon+' ':'')+(c.label||c.key))+'</option>';}).join(''); if(_qcv)_qc.value=_qcv; }
   var dateEl=document.getElementById('qaDate');if(dateEl)dateEl.value=new Date().toISOString().split('T')[0];
   ['qaAmount','qaDesc'].forEach(function(id){var e=document.getElementById(id);if(e)e.value='';});
   var cat=document.getElementById('qaCat');if(cat)cat.value='food';
@@ -7047,6 +7057,25 @@ function simplifyCategory(cat){var map={housing:'housing',utilities:'housing',fo
 // Resolve a credit-card debt by STABLE id (splice-safe) so a financed-debt splice elsewhere can't shift the
 // raw card_idx onto the wrong card. Falls back to the index for entries logged before card_id existed.
 function _cardDebt(pd){ if(!pd||!Array.isArray(S.debts))return null; if(pd.card_id!=null){ for(var i=0;i<S.debts.length;i++){ if(S.debts[i]&&S.debts[i].id===pd.card_id)return S.debts[i]; } return null; } return (pd.card_idx!=null)?(S.debts[pd.card_idx]||null):null; }
+// §1.3 transaction splits: expand an entry into its category-attribution PARTS. A split entry
+// (entry.splits=[{category,category_bucket,amount}] whose amounts sum to entry.amount within 1¢)
+// attributes to its parts; everything else — and any invalid/partial split — falls back to the
+// entry's OWN {category, category_bucket, amount}, so NON-SPLIT entries are byte-identical at every
+// call site and the TOTAL across parts always equals the entry amount. Use wherever spend is summed
+// BY category (never for total-spend sums, which must stay on the whole entry amount).
+function _spendSplitParts(e){
+  if(e&&e.splits&&e.splits.length){
+    var amt=parseFloat(e.amount)||0,sum=0;
+    for(var i=0;i<e.splits.length;i++){sum+=parseFloat(e.splits[i].amount)||0;}
+    if(Math.abs(sum-amt)<0.01) return e.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0};});
+  }
+  return [{category:(e?e.category:undefined),category_bucket:(e?e.category_bucket:undefined),amount:(e?(parseFloat(e.amount)||0):0)}];
+}
+// §1.5a free-form tags: canonical normalization (engine is the source of truth — never trust the client).
+// Lowercase, collapse whitespace, strip everything but [a-z0-9 _-] (kills markup + the comma/# separators),
+// dedupe, cap 24 chars/tag and 12 tags/entry. MUST stay byte-identical to the pfos-client _normTags mirror.
+function _normTag(t){ return String(t==null?'':t).trim().toLowerCase().replace(/\s+/g,' ').replace(/[^a-z0-9 _\-]/g,'').slice(0,24).trim(); }
+function _normTags(arr){ var out=[],seen={}; (Array.isArray(arr)?arr:[]).forEach(function(t){ var n=_normTag(t); if(n&&!seen[n]&&out.length<12){seen[n]=1;out.push(n);} }); return out; }
 function _applySpendSideEffects(e){
   if(!e)return; var amt=parseFloat(e.amount)||0; var pd=e.payment_detail||{};
   if(e.payment_method==='credit_card'){ var _cd=_cardDebt(pd); if(_cd)_cd.balance=(parseFloat(_cd.balance)||0)+amt; }
@@ -8808,7 +8837,7 @@ function initExpData(){
   if(!S.expData) S.expData={};
   // Migrate old key names
   if(S.expData.savings&&!S.expData.activeSavings){S.expData.activeSavings=S.expData.savings;delete S.expData.savings;}
-  L1_CATS.forEach(function(c){ if(!S.expData[c.key]) S.expData[c.key]={amount:'',period:'monthly',expanded:false,subs:{},leakTagged:false,essential:true,recurring:true}; });
+  getL1Cats().forEach(function(c){ if(!S.expData[c.key]) S.expData[c.key]={amount:'',period:'monthly',expanded:false,subs:{},leakTagged:false,essential:true,recurring:true}; });
 }
 function getMonthlyExp(key){
   var d=S.expData[key]; if(!d) return 0;
@@ -8936,13 +8965,13 @@ function getHybridJointExpShareMonthly(){
     return t + (monthly * pct / 100);
   }, 0);
 }
-function getTotalMonthlyExp(){ return L1_CATS.reduce(function(t,c){return t+getMonthlyExp(c.key);},0)+getDebtPaymentsAuto()+getInvestContribAuto()+getEduContribAuto()+getInsurancePremiumsAuto()+getHybridJointExpShareMonthly(); }
+function getTotalMonthlyExp(){ return getL1Cats().reduce(function(t,c){return t+getMonthlyExp(c.key);},0)+getDebtPaymentsAuto()+getInvestContribAuto()+getEduContribAuto()+getInsurancePremiumsAuto()+getHybridJointExpShareMonthly(); }
 
 function getFixedBills(){
   // Extract all fixed expenses with due dates for the calendar
   var bills=[];
   initExpData();
-  L1_CATS.forEach(function(cat){
+  getL1Cats().forEach(function(cat){
     var d=S.expData[cat.key];
     if(!d||!d.subs) return;
     Object.keys(d.subs).forEach(function(sk){
@@ -9079,7 +9108,7 @@ function renderExpenses(){
     +'</div>';
   }
 
-  list.innerHTML=L1_CATS.map(function(c){
+  list.innerHTML=getL1Cats().map(function(c){
     var d=S.expData[c.key];
     var mo=getMonthlyExp(c.key);
     // Hybrid: include this user's share of joint subs in the category header
@@ -9098,7 +9127,7 @@ function renderExpenses(){
       });
     }
     var leaked=d.leakTagged;
-    var hasSubs=L2_CATS[c.key]&&L2_CATS[c.key].length>0;
+    var hasSubs=getL2Cats()[c.key]&&getL2Cats()[c.key].length>0;
     var subHtml='';
 
     if(d.expanded){
@@ -9106,7 +9135,7 @@ function renderExpenses(){
 
       // Render predefined subcategories
       if(hasSubs){
-        L2_CATS[c.key].forEach(function(sub){
+        getL2Cats()[c.key].forEach(function(sub){
           var sk=c.key+'__'+sub.replace(/[\s\/\-]+/g,'_').toLowerCase();
           var sd=d.subs[sk]||{amount:'',period:'monthly',is_fixed:false,due_day:'',notes:''};
           subHtml+=subRow(c.key,sk,sub,sd,false);
@@ -9127,7 +9156,7 @@ function renderExpenses(){
         // Skip predefined sub keys and their duplicates (already rendered above)
         if(hasSubs){
           var isPredefined=false;
-          L2_CATS[c.key].forEach(function(sub){
+          getL2Cats()[c.key].forEach(function(sub){
             var predKey=c.key+'__'+sub.replace(/[\s\/\-]+/g,'_').toLowerCase();
             if(sk===predKey||sk.indexOf(predKey+'__dup_')===0) isPredefined=true;
           });
@@ -9170,7 +9199,7 @@ function renderExpenses(){
           if(!je || je.categoryKey !== c.key) return;
           // Skip if this label is already rendered (via predefined L2 path
           // or via a custom personal entry that happens to share the label)
-          var inL2 = L2_CATS[c.key] && L2_CATS[c.key].indexOf(je.subcatName) >= 0;
+          var inL2 = getL2Cats()[c.key] && getL2Cats()[c.key].indexOf(je.subcatName) >= 0;
           if(inL2) return;// already handled in the predefined loop
           var hasPersonalMatch = false;
           if(d.subs) Object.keys(d.subs).forEach(function(psk){
@@ -9270,7 +9299,7 @@ function renderHybridExpenseBreakdown(){
   // Personal categorized expenses (everything in S.expData + personal debt
   // minimums + personal investment contribs + edu + insurance — same as
   // getTotalMonthlyExp but split out)
-  var catTotal = L1_CATS.reduce(function(t,c){return t+getMonthlyExp(c.key);},0);
+  var catTotal = getL1Cats().reduce(function(t,c){return t+getMonthlyExp(c.key);},0);
   // Joint outflows weighted by user's share. We use the SAME debt-type
   // filter as getDebtPaymentsAuto (Mortgage and Auto Loan excluded — those
   // are handled by Protection panel premium fields), so personalDebt =
@@ -11280,7 +11309,7 @@ function renderTCOL(){
   var c=S.calcs; if(!c||!c.inc) return;
   var el=document.getElementById('tcolBox'); if(!el) return;
   var annNorm=0;
-  if(S.expData) L1_CATS.forEach(function(cat){var d=S.expData[cat.key]; if(d&&d.period==='annual') annNorm+=(parseFloat(d.amount)||0)/12;});
+  if(S.expData) getL1Cats().forEach(function(cat){var d=S.expData[cat.key]; if(d&&d.period==='annual') annNorm+=(parseFloat(d.amount)||0)/12;});
   el.innerHTML='<div class="rbox-title">True Cost of Living Analysis</div>'
     +'<div class="rbox-row"><span class="rbox-key">Monthly Pure Expenses</span><span class="rbox-val">'+fmt(c.baseExp-annNorm)+'</span></div>'
     +'<div class="rbox-row"><span class="rbox-key">Annual Items (÷12)</span><span class="rbox-val accent">+'+fmt(annNorm)+'</span></div>'
@@ -11355,14 +11384,19 @@ function renderBehavioralFinance(){
   // Spending Trigger Identification
   if(S.expData&&c.baseExp>0){
     var triggers=[];
-    var discretionary=['food','entertainment','personal','subscriptions','pets'];
+    // §1.4b: category-dynamic disc/ess split — a category is discretionary if its expData explicitly marks it
+    // non-essential (d.essential===false), else it falls to the default discretionary keyset (now correctly
+    // INCLUDING the 'discretionary' key itself — the prior hardcoded array misclassified it as essential). This
+    // makes CUSTOM categories participate (via their essential flag) while keeping unflagged defaults sensible.
+    var _discDefault={food:1,entertainment:1,personal:1,subscriptions:1,pets:1,discretionary:1};
     var discTotal=0,essTotal=0;
     var catAmts=[];
-    L1_CATS.forEach(function(cat){
+    getL1Cats().forEach(function(cat){
       var d=S.expData[cat.key];if(!d)return;
       var amt=getMonthlyExp(cat.key);if(amt<=0)return;
       catAmts.push({key:cat.key,label:cat.label,amt:amt,leak:d.leakTagged,essential:d.essential!==false});
-      if(discretionary.indexOf(cat.key)>=0) discTotal+=amt; else essTotal+=amt;
+      var isDisc=(d.essential===false)||(d.essential!==true&&_discDefault[cat.key]===1); // explicit flag wins; else default keyset
+      if(isDisc) discTotal+=amt; else essTotal+=amt;
     });
     catAmts.sort(function(a,b){return b.amt-a.amt;});
     // Trigger: discretionary > 35% of total
@@ -13971,7 +14005,7 @@ function captureSnapshot(){
   var c=S.calcs;if(!c||!c.inc){_pmToast('Enter financial data first.');return;}
   var now=new Date();
   var expBreak={};
-  L1_CATS.forEach(function(cat){expBreak[cat.key]=Math.round(getMonthlyExp(cat.key));});
+  getL1Cats().forEach(function(cat){expBreak[cat.key]=Math.round(getMonthlyExp(cat.key));});
   var snap={
     date:now.toISOString(),
     month:now.getMonth(),
@@ -14176,7 +14210,7 @@ function buildTrackingHTML(){
   // ── FULL MONEY FLOW — WHERE EVERY DOLLAR GOES ──
   var catColors=['#5B9BFF','#22C55E','#F97316','#EF4444','#A855F7','#EAB308','#EC4899','#14B8A6','#6366F1','#64748B'];
   var expData=[];
-  L1_CATS.forEach(function(cat,i){var amt=Math.round(getMonthlyExp(cat.key));if(amt>0)expData.push({l:cat.icon+' '+cat.label,v:amt,c:catColors[i%catColors.length]});});
+  getL1Cats().forEach(function(cat,i){var amt=Math.round(getMonthlyExp(cat.key));if(amt>0)expData.push({l:cat.icon+' '+cat.label,v:amt,c:catColors[i%catColors.length]});});
   var planAllocs=S._planAllocations||[];
   var planTotal=S._planDeployed||0;
   var totalOut=(c.baseExp||0)+planTotal;
@@ -15043,6 +15077,13 @@ function submitAdvisorRequestFromModal(){
           created_at:entry.created_at||new Date().toISOString(),
           _source:entry._source||'portal'
         };
+        // §1.3: persist a validated split array (Σ amount === entry.amount within 1¢) if present.
+        if(Array.isArray(entry.splits)&&entry.splits.length){
+          var _qsum=0; for(var _qsi=0;_qsi<entry.splits.length;_qsi++){_qsum+=parseFloat(entry.splits[_qsi].amount)||0;}
+          if(Math.abs(_qsum-(parseFloat(normalized.amount)||0))<0.01) normalized.splits=entry.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0,note:s.note||''};});
+        }
+        // §1.5a: persist normalized free-form tags — only when present, so a no-tag entry stays byte-identical.
+        var _qt=_normTags(entry.tags); if(_qt.length)normalized.tags=_qt;
         // Side effects matching saveSpendingEntry — keeps the portal path at full parity
         // with the pfos-main quickAddModal path.
         // 1) credit_card → increment the chosen card's balance
@@ -15162,6 +15203,15 @@ function submitAdvisorRequestFromModal(){
         if(_methodChanged)_applySpendSideEffects(_cur);
         else if(_newAmt!==_oldAmt)_adjustSpendSideEffects(_cur,_oldAmt,_newAmt);
         if(_wasPlaid){ _cur._source='plaid'; if(_catChanged)_cur._userCat=true; } // never let an edit strip the linked identity
+        // §1.3: accept a validated splits array (Σ==amount) or clear it; and drop any splits left
+        // stale by an amount change, so an entry never carries splits that don't sum to its amount.
+        if(_ed.splits!==undefined){
+          if(Array.isArray(_ed.splits)&&_ed.splits.length){ var _es=0; for(var _esi=0;_esi<_ed.splits.length;_esi++){_es+=parseFloat(_ed.splits[_esi].amount)||0;} if(Math.abs(_es-(parseFloat(_cur.amount)||0))<0.01) _cur.splits=_ed.splits.map(function(s){return {category:s.category,category_bucket:s.category_bucket||s.category,amount:parseFloat(s.amount)||0,note:s.note||''};}); else delete _cur.splits; }
+          else delete _cur.splits;
+        }
+        if(_cur.splits&&_cur.splits.length){ var _cs=0;for(var _ci=0;_ci<_cur.splits.length;_ci++){_cs+=parseFloat(_cur.splits[_ci].amount)||0;} if(Math.abs(_cs-(parseFloat(_cur.amount)||0))>=0.01)delete _cur.splits; }
+        // §1.5a: set/clear normalized tags. undefined → leave as-is; [] (or all-invalid) → clear the field.
+        if(_ed.tags!==undefined){ var _et2=_normTags(_ed.tags); if(_et2.length)_cur.tags=_et2; else delete _cur.tags; }
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
         try{if(typeof calc==='function')calc();}catch(e){}
@@ -15169,6 +15219,199 @@ function submitAdvisorRequestFromModal(){
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
         else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
       }catch(e){console.warn('PFOS_EDIT_ENTRY:',e);}
+      return;
+    }
+    // ── PFOS_BULK_ENTRY (§1.2) ──
+    // Apply an array of register bulk ops to S.spendingEntries in ONE calc()+_doSync cycle (vs N
+    // PFOS_EDIT/DELETE round-trips). Mirrors the canonical single handlers: 'recategorize' = a
+    // category-only edit (stamps _userCat on linked rows so the next plaid re-sync keeps it,
+    // exactly like PFOS_EDIT_ENTRY); 'delete' = reverse side effects then remove (like
+    // PFOS_DELETE_ENTRY). The shell performs any server-side edge writes (plaid-txn-edit
+    // recategorize/exclude) BEFORE posting this, so the handler only touches local state.
+    if(msg.type==='PFOS_BULK_ENTRY'){
+      try{
+        var _bops=msg.ops; if(!Array.isArray(_bops)||!_bops.length)return;
+        if(!Array.isArray(S.spendingEntries))return;
+        var _bIdx={}; for(var _bi=0;_bi<S.spendingEntries.length;_bi++){ var _be=S.spendingEntries[_bi]; if(_be)_bIdx[String(_be.id)]=_be; }
+        var _bDel={}, _bChanged=false, _bNeedCalc=false;
+        _bops.forEach(function(op){
+          if(!op||op.id==null)return;
+          var ent=_bIdx[String(op.id)]; if(!ent)return; // unknown id — skip, no spurious save
+          if(op.op==='recategorize'){
+            if(op.value==null||op.value==='')return;
+            var _wp=!!ent._plaidTxnId, _cc=(ent.category!==op.value);
+            ent.category=op.value;
+            if(typeof simplifyCategory==='function'){try{ent.category_bucket=simplifyCategory(op.value);}catch(_se){}}
+            if(_wp&&_cc)ent._userCat=true; // linked recategorize must survive the next plaid re-sync (Chunk 5)
+            _bChanged=true; _bNeedCalc=true;
+          } else if(op.op==='delete'){
+            _reverseSpendSideEffects(ent); // no-op for linked (debit/no detail); reverses card/financed/EF/policy for manual
+            _bDel[String(op.id)]=true;
+            _bChanged=true; _bNeedCalc=true;
+          } else if(op.op==='addTags'||op.op==='removeTags'){
+            // §1.5a tag-only op — pure attribution; computeCalcs never reads tags, so NO calc() needed.
+            var _tv=_normTags(Array.isArray(op.value)?op.value:[op.value]); if(!_tv.length)return;
+            var _cu=_normTags(ent.tags);
+            if(op.op==='addTags'){ _tv.forEach(function(t){ if(_cu.indexOf(t)<0&&_cu.length<12)_cu.push(t); }); }
+            else { _cu=_cu.filter(function(t){return _tv.indexOf(t)<0;}); }
+            if(_cu.length)ent.tags=_cu; else delete ent.tags;
+            _bChanged=true;
+          } else if(op.op==='approve'||op.op==='unapprove'){
+            // §1.6a review queue — pure attribution flag (computeCalcs never reads _reviewed), so NO calc().
+            // Survives Plaid re-sync: _plaidApplyToState's update path only overwrites _ofields, never _reviewed.
+            if(op.op==='approve')ent._reviewed=true; else delete ent._reviewed;
+            _bChanged=true;
+          } else if(op.op==='clear'||op.op==='unclear'){
+            // §1.6b reconciliation cleared mark — pure attribution (NO calc; survives re-sync like _reviewed).
+            if(op.op==='clear')ent._cleared=true; else delete ent._cleared;
+            _bChanged=true;
+          }
+        });
+        if(Object.keys(_bDel).length){ S.spendingEntries=S.spendingEntries.filter(function(e){return !(e&&_bDel[String(e.id)]);}); }
+        if(!_bChanged)return; // nothing matched — no spurious save
+        if(!S._touched)S._touched={};
+        S._touched.spendingEntries=true;
+        if(_bNeedCalc){try{if(typeof calc==='function')calc();}catch(e){}} // tag-only batch skips the metric recompute
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+        else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+      }catch(e){console.warn('PFOS_BULK_ENTRY:',e);}
+      return;
+    }
+    // ── PFOS_RECONCILE (§1.6b) ──
+    // Snapshot cash-flow reconcile: record a verified-balance baseline S.reconcile={balance,date} the client
+    // compares later activity against, and mark every spending entry _cleared (the period up to now is now
+    // reconciled; new synced/manual entries arrive uncleared = "since last reconcile"). PURE ATTRIBUTION —
+    // S.reconcile + _cleared are never read by computeCalcs, so NO calc(). _cleared survives re-sync because
+    // _plaidApplyToState's update path only overwrites _ofields.
+    if(msg.type==='PFOS_RECONCILE'){
+      try{
+        var _rc=msg.reconcile; if(!_rc||_rc.balance==null||isNaN(parseFloat(_rc.balance)))return;
+        S.reconcile={balance:parseFloat(_rc.balance)||0, date:String(_rc.date||new Date().toISOString().slice(0,10)).slice(0,10)};
+        if(Array.isArray(S.spendingEntries))S.spendingEntries.forEach(function(e){ if(e)e._cleared=true; });
+        if(!S._touched)S._touched={};
+        S._touched.reconcile=true; S._touched.spendingEntries=true;
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+        else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+      }catch(e){console.warn('PFOS_RECONCILE:',e);}
+      return;
+    }
+    // ── PFOS_BUDGET_ASSIGN (§1.7a) ──
+    // Writes per-month envelope assignments into the unified-budget ledger
+    // S.budget.months['YYYY-MM'].assigned[catKey]=amt — the DISPLAY-LAYER "give every
+    // dollar a job" envelope state. S.budget is NOT a field of the engine's
+    // FinancialState and is NEVER read by computeCalcs/calc() (metric guard 5b), so —
+    // exactly like PFOS_RECONCILE / PFOS_WRITE_RECS — this runs NO calc(): set state →
+    // _touched.budget → debounced _doSync (the shell owns the budget surface; the engine
+    // only stores + flushes it so the parent's section-merge carries it back).
+    // LAZY-INIT: untouched users have no S.budget (byte-identical) — it is created only
+    // on the first real assignment; a no-op message (no assigned/settings) never creates
+    // it. msg.assigned {catKey:amt}: amt>0 sets (rounded to cents); amt<=0/invalid DELETES
+    // the key (an unset envelope leaves no zero residue → assign-then-clear returns to a
+    // clean state) and an emptied month is pruned. msg.settings merges a sanitized
+    // whitelist (style/rolloverDefault/firstMonth). msg.month defaults to the current month.
+    if(msg.type==='PFOS_BUDGET_ASSIGN'){
+      try{
+        var _bHasA=msg.assigned&&typeof msg.assigned==='object';
+        var _bHasSet=msg.settings&&typeof msg.settings==='object';
+        var _bHasT=msg.targets&&typeof msg.targets==='object'; // §1.8b funding targets
+        var _bHasI=msg.incomeStreams&&typeof msg.incomeStreams==='object'; // §2.4c income-source confirmation
+        if(!_bHasA&&!_bHasSet&&!_bHasT&&!_bHasI)return; // nothing to write — never create S.budget on a no-op (untouched users stay byte-identical)
+        var _bNow=new Date().toISOString().slice(0,7);
+        var _bm=(typeof msg.month==='string'&&/^\d{4}-\d{2}$/.test(msg.month))?msg.month:_bNow;
+        if(!S.budget||typeof S.budget!=='object')S.budget={settings:{style:'flexible',rolloverDefault:false,firstMonth:_bNow},months:{}};
+        if(!S.budget.settings||typeof S.budget.settings!=='object')S.budget.settings={style:'flexible',rolloverDefault:false,firstMonth:_bNow};
+        if(!S.budget.months||typeof S.budget.months!=='object')S.budget.months={};
+        if(_bHasSet){
+          if(msg.settings.style==='flexible'||msg.settings.style==='envelope'||msg.settings.style==='auto')S.budget.settings.style=msg.settings.style;
+          if(typeof msg.settings.rolloverDefault==='boolean')S.budget.settings.rolloverDefault=msg.settings.rolloverDefault;
+          if(typeof msg.settings.firstMonth==='string'&&/^\d{4}-\d{2}$/.test(msg.settings.firstMonth)&&msg.settings.firstMonth<=_bNow)S.budget.settings.firstMonth=msg.settings.firstMonth; // §1.8a: never a FUTURE start (would zero all carry)
+          // §1.8a per-category rollover override map {catKey:bool}; null clears an override (→ rolloverDefault).
+          if(msg.settings.rolloverCats&&typeof msg.settings.rolloverCats==='object'){
+            if(!S.budget.settings.rolloverCats||typeof S.budget.settings.rolloverCats!=='object')S.budget.settings.rolloverCats={};
+            Object.keys(msg.settings.rolloverCats).forEach(function(k){ if(!k)return; var v=msg.settings.rolloverCats[k]; if(v===null){delete S.budget.settings.rolloverCats[k];} else if(typeof v==='boolean'){S.budget.settings.rolloverCats[k]=v;} });
+          }
+        }
+        if(_bHasA){
+          var _mo=S.budget.months[_bm]; if(!_mo||typeof _mo!=='object'){_mo={assigned:{},rolloverIn:{}};S.budget.months[_bm]=_mo;}
+          if(!_mo.assigned||typeof _mo.assigned!=='object')_mo.assigned={};
+          if(!_mo.rolloverIn||typeof _mo.rolloverIn!=='object')_mo.rolloverIn={};
+          Object.keys(msg.assigned).forEach(function(k){ if(!k)return; var v=parseFloat(msg.assigned[k]); if(!isFinite(v)||v<=0){ delete _mo.assigned[k]; } else { _mo.assigned[k]=Math.round(v*100)/100; } });
+          if(!Object.keys(_mo.assigned).length&&!Object.keys(_mo.rolloverIn).length)delete S.budget.months[_bm];
+        }
+        if(_bHasT){
+          // §1.8b funding targets: S.budget.targets[catKey]={type:'monthly'|'refill'|'by_date', amount, byDate?, pinned}.
+          // Sanitized whitelist (type / amount>=0 / byDate / pinned bool); null clears a category's target. Display-
+          // layer/advisory only — NEVER read by computeCalcs (metric guard 5b), so no calc() (like assigned/settings).
+          if(!S.budget.targets||typeof S.budget.targets!=='object')S.budget.targets={};
+          Object.keys(msg.targets).forEach(function(k){ if(!k)return; var t=msg.targets[k];
+            if(t===null){ delete S.budget.targets[k]; return; }
+            if(typeof t!=='object')return;
+            var _tt=(t.type==='monthly'||t.type==='refill'||t.type==='by_date')?t.type:'monthly';
+            var _ta=parseFloat(String(t.amount==null?'':t.amount).replace(/,/g,'')); if(!isFinite(_ta)||_ta<0)_ta=0; // strip commas to match the shell mirror's _lnum (5c byte-parity)
+            var _trec={type:_tt, amount:Math.round(_ta*100)/100, pinned:t.pinned===true};
+            if(_tt==='by_date'&&typeof t.byDate==='string'&&/^\d{4}-\d{2}(-\d{2})?$/.test(t.byDate))_trec.byDate=t.byDate;
+            S.budget.targets[k]=_trec;
+          });
+        }
+        if(_bHasI){
+          // §2.4c income-source confirmation: S.budget.incomeStreams[streamKey]=bool — which linked DEPOSITS
+          // the user confirmed (or excluded) as income for the Reports cash-flow. {key:bool} sets, null clears
+          // (→ the stream's suggested default). Display-layer/advisory; NEVER read by computeCalcs (5b) → no calc().
+          if(!S.budget.incomeStreams||typeof S.budget.incomeStreams!=='object')S.budget.incomeStreams={};
+          Object.keys(msg.incomeStreams).forEach(function(k){ if(!k)return; var v=msg.incomeStreams[k]; if(v===null){delete S.budget.incomeStreams[k];} else if(typeof v==='boolean'){S.budget.incomeStreams[k]=v;} });
+        }
+        if(!S._touched)S._touched={};
+        S._touched.budget=true;
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+      }catch(e){console.warn('PFOS_BUDGET_ASSIGN:',e);}
+      return;
+    }
+    // ── PFOS_EDIT_CATEGORIES (§1.4) ──
+    // Sets the user-editable category taxonomy S.categories={l1:[{key,label,icon,sub}],l2:{...}}.
+    // l1 holds EDITABLE EXPENSE categories only (never activeSavings — the engine excludes it from
+    // baseExp). The 8 engine default keys are PERMANENT: any default key omitted from the incoming
+    // l1 is re-added (rename/reorder only), so a default category can never disappear (keeps deApply /
+    // PFOS_WRITE_EXP_BUDGET / every ||'misc' fallback valid). msg.remap {oldKey:newKey} merges a
+    // removed CUSTOM category into another: its budget folds into the target and its spending entries
+    // (incl. splits) are recategorized, so no budget/attribution is ever orphaned. Then re-seed
+    // expData + calc (categories feed baseExp via initExpData + getTotalMonthlyExp).
+    if(msg.type==='PFOS_EDIT_CATEGORIES'){
+      try{
+        var _nc=msg.categories; if(!_nc||!Array.isArray(_nc.l1))return;
+        var _seen={}, _l1=[];
+        // §1.4-S5: sanitize user-supplied label/icon (strip <>, clamp length) so a malicious category
+        // name can never inject markup into any innerHTML sink — including the cross-user advisor profile
+        // view, which renders this client-controlled taxonomy. Keys are slug-safe already.
+        var _sanLbl=function(s){return String(s==null?'':s).replace(/[<>]/g,'').slice(0,40);};
+        var _sanIco=function(s){return String(s==null?'':s).replace(/[<>]/g,'').slice(0,8)||'📦';};
+        _nc.l1.forEach(function(c){ if(!c||!c.key)return; var k=String(c.key); if(_seen[k]||k==='activeSavings')return; _seen[k]=1; _l1.push({key:k,label:_sanLbl(c.label||k),icon:_sanIco(c.icon),sub:c.sub||''}); });
+        L1_CATS.forEach(function(dc){ if(!_seen[dc.key]){ _l1.push({key:dc.key,label:dc.label,icon:dc.icon,sub:dc.sub}); _seen[dc.key]=1; } }); // defaults are permanent
+        var _remap=msg.remap||{};
+        Object.keys(_remap).forEach(function(from){ var to=_remap[from]; if(!to||from===to||!_seen[to])return;
+          if(Array.isArray(S.spendingEntries)) S.spendingEntries.forEach(function(e){
+            if(e&&e.category===from){ e.category=to; if(typeof simplifyCategory==='function')e.category_bucket=simplifyCategory(to); }
+            if(e&&Array.isArray(e.splits)) e.splits.forEach(function(s){ if(s&&s.category===from){ s.category=to; if(typeof simplifyCategory==='function')s.category_bucket=simplifyCategory(to); } });
+          });
+          if(S.expData&&S.expData[from]){ if(!S.expData[to])S.expData[to]={amount:'',period:'monthly',expanded:false,subs:{},leakTagged:false,essential:true,recurring:true};
+            // §1.4-S5: fold the removed category's TRUE monthly budget via getMonthlyExp (honors .total
+            // override > subs-sum > amount, normalizes annual→monthly) into the target as a .total override.
+            // The old code read only .amount, so a budget held in .total/.subs was silently orphaned and an
+            // annual .amount was 12x-inflated. getMonthlyExp(to) preserves the target's own existing budget.
+            var _fromMo=(typeof getMonthlyExp==='function')?(getMonthlyExp(from)||0):(parseFloat(S.expData[from].amount)||0);
+            if(_fromMo>0){ var _toMo=(typeof getMonthlyExp==='function')?(getMonthlyExp(to)||0):(parseFloat(S.expData[to].amount)||0); S.expData[to].total=String(_toMo+_fromMo); }
+            delete S.expData[from]; }
+        });
+        S.categories={l1:_l1, l2:(_nc.l2&&typeof _nc.l2==='object')?_nc.l2:((S.categories&&S.categories.l2)||{})};
+        if(!S._touched)S._touched={};
+        S._touched.categories=true; S._touched.expData=true; S._touched.spendingEntries=true;
+        try{if(typeof initExpData==='function')initExpData();}catch(e){}
+        try{if(typeof calc==='function')calc();}catch(e){}
+        clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+        if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+        else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+      }catch(e){console.warn('PFOS_EDIT_CATEGORIES:',e);}
       return;
     }
     // ── PFOS_WRITE_EXP_BUDGET ──
@@ -15610,6 +15853,11 @@ function submitAdvisorRequestFromModal(){
       S._spouseAnnualGross=null;S._spouseAnnualPretax=null;S._spouseTaxUpdatedAt=null;
       S._jointItems={incomeSources:[],retAccounts:[],investments:[],debts:[],goals:[],linkedCash:[],spendingEntries:[]};// Phase 4 — reset on client switch (linkedCash for hybrid shared cash, Chunk 13; spendingEntries Chunk 8)
       S.profile=null;S.snapshot=null;S.visitedPanels=[];
+      // M1 budget_v2: clear unified-budget state on client switch so it never bleeds across
+      // a client/partner switch. DELETE (not default) — keeps the keys ABSENT for users who
+      // have none, so their saved financial_data.S is byte-identical (no metric divergence).
+      // Object.assign below restores them from msg.state only when the row actually has them.
+      delete S.budget;delete S.categories;delete S.reconcile; // §1.6b reconcile baseline — DELETE (not default) so absent users stay byte-identical
       // ── Clear all DOM inputs ──
       ['cpFirstName','cpLastName','cpEmail','cpPhone','cpDOB','cpSpouse','cpChildren',
        'cpOccupation','cpEmployer','cpEmploymentType','cpState','cpHealthStatus',
@@ -27085,7 +27333,7 @@ function populateFromState(){
 </script>
 <!-- PFOS canonical engine (single source of truth). Loaded for SHADOW MODE:
      computes calcs alongside calc() and logs parity diffs; changes nothing rendered. -->
-<script src="/pfos-core.v54.js" defer></script>
+<script src="/pfos-core.v55.js" defer></script>
 <script src="/pfos-walkthrough/pfos-walkthrough.js" defer></script>
 <script>
 // Listen for theme changes from parent page
