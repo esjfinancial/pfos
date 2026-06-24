@@ -2971,6 +2971,40 @@ function _cpHoldingsByType(holdings){
   (holdings||[]).forEach(function(h){ if(!h)return; var t=((h.type==null?'':String(h.type)).toLowerCase())||'other'; by[t]=(by[t]||0)+(parseFloat(h.value)||0); });
   return Object.keys(by).map(function(t){ return {l:_cpEscHtml(_acLabel(t)),v:by[t],c:_acColor(t)}; }).filter(function(d){return d.v>0;}).sort(function(a,b){return b.v-a.v;}); // escape label here: _portalSvgDonut's legend injects d.l raw
 }
+// §2.2b PURE: portfolio performance / returns from the §2.1 holdings (Plaid cost_basis = TOTAL contributed).
+// Return-bearing only — EXCLUDE cash (no return) and holdings with no/zero cost basis (return unknowable),
+// tallied aside. TOTAL return = dollar-weighted Σgain/Σcontributed ("the portfolio is up X%"); AVERAGE return
+// = equal-weighted mean of per-holding % ("the average position is up Y%"). Crypto INCLUDED (it IS the portfolio).
+// `dataSuspect` flags implausible cost basis (e.g. Plaid SANDBOX placeholders → 1,000%+ returns) so we caveat
+// rather than present nonsense as fact. No time-annualized (CAGR) return — Plaid holdings carry no purchase date.
+function _cpPortfolioPerf(holdings){
+  var valid=[], cashVal=0, noBasis=0;
+  (holdings||[]).forEach(function(x){ if(!x)return;
+    if(String(x.type||'').toLowerCase()==='cash'){ cashVal+=(x.value||0); return; }
+    if(x.costBasis==null||!(x.costBasis>0)){ noBasis++; return; }
+    valid.push(x); });
+  if(!valid.length) return { hasData:false, cashValue:Math.round(cashVal), noBasisCount:noBasis };
+  var contributed=valid.reduce(function(t,x){ return t+x.costBasis; },0);
+  var value=valid.reduce(function(t,x){ return t+(x.value||0); },0);
+  var gain=value-contributed, totalReturnPct=(contributed>0)?(gain/contributed*100):null;
+  var pcts=valid.map(function(x){ return (x.gainLossPct!=null)?x.gainLossPct:((x.value-x.costBasis)/x.costBasis*100); });
+  var avgReturnPct=pcts.reduce(function(a,b){return a+b;},0)/pcts.length;
+  var winners=0, losers=0; valid.forEach(function(x){ var g=(x.value||0)-x.costBasis; if(g>0)winners++; else if(g<0)losers++; });
+  var sorted=valid.slice().sort(function(a,b){ return (b.gainLossPct||0)-(a.gainLossPct||0); });
+  var best=sorted[0], worst=sorted[sorted.length-1];
+  return { hasData:true, count:valid.length, contributed:Math.round(contributed), value:Math.round(value), gain:Math.round(gain),
+    totalReturnPct:totalReturnPct, avgReturnPct:avgReturnPct, winners:winners, losers:losers,
+    best:{name:(best.ticker||best.name||'—'),pct:best.gainLossPct}, worst:{name:(worst.ticker||worst.name||'—'),pct:worst.gainLossPct},
+    cashValue:Math.round(cashVal), noBasisCount:noBasis,
+    // suspect if ANY view is implausible — the size-weighted total is the LEAST corrupted by a placeholder cost
+    // basis, so also check the equal-weighted average AND any single position (else a $1-basis holding shows a
+    // six-figure "Avg Holding Return"/"Best" with no warning — the exact sandbox/partial-data case this flags).
+    dataSuspect:((totalReturnPct!=null&&totalReturnPct>1000)||avgReturnPct>1000||pcts.some(function(p){return p>1000;})) };
+}
+// Format a return %: implausible magnitudes (|pct|>1000, a 10x+ return — almost always a placeholder/partial
+// cost basis, e.g. Plaid sandbox) render as ">±1,000%" instead of an absurd literal (+114,768%). Shared by the
+// performance card, the headline tile, and the per-holding table so all three never contradict each other.
+function _cpFmtRetPct(pct){ if(pct==null||!isFinite(pct)) return '—'; if(Math.abs(pct)>1000) return (pct>0?'>+1,000%':'<−1,000%'); return (pct>=0?'+':'')+pct.toFixed(1)+'%'; }
 function renderPortfolioView(){
   var el=document.getElementById('portfolioView'); if(!el) return;
   var ev=_cpEscHtml; // single-source escaper (§2.2)
@@ -2988,21 +3022,38 @@ function renderPortfolioView(){
     var totalAll=_cpHoldingsValue(holdings,true);
     var totalExCrypto=_cpHoldingsValue(holdings,false);
     var cryptoVal=totalAll-totalExCrypto;
-    var totalCost=holdings.reduce(function(t,x){ return t+((x&&x.costBasis!=null)?x.costBasis:0); },0);
-    var costKnown=holdings.some(function(x){return x&&x.costBasis!=null;});
-    var totGain=costKnown?holdings.reduce(function(t,x){ return t+((x&&x.costBasis!=null)?(x.value-x.costBasis):0); },0):null;
-    var totGainPct=(costKnown&&totalCost>0)?(totGain/totalCost*100):null;
+    var perf=_cpPortfolioPerf(holdings); // §2.2b return-bearing aggregate (excludes cash + no-basis so a placeholder cost basis can't corrupt the headline)
     var accts={}; holdings.forEach(function(x){ if(x&&x.accountId)accts[x.accountId]=1; });
     h+='<div class="info-card" style="padding:14px;margin-bottom:12px">';
     h+='<div class="stat-grid" style="gap:6px;margin-bottom:0">'; // responsive 4→2→1 cols via the app's media queries
     h+=statTile(fmtK(totalAll),'Portfolio Value','#5B9BFF');
     h+=statTile(String(holdings.length),'Holdings','var(--mu)');
     h+=statTile(String(Object.keys(accts).length||'—'),'Accounts','var(--mu)');
-    if(totGain==null){ h+=statTile('—','Gain / Loss','var(--mu)'); }
-    else { h+=statTile((totGain>=0?'+':'')+fmtK(totGain)+(totGainPct!=null?' ('+(totGainPct>=0?'+':'')+totGainPct.toFixed(1)+'%)':''),'Unrealized Gain / Loss',totGain>=0?'var(--gr)':'var(--rd)'); }
+    if(!perf.hasData){ h+=statTile('—','Gain / Loss','var(--mu)'); }
+    else { h+=statTile((perf.gain>=0?'+':'')+fmtK(perf.gain)+(perf.totalReturnPct!=null?' ('+_cpFmtRetPct(perf.totalReturnPct)+')':''),'Unrealized Gain / Loss',perf.gain>=0?'var(--gr)':'var(--rd)'); }
     h+='</div>';
     if(cryptoVal>0){ h+='<div style="font-size:11px;color:var(--mu);margin-top:8px">Includes '+fmt(Math.round(cryptoVal))+' crypto · net-worth value excl. crypto: '+fmt(Math.round(totalExCrypto))+'</div>'; }
     h+='</div>';
+    // ── §2.2b Performance: contributed vs gained + total (size-weighted) and average (per-holding) return ──
+    if(perf.hasData){
+      var _pos=(perf.gain>=0), _base=Math.max(perf.contributed,perf.value)||1;
+      var _w1=(_pos?perf.contributed:perf.value)/_base*100, _w2=Math.abs(perf.gain)/_base*100;
+      h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Performance</div>';
+      h+='<div style="height:9px;border-radius:3px;overflow:hidden;display:flex;background:var(--bd)"><div style="width:'+_w1.toFixed(1)+'%;background:#5B9BFF"></div><div style="width:'+_w2.toFixed(1)+'%;background:'+(_pos?'#22C55E':'#EF4444')+'"></div></div>';
+      h+='<div style="display:flex;justify-content:space-between;font-size:11px;margin-top:4px"><span style="color:var(--mu)">Invested '+fmt(perf.contributed)+'</span><span style="color:'+(_pos?'var(--gr)':'var(--rd)')+'">'+(_pos?'+':'−')+fmt(Math.abs(perf.gain))+' '+(_pos?'gain':'loss')+'</span><span style="color:var(--wh)">Now '+fmt(perf.value)+'</span></div>';
+      h+='<div class="stat-grid" style="gap:6px;margin-top:10px;margin-bottom:0">';
+      h+=statTile(_cpFmtRetPct(perf.totalReturnPct),'Total Return',perf.totalReturnPct==null?'var(--mu)':(perf.totalReturnPct>=0?'var(--gr)':'var(--rd)'));
+      h+=statTile(_cpFmtRetPct(perf.avgReturnPct),'Avg Holding Return',perf.avgReturnPct>=0?'var(--gr)':'var(--rd)');
+      h+=statTile(perf.winners+' / '+perf.losers,'Winners / Losers','var(--mu)');
+      h+='</div>';
+      var _ex='Total return = gain ÷ invested (weighted by position size). Avg holding return = the simple average across your '+perf.count+' position'+(perf.count>1?'s':'')+'.';
+      if(perf.best&&perf.best.pct!=null&&perf.worst&&perf.worst.pct!=null&&perf.count>1){ _ex+=' Best '+ev(perf.best.name)+' '+_cpFmtRetPct(perf.best.pct)+', worst '+ev(perf.worst.name)+' '+_cpFmtRetPct(perf.worst.pct)+'.'; }
+      if(perf.noBasisCount>0){ _ex+=' '+perf.noBasisCount+' holding'+(perf.noBasisCount>1?'s':'')+' excluded (no cost basis).'; }
+      if(perf.cashValue>0){ _ex+=' Cash '+fmt(perf.cashValue)+' excluded from returns.'; }
+      h+='<div style="font-size:11px;color:var(--mu);margin-top:8px">'+_ex+'</div>';
+      if(perf.dataSuspect){ h+='<div style="font-size:11px;color:var(--yl);margin-top:4px">⚠ Some cost-basis figures look incomplete, so returns may be overstated (common with sandbox or partial brokerage data).</div>'; }
+      h+='</div>';
+    }
     var donutData=_cpHoldingsByType(holdings);
     if(donutData.length){
       h+='<div class="info-card" style="padding:14px;margin-bottom:12px">';
@@ -3017,8 +3068,10 @@ function renderPortfolioView(){
     h+='<th style="text-align:left;padding:6px 8px">Holding</th><th style="padding:6px 8px">Qty</th><th style="padding:6px 8px">Value</th><th style="padding:6px 8px">Cost Basis</th><th style="padding:6px 8px">Gain / Loss</th><th style="padding:6px 8px">Alloc</th></tr></thead><tbody>';
     holdings.slice().sort(function(a,b){return (b.value||0)-(a.value||0);}).forEach(function(x){
       var allocPct=totalAll>0?(x.value/totalAll*100):0;
-      var glCol=(x.gainLoss==null)?'var(--mu)':(x.gainLoss>=0?'var(--gr)':'var(--rd)');
-      var glTxt=(x.gainLoss==null)?'—':((x.gainLoss>=0?'+':'')+fmt(Math.round(x.gainLoss))+(x.gainLossPct!=null?' ('+(x.gainLossPct>=0?'+':'')+x.gainLossPct.toFixed(1)+'%)':''));
+      var _glCash=(String(x.type||'').toLowerCase()==='cash'); // cash has no return — never show a gain/loss for it
+      var _glSus=(x.gainLossPct!=null&&Math.abs(x.gainLossPct)>1000); // implausible per-holding % → placeholder cost basis: mute + cap (consistent with the Performance card)
+      var glCol=(_glCash||x.gainLoss==null||_glSus)?'var(--mu)':(x.gainLoss>=0?'var(--gr)':'var(--rd)');
+      var glTxt=(_glCash||x.gainLoss==null)?'—':((x.gainLoss>=0?'+':'')+fmt(Math.round(x.gainLoss))+(x.gainLossPct!=null?' ('+_cpFmtRetPct(x.gainLossPct)+')':''));
       var nm=ev(x.ticker||'')||ev(x.name||'')||'—';
       var sub=(x.ticker&&x.name)?ev(x.name):'';
       h+='<tr style="border-top:1px solid var(--bd);text-align:right">';
@@ -3030,7 +3083,9 @@ function renderPortfolioView(){
       h+='<td style="padding:6px 8px;color:var(--mu)">'+allocPct.toFixed(0)+'%</td>';
       h+='</tr>';
     });
-    h+='</tbody></table></div></div>';
+    h+='</tbody></table></div>';
+    if(perf&&perf.dataSuspect){ h+='<div style="font-size:11px;color:var(--yl);margin-top:8px">⚠ Some cost-basis figures look incomplete, so per-holding returns may be overstated.</div>'; }
+    h+='</div>';
     el.innerHTML=_nwCard+h; renderNetWorthTimeline('nwTimeline');
     return;
   }
