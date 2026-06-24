@@ -3145,11 +3145,39 @@ function _cfMonthLabel(key){ var y=Math.floor(key/12), m=((key%12)+12)%12; retur
 // class). Used by every M2 report fn (cash-flow / merchant / export).
 function _cpMonthKey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
 
+// §2.4c — CONFIRMED income from linked DEPOSITS. Plaid amount<0 = inflow (a deposit). Not every deposit is
+// income (transfers/refunds), so we DETECT candidate streams, SUGGEST the obvious ones (recurring or large),
+// and let the user CONFIRM which are income — the confirmed deposits then drive the cash-flow income so income
+// + expense come from the SAME linked source/period (fixing the snapshot-income vs ~90-day-expense mismatch).
+function _cpIncomeStreamKey(t){ if(!t)return 'Deposit'; var m=(t.merchant==null?'':String(t.merchant)).trim(); if(m)return m; var n=(t.name==null?'':String(t.name)).trim(); return n||'Deposit'; }
+// PURE: group in-range inflows (amount<0, excl. transfers/excluded) by source → candidate income streams.
+// `suggested` (pre-checked + counted by default) = RECURRING across ≥2 distinct months — the strongest income
+// signal. A single large one-off is NOT auto-suggested (it's more often a transfer/refund/gift than income, and
+// auto-INCLUDING non-income over-states cash flow — the costlier error); it's still shown for the user to opt in.
+function _cpDetectIncome(txns,startKey,endKey){
+  var by={};
+  (txns||[]).forEach(function(t){ if(!t||t.isTransfer||t.excluded)return; var amt=parseFloat(t.amount)||0; if(amt>=0)return; var k=_cpMonthKey(t.date); if(k==null||k<startKey||k>endKey)return;
+    var key=_cpIncomeStreamKey(t); var s=by[key]; if(!s){s=by[key]={key:key,label:key,total:0,count:0,_mo:{}};} s.total+=(-amt); s.count++; s._mo[k]=1; });
+  return Object.keys(by).map(function(kk){ var s=by[kk]; var monthsSeen=0; for(var x in s._mo)monthsSeen++; var avg=s.count>0?(s.total/s.count):0;
+    return {key:s.key,label:s.label,total:Math.round(s.total),count:s.count,monthsSeen:monthsSeen,monthlyAvg:Math.round(avg),suggested:(monthsSeen>=2)}; })
+    .sort(function(a,b){return (b.total-a.total)||(a.key<b.key?-1:(a.key>b.key?1:0));}); // deterministic tie-break so the list/slice order is stable across re-syncs
+}
+// PURE: given detected streams + the user's confirm map ({streamKey:bool}; an absent key → the stream's own
+// `suggested` default), STAMP `.confirmed` on each stream and return whether ANY stream is on. Single-source
+// for both the report income summation AND the confirm UI (both read the same stamped streams).
+function _cpApplyIncomeConfirm(streams,confirmMap){
+  var anyOn=false, hasMap=(confirmMap&&typeof confirmMap==='object');
+  (streams||[]).forEach(function(s){ var on=(hasMap&&(s.key in confirmMap))?!!confirmMap[s.key]:s.suggested; s.confirmed=on; if(on)anyOn=true; });
+  return anyOn;
+}
+
 // PURE: a custom-range cash-flow report. Expense source = the 24-mo txns when any
 // land in-range (outflow = amount>0, excl. transfers/excluded), else the split-
 // expanded S.spendingEntries (avoids double-counting the same plaid data). Income
-// = the month's snapshot income, else fallbackIncome. Returns per-month rows +
-// totals + byCategory + savingsRate. The testable seam (no globals, no I/O).
+// = the user's CONFIRMED linked deposits when source=linked + any are confirmed/
+// suggested (§2.4c), else the month's snapshot income (fallbackIncome when absent).
+// Returns per-month rows + totals + byCategory + savingsRate + incomeStreams. The
+// testable seam (no globals, no I/O).
 function _cpCashFlowReport(opts){
   opts=opts||{};
   var startKey=opts.startKey, endKey=opts.endKey;
@@ -3171,17 +3199,28 @@ function _cpCashFlowReport(opts){
     spendEntries.forEach(function(e){ var k=_cpMonthKey(e&&e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
   }
   var snapByKey={}; snaps.forEach(function(s){ if(s&&s.month!=null&&s.year!=null){ var v=parseFloat(s.income); if(isFinite(v)) snapByKey[s.year*12+s.month]=v; } });
+  // §2.4c income: prefer the user's CONFIRMED linked deposits (income + expense then share one source/period);
+  // fall back to per-month snapshot income (else profile fallbackIncome) when nothing is confirmed/suggested.
+  var incomeStreams=useTxns?_cpDetectIncome(txnsInRange,startKey,endKey):[];
+  var useLinkedIncome=_cpApplyIncomeConfirm(incomeStreams, opts.incomeStreams);
+  var inflowByMonth={};
+  if(useLinkedIncome){ txnsInRange.forEach(function(t){ var amt=parseFloat(t.amount)||0; if(amt>=0)return; var key=_cpIncomeStreamKey(t); var on=false; for(var i=0;i<incomeStreams.length;i++){ if(incomeStreams[i].key===key){ on=incomeStreams[i].confirmed; break; } } if(!on)return; var k=_cpMonthKey(t.date); if(k!=null&&k>=startKey&&k<=endKey) inflowByMonth[k]=(inflowByMonth[k]||0)+(-amt); }); }
   var rows=[], totalIncome=0, totalExpense=0, catTotals={}, estMonths=0;
   for(var k2=startKey;k2<=endKey;k2++){
-    var m=months[k2], hasSnap=(snapByKey[k2]!=null), inc=hasSnap?snapByKey[k2]:fallbackIncome;
-    if(!hasSnap) estMonths++;
+    var m=months[k2], inc, incEst, hasSnap;
+    // §2.4c income, PER MONTH (not all-or-nothing): a month with a confirmed deposit → real linked income;
+    // a linked month with expense but NO deposit (e.g. pre-link history) → snapshot income so its net stays
+    // real (never a false deficit); a genuinely empty month (no deposit, no expense) → $0 (never phantom savings).
+    if(useLinkedIncome&&inflowByMonth[k2]!=null){ inc=inflowByMonth[k2]; incEst=false; }
+    else if(useLinkedIncome&&!(m.expense>0)){ inc=0; incEst=false; }
+    else { hasSnap=(snapByKey[k2]!=null); inc=hasSnap?snapByKey[k2]:fallbackIncome; incEst=!hasSnap; if(!hasSnap)estMonths++; }
     totalIncome+=inc; totalExpense+=m.expense;
     Object.keys(m.byCat).forEach(function(c){ catTotals[c]=(catTotals[c]||0)+m.byCat[c]; });
-    rows.push({key:k2, label:_cfMonthLabel(k2), income:Math.round(inc), expense:Math.round(m.expense), net:Math.round(inc-m.expense), incomeEstimated:!hasSnap});
+    rows.push({key:k2, label:_cfMonthLabel(k2), income:Math.round(inc), expense:Math.round(m.expense), net:Math.round(inc-m.expense), incomeEstimated:incEst});
   }
   var net=totalIncome-totalExpense;
   var byCategory=Object.keys(catTotals).map(function(c){ return {key:c, total:Math.round(catTotals[c])}; }).sort(function(a,b){ return b.total-a.total; });
-  return { months:rows, monthsCount:rows.length, totalIncome:Math.round(totalIncome), totalExpense:Math.round(totalExpense), net:Math.round(net), savingsRate:(totalIncome>0?Math.round(net/totalIncome*100):null), byCategory:byCategory, source:(useTxns?'linked':'manual'), estimatedMonths:estMonths, hasExpense:(totalExpense>0) };
+  return { months:rows, monthsCount:rows.length, totalIncome:Math.round(totalIncome), totalExpense:Math.round(totalExpense), net:Math.round(net), savingsRate:(totalIncome>0?Math.round(net/totalIncome*100):null), byCategory:byCategory, source:(useTxns?'linked':'manual'), incomeSource:(useLinkedIncome?'linked':'snapshot'), incomeStreams:incomeStreams, estimatedMonths:estMonths, hasExpense:(totalExpense>0) };
 }
 
 // Spending-category palette (mirrors the Historical donut catMap so Reports anchors visually).
@@ -3371,7 +3410,8 @@ function renderReportsView(){
   var now=new Date(), curKey=now.getFullYear()*12+now.getMonth();
   var rng=_cpReportRange, isCustom=(typeof rng==='object'), startKey, endKey;
   if(isCustom){ startKey=rng.startKey; endKey=rng.endKey; } else { var nn=parseInt(String(rng),10)||12; endKey=curKey; startKey=curKey-(nn-1); }
-  var rep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey, endKey:endKey, fallbackIncome:calcs.inc||0});
+  var _incomeConfirm=(S.budget&&S.budget.incomeStreams&&typeof S.budget.incomeStreams==='object')?S.budget.incomeStreams:null; // §2.4c user-confirmed deposit→income map
+  var rep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey, endKey:endKey, fallbackIncome:calcs.inc||0, incomeStreams:_incomeConfirm});
   function keyToMonthInput(k){ var y=Math.floor(k/12), m=(k%12)+1; return y+'-'+(m<10?'0'+m:m); }
   var h='';
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">';
@@ -3391,7 +3431,20 @@ function renderReportsView(){
   h+=statTile(fmtK(rep.totalExpense),'Expenses','#EF4444');
   h+=statTile((rep.net>=0?'+':'')+fmtK(rep.net),'Net Cash Flow',rep.net>=0?'var(--gr)':'var(--rd)');
   h+=statTile(rep.savingsRate==null?'—':(rep.savingsRate+'%'),'Savings Rate',rep.savingsRate==null?'var(--mu)':(rep.savingsRate>=0?'var(--gr)':'var(--rd)'));
-  h+='</div></div>';
+  h+='</div>';
+  // label the Income number's SOURCE (linked deposits vs profile estimate) so a source switch is never silent
+  var _incOn=0; (rep.incomeStreams||[]).forEach(function(s){ if(s.confirmed)_incOn++; });
+  if(rep.incomeStreams&&rep.incomeStreams.length){ h+='<div style="font-size:11px;color:var(--mu);margin-top:8px">'+(rep.incomeSource==='linked'?('💵 Income = '+_incOn+' confirmed deposit source'+(_incOn===1?'':'s')+' (confirm below)'):'📊 Income estimated from your profile — confirm your deposits below for accurate cash flow')+'</div>'; }
+  h+='</div>';
+  // §2.4c income-source confirmation — let the user mark which linked DEPOSITS are real income (vs transfers/refunds)
+  if(rep.incomeStreams&&rep.incomeStreams.length){
+    h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:4px">💵 Income sources <span style="font-size:11px;color:var(--mu);font-weight:400">— confirm which deposits are income</span></div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-bottom:8px">'+(rep.incomeSource==='linked'?('Using '+_incOn+' deposit source'+(_incOn===1?'':'s')+' as your income. Uncheck anything that isn\'t income (transfers, refunds, reimbursements).'):'No deposits are marked as income, so we\'re estimating it from your profile. Check the deposits below that are real income for an accurate cash flow.')+'</div>';
+    rep.incomeStreams.slice(0,12).forEach(function(s){ var _tok=encodeURIComponent(s.key).replace(/'/g,'%27');
+      h+='<label style="display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid var(--bd);cursor:pointer"><input type="checkbox" '+(s.confirmed?'checked':'')+' onchange="_cpToggleIncomeStream(\''+_tok+'\',this.checked)" style="width:16px;height:16px;flex-shrink:0;accent-color:var(--gr);cursor:pointer"><span style="color:var(--wh);font-size:12px;flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ev(s.label)+'</span><span style="color:var(--mu);font-size:11px;white-space:nowrap">'+fmt(s.total)+' · ×'+s.count+(s.monthsSeen>1?' · '+s.monthsSeen+'mo':'')+'</span></label>'; });
+    if(rep.incomeStreams.length>12){ var _hid=rep.incomeStreams.length-12; h+='<div style="font-size:11px;color:var(--mu);padding:7px 0 0;border-top:1px solid var(--bd)">+ '+_hid+' smaller deposit source'+(_hid===1?'':'s')+' not shown</div>'; }
+    h+='</div>';
+  }
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Monthly Net Cash Flow</div>'+_cpCashFlowBars(rep.months,600,200)+'</div>';
   h+='<div class="info-card" style="padding:14px"><div class="info-card-title" style="margin-bottom:8px">Where It Went</div>';
   if(rep.byCategory.length){
@@ -3404,7 +3457,7 @@ function renderReportsView(){
   h+='</div>';
   // ── §2.5 Top Merchants (plaid merchant_name dimension) ──
   var _span=endKey-startKey+1;
-  var _priorRep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey-_span, endKey:startKey-1, fallbackIncome:calcs.inc||0});
+  var _priorRep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey-_span, endKey:startKey-1, fallbackIncome:calcs.inc||0, incomeStreams:_incomeConfirm});
   var _merch=_cpMerchantReport(APP._txns||[], startKey, endKey);
   var _merchTr=_cpTrendDiff(_merch.merchants, _cpMerchantReport(APP._txns||[], startKey-_span, startKey-1).merchants, 'name');
   h+='<div class="info-card" style="padding:14px;margin-top:12px"><div class="info-card-title" style="margin-bottom:8px">Top Merchants</div>';
@@ -8730,6 +8783,25 @@ function _budgetSetSettings(patch){
 }
 function _budgetSetRolloverDefault(on){ _budgetSetSettings({rolloverDefault:!!on}); }
 function _budgetSetRollover(catKey,on){ var rc={}; rc[String(catKey)]=(on===null?null:!!on); _budgetSetSettings({rolloverCats:rc}); }
+// §2.4c income-source confirmation writers — merge S.budget.incomeStreams {streamKey:bool} on BOTH shell
+// mirrors + post PFOS_BUDGET_ASSIGN {incomeStreams} (the engine merges IDENTICALLY — 5e drift-parity). null
+// clears a key (→ the stream's suggested default). Display-layer/advisory; metric-inert (never read by computeCalcs).
+function _budgetApplyIncomeToMirror(patch){
+  var now=new Date().toISOString().slice(0,7);
+  [(_lastPfosState&&_lastPfosState.state),(typeof APP!=='undefined'&&APP._portalFd&&APP._portalFd.S)].forEach(function(st){ if(!st)return;
+    if(!st.budget||typeof st.budget!=='object')st.budget={settings:{style:'flexible',rolloverDefault:false,firstMonth:now},months:{}};
+    if(!st.budget.incomeStreams||typeof st.budget.incomeStreams!=='object')st.budget.incomeStreams={};
+    Object.keys(patch).forEach(function(k){ if(!k)return; var v=patch[k]; if(v===null){delete st.budget.incomeStreams[k];} else if(typeof v==='boolean'){st.budget.incomeStreams[k]=v;} });
+    st._touched=st._touched||{}; st._touched.budget=true;
+  });
+}
+function _budgetSetIncomeStreams(patch){
+  if(!patch||typeof patch!=='object')return;
+  _budgetApplyIncomeToMirror(patch);
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_BUDGET_ASSIGN',incomeStreams:patch},PFOS_ORIGIN); }catch(_e){}
+}
+// LIVE: toggle a detected deposit stream's income flag (key arrives URI-encoded from the checkbox) + re-render.
+function _cpToggleIncomeStream(tok,on){ var key; try{ key=decodeURIComponent(tok); }catch(_e){ key=tok; } if(!key)return; var p={}; p[key]=!!on; _budgetSetIncomeStreams(p); if(typeof renderReportsView==='function')renderReportsView(); }
 // §1.8b target writers — merge S.budget.targets on BOTH shell mirrors + post PFOS_BUDGET_ASSIGN {targets}
 // (the engine sanitizes IDENTICALLY). null clears a category's target. Metric-inert; the UI is §1.9.
 function _budgetApplyTargetsToMirror(patch){
