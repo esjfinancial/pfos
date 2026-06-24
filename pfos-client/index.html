@@ -1297,6 +1297,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="sb-item" id="cnav-plan" onclick="showClientPage('plan');initClientPlan()"><span class="icon">🗺️</span> My Financial Plan</div>
       <div class="sb-item" id="cnav-spending" onclick="showClientPage('spending');renderSpendingAnalysis()"><span class="icon">💰</span> My Spending <span id="cnavSpendBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:11px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
       <div class="sb-item" id="cnav-invest" onclick="showClientPage('invest');renderPortfolioView()" style="display:none"><span class="icon">📈</span> Investments</div>
+      <div class="sb-item" id="cnav-insights" onclick="showClientPage('insights');renderReportsView()" style="display:none"><span class="icon">📊</span> Reports</div>
       <div class="sb-item" id="cnav-tracking" onclick="showClientPage('tracking');renderClientTracking()"><span class="icon">✅</span> Financial Plan Tracking</div>
       <div class="sb-item" id="cnav-projections" onclick="showClientPage('projections');renderClientProjections()"><span class="icon">📈</span> Financial Projections</div>
       <div class="sb-item" id="cnav-analysis" onclick="showClientPage('analysis');renderClientAnalysis()"><span class="icon">🔍</span> Financial Analysis</div>
@@ -1548,6 +1549,13 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="pg-title">Investments</div>
       <div class="pg-sub">Your portfolio — holdings, allocation, and unrealized gains</div>
       <div id="portfolioView"><div style="color:var(--mu);font-size:14px;padding:12px 0">Loading portfolio…</div></div>
+    </div>
+
+    <!-- Reports / cash-flow analytics (§2.4a) -->
+    <div class="pg" id="cpg-insights">
+      <div class="pg-title">Reports</div>
+      <div class="pg-sub">Cash flow, spending, and trends over any date range</div>
+      <div id="reportsView"><div style="color:var(--mu);font-size:14px;padding:12px 0">Loading reports…</div></div>
     </div>
 
     <!-- Financial Plan Tracking -->
@@ -2556,7 +2564,7 @@ async function initAuth(){
       _lastSaveDirty=false;
       APP._portalFd=null;APP._portalCalcs=null;
       APP.currentClientId=null;APP.currentClient=null;
-      try{ _bridgeCache=null; APP._holdings=null; APP._supabaseSnapshots=null; }catch(_e){} // §1.9b memo + §2.1 holdings + snapshots are client-keyed caches; null on logout (cross-client hygiene)
+      try{ _bridgeCache=null; APP._holdings=null; APP._supabaseSnapshots=null; APP._txns=null; }catch(_e){} // §1.9b memo + §2.1 holdings + snapshots + §2.4 txns are client-keyed caches; null on logout (cross-client hygiene)
       // Force iframe to be recreated on next login so PFOS_READY fires and loads fresh data
       var _cpContainer=document.getElementById('clientPfosContainer');
       if(_cpContainer){_cpContainer.innerHTML='';delete _cpContainer.dataset.loaded;}
@@ -2683,6 +2691,9 @@ function showClientPage(id){
   }
   if(id==='invest'){ // §2.2: render the portfolio screen (defensive — nav onclick also calls it)
     if(typeof renderPortfolioView==='function') renderPortfolioView();
+  }
+  if(id==='insights'){ // §2.4a: render the Reports screen
+    if(typeof renderReportsView==='function') renderReportsView();
   }
   if(id==='pfos'&&APP.currentClientId){
     var container=document.getElementById('clientPfosContainer');
@@ -2966,7 +2977,7 @@ function renderPortfolioView(){
   // §2.1 holdings load is fire-and-forget; if not yet resolved, load then re-render.
   if(APP._holdings===undefined){
     el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:24px 0;text-align:center">Loading your portfolio…</div>';
-    if(typeof _cpLoadHoldings==='function'){ _cpLoadHoldings().then(function(){ if(_currentClientPage==='invest') renderPortfolioView(); }); }
+    if(typeof _cpLoadHoldings==='function'){ _cpLoadHoldings().then(function(){ if(APP._holdings===undefined)APP._holdings=[]; if(_currentClientPage==='invest') renderPortfolioView(); }); } else { APP._holdings=[]; renderPortfolioView(); }
     return;
   }
   var holdings=APP._holdings||[];
@@ -3102,6 +3113,148 @@ function renderNetWorthTimeline(targetId){
   leg+='</div>';
   var xlink=(hasPast&&!hasFuture)?'<div style="text-align:center;margin-top:6px"><a href="javascript:showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="color:#5B9BFF;font-size:12px">Project it forward with My Plan →</a></div>':'';
   el.innerHTML=svg+leg+xlink;
+}
+
+// ── §2.4a (M2) Reports: 24-mo transactions read + custom-range cash-flow ──────
+// _cpLoadTransactions: RLS-scoped read of plaid_transactions (the fuller 24-mo
+// span; S.spendingEntries is only ~90-day for plaid) → APP._txns[]. Metric-inert,
+// mirrors _cpLoadHoldings (error-bail, mid-flight client guard, limit). NOTE:
+// plaid_transactions may be EMPTY (sandbox not synced) → the report degrades to
+// S.spendingEntries. Plaid amount sign: POSITIVE = outflow (spend), NEGATIVE =
+// inflow (income) — the standard Plaid convention, CORROBORATED by the
+// plaid-transactions-sync edge fn (its spend window treats "positive amount" as
+// spend). Still worth a live spot-check on first real sync (owner e2e). §2.4a uses
+// snapshots for income; txns extend the EXPENSE span.
+async function _cpLoadTransactions(months){
+  if(!db||!APP.currentClientId) return;
+  if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')){ APP._txns=[]; return; }
+  var _cid=APP.currentClientId, n=(parseInt(months,10)||24);
+  var now=new Date(), sd=new Date(now.getFullYear(), now.getMonth()-(n-1), 1);
+  var _mm=sd.getMonth()+1, startStr=sd.getFullYear()+'-'+(_mm<10?'0'+_mm:_mm)+'-01';
+  try{
+    var {data:rows,error:err}=await db.from('plaid_transactions').select('date,amount,name,merchant_name,category_pfos,category_bucket,is_transfer,excluded,pending').eq('client_id',_cid).eq('removed',false).gte('date',startStr).order('date',{ascending:true}).limit(10000);
+    if(err) throw err;
+    if(APP.currentClientId!==_cid) return; // client switched mid-flight
+    APP._txns=(rows||[]).map(function(r){ return { date:r.date, amount:(parseFloat(r.amount)||0), name:(r.name==null?'':String(r.name)), merchant:(r.merchant_name==null?'':String(r.merchant_name)), category:(r.category_pfos==null?'':String(r.category_pfos)), bucket:(r.category_bucket==null?'':String(r.category_bucket)), isTransfer:(r.is_transfer===true), excluded:(r.excluded===true), pending:(r.pending===true) }; });
+  }catch(e){ if(APP.currentClientId===_cid) APP._txns=[]; console.warn('_cpLoadTransactions:',e); }
+}
+
+function _cfMonthLabel(key){ var y=Math.floor(key/12), m=((key%12)+12)%12; return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m]+" '"+String(y).slice(-2); }
+
+// PURE: a custom-range cash-flow report. Expense source = the 24-mo txns when any
+// land in-range (outflow = amount>0, excl. transfers/excluded), else the split-
+// expanded S.spendingEntries (avoids double-counting the same plaid data). Income
+// = the month's snapshot income, else fallbackIncome. Returns per-month rows +
+// totals + byCategory + savingsRate. The testable seam (no globals, no I/O).
+function _cpCashFlowReport(opts){
+  opts=opts||{};
+  var startKey=opts.startKey, endKey=opts.endKey;
+  var txns=opts.txns||[], spendEntries=opts.spendEntries||[], snaps=opts.snapshots||[];
+  var fallbackIncome=parseFloat(opts.fallbackIncome)||0;
+  // Timezone-safe month key: parse YYYY-MM directly from the string — NEVER new Date()
+  // (which parses date-only ISO as UTC midnight → a prior-month shift in US zones; the §1.10a class).
+  function mkey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
+  var txnsInRange=txns.filter(function(t){ var k=mkey(t.date); return k!=null&&k>=startKey&&k<=endKey&&!t.isTransfer&&!t.excluded; });
+  var useTxns=txnsInRange.length>0;
+  var months={};
+  for(var k=startKey;k<=endKey;k++){ months[k]={income:0,expense:0,byCat:{}}; }
+  function addExp(k,amt,cat){ if(!months[k]||!(amt>0)) return; months[k].expense+=amt; cat=cat||'misc'; months[k].byCat[cat]=(months[k].byCat[cat]||0)+amt; }
+  if(useTxns){
+    // linked outflows (amount>0 = spend, per the plaid-transactions-sync convention) ...
+    txnsInRange.forEach(function(t){ addExp(mkey(t.date), parseFloat(t.amount)||0, t.category||t.bucket); });
+    // ... PLUS true-manual entries (NOT plaid-sourced) so manual months/entries are never hidden when txns
+    // exist for OTHER months (the all-or-nothing bug). No double-count: the plaid mirror lives in txns, not here.
+    spendEntries.forEach(function(e){ if(!e||e._source==='plaid') return; var k=mkey(e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
+  } else {
+    // no txns in range → ALL spendEntries are the only expense source (incl. the plaid 90-day mirror)
+    spendEntries.forEach(function(e){ var k=mkey(e&&e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
+  }
+  var snapByKey={}; snaps.forEach(function(s){ if(s&&s.month!=null&&s.year!=null){ var v=parseFloat(s.income); if(isFinite(v)) snapByKey[s.year*12+s.month]=v; } });
+  var rows=[], totalIncome=0, totalExpense=0, catTotals={}, estMonths=0;
+  for(var k2=startKey;k2<=endKey;k2++){
+    var m=months[k2], hasSnap=(snapByKey[k2]!=null), inc=hasSnap?snapByKey[k2]:fallbackIncome;
+    if(!hasSnap) estMonths++;
+    totalIncome+=inc; totalExpense+=m.expense;
+    Object.keys(m.byCat).forEach(function(c){ catTotals[c]=(catTotals[c]||0)+m.byCat[c]; });
+    rows.push({key:k2, label:_cfMonthLabel(k2), income:Math.round(inc), expense:Math.round(m.expense), net:Math.round(inc-m.expense), incomeEstimated:!hasSnap});
+  }
+  var net=totalIncome-totalExpense;
+  var byCategory=Object.keys(catTotals).map(function(c){ return {key:c, total:Math.round(catTotals[c])}; }).sort(function(a,b){ return b.total-a.total; });
+  return { months:rows, monthsCount:rows.length, totalIncome:Math.round(totalIncome), totalExpense:Math.round(totalExpense), net:Math.round(net), savingsRate:(totalIncome>0?Math.round(net/totalIncome*100):null), byCategory:byCategory, source:(useTxns?'linked':'manual'), estimatedMonths:estMonths, hasExpense:(totalExpense>0) };
+}
+
+// Spending-category palette (mirrors the Historical donut catMap so Reports anchors visually).
+var _CP_SPENDCAT={food:{l:'Food',c:'#22C55E'},housing:{l:'Housing',c:'#5B9BFF'},transportation:{l:'Transportation',c:'#A855F7'},utilities:{l:'Utilities',c:'#EAB308'},insurance:{l:'Insurance',c:'#06B6D4'},discretionary:{l:'Entertainment',c:'#EC4899'},subscriptions:{l:'Subscriptions',c:'#8B5CF6'},activeSavings:{l:'Active Savings',c:'#10B981'},estate:{l:'Estate',c:'#F97316'},misc:{l:'Other',c:'#94A3B8'}};
+function _cpSpendCatMeta(key){ return _CP_SPENDCAT[key]||{l:_acLabel(key),c:'#94A3B8'}; }
+
+// PURE-ish SVG: per-month NET cash-flow bars (green above / red below a zero axis), native <title> tooltips.
+function _cpCashFlowBars(months,W,H){
+  if(!months||!months.length) return '<div style="color:var(--mu);font-size:12px;padding:12px;text-align:center">No data in this range.</div>';
+  var padL=44,padR=10,padT=12,padB=22,plotW=W-padL-padR,plotH=H-padT-padB;
+  var maxAbs=Math.max.apply(null,months.map(function(m){return Math.abs(m.net);}).concat([1]));
+  var zy=padT+plotH/2, half=plotH/2, n=months.length, gap=plotW/n, bw=Math.max(2,Math.min(28,gap*0.7));
+  var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto" role="img" aria-label="Monthly net cash flow">';
+  svg+='<line x1="'+padL+'" y1="'+zy+'" x2="'+(W-padR)+'" y2="'+zy+'" stroke="var(--bd)" stroke-width="1"/>';
+  months.forEach(function(m,i){ var x=padL+i*gap+(gap-bw)/2, bh=Math.abs(m.net)/maxAbs*half, y=m.net>=0?(zy-bh):zy, col=m.net>=0?'#22C55E':'#EF4444';
+    svg+='<rect x="'+x.toFixed(1)+'" y="'+y.toFixed(1)+'" width="'+bw.toFixed(1)+'" height="'+Math.max(0.5,bh).toFixed(1)+'" fill="'+col+'" rx="1"><title>'+_cpEscHtml(m.label)+': '+(m.net>=0?'+':'')+fmt(m.net)+' (in '+fmt(m.income)+' / out '+fmt(m.expense)+')</title></rect>'; });
+  svg+='<text x="'+(padL-5)+'" y="'+(padT+8)+'" fill="var(--mu)" font-size="8" text-anchor="end">+'+fmtK(maxAbs)+'</text>';
+  svg+='<text x="'+(padL-5)+'" y="'+(padT+plotH)+'" fill="var(--mu)" font-size="8" text-anchor="end">-'+fmtK(maxAbs)+'</text>';
+  svg+='<text x="'+padL+'" y="'+(H-6)+'" fill="var(--mu)" font-size="8" text-anchor="start">'+_cpEscHtml(months[0].label)+'</text>';
+  if(n>1)svg+='<text x="'+(W-padR)+'" y="'+(H-6)+'" fill="var(--mu)" font-size="8" text-anchor="end">'+_cpEscHtml(months[n-1].label)+'</text>';
+  svg+='</svg>'; return svg;
+}
+
+var _cpReportRange='12mo';
+function _cpSetReportRange(rng){ _cpReportRange=rng; if(typeof renderReportsView==='function')renderReportsView(); }
+function _cpSetReportCustom(){
+  var s=document.getElementById('rptCustomStart'), e=document.getElementById('rptCustomEnd');
+  if(!s||!e||!s.value||!e.value) return;
+  function toKey(v){ var p=String(v).split('-'); return (parseInt(p[0],10))*12+(parseInt(p[1],10)-1); }
+  var sk=toKey(s.value), ek=toKey(e.value);
+  if(!isFinite(sk)||!isFinite(ek)||sk>ek) return;
+  if((ek-sk+1)>120){ if(typeof _cpToast==='function')_cpToast('Pick a range of 10 years or less.'); return; } // bound the report loop
+  _cpReportRange={startKey:sk,endKey:ek}; renderReportsView();
+}
+// §2.4a Reports screen: range picker + cash-flow summary + monthly net bars + top categories. READ-ONLY / metric-inert.
+function renderReportsView(){
+  var el=document.getElementById('reportsView'); if(!el) return;
+  var ev=_cpEscHtml;
+  if(APP._txns===undefined){ el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:24px 0;text-align:center">Loading your reports…</div>'; if(typeof _cpLoadTransactions==='function'){ _cpLoadTransactions(24).then(function(){ if(APP._txns===undefined)APP._txns=[]; if(_currentClientPage==='insights') renderReportsView(); }); } else { APP._txns=[]; renderReportsView(); } return; }
+  var S=(_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=(APP._portalCalcs)||(_lastPfosState&&_lastPfosState.calcs)||{};
+  var snaps=(S.snapshots&&S.snapshots.length)?S.snapshots:(APP._supabaseSnapshots||[]);
+  var now=new Date(), curKey=now.getFullYear()*12+now.getMonth();
+  var rng=_cpReportRange, isCustom=(typeof rng==='object'), startKey, endKey;
+  if(isCustom){ startKey=rng.startKey; endKey=rng.endKey; } else { var nn=parseInt(String(rng),10)||12; endKey=curKey; startKey=curKey-(nn-1); }
+  var rep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey, endKey:endKey, fallbackIncome:calcs.inc||0});
+  function keyToMonthInput(k){ var y=Math.floor(k/12), m=(k%12)+1; return y+'-'+(m<10?'0'+m:m); }
+  var h='';
+  h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">';
+  [['3mo','3mo'],['6mo','6mo'],['12mo','12mo'],['24mo','24mo']].forEach(function(o){ var sel=(!isCustom&&String(rng)===o[0]);
+    h+='<button onclick="_cpSetReportRange(\''+o[0]+'\')" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid '+(sel?'rgba(91,155,255,.5)':'var(--bd)')+';border-radius:3px;cursor:pointer;background:'+(sel?'rgba(91,155,255,.18)':'transparent')+';color:'+(sel?'#5B9BFF':'var(--mu)')+';min-height:28px">'+o[1]+'</button>'; });
+  h+='<span style="color:var(--mu);font-size:11px;margin-left:4px">or</span>';
+  h+='<input type="month" id="rptCustomStart" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(startKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
+  h+='<span style="color:var(--mu)">→</span>';
+  h+='<input type="month" id="rptCustomEnd" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(endKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
+  var _plaidLinked=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'));
+  var _srcNote=(rep.source==='manual'&&_plaidLinked)?' · <span style="color:#EAB308">Plaid not yet synced — showing manual expenses</span>':'';
+  var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile).</div>':'';
+  h+='</div><div style="font-size:11px;color:var(--mu);margin-top:8px">'+ev(rep.months.length?(rep.months[0].label+' – '+rep.months[rep.months.length-1].label):'—')+' · '+(rep.source==='linked'?'linked transactions':'manual entries')+_srcNote+'</div>'+_estNote+'</div>';
+  h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="stat-grid" style="gap:6px;margin-bottom:0">';
+  h+=statTile(fmtK(rep.totalIncome),'Income','#22C55E');
+  h+=statTile(fmtK(rep.totalExpense),'Expenses','#EF4444');
+  h+=statTile((rep.net>=0?'+':'')+fmtK(rep.net),'Net Cash Flow',rep.net>=0?'var(--gr)':'var(--rd)');
+  h+=statTile(rep.savingsRate==null?'—':(rep.savingsRate+'%'),'Savings Rate',rep.savingsRate==null?'var(--mu)':(rep.savingsRate>=0?'var(--gr)':'var(--rd)'));
+  h+='</div></div>';
+  h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Monthly Net Cash Flow</div>'+_cpCashFlowBars(rep.months,600,200)+'</div>';
+  h+='<div class="info-card" style="padding:14px"><div class="info-card-title" style="margin-bottom:8px">Where It Went</div>';
+  if(rep.byCategory.length){
+    var maxCat=rep.byCategory[0].total||1;
+    rep.byCategory.slice(0,10).forEach(function(c){ var meta=_cpSpendCatMeta(c.key), pct=rep.totalExpense>0?Math.round(c.total/rep.totalExpense*100):0;
+      h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px"><span style="color:var(--wh)">'+ev(meta.l)+'</span><span style="color:var(--mu)">'+fmt(c.total)+' · '+pct+'%</span></div><div style="height:5px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+Math.round(c.total/maxCat*100)+'%;background:'+meta.c+';border-radius:2px"></div></div></div>'; });
+  } else { var _anyData=((APP._txns&&APP._txns.length)||(S.spendingEntries&&S.spendingEntries.length)); h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">'+(_anyData?'No spending in this period — try a different date range.':'No transactions yet — link a bank or add expenses to get started.')+'</div>'; }
+  h+='</div>';
+  el.innerHTML=h;
 }
 
 function checkAffordability(){
@@ -3995,7 +4148,7 @@ async function _pfosWipeAllUserData(){
     }
   }catch(e){console.warn('Cache Storage wipe failed:',e);}
   try{
-    if(window.APP){APP.user=null;APP.userData=null;APP.currentClient=null;APP.currentClientId=null;APP.role=null;APP._holdings=null;APP._supabaseSnapshots=null;}
+    if(window.APP){APP.user=null;APP.userData=null;APP.currentClient=null;APP.currentClientId=null;APP.role=null;APP._holdings=null;APP._supabaseSnapshots=null;APP._txns=null;}
     if(typeof _lastPfosState!=='undefined')_lastPfosState=null;
     if(typeof APP_CLIENT!=='undefined')APP_CLIENT=null;
   }catch(e){}
@@ -24494,9 +24647,10 @@ function _cpUpdateAdvisoryNav(){
   }
   // Plaid "Link accounts" card — Pro+/comp only; _cpUpdateLinkCard handles show/hide + linked-vs-unlinked state.
   if(typeof _cpUpdateLinkCard==='function')_cpUpdateLinkCard();
-  // §2.2: Investments nav — Pro+ (clientHasFeature('plaid')); shows the portfolio screen.
-  var _invNav=document.getElementById('cnav-invest');
-  if(_invNav)_invNav.style.display=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'))?'':'none';
+  // §2.2/§2.4: Investments + Reports nav — Pro+ (clientHasFeature('plaid')).
+  var _plaidNav=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'));
+  var _invNav=document.getElementById('cnav-invest'); if(_invNav)_invNav.style.display=_plaidNav?'':'none';
+  var _rptNav=document.getElementById('cnav-insights'); if(_rptNav)_rptNav.style.display=_plaidNav?'':'none';
 }
 
 // Render the home Plaid card in its correct state: the invite ("Link your accounts / Link Now") when nothing
