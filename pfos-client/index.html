@@ -3260,6 +3260,27 @@ function _cpRenderSankey(model,W,H){
   return svg+leg;
 }
 
+// ── §2.5 (M2) merchant + category analytics + trends ─────────────────────────
+// PURE top-merchant rollup over the 24-mo txns (merchant_name dimension; only
+// plaid txns carry it). Outflows only (amount>0), transfers/excluded dropped;
+// missing merchant_name → name → "Other". Timezone-safe YYYY-MM bucketing.
+function _cpMerchantReport(txns, startKey, endKey){
+  function mkey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
+  var by={}, total=0;
+  (txns||[]).forEach(function(t){ if(!t||t.isTransfer||t.excluded) return; var k=mkey(t.date); if(k==null||k<startKey||k>endKey) return; var amt=parseFloat(t.amount)||0; if(amt<=0) return;
+    var nm=(t.merchant&&String(t.merchant).trim())||(t.name&&String(t.name).trim())||'Other';
+    if(!by[nm]) by[nm]={name:nm,total:0,count:0}; by[nm].total+=amt; by[nm].count++; total+=amt; });
+  var merchants=Object.keys(by).map(function(n){ var m=by[n]; return {name:m.name,total:Math.round(m.total),count:m.count}; }).sort(function(a,b){ return b.total-a.total; });
+  return { merchants:merchants, totalSpent:Math.round(total), merchantCount:merchants.length };
+}
+// PURE prior-period trend differ — reused for categories (idField 'key') AND merchants ('name').
+// deltaPct = (cur−prior)/prior; null when there's no prior (a "new" item). For SPENDING, up = worse.
+function _cpTrendDiff(cur, prior, idField){
+  var pmap={}; (prior||[]).forEach(function(x){ if(x&&x[idField]!=null) pmap[x[idField]]=x.total||0; });
+  return (cur||[]).map(function(x){ var p=pmap[x[idField]]||0, c=x.total||0; var d=(p>0)?Math.round((c-p)/p*100):(c>0?null:0);
+    return { key:x.key, name:x.name, count:x.count, total:c, priorTotal:p, deltaPct:d, dir:(d==null?'new':(d>0?'up':(d<0?'down':'flat'))) }; }).sort(function(a,b){ return b.total-a.total; });
+}
+
 var _cpReportRange='12mo';
 function _cpSetReportRange(rng){ _cpReportRange=rng; if(typeof renderReportsView==='function')renderReportsView(); }
 function _cpSetReportCustom(){
@@ -3311,6 +3332,27 @@ function renderReportsView(){
     rep.byCategory.slice(0,10).forEach(function(c){ var meta=_cpSpendCatMeta(c.key), pct=rep.totalExpense>0?Math.round(c.total/rep.totalExpense*100):0;
       h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px"><span style="color:var(--wh)">'+ev(meta.l)+'</span><span style="color:var(--mu)">'+fmt(c.total)+' · '+pct+'%</span></div><div style="height:5px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+Math.round(c.total/maxCat*100)+'%;background:'+meta.c+';border-radius:2px"></div></div></div>'; });
   } else { var _anyData=((APP._txns&&APP._txns.length)||(S.spendingEntries&&S.spendingEntries.length)); h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">'+(_anyData?'No spending in this period — try a different date range.':'No transactions yet — link a bank or add expenses to get started.')+'</div>'; }
+  h+='</div>';
+  // ── §2.5 Top Merchants (plaid merchant_name dimension) ──
+  var _span=endKey-startKey+1;
+  var _priorRep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey-_span, endKey:startKey-1, fallbackIncome:calcs.inc||0});
+  var _merch=_cpMerchantReport(APP._txns||[], startKey, endKey);
+  var _merchTr=_cpTrendDiff(_merch.merchants, _cpMerchantReport(APP._txns||[], startKey-_span, startKey-1).merchants, 'name');
+  h+='<div class="info-card" style="padding:14px;margin-top:12px"><div class="info-card-title" style="margin-bottom:8px">Top Merchants</div>';
+  if(_merch.merchants.length){
+    var _mMax=_merch.merchants[0].total||1;
+    _merchTr.slice(0,10).forEach(function(m){ var _ar=(m.dir==='up'?'▲':(m.dir==='down'?'▼':(m.dir==='new'?'•':''))), _ac=(m.dir==='up'?'var(--rd)':(m.dir==='down'?'var(--gr)':'var(--mu)')), _dt=(m.dir==='new'?'new':(m.deltaPct==null?'':(_ar+Math.abs(m.deltaPct)+'%')));
+      h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;margin-bottom:3px"><span style="color:var(--wh);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ev(m.name)+' <span style="color:var(--mu);font-size:11px">×'+m.count+'</span></span><span style="color:var(--mu);white-space:nowrap;flex-shrink:0">'+fmt(m.total)+(_dt?' <span style="color:'+_ac+'">'+_dt+'</span>':'')+'</span></div><div style="height:5px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+Math.round(m.total/_mMax*100)+'%;background:#5B9BFF;border-radius:2px"></div></div></div>'; });
+  } else { h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">'+(_plaidLinked?'Top merchants appear once your linked transactions sync.':'Link a bank to see your top merchants.')+'</div>'; }
+  h+='</div>';
+  // ── §2.5 Category Trends (this period vs the prior equal window) ──
+  var _trends=_cpTrendDiff(rep.byCategory, _priorRep.byCategory, 'key');
+  var _hasPrior=(_priorRep.byCategory&&_priorRep.byCategory.length>0);
+  h+='<div class="info-card" style="padding:14px;margin-top:12px"><div class="info-card-title" style="margin-bottom:8px">Category Trends'+(_hasPrior?' <span style="font-size:11px;color:var(--mu);font-weight:400">vs prior '+_span+' mo</span>':'')+'</div>';
+  if(_trends.length){
+    _trends.slice(0,10).forEach(function(t){ var _m=_cpSpendCatMeta(t.key), _ar=(t.dir==='up'?'▲':(t.dir==='down'?'▼':(t.dir==='new'?'•':'–'))), _ac=(t.dir==='up'?'var(--rd)':(t.dir==='down'?'var(--gr)':'var(--mu)')), _dt=(t.dir==='new'?'new':(t.deltaPct==null?'—':Math.abs(t.deltaPct)+'%'));
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--bd)"><span style="color:var(--wh);font-size:12px"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'+_m.c+';margin-right:6px"></span>'+ev(_m.l)+'</span><span style="font-size:12px"><span style="color:var(--mu)">'+fmt(t.total)+'</span> <span style="color:'+_ac+';font-weight:700">'+_ar+' '+_dt+'</span></span></div>'; });
+  } else { h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">No category data in this range.</div>'; }
   h+='</div>';
   el.innerHTML=h;
 }
