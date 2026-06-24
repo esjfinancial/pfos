@@ -8704,6 +8704,99 @@ function _bridgeEnvelopeChip(impacts,idx,kind){
 }
 
 // ═══════════════════════════════════════════════════
+// §1.10a — 24-month auto-budget classifier (Pro+)
+// ═══════════════════════════════════════════════════
+// Pure: reads up to 24 COMPLETED months of S.spendingEntries (split-expanded via _spendSplitParts) and classifies
+// each L1 spending category as FIXED (present most months, low variance → median), VARIABLE (present a meaningful
+// share of months, swings → de-spiked run-rate), or PERIODIC (lumpy/annual: insurance, holidays, annual subs →
+// amortized annualTotal/12 sinking fund). Emits a recommended Tier-1 spending budget + a surplus summary. The
+// existing 6-mo empty-bucket suggester (_portalAutoBudgetSuggestions) is the small sibling; THIS is the full
+// every-category, 24-mo, 3-class build a user accepts once to bootstrap their whole budget. NO write/UI — §1.10b
+// supplies the Pro+ one-tap, the preview, and the accept (which writes S.budget + targets via the §1.7/§1.8
+// writers). Data-source-agnostic: it classifies whatever history is in S.spendingEntries (§1.10b can hydrate a
+// fuller 24-mo plaid_transactions pull before calling it; the periodic/sinking-fund detection sharpens with span).
+function _abMonthKeyOf(d){ return d.getFullYear()*12+d.getMonth(); }
+function _abRound(v){ v=_lnum(v); if(v<=0)return 0; return v>=200?Math.round(v/25)*25:(v>=40?Math.round(v/5)*5:Math.round(v)); }
+function _abMedian(arr){ if(!arr.length)return 0; var s=arr.slice().sort(function(a,b){return a-b;}); var m=Math.floor(s.length/2); return s.length%2?s[m]:(s[m-1]+s[m])/2; }
+// de-spiked monthly run-rate: average the per-month series (zeros included) after dropping the single highest
+// month when there's enough data — covers a typical month without a one-off spike inflating the budget.
+function _abTrimmedMean(series){ if(!series.length)return 0; var s=series.slice().sort(function(a,b){return a-b;}); if(s.length>=6)s=s.slice(0,s.length-1); var sum=s.reduce(function(t,v){return t+v;},0); return s.length?sum/s.length:0; }
+function _autoBudget24Build(S,calcs,opts){
+  opts=opts||{}; S=S||{}; calcs=calcs||{};
+  var entries=S.spendingEntries||[];
+  var nowKey=(typeof opts.nowKey==='number')?opts.nowKey:_abMonthKeyOf(new Date());
+  var WIN=24, MINM=3;
+  // category keys/labels/icons from the editable categories (§1.4), excluding activeSavings (savings isn't a spend envelope)
+  var cats=(typeof getL1Cats==='function')?getL1Cats():[];
+  var catMeta={}, keys=[];
+  cats.forEach(function(c){ if(c&&c.key&&c.key!=='activeSavings'&&!catMeta[c.key]){ catMeta[c.key]={label:c.label||c.key,icon:c.icon||'•'}; keys.push(c.key); } });
+  var perCat={}; keys.forEach(function(k){ perCat[k]={}; });
+  var monthsSeen={}, hasLinked=false;
+  entries.forEach(function(e){
+    // parse the entry date as LOCAL (a date-only ISO parses as UTC midnight via the bare Date ctor, shifting the
+    // month in negative-offset zones) — _fcParseDate is the file's canonical local-date helper, same basis as nowKey.
+    if(!e||!e.date)return; var d=(typeof _fcParseDate==='function')?_fcParseDate(e.date):new Date(e.date); if(!d||isNaN(d.getTime()))return;
+    var k=_abMonthKeyOf(d);
+    if(k>=nowKey)return;            // exclude the current (partial) month + anything future
+    if(nowKey-k>WIN)return;        // last WIN completed months only
+    if(e._source==='plaid')hasLinked=true;
+    var parts=(typeof _spendSplitParts==='function')?_spendSplitParts(e):[{category:e.category,amount:e.amount}];
+    parts.forEach(function(p){ var cat=p.category||p.category_bucket||'misc'; if(keys.indexOf(cat)<0)cat='misc'; if(keys.indexOf(cat)<0)return; var amt=_lnum(p.amount); if(amt<=0)return; monthsSeen[k]=true; perCat[cat][k]=(perCat[cat][k]||0)+amt; });
+  });
+  var seenKeysNum=Object.keys(monthsSeen).map(Number);
+  if(seenKeysNum.length<MINM)return {ok:false,reason:'too-little-history',months:seenKeysNum.length,monthsWithData:seenKeysNum.length,hasLinked:hasLinked,spending:[],sinkingFunds:[],summary:null};
+  // CALENDAR-SPAN denominator: the earliest observed month (clamped to the WIN floor) through the last completed
+  // month. Building the series over the full span (idle in-span months → 0) makes presence/cv/mean/annualTotal use
+  // the true span — NOT just months-with-spend, which would over-amortize sinking funds for a gappy/sparse history.
+  var earliest=Math.min.apply(null,seenKeysNum), spanStart=Math.max(earliest,nowKey-WIN);
+  var spanKeys=[]; for(var sk=spanStart;sk<nowKey;sk++)spanKeys.push(sk);
+  var windowMonths=spanKeys.length, monthsWithData=seenKeysNum.length;
+  var confidence=windowMonths>=12?'high':(windowMonths>=6?'med':'low');
+  var spending=[];
+  keys.forEach(function(k){
+    var byMonth=perCat[k], monthsWithSpend=Object.keys(byMonth).length; if(!monthsWithSpend)return;
+    var series=spanKeys.map(function(mk){ return _lnum(byMonth[mk]); }); // per span-month spend (0 where this cat was idle)
+    var nonZero=series.filter(function(v){return v>0;});
+    var total=series.reduce(function(t,v){return t+v;},0);
+    var presence=monthsWithSpend/windowMonths, annualTotal=total/windowMonths*12;
+    var mean=total/windowMonths, sd=Math.sqrt(series.reduce(function(t,v){return t+(v-mean)*(v-mean);},0)/windowMonths), cv=mean>0?sd/mean:0;
+    // variance among the ACTUAL charges (nonZero) — so a stable recurring bill present most months still reads as
+    // FIXED even with idle/gap months (the zero-padded cv above would wrongly inflate and divert it to VARIABLE).
+    var nzMean=nonZero.length?total/nonZero.length:0;
+    var nzCv=nzMean>0?Math.sqrt(nonZero.reduce(function(t,v){return t+(v-nzMean)*(v-nzMean);},0)/nonZero.length)/nzMean:0;
+    var type,monthly,basis;
+    if(presence>=0.75&&nzCv<=0.20){ type='fixed'; monthly=_abMedian(nonZero); basis='median'; }
+    // PERIODIC (sinking fund) — lumpy/annual/seasonal: a low-presence lump (annual premium) OR a HIGHLY concentrated
+    // spend even at higher presence (holiday spikes; cv>=1.25 over the span series). Tested BEFORE variable so a
+    // seasonal category isn't run-rated (which under-saves for the spike). Needs >=12 months to trust annualTotal/12.
+    else if(windowMonths>=12&&annualTotal>=120&&(presence<0.4||cv>=1.25)){ type='periodic'; monthly=annualTotal/12; basis='amortized'; }
+    else if(presence>=0.4){ type='variable'; monthly=_abTrimmedMean(series); basis='trimmed-mean'; }
+    else return; // sporadic / not-yet-annualizable — don't budget a one-off
+    monthly=_abRound(monthly); if(monthly<=0)return;
+    spending.push({category:k,label:catMeta[k].label,icon:catMeta[k].icon,type:type,monthly:monthly,annualTotal:Math.round(annualTotal),monthsWithSpend:monthsWithSpend,basis:basis,confidence:confidence});
+  });
+  spending.sort(function(a,b){return b.monthly-a.monthly;});
+  var sinkingFunds=spending.filter(function(s){return s.type==='periodic';});
+  var income=_lnum(calcs.inc), recommendedSpend=spending.reduce(function(t,s){return t+s.monthly;},0);
+  var debtMin=_lnum(opts.debtMin), futureCommitted=_lnum(opts.futureCommitted); // supplied by the wrapper via the §1.7b ledger (no double-count)
+  var surplus=income-recommendedSpend-debtMin-futureCommitted;
+  return {ok:true,reason:null,months:windowMonths,monthsWithData:monthsWithData,hasLinked:hasLinked,confidence:confidence,spending:spending,sinkingFunds:sinkingFunds,
+    summary:{income:Math.round(income),recommendedSpend:Math.round(recommendedSpend),debtMin:Math.round(debtMin),futureCommitted:Math.round(futureCommitted),surplus:Math.round(surplus)}};
+}
+// Live wrapper: pulls globals + the §1.7b ledger's debt-min / future-committed totals (so the surplus reuses the
+// same residual partition the ledger does, never re-deriving). §1.10b calls this for the Pro+ one-tap.
+function _autoBudget24(opts){
+  opts=opts||{};
+  var fd=(typeof APP!=='undefined'&&APP._portalFd)||{};
+  var S=fd.S||(typeof _lastPfosState!=='undefined'&&_lastPfosState&&_lastPfosState.state)||{};
+  var calcs=fd.calcs||(typeof _lastPfosState!=='undefined'&&_lastPfosState&&_lastPfosState.calcs)||{};
+  var ym=(typeof _budgetMonthKey==='function')?_budgetMonthKey():null;
+  var debtMin=(typeof _ledgerDebtAuto==='function')?_ledgerDebtAuto(S):0;
+  var futureCommitted=0; try{ var L=(typeof _budgetLedger==='function')?_budgetLedger(ym):null; if(L&&L.tiers&&L.tiers.future)futureCommitted=_lnum(L.tiers.future.total); }catch(e){}
+  return _autoBudget24Build(S,calcs,{nowKey:opts.nowKey,debtMin:debtMin,futureCommitted:futureCommitted});
+}
+
+// ═══════════════════════════════════════════════════
 // PLAN ALIGNMENT CARD — portal-only (CPLAN lives here)
 // ═══════════════════════════════════════════════════
 // Reads CPLAN.allocations + _cpTracking via _cpGetActualContribution to surface
