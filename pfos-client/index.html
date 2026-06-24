@@ -1296,6 +1296,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="sb-item" id="cnav-pfos" onclick="showClientPage('pfos')"><span class="icon">⚡</span> My Financial Data</div>
       <div class="sb-item" id="cnav-plan" onclick="showClientPage('plan');initClientPlan()"><span class="icon">🗺️</span> My Financial Plan</div>
       <div class="sb-item" id="cnav-spending" onclick="showClientPage('spending');renderSpendingAnalysis()"><span class="icon">💰</span> My Spending <span id="cnavSpendBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:11px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
+      <div class="sb-item" id="cnav-invest" onclick="showClientPage('invest');renderPortfolioView()" style="display:none"><span class="icon">📈</span> Investments</div>
       <div class="sb-item" id="cnav-tracking" onclick="showClientPage('tracking');renderClientTracking()"><span class="icon">✅</span> Financial Plan Tracking</div>
       <div class="sb-item" id="cnav-projections" onclick="showClientPage('projections');renderClientProjections()"><span class="icon">📈</span> Financial Projections</div>
       <div class="sb-item" id="cnav-analysis" onclick="showClientPage('analysis');renderClientAnalysis()"><span class="icon">🔍</span> Financial Analysis</div>
@@ -1540,6 +1541,13 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="pg-title">My Spending</div>
       <div class="pg-sub">Where your money goes each month — categories, patterns, and insights</div>
       <div id="spendingAnalysis"><div style="color:var(--mu);font-size:14px;padding:12px 0">Loading spending data...</div></div>
+    </div>
+
+    <!-- Investments / Portfolio (§2.2) -->
+    <div class="pg" id="cpg-invest">
+      <div class="pg-title">Investments</div>
+      <div class="pg-sub">Your portfolio — holdings, allocation, and unrealized gains</div>
+      <div id="portfolioView"><div style="color:var(--mu);font-size:14px;padding:12px 0">Loading portfolio…</div></div>
     </div>
 
     <!-- Financial Plan Tracking -->
@@ -2673,6 +2681,9 @@ function showClientPage(id){
     // Lazily inject the Learn iframe on first open
     if(typeof ensureLearnFrame==='function') ensureLearnFrame();
   }
+  if(id==='invest'){ // §2.2: render the portfolio screen (defensive — nav onclick also calls it)
+    if(typeof renderPortfolioView==='function') renderPortfolioView();
+  }
   if(id==='pfos'&&APP.currentClientId){
     var container=document.getElementById('clientPfosContainer');
     if(container&&!container.dataset.loaded){
@@ -2931,6 +2942,113 @@ async function _cpLoadHoldings(){
     if(APP.currentClientId!==_cid) return; // re-check after the second await
     APP._holdings=_cpBuildHoldings(hRows, secRows);
   }catch(e){ if(APP.currentClientId===_cid) APP._holdings=[]; console.warn('_cpLoadHoldings:',e); } // never leave stale/undefined for the current client
+}
+
+// ── §2.2 (M2) Investments / portfolio view ───────────────────────────────────
+// The real per-security portfolio screen, built from §2.1 APP._holdings (RLS-
+// scoped, crypto-aware). Reuses the app's donut (_portalSvgDonut, value-mode) +
+// statTile + info-card tokens — visually identical to the rest of the portal.
+// Falls back to the balance-level S.investments[] for the un-linked (never a
+// blank tab); empty state has a clear CTA (no dead-end). READ-ONLY / metric-inert:
+// it renders APP._holdings + S and writes nothing.
+var _AC_COLORS={equity:'#22C55E',etf:'#5B9BFF','mutual fund':'#8B5CF6','fixed income':'#F59E0B',cash:'#94A3B8',derivative:'#EC4899',cryptocurrency:'#F7931A',loan:'#EF4444',other:'#64748B'};
+function _acColor(t){ return _AC_COLORS[(t==null?'other':String(t)).toLowerCase()]||_AC_COLORS.other; }
+function _acLabel(t){ t=(t==null?'':String(t)); if(!t)return 'Other'; return t.replace(/\b\w/g,function(m){return m.toUpperCase();}); }
+function _cpEscHtml(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); } // §2.2: single HTML escaper for ALL portfolio output (donut labels via the legend too, + table)
+function _cpHoldingsByType(holdings){
+  var by={};
+  (holdings||[]).forEach(function(h){ if(!h)return; var t=((h.type==null?'':String(h.type)).toLowerCase())||'other'; by[t]=(by[t]||0)+(parseFloat(h.value)||0); });
+  return Object.keys(by).map(function(t){ return {l:_cpEscHtml(_acLabel(t)),v:by[t],c:_acColor(t)}; }).filter(function(d){return d.v>0;}).sort(function(a,b){return b.v-a.v;}); // escape label here: _portalSvgDonut's legend injects d.l raw
+}
+function renderPortfolioView(){
+  var el=document.getElementById('portfolioView'); if(!el) return;
+  var ev=_cpEscHtml; // single-source escaper (§2.2)
+  // §2.1 holdings load is fire-and-forget; if not yet resolved, load then re-render.
+  if(APP._holdings===undefined){
+    el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:24px 0;text-align:center">Loading your portfolio…</div>';
+    if(typeof _cpLoadHoldings==='function'){ _cpLoadHoldings().then(function(){ if(_currentClientPage==='invest') renderPortfolioView(); }); }
+    return;
+  }
+  var holdings=APP._holdings||[];
+  var S=(_lastPfosState&&_lastPfosState.state)||{};
+  var h='';
+  if(holdings.length){
+    var totalAll=_cpHoldingsValue(holdings,true);
+    var totalExCrypto=_cpHoldingsValue(holdings,false);
+    var cryptoVal=totalAll-totalExCrypto;
+    var totalCost=holdings.reduce(function(t,x){ return t+((x&&x.costBasis!=null)?x.costBasis:0); },0);
+    var costKnown=holdings.some(function(x){return x&&x.costBasis!=null;});
+    var totGain=costKnown?holdings.reduce(function(t,x){ return t+((x&&x.costBasis!=null)?(x.value-x.costBasis):0); },0):null;
+    var totGainPct=(costKnown&&totalCost>0)?(totGain/totalCost*100):null;
+    var accts={}; holdings.forEach(function(x){ if(x&&x.accountId)accts[x.accountId]=1; });
+    h+='<div class="info-card" style="padding:14px;margin-bottom:12px">';
+    h+='<div class="stat-grid" style="gap:6px;margin-bottom:0">'; // responsive 4→2→1 cols via the app's media queries
+    h+=statTile(fmtK(totalAll),'Portfolio Value','#5B9BFF');
+    h+=statTile(String(holdings.length),'Holdings','var(--mu)');
+    h+=statTile(String(Object.keys(accts).length||'—'),'Accounts','var(--mu)');
+    if(totGain==null){ h+=statTile('—','Gain / Loss','var(--mu)'); }
+    else { h+=statTile((totGain>=0?'+':'')+fmtK(totGain)+(totGainPct!=null?' ('+(totGainPct>=0?'+':'')+totGainPct.toFixed(1)+'%)':''),'Unrealized Gain / Loss',totGain>=0?'var(--gr)':'var(--rd)'); }
+    h+='</div>';
+    if(cryptoVal>0){ h+='<div style="font-size:11px;color:var(--mu);margin-top:8px">Includes '+fmt(Math.round(cryptoVal))+' crypto · net-worth value excl. crypto: '+fmt(Math.round(totalExCrypto))+'</div>'; }
+    h+='</div>';
+    var donutData=_cpHoldingsByType(holdings);
+    if(donutData.length){
+      h+='<div class="info-card" style="padding:14px;margin-bottom:12px">';
+      h+='<div class="info-card-title" style="margin-bottom:8px">Asset Allocation</div>';
+      h+=_portalSvgDonut(donutData,220,'Allocation',{amtSuffix:'',centerSub:'total'});
+      h+='</div>';
+    }
+    h+='<div class="info-card" style="padding:14px">';
+    h+='<div class="info-card-title" style="margin-bottom:8px">Holdings</div>';
+    h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px;min-width:520px">';
+    h+='<thead><tr style="color:var(--mu);font-family:var(--fh);font-size:11px;text-transform:uppercase;letter-spacing:.06em;text-align:right">';
+    h+='<th style="text-align:left;padding:6px 8px">Holding</th><th style="padding:6px 8px">Qty</th><th style="padding:6px 8px">Value</th><th style="padding:6px 8px">Cost Basis</th><th style="padding:6px 8px">Gain / Loss</th><th style="padding:6px 8px">Alloc</th></tr></thead><tbody>';
+    holdings.slice().sort(function(a,b){return (b.value||0)-(a.value||0);}).forEach(function(x){
+      var allocPct=totalAll>0?(x.value/totalAll*100):0;
+      var glCol=(x.gainLoss==null)?'var(--mu)':(x.gainLoss>=0?'var(--gr)':'var(--rd)');
+      var glTxt=(x.gainLoss==null)?'—':((x.gainLoss>=0?'+':'')+fmt(Math.round(x.gainLoss))+(x.gainLossPct!=null?' ('+(x.gainLossPct>=0?'+':'')+x.gainLossPct.toFixed(1)+'%)':''));
+      var nm=ev(x.ticker||'')||ev(x.name||'')||'—';
+      var sub=(x.ticker&&x.name)?ev(x.name):'';
+      h+='<tr style="border-top:1px solid var(--bd);text-align:right">';
+      h+='<td style="text-align:left;padding:6px 8px"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'+_acColor(x.type)+';margin-right:6px"></span><strong style="color:var(--wh)">'+nm+'</strong>'+(sub?'<div style="font-size:11px;color:var(--mu);margin-left:14px">'+sub+'</div>':'')+(x.isCrypto?' <span style="font-size:10px;color:#F7931A">crypto</span>':'')+'</td>';
+      h+='<td style="padding:6px 8px;color:var(--mu)">'+(x.quantity?(Math.round(x.quantity*1000)/1000):'—')+'</td>';
+      h+='<td style="padding:6px 8px;color:var(--wh);font-family:var(--fd)">'+fmt(Math.round(x.value))+'</td>';
+      h+='<td style="padding:6px 8px;color:var(--mu)">'+(x.costBasis!=null?fmt(Math.round(x.costBasis)):'—')+'</td>';
+      h+='<td style="padding:6px 8px;color:'+glCol+'">'+glTxt+'</td>';
+      h+='<td style="padding:6px 8px;color:var(--mu)">'+allocPct.toFixed(0)+'%</td>';
+      h+='</tr>';
+    });
+    h+='</tbody></table></div></div>';
+    el.innerHTML=h;
+    return;
+  }
+  // ── Fallback: balance-level manual / synced investments (no per-holding data) ──
+  var invs=(S.investments||[]).filter(function(x){return x&&(parseFloat(x.balance)||0)>0;});
+  if(invs.length){
+    var by={}; invs.forEach(function(x){ var t=((x.type==null?'':String(x.type)).toLowerCase())||'other'; by[t]=(by[t]||0)+(parseFloat(x.balance)||0); });
+    var dd=Object.keys(by).map(function(t){return {l:_cpEscHtml(_acLabel(t)),v:by[t],c:_acColor(t)};}).filter(function(d){return d.v>0;}).sort(function(a,b){return b.v-a.v;});
+    var tot=invs.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);
+    h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px">';
+    h+=statTile(fmtK(tot),'Investment Balance','#5B9BFF');
+    h+=statTile(String(invs.length),'Accounts','var(--mu)');
+    h+='</div><div style="font-size:11px;color:var(--mu);margin-top:8px">Showing account balances. Link an investment account for per-holding detail, cost basis, and gain/loss.</div></div>';
+    if(dd.length){ h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Allocation by Type</div>'+_portalSvgDonut(dd,220,'Allocation',{amtSuffix:'',centerSub:'total'})+'</div>'; }
+    h+='<div class="info-card" style="padding:14px"><div class="info-card-title" style="margin-bottom:8px">Accounts</div>';
+    invs.slice().sort(function(a,b){return (parseFloat(b.balance)||0)-(parseFloat(a.balance)||0);}).forEach(function(x){
+      var own=(x.owner&&x.owner!=='self'&&x.owner!=='personal')?' <span style="font-size:10px;color:var(--mu)">('+ev(x.owner)+')</span>':'';
+      h+='<div style="display:flex;justify-content:space-between;padding:6px 0;border-top:1px solid var(--bd)"><span style="color:var(--wh)"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'+_acColor(x.type)+';margin-right:6px"></span>'+ev(_acLabel(x.type))+own+'</span><span style="font-family:var(--fd);color:var(--wh)">'+fmt(Math.round(parseFloat(x.balance)||0))+'</span></div>';
+    });
+    h+='</div>';
+    el.innerHTML=h;
+    return;
+  }
+  // ── Empty state (no holdings, no manual investments) — never a dead-end ──
+  el.innerHTML='<div class="info-card" style="padding:24px;text-align:center">'
+    +'<div style="font-size:32px;margin-bottom:8px">📈</div>'
+    +'<div style="color:var(--wh);font-family:var(--fh);font-weight:700;margin-bottom:6px">No investments yet</div>'
+    +'<div style="color:var(--mu);font-size:13px;line-height:1.6;margin-bottom:14px">Link a brokerage or retirement account to see your holdings, allocation, and gains here — or add investments manually in My Financial Data.</div>'
+    +'<button class="btn btn-bl" aria-label="Add or link investments" onclick="showClientPage(\'pfos\')" style="max-width:280px;margin:0 auto">ADD OR LINK INVESTMENTS</button>'
+    +'</div>';
 }
 
 function checkAffordability(){
@@ -7793,8 +7911,9 @@ function _portalGetMonthlyExp(key){
   return subTotal>0?subTotal:v;
 }
 // SVG donut renderer mirroring pfos-main's _svgDonut signature/output exactly
-function _portalSvgDonut(data,size,label){
+function _portalSvgDonut(data,size,label,opts){
   if(!data||!data.length) return '';
+  var _amtSuf=(opts&&opts.amtSuffix!=null)?opts.amtSuffix:'/mo'; var _ctrSub=(opts&&opts.centerSub!=null)?opts.centerSub:'/month'; // §2.2: value-mode donut overrides the cash-flow '/mo' labels; default = byte-identical for existing callers
   var total=data.reduce(function(s,d){return s+d.v;},0)||1;
   var cx=size/2,cy=size/2,r=size/2-20,r2=r*0.6;
   // Unique donut ID so the tooltip element stays scoped per-instance. Shared
@@ -7820,13 +7939,13 @@ function _portalSvgDonut(data,size,label){
     // in white, percentage in muted small text.
     var _label=(d.l||'Unlabeled');
     var _tipHtml='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:4px">'+_label.replace(/</g,'&lt;').replace(/"/g,'&quot;')+'</div>'
-      +'<div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">'+fmt(Math.round(d.v))+'/mo</div>'
+      +'<div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">'+fmt(Math.round(d.v))+_amtSuf+'</div>'
       +'<div style="font-size:11px;color:var(--mu)">'+_pct+'% of total</div>';
     svg+='<path d="M'+ix1+' '+iy1+' L'+x1+' '+y1+' A'+r+' '+r+' 0 '+large+' 1 '+x2+' '+y2+' L'+ix2+' '+iy2+' A'+r2+' '+r2+' 0 '+large+' 0 '+ix1+' '+iy1+'" fill="'+d.c+'" stroke="var(--bg)" stroke-width="1" data-tip="'+_tipHtml.replace(/"/g,'&quot;')+'" onmouseenter="_donutTip(\''+_donutId+'\',event,this)" onmousemove="_donutTip(\''+_donutId+'\',event,this)" onmouseleave="_donutTipHide(\''+_donutId+'\')"></path>';
     angle+=slice;
   });
   svg+='<text x="'+cx+'" y="'+(cy-4)+'" fill="var(--wh)" font-size="13" font-weight="700" text-anchor="middle" font-family="var(--fh)" pointer-events="none">'+fmtK(total)+'</text>';
-  svg+='<text x="'+cx+'" y="'+(cy+10)+'" fill="var(--mu)" font-size="9" text-anchor="middle" pointer-events="none">/month</text>';
+  svg+='<text x="'+cx+'" y="'+(cy+10)+'" fill="var(--mu)" font-size="9" text-anchor="middle" pointer-events="none">'+_ctrSub+'</text>';
   svg+='</svg>';
   // Positioned tooltip element — managed by _donutTip / _donutTipHide
   svg+='<div id="'+_donutId+'_tip" style="display:none;position:absolute;pointer-events:none;background:rgba(12,12,52,.95);border:1px solid rgba(91,155,255,.3);border-radius:4px;padding:8px 12px;font-size:12px;min-width:120px;max-width:220px;z-index:10;box-shadow:0 4px 12px rgba(0,0,0,.3);top:0;left:0"></div>';
@@ -24322,6 +24441,9 @@ function _cpUpdateAdvisoryNav(){
   }
   // Plaid "Link accounts" card — Pro+/comp only; _cpUpdateLinkCard handles show/hide + linked-vs-unlinked state.
   if(typeof _cpUpdateLinkCard==='function')_cpUpdateLinkCard();
+  // §2.2: Investments nav — Pro+ (clientHasFeature('plaid')); shows the portfolio screen.
+  var _invNav=document.getElementById('cnav-invest');
+  if(_invNav)_invNav.style.display=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'))?'':'none';
 }
 
 // Render the home Plaid card in its correct state: the invite ("Link your accounts / Link Now") when nothing
