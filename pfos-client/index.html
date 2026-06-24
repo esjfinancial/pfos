@@ -3190,7 +3190,9 @@ function _cpCashFlowReport(opts){
   function addExp(k,amt,cat){ if(!months[k]||!(amt>0)) return; months[k].expense+=amt; cat=cat||'misc'; months[k].byCat[cat]=(months[k].byCat[cat]||0)+amt; }
   if(useTxns){
     // linked outflows (amount>0 = spend, per the plaid-transactions-sync convention) ...
-    txnsInRange.forEach(function(t){ addExp(_cpMonthKey(t.date), parseFloat(t.amount)||0, t.category||t.bucket); });
+    // category = the CLEAN PFOS bucket (category_bucket: "transportation") preferred over the raw plaid
+    // detail (category_pfos: "rideshare_transit") so labels map via _cpSpendCatMeta instead of showing raw keys.
+    txnsInRange.forEach(function(t){ addExp(_cpMonthKey(t.date), parseFloat(t.amount)||0, t.bucket||t.category); });
     // ... PLUS true-manual entries (NOT plaid-sourced) so manual months/entries are never hidden when txns
     // exist for OTHER months (the all-or-nothing bug). No double-count: the plaid mirror lives in txns, not here.
     spendEntries.forEach(function(e){ if(!e||e._source==='plaid') return; var k=_cpMonthKey(e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
@@ -3276,23 +3278,36 @@ function _cpRenderSankey(model,W,H){
   var leftX=padL, rightX=W-labelW-nodeW, midX=(leftX+nodeW+rightX)/2, plotH=H-padT-padB;
   var nR=model.rights.length, gap=Math.max(2.5, Math.min(9, (plotH*0.42)/nR)); // node padding turns the blob into distinct bands
   var rAvail=plotH-(nR-1)*gap;
+  // TRUE (income-side) heights vs DISPLAY (destination-side) heights. A single band that dwarfs the rest
+  // (e.g. a 90%+-savings "Saved" band over a long range) would crush every spending band into an unreadable
+  // sliver — defeating "Where It Went". So CAP any one destination band at CAPFRAC of the plot and redistribute
+  // the freed height to the others ∝ their true size, keeping the spending breakdown legible. Amounts on the
+  // labels stay EXACT (the chart never lies about $); a capped band is marked "≈" + a note. Income side stays true.
+  var rawH=model.rights.map(function(nd){ return (nd.value/total)*rAvail; });
+  // Only cap when there are ≥3 bands: with just 2, the single "other" band is already legible (or falls to the
+  // legend), and capping would force BOTH to equal height (a 92/8 split → 50/50) — more misleading than helpful.
+  // At ≥3 only ONE band can exceed 50%, so it alone is compressed while the rest keep their RELATIVE proportions
+  // (uniformly scaled up into the freed height) — defensible, and flagged not-to-scale.
+  var CAPFRAC=0.5, capH=rAvail*CAPFRAC, capped=false, freed=0, uncRaw=0;
+  if(nR>=3){ rawH.forEach(function(h){ if(h>capH){ freed+=(h-capH); capped=true; } else { uncRaw+=h; } }); }
+  var dispH=rawH.map(function(h){ if(capped&&h>capH) return capH; return (capped&&uncRaw>0)? h+freed*(h/uncRaw) : h; });
   var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto" role="img" aria-label="Income to category flow">';
-  // ribbons stack CONTIGUOUSLY on the income side, GAPPED on the destination side (each band reads distinctly)
+  // ribbons: left endpoints stack at TRUE heights (matching the income bar), right endpoints at DISPLAY heights
   var lY=padT, rY=padT, rows=[];
-  model.rights.forEach(function(nd){ var h=(nd.value/total)*rAvail; rows.push({nd:nd, lt:lY, lb:lY+h, rt:rY, rb:rY+h}); lY+=h; rY+=h+gap; });
+  model.rights.forEach(function(nd,i){ rows.push({nd:nd, lt:lY, lb:lY+rawH[i], rt:rY, rb:rY+dispH[i], cap:(capped&&rawH[i]>capH)}); lY+=rawH[i]; rY+=dispH[i]+gap; });
   rows.forEach(function(r){
     var p='M'+(leftX+nodeW)+','+r.lt.toFixed(2)+' C'+midX+','+r.lt.toFixed(2)+' '+midX+','+r.rt.toFixed(2)+' '+rightX+','+r.rt.toFixed(2)+' L'+rightX+','+r.rb.toFixed(2)+' C'+midX+','+r.rb.toFixed(2)+' '+midX+','+r.lb.toFixed(2)+' '+(leftX+nodeW)+','+r.lb.toFixed(2)+' Z';
     svg+='<path d="'+p+'" fill="'+r.nd.color+'" opacity="0.55" stroke="'+r.nd.color+'" stroke-width="0.6"><title>'+_cpEscHtml(r.nd.label)+': '+fmt(Math.round(r.nd.value))+'</title></path>';
   });
-  // left source bar(s) — Income (green) [+ Deficit (red)], contiguous, matching the ribbon stack
+  // left source bar(s) — Income (green) [+ Deficit (red)], contiguous, TRUE heights (matches the ribbon left edges)
   var lYb=padT;
   model.lefts.forEach(function(nd){ var h=(nd.value/total)*rAvail; svg+='<rect x="'+leftX+'" y="'+lYb.toFixed(2)+'" width="'+nodeW+'" height="'+h.toFixed(2)+'" fill="'+nd.color+'" rx="1.5"><title>'+_cpEscHtml(nd.label)+': '+fmt(Math.round(nd.value))+'</title></rect>'; lYb+=h; });
-  // right destination bars + ON-CHART labels (name + amount) for bands tall enough; tiny ones fall to the legend
-  rows.forEach(function(r){
-    svg+='<rect x="'+rightX+'" y="'+r.rt.toFixed(2)+'" width="'+nodeW+'" height="'+(r.rb-r.rt).toFixed(2)+'" fill="'+r.nd.color+'" rx="1.5"></rect>';
-    if((r.rb-r.rt)>=9){ var cy=((r.rt+r.rb)/2+3.2).toFixed(1);
+  // right destination bars (DISPLAY heights) + ON-CHART labels (name + amount) for bands tall enough; "≈" if capped
+  rows.forEach(function(r){ var bh=r.rb-r.rt;
+    svg+='<rect x="'+rightX+'" y="'+r.rt.toFixed(2)+'" width="'+nodeW+'" height="'+bh.toFixed(2)+'" fill="'+r.nd.color+'" rx="1.5"></rect>';
+    if(bh>=9){ var cy=((r.rt+r.rb)/2+3.2).toFixed(1);
       svg+='<text x="'+(rightX+nodeW+6)+'" y="'+cy+'" fill="var(--wh)" font-size="10.5" font-family="var(--fh)">'+_cpEscHtml(r.nd.label)+'</text>';
-      svg+='<text x="'+(W-4)+'" y="'+cy+'" fill="var(--mu)" font-size="9.5" text-anchor="end">'+fmt(Math.round(r.nd.value))+'</text>'; }
+      svg+='<text x="'+(W-4)+'" y="'+cy+'" fill="var(--mu)" font-size="9.5" text-anchor="end">'+(r.cap?'≈':'')+fmt(Math.round(r.nd.value))+'</text>'; }
   });
   // column headers
   svg+='<text x="'+leftX+'" y="11" fill="var(--mu)" font-size="9" font-weight="700" text-anchor="start" font-family="var(--fh)" letter-spacing="0.6">INCOME</text>';
@@ -3302,6 +3317,7 @@ function _cpRenderSankey(model,W,H){
   var leg='<div style="display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:4px;justify-content:center">';
   model.lefts.concat(model.rights).forEach(function(nd){ leg+='<div style="font-size:11px;color:var(--mu);display:flex;align-items:center;gap:3px"><span style="width:8px;height:8px;border-radius:1px;background:'+nd.color+'"></span>'+_cpEscHtml(nd.label)+' '+fmt(Math.round(nd.value))+'</div>'; });
   leg+='</div>';
+  if(capped) leg+='<div style="font-size:10px;color:var(--mu);text-align:center;margin-top:3px;opacity:.85">≈ heights adjusted for legibility (not to scale) — the amounts are exact</div>';
   return svg+leg;
 }
 
@@ -3358,7 +3374,7 @@ function _cpExportRows(opts){
   var rows=[], txnsInRange=txns.filter(function(t){ return t&&!t.removed&&inRange(_cpMonthKey(t.date)); });
   if(txnsInRange.length){
     txnsInRange.forEach(function(t){ var amt=parseFloat(t.amount)||0;
-      rows.push({date:(t.date||''), description:(t.name||''), merchant:(t.merchant||''), category:(t.category||t.bucket||''), amount:Math.abs(amt).toFixed(2), type:(t.isTransfer?'Transfer':(amt<0?'Income':'Expense')), status:(t.excluded?'excluded':(t.pending?'pending':''))}); });
+      rows.push({date:(t.date||''), description:(t.name||''), merchant:(t.merchant||''), category:(t.bucket||t.category||''), amount:Math.abs(amt).toFixed(2), type:(t.isTransfer?'Transfer':(amt<0?'Income':'Expense')), status:(t.excluded?'excluded':(t.pending?'pending':''))}); });
     spendEntries.forEach(function(e){ if(!e||e._source==='plaid'||!inRange(_cpMonthKey(e.date))) return; var amt=parseFloat(e.amount)||0;
       rows.push({date:(e.date||''), description:(e.description||''), merchant:'', category:(e.category||e.category_bucket||''), amount:Math.abs(amt).toFixed(2), type:(amt<0?'Income':'Expense'), status:''}); });
   } else {
@@ -3459,11 +3475,13 @@ function renderReportsView(){
   var _span=endKey-startKey+1;
   var _priorRep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey-_span, endKey:startKey-1, fallbackIncome:calcs.inc||0, incomeStreams:_incomeConfirm});
   var _merch=_cpMerchantReport(APP._txns||[], startKey, endKey);
-  var _merchTr=_cpTrendDiff(_merch.merchants, _cpMerchantReport(APP._txns||[], startKey-_span, startKey-1).merchants, 'name');
+  var _priorMerchRep=_cpMerchantReport(APP._txns||[], startKey-_span, startKey-1);
+  var _hasPriorMerch=_priorMerchRep.merchants.length>0; // no prior window data → suppress the "new"/Δ noise (everything would read "new")
+  var _merchTr=_cpTrendDiff(_merch.merchants, _priorMerchRep.merchants, 'name');
   h+='<div class="info-card" style="padding:14px;margin-top:12px"><div class="info-card-title" style="margin-bottom:8px">Top Merchants</div>';
   if(_merch.merchants.length){
     var _mMax=_merch.merchants[0].total||1;
-    _merchTr.slice(0,10).forEach(function(m){ var _ar=(m.dir==='up'?'▲':(m.dir==='down'?'▼':(m.dir==='new'?'•':''))), _ac=(m.dir==='up'?'var(--rd)':(m.dir==='down'?'var(--gr)':'var(--mu)')), _dt=(m.dir==='new'?'new':(m.deltaPct==null?'':(_ar+Math.abs(m.deltaPct)+'%')));
+    _merchTr.slice(0,10).forEach(function(m){ var _ar=(m.dir==='up'?'▲':(m.dir==='down'?'▼':(m.dir==='new'?'•':''))), _ac=(m.dir==='up'?'var(--rd)':(m.dir==='down'?'var(--gr)':'var(--mu)')), _dt=(!_hasPriorMerch?'':(m.dir==='new'?'new':(m.deltaPct==null?'':(_ar+Math.abs(m.deltaPct)+'%'))));
       h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;margin-bottom:3px"><span style="color:var(--wh);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ev(m.name)+' <span style="color:var(--mu);font-size:11px">×'+m.count+'</span></span><span style="color:var(--mu);white-space:nowrap;flex-shrink:0">'+fmt(m.total)+(_dt?' <span style="color:'+_ac+'">'+_dt+'</span>':'')+'</span></div><div style="height:5px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+Math.round(m.total/_mMax*100)+'%;background:#5B9BFF;border-radius:2px"></div></div></div>'; });
   } else { h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">'+(_plaidLinked?'Top merchants appear once your linked transactions sync.':'Link a bank to see your top merchants.')+'</div>'; }
   h+='</div>';
@@ -3472,8 +3490,9 @@ function renderReportsView(){
   var _hasPrior=(_priorRep.byCategory&&_priorRep.byCategory.length>0);
   h+='<div class="info-card" style="padding:14px;margin-top:12px"><div class="info-card-title" style="margin-bottom:8px">Category Trends'+(_hasPrior?' <span style="font-size:11px;color:var(--mu);font-weight:400">vs prior '+_span+' mo</span>':'')+'</div>';
   if(_trends.length){
-    _trends.slice(0,10).forEach(function(t){ var _m=_cpSpendCatMeta(t.key), _ar=(t.dir==='up'?'▲':(t.dir==='down'?'▼':(t.dir==='new'?'•':'–'))), _ac=(t.dir==='up'?'var(--rd)':(t.dir==='down'?'var(--gr)':'var(--mu)')), _dt=(t.dir==='new'?'new':(t.deltaPct==null?'—':Math.abs(t.deltaPct)+'%'));
-      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--bd)"><span style="color:var(--wh);font-size:12px"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'+_m.c+';margin-right:6px"></span>'+ev(_m.l)+'</span><span style="font-size:12px"><span style="color:var(--mu)">'+fmt(t.total)+'</span> <span style="color:'+_ac+';font-weight:700">'+_ar+' '+_dt+'</span></span></div>'; });
+    _trends.slice(0,10).forEach(function(t){ var _m=_cpSpendCatMeta(t.key), _trendSpan='';
+      if(_hasPrior){ var _ar=(t.dir==='up'?'▲':(t.dir==='down'?'▼':(t.dir==='new'?'•':'–'))), _ac=(t.dir==='up'?'var(--rd)':(t.dir==='down'?'var(--gr)':'var(--mu)')), _dt=(t.dir==='new'?'new':(t.deltaPct==null?'—':Math.abs(t.deltaPct)+'%')); _trendSpan=' <span style="color:'+_ac+';font-weight:700">'+_ar+' '+_dt+'</span>'; } // no prior window → just the amount + bar, no "new" on every row
+      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--bd)"><span style="color:var(--wh);font-size:12px"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'+_m.c+';margin-right:6px"></span>'+ev(_m.l)+'</span><span style="font-size:12px"><span style="color:var(--mu)">'+fmt(t.total)+'</span>'+_trendSpan+'</span></div>'; });
   } else { h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">No category data in this range.</div>'; }
   h+='</div>';
   el.innerHTML=h;
@@ -12455,7 +12474,9 @@ function _updateLastSaved(){
   var el=document.getElementById('lastSavedIndicator');
   if(!el){el=document.createElement('div');el.id='lastSavedIndicator';el.style.cssText='position:fixed;bottom:8px;right:8px;z-index:9000;padding:5px 12px;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.25);border-radius:4px;font-family:var(--fh);font-size:12px;color:var(--gr);font-weight:600;transition:opacity .5s;pointer-events:none';document.body.appendChild(el);}
   el.textContent='✓ Saved '+new Date().toLocaleTimeString('en-US',{hour:'numeric',minute:'2-digit'});
-  el.style.opacity='1';clearTimeout(el._fadeTimer);el._fadeTimer=setTimeout(function(){el.style.opacity='0.4';},5000);
+  el.style.display='block';el.style.opacity='1';clearTimeout(el._fadeTimer);clearTimeout(el._hideTimer);
+  el._fadeTimer=setTimeout(function(){el.style.opacity='0';},5000); // fully fade (was parked at 0.4 → lingered over bottom-right content)
+  el._hideTimer=setTimeout(function(){el.style.display='none';},5600);
 }
 
 async function clientSaveOwnData(){
