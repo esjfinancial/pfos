@@ -2564,7 +2564,7 @@ async function initAuth(){
       _lastSaveDirty=false;
       APP._portalFd=null;APP._portalCalcs=null;
       APP.currentClientId=null;APP.currentClient=null;
-      try{ _bridgeCache=null; APP._holdings=null; APP._supabaseSnapshots=null; APP._txns=null; }catch(_e){} // §1.9b memo + §2.1 holdings + snapshots + §2.4 txns are client-keyed caches; null on logout (cross-client hygiene)
+      try{ _bridgeCache=null; APP._holdings=null; APP._supabaseSnapshots=null; APP._txns=null; if(typeof CPLAN!=='undefined'&&CPLAN)CPLAN._sim=null; }catch(_e){} // §1.9b memo + §2.1 holdings + snapshots + §2.4 txns + §2.3 the global CPLAN._sim projection are client-keyed; null on logout (cross-client hygiene)
       // Force iframe to be recreated on next login so PFOS_READY fires and loads fresh data
       var _cpContainer=document.getElementById('clientPfosContainer');
       if(_cpContainer){_cpContainer.innerHTML='';delete _cpContainer.dataset.loaded;}
@@ -3140,6 +3140,10 @@ async function _cpLoadTransactions(months){
 }
 
 function _cfMonthLabel(key){ var y=Math.floor(key/12), m=((key%12)+12)%12; return ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'][m]+" '"+String(y).slice(-2); }
+// SINGLE-SOURCE timezone-safe month key (year*12 + month-1): parse YYYY-MM directly from the string —
+// NEVER new Date() (date-only ISO parses as UTC midnight → a prior-month shift in US zones; the §1.10a
+// class). Used by every M2 report fn (cash-flow / merchant / export).
+function _cpMonthKey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
 
 // PURE: a custom-range cash-flow report. Expense source = the 24-mo txns when any
 // land in-range (outflow = amount>0, excl. transfers/excluded), else the split-
@@ -3151,23 +3155,20 @@ function _cpCashFlowReport(opts){
   var startKey=opts.startKey, endKey=opts.endKey;
   var txns=opts.txns||[], spendEntries=opts.spendEntries||[], snaps=opts.snapshots||[];
   var fallbackIncome=parseFloat(opts.fallbackIncome)||0;
-  // Timezone-safe month key: parse YYYY-MM directly from the string — NEVER new Date()
-  // (which parses date-only ISO as UTC midnight → a prior-month shift in US zones; the §1.10a class).
-  function mkey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
-  var txnsInRange=txns.filter(function(t){ var k=mkey(t.date); return k!=null&&k>=startKey&&k<=endKey&&!t.isTransfer&&!t.excluded; });
+  var txnsInRange=txns.filter(function(t){ var k=_cpMonthKey(t.date); return k!=null&&k>=startKey&&k<=endKey&&!t.isTransfer&&!t.excluded; });
   var useTxns=txnsInRange.length>0;
   var months={};
   for(var k=startKey;k<=endKey;k++){ months[k]={income:0,expense:0,byCat:{}}; }
   function addExp(k,amt,cat){ if(!months[k]||!(amt>0)) return; months[k].expense+=amt; cat=cat||'misc'; months[k].byCat[cat]=(months[k].byCat[cat]||0)+amt; }
   if(useTxns){
     // linked outflows (amount>0 = spend, per the plaid-transactions-sync convention) ...
-    txnsInRange.forEach(function(t){ addExp(mkey(t.date), parseFloat(t.amount)||0, t.category||t.bucket); });
+    txnsInRange.forEach(function(t){ addExp(_cpMonthKey(t.date), parseFloat(t.amount)||0, t.category||t.bucket); });
     // ... PLUS true-manual entries (NOT plaid-sourced) so manual months/entries are never hidden when txns
     // exist for OTHER months (the all-or-nothing bug). No double-count: the plaid mirror lives in txns, not here.
-    spendEntries.forEach(function(e){ if(!e||e._source==='plaid') return; var k=mkey(e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
+    spendEntries.forEach(function(e){ if(!e||e._source==='plaid') return; var k=_cpMonthKey(e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
   } else {
     // no txns in range → ALL spendEntries are the only expense source (incl. the plaid 90-day mirror)
-    spendEntries.forEach(function(e){ var k=mkey(e&&e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
+    spendEntries.forEach(function(e){ var k=_cpMonthKey(e&&e.date); if(k==null||k<startKey||k>endKey) return; _spendSplitParts(e).forEach(function(p){ addExp(k, parseFloat(p.amount)||0, p.category||p.category_bucket); }); });
   }
   var snapByKey={}; snaps.forEach(function(s){ if(s&&s.month!=null&&s.year!=null){ var v=parseFloat(s.income); if(isFinite(v)) snapByKey[s.year*12+s.month]=v; } });
   var rows=[], totalIncome=0, totalExpense=0, catTotals={}, estMonths=0;
@@ -3265,9 +3266,8 @@ function _cpRenderSankey(model,W,H){
 // plaid txns carry it). Outflows only (amount>0), transfers/excluded dropped;
 // missing merchant_name → name → "Other". Timezone-safe YYYY-MM bucketing.
 function _cpMerchantReport(txns, startKey, endKey){
-  function mkey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
   var by={}, total=0;
-  (txns||[]).forEach(function(t){ if(!t||t.isTransfer||t.excluded) return; var k=mkey(t.date); if(k==null||k<startKey||k>endKey) return; var amt=parseFloat(t.amount)||0; if(amt<=0) return;
+  (txns||[]).forEach(function(t){ if(!t||t.isTransfer||t.excluded) return; var k=_cpMonthKey(t.date); if(k==null||k<startKey||k>endKey) return; var amt=parseFloat(t.amount)||0; if(amt<=0) return;
     var nm=(t.merchant&&String(t.merchant).trim())||(t.name&&String(t.name).trim())||'Other';
     if(!by[nm]) by[nm]={name:nm,total:0,count:0}; by[nm].total+=amt; by[nm].count++; total+=amt; });
   var merchants=Object.keys(by).map(function(n){ var m=by[n]; return {name:m.name,total:Math.round(m.total),count:m.count}; }).sort(function(a,b){ return b.total-a.total; });
@@ -3308,18 +3308,17 @@ function _cpToCsv(rows, columns){
 function _cpExportRows(opts){
   opts=opts||{};
   var startKey=opts.startKey, endKey=opts.endKey, txns=opts.txns||[], spendEntries=opts.spendEntries||[];
-  function mkey(dstr){ if(!dstr) return null; var p=String(dstr).split('-'); var y=parseInt(p[0],10), mo=parseInt(p[1],10); if(!isFinite(y)||!isFinite(mo)||mo<1||mo>12) return null; return y*12+(mo-1); }
   function inRange(k){ return k!=null && k>=startKey && k<=endKey; }
   // Amount = positive MAGNITUDE (matches the in-app positive-expense display); the Type column gives
   // the direction (Expense / Income / Transfer) — avoids the signed-export surprise.
-  var rows=[], txnsInRange=txns.filter(function(t){ return t&&!t.removed&&inRange(mkey(t.date)); });
+  var rows=[], txnsInRange=txns.filter(function(t){ return t&&!t.removed&&inRange(_cpMonthKey(t.date)); });
   if(txnsInRange.length){
     txnsInRange.forEach(function(t){ var amt=parseFloat(t.amount)||0;
       rows.push({date:(t.date||''), description:(t.name||''), merchant:(t.merchant||''), category:(t.category||t.bucket||''), amount:Math.abs(amt).toFixed(2), type:(t.isTransfer?'Transfer':(amt<0?'Income':'Expense')), status:(t.excluded?'excluded':(t.pending?'pending':''))}); });
-    spendEntries.forEach(function(e){ if(!e||e._source==='plaid'||!inRange(mkey(e.date))) return; var amt=parseFloat(e.amount)||0;
+    spendEntries.forEach(function(e){ if(!e||e._source==='plaid'||!inRange(_cpMonthKey(e.date))) return; var amt=parseFloat(e.amount)||0;
       rows.push({date:(e.date||''), description:(e.description||''), merchant:'', category:(e.category||e.category_bucket||''), amount:Math.abs(amt).toFixed(2), type:(amt<0?'Income':'Expense'), status:''}); });
   } else {
-    spendEntries.forEach(function(e){ if(!e||!inRange(mkey(e.date))) return; var amt=parseFloat(e.amount)||0;
+    spendEntries.forEach(function(e){ if(!e||!inRange(_cpMonthKey(e.date))) return; var amt=parseFloat(e.amount)||0;
       rows.push({date:(e.date||''), description:(e.description||''), merchant:'', category:(e.category||e.category_bucket||''), amount:Math.abs(amt).toFixed(2), type:(amt<0?'Income':'Expense'), status:''}); });
   }
   rows.sort(function(a,b){ return String(a.date).localeCompare(String(b.date)); });
@@ -4314,6 +4313,7 @@ async function _pfosWipeAllUserData(){
   }catch(e){console.warn('Cache Storage wipe failed:',e);}
   try{
     if(window.APP){APP.user=null;APP.userData=null;APP.currentClient=null;APP.currentClientId=null;APP.role=null;APP._holdings=null;APP._supabaseSnapshots=null;APP._txns=null;}
+    if(typeof CPLAN!=='undefined'&&CPLAN)CPLAN._sim=null; // §2.3: the global CPLAN._sim projection is client-keyed — clear on wipe (cross-client hygiene)
     if(typeof _lastPfosState!=='undefined')_lastPfosState=null;
     if(typeof APP_CLIENT!=='undefined')APP_CLIENT=null;
   }catch(e){}
