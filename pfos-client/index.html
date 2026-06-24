@@ -8105,7 +8105,8 @@ function _buildBudgetLedger(S,calcs,plan,month){
   });
   var autoRemainder=tier1Total-rowsSum; // insurance premiums + hybrid joint share (+ any custom-category delta)
   var cpName=(typeof CP_NM!=='undefined')?CP_NM:{}, cpIcon=(typeof CP_IC!=='undefined')?CP_IC:{};
-  var futureRows=cplanFuture.map(function(a){ return {type:a.type,label:a.customName||cpName[a.type]||a.type||'Allocation',icon:cpIcon[a.type]||'•',amount:_lnum(a.amount)}; });
+  var _planAllocs=Array.isArray(plan.allocations)?plan.allocations:[];
+  var futureRows=cplanFuture.map(function(a){ return {type:a.type,label:a.customName||cpName[a.type]||a.type||'Allocation',icon:cpIcon[a.type]||'•',amount:_lnum(a.amount),idx:_planAllocs.indexOf(a)}; }); // §1.9a-ii: idx → edit the EXACT allocation (same-type rows don't collide)
   var debtRows=cplanDebt.map(function(a){ return {type:a.type,label:a.customName||cpName[a.type]||'Pay off debt',icon:cpIcon[a.type]||'•',amount:_lnum(a.amount)}; });
   // Reconciliation self-check (the §1.7b STOP invariant): Σtiers == baseExp+planTotal (no dollar invented/lost,
   // no double-count) AND the residual is non-negative for the default (un-overridden) breakdown.
@@ -8502,37 +8503,69 @@ function _portalBudgetStyleToggle(cur){
   opts.forEach(function(o){ var a=(cur===o[0]); h+='<button onclick="_budgetSetStyle(\''+o[0]+'\')" style="padding:4px 9px;border-radius:4px;border:1px solid '+(a?'var(--gr)':'var(--bd)')+';background:'+(a?'rgba(34,197,94,.12)':'transparent')+';color:'+(a?'var(--gr)':'var(--mu)')+';font-size:11px;font-weight:700;cursor:pointer;min-height:28px">'+o[2]+' '+o[1]+'</button>'; });
   return h+'</div>';
 }
-function _portalLedgerTierSpending(L,style,fm,ev){
+// §1.9a-ii — inline envelope EDIT wiring. Each tier row carries an editable amount input; on commit (blur/enter)
+// it routes through the §1.7c _ledgerAssign dispatcher (spending→PFOS_BUDGET_ASSIGN/S.budget, future→CPLAN alloc,
+// debt→_ledgerAssignDebt validated ≥ minimum) then re-renders. A blocked debt edit (below min) toasts + reverts
+// (the re-render shows the unchanged value). All writes are metric-inert (§1.7/§1.8); key is attribute-sanitized.
+function _ledgerAssignInput(tier,key,amount,ym,editable){
+  var amt=Math.round(_lnum(amount)), k=String(key==null?'':key);
+  // Read-only unless: editing the CURRENT month (past months are history) + a safe slug/index key + a valid
+  // YYYY-MM. The key/ym are embedded into an inline onchange, so this whitelist hardens against attribute injection.
+  if(!editable||!/^[A-Za-z0-9_-]+$/.test(k)||!/^\d{4}-\d{2}$/.test(String(ym||'')))
+    return '<span style="font-family:var(--fd);font-size:14px;font-weight:700;color:var(--wh)">$'+amt.toLocaleString('en-US')+'</span>';
+  return '<span style="display:inline-flex;align-items:center;gap:2px"><span style="color:var(--mu);font-size:13px">$</span><input class="inp" type="text" inputmode="decimal" value="'+amt+'" oninput="autoComma(this)" onchange="_ledgerEditAssign(\''+tier+'\',\''+k+'\',this,\''+ym+'\')" onclick="event.stopPropagation()" style="width:74px;text-align:right;padding:3px 6px;font-size:13px;min-height:30px" aria-label="assign amount"></span>';
+}
+// Edit a FUTURE envelope by its EXACT CPLAN allocation index (never first-of-type — same-type rows can't collide).
+function _ledgerSetFutureAlloc(idx,amount){
+  if(typeof CPLAN==='undefined'||!Array.isArray(CPLAN.allocations))return {ok:false,reason:'no-plan'};
+  var a=CPLAN.allocations[idx]; if(!a)return {ok:false,reason:'no-alloc'};
+  if(a.type==='debt'&&!a._ibcDebtStrategy)return {ok:false,reason:'is-debt'}; // real debt routes via _ledgerAssignDebt
+  if(typeof _ledgerSetAllocAmount==='function')_ledgerSetAllocAmount(a,Math.max(0,_lnum(amount))); else a.amount=Math.max(0,_lnum(amount));
+  if(typeof _ledgerPersistPlan==='function')_ledgerPersistPlan();
+  return {ok:true};
+}
+function _ledgerEditAssign(tier,key,el,ym){
+  var amt=(typeof pf==='function')?pf(el&&el.value):(parseFloat(String((el&&el.value)||'').replace(/[^0-9.\-]/g,''))||0);
+  var r=(tier==='future')?_ledgerSetFutureAlloc(parseInt(key,10),amt):((typeof _ledgerAssign==='function')?_ledgerAssign(tier,key,amt,{month:ym}):null);
+  if(r&&r.blocked&&typeof _cpToast==='function')_cpToast(r.message||'That envelope can’t go below its required minimum.');
+  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+}
+function _portalLedgerTierSpending(L,style,fm,ev,ym,editable){
   var t=(L.tiers&&L.tiers.spending)||{rows:[]}, rows=t.rows||[];
   var h='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin:14px 0 8px;display:flex;justify-content:space-between"><span>🛒 Spending</span><span style="color:var(--mu)">'+fm(t.total||0)+'/mo</span></div>';
   rows.forEach(function(r){
     var avail=_lnum(r.available), assigned=_lnum(r.assigned), activity=_lnum(r.activity);
     h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(0,68,191,.06);gap:8px">';
     h+='<span style="display:flex;align-items:center;gap:7px;min-width:0"><span style="font-size:15px">'+ev(r.icon||'•')+'</span><span style="font-family:var(--fh);font-weight:700;color:var(--wh);font-size:13px">'+ev(r.label||r.key)+'</span>'+(r.target&&r.target.pinned?'<span title="pinned target" style="font-size:11px">📌</span>':'')+'</span>';
+    h+='<span style="text-align:right">'+_ledgerAssignInput('spending',r.key,assigned,ym,editable);
     if(style==='envelope'){
       var ac=avail<-0.005?'var(--rd)':(avail>0.005?'var(--gr)':'var(--mu)');
-      h+='<span style="text-align:right"><span style="font-family:var(--fd);font-size:14px;font-weight:700;color:'+ac+'">'+fm(avail)+'</span><div style="font-size:11px;color:var(--mu)">assigned '+fm(assigned)+' · spent '+fm(activity)+(_lnum(r.rolloverIn)?' · rolled '+fm(r.rolloverIn):'')+'</div></span>';
+      h+='<div style="font-size:11px;color:'+ac+';margin-top:2px">available '+fm(avail)+' · spent '+fm(activity)+(_lnum(r.rolloverIn)?' · rolled '+fm(r.rolloverIn):'')+'</div>';
     } else if(style==='auto'){
       var tgt=(r.target&&r.target.monthlyTarget!=null)?_lnum(r.target.monthlyTarget):0;
-      h+='<span style="text-align:right"><span style="font-family:var(--fd);font-size:14px;font-weight:700;color:var(--wh)">'+fm(assigned)+'</span><div style="font-size:11px;color:'+(tgt>0?'#5B9BFF':'var(--mu)')+'">'+(tgt>0?'suggested '+fm(tgt):'no suggestion')+'</div></span>';
-    } else { // flexible — spent vs assigned bar (Monarch-style budget-vs-actual)
+      h+='<div style="font-size:11px;color:'+(tgt>0?'#5B9BFF':'var(--mu)')+';margin-top:2px">'+(tgt>0?'suggested '+fm(tgt):'no suggestion')+' · spent '+fm(activity)+'</div>';
+    } else { // flexible — spent + budget-vs-actual bar (Monarch)
       var pct=assigned>0?Math.min(100,Math.round(activity/assigned*100)):0, over=assigned>0&&activity>assigned;
       var col=over?'var(--rd)':(pct>80?'var(--or)':(assigned>0?'var(--gr)':'var(--mu)'));
-      h+='<span style="text-align:right;min-width:120px"><span style="font-family:var(--fh);font-weight:700;font-size:13px;color:'+col+'">'+fm(activity)+(assigned>0?' / '+fm(assigned):'')+'</span><div style="height:5px;background:rgba(0,68,191,.08);border-radius:3px;overflow:hidden;margin-top:3px">'+(assigned>0?'<div style="height:100%;width:'+Math.min(100,pct)+'%;background:'+col+'"></div>':'')+'</div></span>';
+      h+='<div style="margin-top:3px"><div style="font-size:11px;color:'+col+'">spent '+fm(activity)+'</div><div style="height:5px;width:90px;margin-left:auto;background:rgba(0,68,191,.08);border-radius:3px;overflow:hidden;margin-top:2px">'+(assigned>0?'<div style="height:100%;width:'+Math.min(100,pct)+'%;background:'+col+'"></div>':'')+'</div></div>';
     }
-    h+='</div>';
+    h+='</span></div>';
   });
   if(_lnum(t.autoRemainder)>0.5)h+='<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;color:var(--mu)"><span>🛡️ Insurance & shared (committed)</span><span>'+fm(t.autoRemainder)+'</span></div>';
   return h;
 }
-function _portalLedgerTierPlan(title,col,tier,autoAmt,autoLabel,fm,ev){
-  var rows=(tier&&tier.rows)||[];
-  var h='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+col+';margin:14px 0 8px;display:flex;justify-content:space-between"><span>'+ev(title)+'</span><span style="color:var(--mu)">'+fm((tier&&tier.total)||0)+'/mo</span></div>';
+function _portalLedgerTierPlan(title,col,tier,autoAmt,autoLabel,fm,ev,ym,kind,editable){
+  tier=tier||{rows:[]}; var rows=tier.rows||[];
+  var h='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+col+';margin:14px 0 8px;display:flex;justify-content:space-between"><span>'+ev(title)+'</span><span style="color:var(--mu)">'+fm(tier.total||0)+'/mo</span></div>';
   if(_lnum(autoAmt)>0.5)h+='<div style="display:flex;justify-content:space-between;padding:6px 0;font-size:12px;color:var(--mu)"><span>'+ev(autoLabel)+'</span><span>'+fm(autoAmt)+'</span></div>';
+  if(kind==='debt'){ // one editable TOTAL monthly payment (= minimum + extra); _ledgerAssignDebt validates ≥ minimum
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;gap:8px"><span style="font-family:var(--fh);font-weight:700;color:var(--wh);font-size:13px">⚡ Total monthly payment <span style="font-size:11px;color:var(--mu);font-weight:400">(min '+fm(_lnum(autoAmt))+')</span></span>'+_ledgerAssignInput('debt','debt',tier.total||0,ym,editable)+'</div>';
+    return h;
+  }
   rows.forEach(function(r){
     h+='<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(0,68,191,.06);gap:8px">';
     h+='<span style="display:flex;align-items:center;gap:7px"><span style="font-size:15px">'+ev(r.icon||'•')+'</span><span style="font-family:var(--fh);font-weight:700;color:var(--wh);font-size:13px">'+ev(r.label||r.type)+'</span></span>';
-    h+='<span style="font-family:var(--fd);font-size:14px;font-weight:700;color:var(--wh)">'+fm(_lnum(r.amount))+'/mo</span></div>';
+    h+=_ledgerAssignInput('future',r.idx,_lnum(r.amount),ym,editable)+'</div>';
   });
   if(!rows.length&&_lnum(autoAmt)<=0.5)h+='<div style="font-size:12px;color:var(--mu);font-style:italic;padding:4px 0">Nothing here yet.</div>';
   return h;
@@ -8554,9 +8587,10 @@ function _portalBudgetLedgerBlock(ym){
   h+='<div style="padding:12px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:6px;margin-bottom:12px">';
   h+='<div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px"><span style="font-family:var(--fd);font-size:20px;font-weight:800;color:'+rcol+'">'+ev(rlabel)+'</span><span style="font-size:12px;color:var(--mu)">'+ev(L.month)+'</span></div>';
   h+='<div style="font-size:11px;color:var(--mu);margin-top:4px">'+ev(rsub)+'</div></div>';
-  h+=_portalLedgerTierSpending(L,style,fm,ev);
-  h+=_portalLedgerTierPlan('🚀 Future','var(--gr)',L.tiers&&L.tiers.future,(L.tiers&&L.tiers.future&&L.tiers.future.autoContrib)||0,'invested elsewhere',fm,ev);
-  h+=_portalLedgerTierPlan('💳 Debt','var(--or)',L.tiers&&L.tiers.debt,(L.tiers&&L.tiers.debt&&L.tiers.debt.minAuto)||0,'minimums (required)',fm,ev);
+  var editable=(ym===((typeof _budgetMonthKey==='function')?_budgetMonthKey():'')); // only the CURRENT month is editable; past months are read-only history
+  h+=_portalLedgerTierSpending(L,style,fm,ev,ym,editable);
+  h+=_portalLedgerTierPlan('🚀 Future','var(--gr)',L.tiers&&L.tiers.future,(L.tiers&&L.tiers.future&&L.tiers.future.autoContrib)||0,'invested elsewhere',fm,ev,ym,'future',editable);
+  h+=_portalLedgerTierPlan('💳 Debt','var(--or)',L.tiers&&L.tiers.debt,(L.tiers&&L.tiers.debt&&L.tiers.debt.minAuto)||0,'minimums (required)',fm,ev,ym,'debt',editable);
   h+='</div>';
   return h;
 }
