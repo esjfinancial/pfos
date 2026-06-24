@@ -2548,7 +2548,7 @@ async function initAuth(){
       _lastSaveDirty=false;
       APP._portalFd=null;APP._portalCalcs=null;
       APP.currentClientId=null;APP.currentClient=null;
-      try{ _bridgeCache=null; }catch(_e){} // §1.9b memo is keyed on the client, but null it on logout too (hygiene)
+      try{ _bridgeCache=null; APP._holdings=null; APP._supabaseSnapshots=null; }catch(_e){} // §1.9b memo + §2.1 holdings + snapshots are client-keyed caches; null on logout (cross-client hygiene)
       // Force iframe to be recreated on next login so PFOS_READY fires and loads fresh data
       var _cpContainer=document.getElementById('clientPfosContainer');
       if(_cpContainer){_cpContainer.innerHTML='';delete _cpContainer.dataset.loaded;}
@@ -2695,6 +2695,7 @@ function updateMobileTools(){
   // Net Worth Ticker
   renderClientTracking();
   loadSupabaseSnapshots();
+  _cpLoadHoldings(); // §2.1 (M2): fire-and-forget RLS-scoped holdings read → APP._holdings[]; metric-inert
   if(typeof _trackLoadFromSupabase==='function')_trackLoadFromSupabase();
   if(typeof checkPartnerStatus==='function')checkPartnerStatus();
   var nwEl=document.getElementById('nwTickerVal');
@@ -2832,7 +2833,8 @@ function renderClientTrendsSnapshot(){
 async function loadSupabaseSnapshots(){
   if(!db||!APP.currentClientId) return;
   try{
-    var {data:rows}=await db.from('client_snapshots').select('*').eq('client_id',APP.currentClientId).order('snapshot_date',{ascending:true}).limit(36);
+    var {data:rows,error:snapErr}=await db.from('client_snapshots').select('*').eq('client_id',APP.currentClientId).order('snapshot_date',{ascending:true}).limit(36);
+    if(snapErr) throw snapErr; // observability: surface a snapshot-query failure to the catch's console.warn (matches §2.1 _cpLoadHoldings)
     if(rows&&rows.length){
       APP._supabaseSnapshots=rows.map(function(r){
         var sd=r.snapshot_data||{};
@@ -2851,6 +2853,84 @@ async function loadSupabaseSnapshots(){
       renderClientTracking();
     }
   }catch(e){console.warn('loadSupabaseSnapshots:',e);}
+}
+
+// ── §2.1 (M2) Holdings read-path ─────────────────────────────────────────────
+// Brings the RICH per-security holdings client-side (today the client only has
+// the balance-level S.investments[]). Reads plaid_holdings ⋈ plaid_securities ON
+// security_id (both RLS-scoped at the DB: plaid_holdings_client_read limits to
+// the caller's own client_id; plaid_securities is a shared auth-read reference
+// table), maps to APP._holdings[] and STOPS. This is a DATA LAYER ONLY (§2.2 adds
+// the portfolio screen): it never mutates S, never calls calc()/computeCalcs,
+// never posts a message — so it CANNOT move any metric (invariant 5b). The
+// rollup helper excludes crypto, mirroring the engine's net-worth treatment
+// (pfos-main:9964) so any displayed portfolio total stays consistent.
+
+// PURE: join holding rows to security rows on security_id, derive the model.
+// No globals, no I/O — the testable seam.
+function _cpBuildHoldings(holdingRows, securityRows){
+  var secById={};
+  (securityRows||[]).forEach(function(s){ if(s&&s.security_id!=null) secById[String(s.security_id)]=s; });
+  var out=[];
+  (holdingRows||[]).forEach(function(h){
+    if(!h) return;
+    var sec=secById[String(h.security_id)]||{};
+    var qty=parseFloat(h.quantity); if(!isFinite(qty)) qty=0;
+    var costRaw=parseFloat(h.cost_basis); var cost=isFinite(costRaw)?costRaw:null; // Plaid often omits cost_basis
+    var valRaw=parseFloat(h.institution_value); var val=isFinite(valRaw)?valRaw:0;
+    var priceRaw=parseFloat(h.institution_price); var price=isFinite(priceRaw)?priceRaw:null;
+    var typ=(sec.type==null?'':String(sec.type));
+    var isCrypto=(typ.toLowerCase()==='cryptocurrency'); // exact Plaid security type; mirrors pfos-main:9964 intent
+    var gainLoss=(cost!=null)?(val-cost):null;
+    var gainLossPct=(cost!=null&&cost>0)?((val-cost)/cost*100):null;
+    out.push({
+      id:h.id, accountId:(h.plaid_account_id==null?'':String(h.plaid_account_id)),
+      securityId:(h.security_id==null?'':String(h.security_id)),
+      ticker:(sec.ticker_symbol==null?'':String(sec.ticker_symbol)),
+      name:(sec.name==null?'':String(sec.name)), type:typ,
+      quantity:qty, costBasis:cost, value:val, price:price,
+      gainLoss:gainLoss, gainLossPct:gainLossPct, isCrypto:isCrypto,
+      currency:(h.iso_currency_code||sec.iso_currency_code||'USD')
+    });
+  });
+  return out;
+}
+
+// PURE: total market value of holdings; crypto EXCLUDED by default (consistent
+// with the engine's net-worth rollup, pfos-main:9964). Pass includeCrypto=true
+// for a full-portfolio figure.
+function _cpHoldingsValue(holdings, includeCrypto){
+  return (holdings||[]).reduce(function(t,h){
+    if(!h) return t;
+    if(!includeCrypto && h.isCrypto) return t;
+    var v=parseFloat(h.value); return t+(isFinite(v)?v:0);
+  },0);
+}
+
+// Async loader: RLS-scoped fetch → build → APP._holdings[]. Metric-inert. On
+// completion APP._holdings is ALWAYS an array (empty on gate-off / no-data /
+// error); the result is DROPPED if the client switches mid-flight so an in-flight
+// load can never clobber the next client (cross-client safety, the §1.11
+// _bridgeCache precedent). §2.2 consumers should still read (APP._holdings||[]).
+async function _cpLoadHoldings(){
+  if(!db||!APP.currentClientId) return;
+  // Holdings are a Plaid artifact; skip the round-trip for users without the
+  // surface (RLS would return empty anyway). typeof-guarded so a not-yet-loaded
+  // gate degrades to "fetch" (still RLS-empty for non-linked users).
+  if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')){ APP._holdings=[]; return; }
+  var _cid=APP.currentClientId; // stamp: drop the result if the client switches before we write
+  try{
+    var {data:hRows,error:hErr}=await db.from('plaid_holdings').select('*').eq('client_id',_cid).limit(2000);
+    if(hErr) throw hErr;
+    if(APP.currentClientId!==_cid) return; // client switched mid-flight → don't clobber the new client
+    if(!hRows||!hRows.length){ APP._holdings=[]; return; }
+    var ids=[], seen={};
+    hRows.forEach(function(h){ var sid=(h&&h.security_id!=null)?String(h.security_id):''; if(sid&&!seen[sid]){ seen[sid]=1; ids.push(sid); } });
+    var secRows=[];
+    if(ids.length){ var {data:sRows,error:sErr}=await db.from('plaid_securities').select('*').in('security_id',ids); if(sErr) throw sErr; secRows=sRows||[]; }
+    if(APP.currentClientId!==_cid) return; // re-check after the second await
+    APP._holdings=_cpBuildHoldings(hRows, secRows);
+  }catch(e){ if(APP.currentClientId===_cid) APP._holdings=[]; console.warn('_cpLoadHoldings:',e); } // never leave stale/undefined for the current client
 }
 
 function checkAffordability(){
@@ -3744,7 +3824,7 @@ async function _pfosWipeAllUserData(){
     }
   }catch(e){console.warn('Cache Storage wipe failed:',e);}
   try{
-    if(window.APP){APP.user=null;APP.userData=null;APP.currentClient=null;APP.currentClientId=null;APP.role=null;}
+    if(window.APP){APP.user=null;APP.userData=null;APP.currentClient=null;APP.currentClientId=null;APP.role=null;APP._holdings=null;APP._supabaseSnapshots=null;}
     if(typeof _lastPfosState!=='undefined')_lastPfosState=null;
     if(typeof APP_CLIENT!=='undefined')APP_CLIENT=null;
   }catch(e){}
