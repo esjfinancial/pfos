@@ -2548,6 +2548,7 @@ async function initAuth(){
       _lastSaveDirty=false;
       APP._portalFd=null;APP._portalCalcs=null;
       APP.currentClientId=null;APP.currentClient=null;
+      try{ _bridgeCache=null; }catch(_e){} // §1.9b memo is keyed on the client, but null it on logout too (hygiene)
       // Force iframe to be recreated on next login so PFOS_READY fires and loads fresh data
       var _cpContainer=document.getElementById('clientPfosContainer');
       if(_cpContainer){_cpContainer.innerHTML='';delete _cpContainer.dataset.loaded;}
@@ -8636,7 +8637,10 @@ function _bridgeComputeImpacts(calcs){
   // changed _sim reference is an exact "projection is dirty" signal no matter which input moved. The signature
   // catches the (budget-surface) allocations edits directly; the _sim identity catches everything else. Together:
   // a cache hit ⇒ truly-identical projection ⇒ no sim. (Budget-surface edits bust BOTH, via the binding's re-sim.)
-  var sig=fiNumber+'|'+age+'|'+_lnum(CPLAN.retirementAge)+'|'+_lnum(CPLAN.surplus)+'|'+live.map(function(a){return (a&&a.type)+':'+_lnum(a&&a.amount)+':'+(a&&a._ibcDebtStrategy?'i':'');}).join(',');
+  // Key on the CLIENT too — so a same-tab client switch (logout→login on a shared device) can NEVER false-hit a
+  // prior client's cached projection even if the scalar tuple collides and the new client's sim hasn't re-run yet.
+  var _cid=(typeof APP!=='undefined'&&APP.currentClientId)||'';
+  var sig=_cid+'|'+fiNumber+'|'+age+'|'+_lnum(CPLAN.retirementAge)+'|'+_lnum(CPLAN.surplus)+'|'+live.map(function(a){return (a&&a.type)+':'+_lnum(a&&a.amount)+':'+(a&&a._ibcDebtStrategy?'i':'');}).join(',');
   if(_bridgeCache&&_bridgeCache.sig===sig&&_bridgeCache.simRef===savedSim)return _bridgeCache.data;
   try{
     CPLAN.allocations=JSON.parse(JSON.stringify(savedAllocs)); _cpRunSimulation(); var b=CPLAN._sim||{};
@@ -8871,7 +8875,10 @@ function _autoBudget24Apply(rec,ym){
   rec.spending.forEach(function(s){
     if(!s||!s.category||_lnum(s.monthly)<=0)return;
     if(typeof _budgetAssign==='function')_budgetAssign(s.category,_lnum(s.monthly),month);
-    if(typeof _budgetSetTarget==='function')_budgetSetTarget(s.category,{type:'monthly',amount:_lnum(s.monthly)});
+    // PIN the target: the user explicitly reviewed+accepted these numbers, so they must STICK — and critically a
+    // PERIODIC sinking-fund amount (annualTotal/12) must NOT be overwritten by §1.8b's 6-month adaptive recompute,
+    // which can't amortize an annual cost (it would re-derive ~$0 or a spike). _budgetEffectiveTarget honors pinned.
+    if(typeof _budgetSetTarget==='function')_budgetSetTarget(s.category,{type:'monthly',amount:_lnum(s.monthly),pinned:true});
     if(s.type==='periodic'&&typeof _budgetSetRollover==='function')_budgetSetRollover(s.category,true);
     n++;
   });
@@ -9413,7 +9420,7 @@ function _portalRenderSpendDashboard(){
   }
 
   var h='';
-  h+=(typeof _portalCashForecastBlock==='function'?_portalCashForecastBlock(S,calcs):''); // §1.8d predictive shortfall (gated; '' unless a genuine shortfall → byte-identical otherwise)
+  try{ if(typeof _portalCashForecastBlock==='function')h+=_portalCashForecastBlock(S,calcs); }catch(e){console.warn('Cash forecast:',e);} // §1.8d predictive shortfall (gated; '' unless a genuine shortfall → byte-identical otherwise)
   h+=(typeof _portalReconcileBlock==='function'?_portalReconcileBlock(S,calcs):''); // §1.6b cash & reconcile (gated; '' when off / no cash → byte-identical)
 
   // ── 1. Header (month picker) + Add Expense + Savings Goal action row ──
