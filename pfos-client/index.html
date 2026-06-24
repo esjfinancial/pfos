@@ -8797,6 +8797,88 @@ function _autoBudget24(opts){
 }
 
 // ═══════════════════════════════════════════════════
+// §1.10b — 24-month auto-budget: Pro+ one-tap + preview + accept
+// ═══════════════════════════════════════════════════
+// Gated by budgetV2 && clientHasFeature('plaid') (Pro+). _autoBudget24Card renders the CTA (only on a FRESH
+// budget so it's a bootstrap, not an ever-present clobber); _autoBudget24Run previews the §1.10a recommendation
+// in _cpConfirmModal; on accept, _autoBudget24Apply WRITES the Tier-1 spending budget via the §1.7/§1.8 writers —
+// assign the current month + a recurring monthly target; sinking funds also get rollover so the monthly
+// contribution accumulates toward the annual cost. It does NOT fabricate Future/Debt allocations (the user's
+// choice, via the bridge / AI plan generator) — it surfaces the leftover surplus. All writes are metric-inert
+// (PFOS_BUDGET_ASSIGN — no calc); the bridge re-renders after, showing the freed-up future.
+function _autoBudget24Enabled(){ try{ return (typeof budgetV2Enabled==='function'&&budgetV2Enabled())&&(typeof clientHasFeature==='function'&&clientHasFeature('plaid')); }catch(_e){ return false; } }
+function _abFmt(v){ return (typeof fmt==='function')?fmt(Math.round(_lnum(v))):('$'+Math.round(_lnum(v))); }
+function _abEv(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+// A FRESH budget = no targets and no month has any assignment (the one-tap is a bootstrap, not a re-clobber tool).
+function _autoBudget24BudgetIsFresh(S){
+  var b=S&&S.budget; if(!b||typeof b!=='object')return true;
+  if(b.targets&&Object.keys(b.targets).length>0)return false;
+  if(b.months){ var mk=Object.keys(b.months); for(var i=0;i<mk.length;i++){ var a=b.months[mk[i]]&&b.months[mk[i]].assigned; if(a&&Object.keys(a).length>0)return false; } }
+  return true;
+}
+function _autoBudget24Card(){
+  if(!_autoBudget24Enabled())return '';
+  var S=(typeof _ledgerActiveS==='function')?_ledgerActiveS():{};
+  if(!_autoBudget24BudgetIsFresh(S))return ''; // already budgeting → don't show the bulk-build CTA
+  var rec; try{ rec=(typeof _autoBudget24==='function')?_autoBudget24():null; }catch(e){ return ''; }
+  if(!rec||!rec.ok||!rec.spending||!rec.spending.length)return '';
+  var n=rec.spending.length, total=(rec.summary&&rec.summary.recommendedSpend)||0, sf=(rec.sinkingFunds||[]).length;
+  var h='<div class="sec-group" style="border:1px solid rgba(34,197,94,.25);background:rgba(34,197,94,.04)">';
+  h+='<div style="font-size:13px;font-weight:700;color:#fff;margin-bottom:2px">✨ Build my budget from '+rec.months+' months of spending</div>';
+  h+='<div style="font-size:12px;color:rgba(226,232,240,.8);margin-bottom:10px">We analyzed your linked transactions and drafted a full budget — '+n+' categor'+(n===1?'y':'ies')+' ('+_abFmt(total)+'/mo)'+(sf?' including '+sf+' sinking fund'+(sf===1?'':'s')+' for annual costs':'')+'. Nothing changes until you accept.</div>';
+  h+='<button onclick="_autoBudget24Run()" style="padding:7px 14px;font-size:12px;font-weight:700;background:rgba(34,197,94,.2);border:1px solid rgba(34,197,94,.45);color:#86efac;border-radius:5px;cursor:pointer;min-height:34px">Review &amp; build my budget</button>';
+  return h+'</div>';
+}
+function _autoBudget24PreviewHtml(rec){
+  var typeLabel={fixed:'fixed',variable:'variable',periodic:'sinking fund'};
+  var rows=(rec.spending||[]).map(function(s){
+    return '<div style="display:flex;justify-content:space-between;gap:10px;padding:5px 0;border-top:1px solid rgba(255,255,255,.06)">'
+      +'<span>'+_abEv(s.icon||'•')+' <strong>'+_abEv(s.label)+'</strong> <span style="color:var(--mu);font-size:11px">'+_abEv(typeLabel[s.type]||s.type)+'</span></span>'
+      +'<span style="font-weight:700;color:#fff">'+_abFmt(s.monthly)+'/mo</span></div>';
+  }).join('');
+  var sm=rec.summary||{}, sp=_lnum(sm.surplus);
+  var surplusLine=(sp>0)
+    ? 'After this budget, debt minimums, and your current plan, about <strong>'+_abFmt(sp)+'/mo</strong> is left for goals — assign it on your plan.'
+    : (sp<0 ? 'Heads up: this budget plus your commitments runs about <strong>'+_abFmt(-sp)+'/mo</strong> over your income — you may want to trim a category.' : 'This budget gives every dollar of income a job.');
+  var shortNote=(_lnum(rec.monthsWithData)<12)?' <span style="color:var(--yl)">Based on '+_abEv(rec.monthsWithData)+' months of data — annual costs may be missed until a full year is linked.</span>':'';
+  return { message: rows, detail: surplusLine + shortNote };
+}
+function _autoBudget24Run(){
+  // RE-VALIDATE at execute time (TOCTOU): the card may be stale — a second tab / joint partner / advisor could
+  // have populated the budget since it mounted. Bail before previewing, and re-render to unmount the stale card.
+  var liveS=(typeof _ledgerActiveS==='function')?_ledgerActiveS():{};
+  if(!_autoBudget24Enabled()||!_autoBudget24BudgetIsFresh(liveS)){ if(typeof _cpToast==='function')_cpToast('Your budget already has entries — auto-build only sets up an empty budget.'); if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis(); return; }
+  var rec; try{ rec=_autoBudget24(); }catch(e){ rec=null; }
+  if(!rec||!rec.ok||!rec.spending||!rec.spending.length){ if(typeof _cpToast==='function')_cpToast('Not enough linked history yet to build a budget.'); return; }
+  var pv=_autoBudget24PreviewHtml(rec);
+  Promise.resolve(_cpConfirmModal({title:'Build your budget from '+rec.months+' months?',message:pv.message,detail:pv.detail,confirmLabel:'Accept & build',confirmStyle:'success',icon:'✨'})).then(function(ok){
+    if(!ok)return;
+    var applied=_autoBudget24Apply(rec); // Apply re-checks freshness (the modal may have been open while it changed)
+    if(typeof _cpToast==='function')_cpToast(applied>0?('Budget built — '+applied+' categor'+(applied===1?'y':'ies')+' set. Every envelope now updates your plan.'):'Your budget already has entries — nothing was changed.');
+    if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+  });
+}
+// Apply the recommendation: fund the current month + set a recurring monthly target per category; sinking funds
+// also get rollover so the monthly contribution accumulates. Spending-only (Tier-1) — metric-inert. Returns the count.
+function _autoBudget24Apply(rec,ym){
+  if(!rec||!rec.spending)return 0;
+  // AUTHORITATIVE write guard (closest to the write): never bulk-overwrite a budget that is no longer fresh/eligible
+  // (the preview modal may have been open while another tab / joint partner / advisor populated it). No clobber.
+  var gS=(typeof _ledgerActiveS==='function')?_ledgerActiveS():{};
+  if(!_autoBudget24Enabled()||!_autoBudget24BudgetIsFresh(gS))return 0;
+  var month=(typeof ym==='string'&&/^\d{4}-\d{2}$/.test(ym))?ym:((typeof _budgetMonthKey==='function')?_budgetMonthKey():null);
+  var n=0;
+  rec.spending.forEach(function(s){
+    if(!s||!s.category||_lnum(s.monthly)<=0)return;
+    if(typeof _budgetAssign==='function')_budgetAssign(s.category,_lnum(s.monthly),month);
+    if(typeof _budgetSetTarget==='function')_budgetSetTarget(s.category,{type:'monthly',amount:_lnum(s.monthly)});
+    if(s.type==='periodic'&&typeof _budgetSetRollover==='function')_budgetSetRollover(s.category,true);
+    n++;
+  });
+  return n;
+}
+
+// ═══════════════════════════════════════════════════
 // PLAN ALIGNMENT CARD — portal-only (CPLAN lives here)
 // ═══════════════════════════════════════════════════
 // Reads CPLAN.allocations + _cpTracking via _cpGetActualContribution to surface
@@ -9430,6 +9512,8 @@ function _portalRenderSpendDashboard(){
 
   // ── 6.6 §1.9a — UNIFIED BUDGET=PLAN LEDGER (budgetV2; 3-style toggle; supersedes the legacy category bars below) ──
   try{h+=_portalBudgetLedgerBlock(curYear+'-'+('0'+(curMonth+1)).slice(-2));}catch(e){console.warn('Budget ledger:',e);}
+  // ── 6.7 §1.10b — 24-MONTH AUTO-BUDGET one-tap (Pro+; only on a fresh budget) — bootstraps the ledger above ──
+  try{h+=_autoBudget24Card();}catch(e){console.warn('Auto-budget 24:',e);}
 
   // ── 6.5 HISTORICAL PROGRESS — zoom-out lens (independent of month picker) ──
   // Window buttons + aggregate donut + top categories + recurring breakout +
