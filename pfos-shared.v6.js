@@ -553,6 +553,13 @@ function _issuesDetect(ctx){
     if(_cashRatio>0.6&&_aCash>10000&&(parseFloat(_calc.efMonths)||0)>6) flags.push({type:'opp',icon:'🏦',title:'High cash allocation: '+Math.round(_cashRatio*100)+'%',desc:fmtK(_aCash)+' is in cash while your emergency fund is already full — cash loses purchasing power to inflation (~'+fmt(Math.round(_aCash*0.035))+'/yr). Consider moving the excess into investments.',action:'savings'});
     var _dti=parseFloat(_calc.dti)||0;
     if(_dti>43) flags.push({type:'warn',icon:'📊',title:'High debt-to-income: '+Math.round(_dti)+'%',desc:'Your DTI is above 43% — the threshold most lenders use to deny new credit. Reducing debt or raising income restores borrowing options.',action:'debt'});
+    // M5.2d-1b — spending leaks (list-only, action 'leaks' → L3, no plan card; mirrors the engine's leaks flag).
+    var _lk=parseFloat(_calc.leakCount)||0;
+    if(_lk>0) flags.push({type:'warn',icon:'💧',title:'Spending leaks: '+_lk+' area'+(_lk>1?'s':''),desc:'You\'ve tagged '+_lk+' expense categor'+(_lk>1?'ies':'y')+' as low-value. Reclaiming even ~'+fmt(_lk*50)+'/mo and redirecting it to debt or savings compounds over time.',action:'leaks'});
+    // M5.2d-1b — estate-tax exposure (HNW; action 'estate_tax' → L4 engine-exact, routes to the estate card).
+    var _estCov=(rawS2.protCalcs&&parseFloat(rawS2.protCalcs.coverage))||0, _estVal=_tAssets+_estCov, _estExempt=15000000;
+    if(_estVal>_estExempt*0.7){var _estExp=Math.max(0,_estVal-_estExempt),_estTax=Math.round(_estExp*0.40);
+      flags.push({type:_estExp>0?'warn':'opp',icon:'🏛️',title:'Estate tax exposure: '+fmtK(_estTax),desc:'Your projected estate ('+fmtK(_estVal)+') approaches the federal exemption ('+fmtK(_estExempt)+'). Amounts above it are taxed at 40% — trusts, lifetime gifting, and beneficiary structuring can reduce the exposure.',action:'estate_tax'});}
 
     // ── Spouse pass — PROFILE-ONLY (ctx.spouse). Same call site + try/catch as source. ──
     if(ctx.spouse&&(ctx.spouse.householdType==='joint'||ctx.spouse.householdType==='hybrid'||ctx.spouse.householdType==='separate')){
@@ -768,10 +775,10 @@ function _issuesDetect(ctx){
     expenses:1, cashflow:1, ef:1, '401k':1,
     // Level 2 — Risk Protection: life/disability/LTC protection, estate (will/beneficiary)
     protection:2, estate:2,
-    // Level 3 — Efficiency: high-interest debt/DTI, umbrella, HSA, savings rate, rollover/consolidation
-    debt:3, protection_ext:3, hsa:3, savings:3, rollover:3,
-    // Level 4 — Growth & opportunities: retirement, education, growth/diversification, annuity/IBC/policy
-    retirement:4, edu:4, growth:4, annuity_research:4, ibc:4, ibc_audit:4, existing_policy:4, diversify:4
+    // Level 3 — Efficiency: high-interest debt/DTI, umbrella, HSA, savings rate, rollover/consolidation, spending leaks
+    debt:3, protection_ext:3, hsa:3, savings:3, rollover:3, leaks:3,
+    // Level 4 — Growth & opportunities: retirement, education, growth/diversification, annuity/IBC/policy, estate-tax
+    retirement:4, edu:4, growth:4, annuity_research:4, ibc:4, ibc_audit:4, existing_policy:4, diversify:4, estate_tax:4
   };
   var _TYPE_SEV = { crit:0, warn:1, opp:2, info:3 };   // PFOSIssues `type` → DE severity rank (critical<high<medium<low)
   function _issuesRank(issues){
