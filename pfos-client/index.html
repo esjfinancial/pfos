@@ -2718,6 +2718,7 @@ function updateMobileTools(){
   renderClientTracking();
   loadSupabaseSnapshots();
   _cpLoadHoldings(); // §2.1 (M2): fire-and-forget RLS-scoped holdings read → APP._holdings[]; metric-inert
+  if(typeof _writeAlertStateSoon==='function') _writeAlertStateSoon(); // §4.2a (M4): debounced alert snapshot; coalesces with the data-change trigger (one write per settle); metric-inert
   if(typeof _trackLoadFromSupabase==='function')_trackLoadFromSupabase();
   if(typeof checkPartnerStatus==='function')checkPartnerStatus();
   var nwEl=document.getElementById('nwTickerVal');
@@ -6187,6 +6188,55 @@ async function _pushToggleRowHtml(){
     +'<div><div style="font-size:14px;color:rgba(226,232,240,.9);font-weight:600">🔔 Push alerts</div><div style="font-size:12px;color:var(--mu);margin-top:2px">A heads-up before you’re short before payday, when bills are due, and when you hit a milestone.</div></div>'
     +'<button onclick="'+(on?'_pushUnsubscribe()':'_pushSubscribe()')+'" class="btn '+(on?'bgh':'bbl')+'" style="flex-shrink:0;width:auto;padding:8px 16px;font-size:13px">'+(on?'On — turn off':'Turn on')+'</button>'
   +'</div>';
+}
+
+// ── M4 §4.2a — alert_state snapshot + channel prefs. The client computes the 6 alert signals via its EXISTING
+// single-source detectors (forecast/ledger/sim — no server re-implementation → no drift, 5e) and upserts a compact
+// snapshot row; the §4.2b cron reads it + watches dates/thresholds + sends. DERIVED — separate from financial_data.S,
+// never feeds calc (metric-inert 5b). RLS-scoped to the caller's own row (5d).
+function _alertCtx(){ var fd=(typeof APP!=='undefined'&&APP._portalFd)||{}; return { S:fd.S||(_lastPfosState&&_lastPfosState.state)||{}, calcs:fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{} }; }
+function _alertStateRow(ctx){
+  var S=(ctx&&ctx.S)||{}, calcs=(ctx&&ctx.calcs)||{}, row={ computed_at:new Date().toISOString() };
+  // 1) shortfall (the flagship) + the next upcoming bill — via _forecastCashFlow (read-only)
+  try{
+    var f=(typeof _forecastCashFlow==='function')?_forecastCashFlow(S,calcs):null;
+    if(f&&f.ok&&f.shortfall){ row.shortfall_date=f.shortfallDate||null; row.shortfall_amount=(f.shortfallAmount!=null?f.shortfallAmount:null); row.shortfall_bills=(f.offendingBills||[]).slice(0,5); }
+    else { row.shortfall_date=null; row.shortfall_amount=null; row.shortfall_bills=null; }
+    var nb=null; if(f&&f.ok&&Array.isArray(f.bills)){ f.bills.forEach(function(b){ if(b&&b.dueDate&&(nb===null||b.dueDate<nb.dueDate)) nb=b; }); }
+    row.next_bill_date=nb?nb.dueDate:null; row.next_bill_name=nb?String(nb.name||'Bill').slice(0,80):null; row.next_bill_amount=nb?nb.amount:null;
+  }catch(e){ row.shortfall_date=null; row.next_bill_date=null; }
+  // 2) emergency fund / low-balance
+  row.ef_months=(typeof calcs.efMonths==='number')?Math.round(calcs.efMonths*100)/100:null;
+  row.low_balance=(typeof calcs.efMonths==='number')?(calcs.efMonths<1):false;
+  // 3) overspent envelopes (this month) — via the §1.7b ledger (read-only)
+  try{ var led=(typeof _budgetLedger==='function')?_budgetLedger(new Date().toISOString().slice(0,7)):null; var ov=(led&&typeof _budgetOverspent==='function')?_budgetOverspent(led):[]; row.overspent=(ov&&ov.length)?ov.slice(0,8):null; }catch(e){ row.overspent=null; }
+  // 4) review queue depth
+  try{ row.review_count=(typeof _reviewCount==='function')?_reviewCount(S):0; }catch(e){ row.review_count=0; }
+  // 5) plan milestones — read the EXISTING cached sim (never re-run the sim here)
+  try{ var sim=(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN._sim)||null; row.milestone=sim?{ debtFreeMonth:(sim.debtFreeMonth||null), fullFundingMonth:(sim.fullFundingMonth||null) }:null; }catch(e){ row.milestone=null; }
+  return row;
+}
+async function _writeAlertState(){
+  try{
+    if(!APP.currentClientId||typeof db==='undefined'||!db) return;
+    var ctx=_alertCtx(); if(!ctx.calcs||!ctx.calcs.inc) return; // no real data yet → skip (untouched user stays byte-identical)
+    var row=_alertStateRow(ctx); row.client_id=APP.currentClientId;
+    await db.from('alert_state').upsert(row,{onConflict:'client_id'}); // payload omits prefs → prefs are PRESERVED on update (disjoint column sets)
+  }catch(e){}
+}
+var _alertWriteTimer=null;
+function _writeAlertStateSoon(){ try{ if(_alertWriteTimer)clearTimeout(_alertWriteTimer); _alertWriteTimer=setTimeout(function(){ _writeAlertState(); },2000); }catch(e){} }
+// Channel prefs — stored in alert_state.prefs (same RLS-scoped row, no clients-table update). Shape:
+// {push:{shortfall,bill_due,low_balance,overspent,review,milestone:bool}}. An ABSENT type defaults to ON.
+var _ALERT_TYPES=['shortfall','bill_due','low_balance','overspent','review','milestone'];
+async function _loadNotifPrefs(){ try{ if(!APP.currentClientId)return {}; var q=await db.from('alert_state').select('prefs').eq('client_id',APP.currentClientId).maybeSingle(); return (q&&q.data&&q.data.prefs)||{}; }catch(e){ return {}; } }
+async function _setNotifPref(type,on){
+  try{
+    if(!APP.currentClientId||_ALERT_TYPES.indexOf(type)<0) return false;
+    var cur=await _loadNotifPrefs(); var push=cur.push||{}; push[type]=!!on; cur.push=push;
+    await db.from('alert_state').upsert({client_id:APP.currentClientId, prefs:cur},{onConflict:'client_id'}); // payload omits signals → signals PRESERVED (disjoint column sets)
+    return true;
+  }catch(e){ return false; }
 }
 
 async function loadNotificationCenter(){
@@ -13363,6 +13413,7 @@ window.addEventListener('message',async function(e){
       console.warn('[PFOS] ⛔ Client switch race: msg.clientId='+msg.clientId+' but current='+APP.currentClientId+' — dropping save');return;
     }
     if(!_pfosDataLoaded){console.log('[PFOS] Skipping save — data not loaded yet');return;}
+    if(typeof _writeAlertStateSoon==='function') _writeAlertStateSoon(); // §4.2a (M4): refresh the alert snapshot after the edit settles (debounced)
     try{
       var state=msg.state,calcs=state.calcs||{};
       // ══ FIRST-SAVE DATA PROTECTION ══
