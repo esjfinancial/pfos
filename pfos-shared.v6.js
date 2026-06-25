@@ -538,6 +538,22 @@ function _issuesDetect(ctx){
       }
     }
 
+    // ── M5.2d-1 — engine-parity flags (idle cash, high cash, DTI). These mirror the engine's
+    // deDetectFlags so the plan/shell red-flag list surfaces them too (the engine already shows them).
+    // They read S.calcs (rawS2.calcs) — the engine's authoritative computeCalcs outputs — NEVER a
+    // recomputed CPLAN value, which avoids the CLAUDE.md §4 DTI/cash divergence. They ride the existing
+    // issuesDetect dark-launch (emitted only when the unified detector is active) and reuse existing
+    // action keys (savings→invest, debt), so NO sync-map change is needed; their action→level mapping
+    // (savings/debt → level 3) matches DE's level-3 ordering exactly. (More engine-only flags — leaks,
+    // estate_tax, the Roth-strategy items — are deferred pending rank/owner decisions, see M5.2d notes.)
+    var _calc=rawS2.calcs||{};
+    var _idle=parseFloat(_calc.idleCash)||0;
+    if(_idle>2000) flags.push({type:'opp',icon:'💤',title:'Idle cash: '+fmtK(_idle),desc:fmtK(_idle)+' sits above your emergency-fund target, losing ~'+fmt(Math.round(_idle*0.035))+'/yr to inflation. Putting it to work (money market, index fund) captures the return you\'re currently giving up.',action:'savings'});
+    var _aCash=parseFloat(_calc.aCash)||0, _tAssets=parseFloat(_calc.totalAssets)||0, _cashRatio=_tAssets>0?_aCash/_tAssets:0;
+    if(_cashRatio>0.6&&_aCash>10000&&(parseFloat(_calc.efMonths)||0)>6) flags.push({type:'opp',icon:'🏦',title:'High cash allocation: '+Math.round(_cashRatio*100)+'%',desc:fmtK(_aCash)+' is in cash while your emergency fund is already full — cash loses purchasing power to inflation (~'+fmt(Math.round(_aCash*0.035))+'/yr). Consider moving the excess into investments.',action:'savings'});
+    var _dti=parseFloat(_calc.dti)||0;
+    if(_dti>43) flags.push({type:'warn',icon:'📊',title:'High debt-to-income: '+Math.round(_dti)+'%',desc:'Your DTI is above 43% — the threshold most lenders use to deny new credit. Reducing debt or raising income restores borrowing options.',action:'debt'});
+
     // ── Spouse pass — PROFILE-ONLY (ctx.spouse). Same call site + try/catch as source. ──
     if(ctx.spouse&&(ctx.spouse.householdType==='joint'||ctx.spouse.householdType==='hybrid'||ctx.spouse.householdType==='separate')){
       try{ _spouseFlags(flags, rawS2, d, ctx.spouse); }catch(_sf){console.warn('Spouse flags (cards):',_sf); }
