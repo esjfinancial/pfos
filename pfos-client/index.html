@@ -3240,7 +3240,8 @@ function _cpApplyIncomeConfirm(streams,confirmMap){
 // land in-range (outflow = amount>0, excl. transfers/excluded), else the split-
 // expanded S.spendingEntries (avoids double-counting the same plaid data). Income
 // = the user's CONFIRMED linked deposits when source=linked + any are confirmed/
-// suggested (§2.4c), else the month's snapshot income (fallbackIncome when absent).
+// suggested (§2.4c); else imported/manual income (negative non-plaid entries, §4.3);
+// else the month's snapshot income (fallbackIncome when absent).
 // Returns per-month rows + totals + byCategory + savingsRate + incomeStreams. The
 // testable seam (no globals, no I/O).
 function _cpCashFlowReport(opts){
@@ -3272,6 +3273,12 @@ function _cpCashFlowReport(opts){
   var useLinkedIncome=_cpApplyIncomeConfirm(incomeStreams, opts.incomeStreams);
   var inflowByMonth={};
   if(useLinkedIncome){ txnsInRange.forEach(function(t){ var amt=parseFloat(t.amount)||0; if(amt>=0)return; var key=_cpIncomeStreamKey(t); var on=false; for(var i=0;i<incomeStreams.length;i++){ if(incomeStreams[i].key===key){ on=incomeStreams[i].confirmed; break; } } if(!on)return; var k=_cpMonthKey(t.date); if(k!=null&&k>=startKey&&k<=endKey) inflowByMonth[k]=(inflowByMonth[k]||0)+(-amt); }); }
+  // Imported/manual income (negative non-plaid spendingEntries — the app's "amt<0 = Income"
+  // convention, identical to _cpExportRows) is real per-month income, so a Monarch/YNAB migrant's
+  // imported paychecks are NOT dropped from cash-flow (they're never expenses — addExp rejects
+  // amt<=0). Ranks below confirmed linked inflow so a linked+imported month never double-counts.
+  var manualInflowByMonth={};
+  spendEntries.forEach(function(e){ if(!e||e._source==='plaid')return; var amt=parseFloat(e.amount)||0; if(amt>=0)return; var mk=_cpMonthKey(e.date); if(mk!=null&&mk>=startKey&&mk<=endKey) manualInflowByMonth[mk]=(manualInflowByMonth[mk]||0)+(-amt); });
   var rows=[], totalIncome=0, totalExpense=0, catTotals={}, estMonths=0;
   for(var k2=startKey;k2<=endKey;k2++){
     var m=months[k2], inc, incEst, hasSnap;
@@ -3279,6 +3286,7 @@ function _cpCashFlowReport(opts){
     // a linked month with expense but NO deposit (e.g. pre-link history) → snapshot income so its net stays
     // real (never a false deficit); a genuinely empty month (no deposit, no expense) → $0 (never phantom savings).
     if(useLinkedIncome&&inflowByMonth[k2]!=null){ inc=inflowByMonth[k2]; incEst=false; }
+    else if(manualInflowByMonth[k2]>0){ inc=manualInflowByMonth[k2]; incEst=false; } // §4.3: imported/manual income (real actuals) beats the profile fallback
     else if(useLinkedIncome&&!(m.expense>0)){ inc=0; incEst=false; }
     else { hasSnap=(snapByKey[k2]!=null); inc=hasSnap?snapByKey[k2]:fallbackIncome; incEst=!hasSnap; if(!hasSnap)estMonths++; }
     totalIncome+=inc; totalExpense+=m.expense;
@@ -6351,7 +6359,7 @@ async function _pushSubscribe(){
     if(!sub) sub=await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:_urlB64ToUint8(_VAPID_PUBLIC)});
     await db.rpc('push_subscriptions_claim', _pushClaimArgs(sub));
     try{ localStorage.setItem('pfos_push_asked','1'); }catch(e){}
-    if(typeof _cpToast==='function')_cpToast('Alerts on — we’ll flag shortfalls, bills, and milestones','success');
+    if(typeof _cpToast==='function')_cpToast('Alerts on — we’ll flag shortfalls, bills, and overspending','success');
     if(typeof loadNotificationCenter==='function') loadNotificationCenter();
     return true;
   }catch(e){ if(typeof _cpToast==='function')_cpToast('Couldn’t enable alerts','error'); return false; }
@@ -6378,7 +6386,7 @@ async function _pushToggleRowHtml(){
   if(!_pushSupported()) return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:10px;font-size:13px;color:var(--mu)">🔔 Push alerts aren’t available in this browser. Add PFOS to your home screen to enable them.</div>';
   var on=await _pushIsOn();
   return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:12px">'
-    +'<div><div style="font-size:14px;color:rgba(226,232,240,.9);font-weight:600">🔔 Push alerts</div><div style="font-size:12px;color:var(--mu);margin-top:2px">A heads-up before you’re short before payday, when bills are due, and when you hit a milestone.</div></div>'
+    +'<div><div style="font-size:14px;color:rgba(226,232,240,.9);font-weight:600">🔔 Push alerts</div><div style="font-size:12px;color:var(--mu);margin-top:2px">A heads-up before you’re short before payday, when bills are due, and when you overspend a budget.</div></div>'
     +'<button onclick="'+(on?'_pushUnsubscribe()':'_pushSubscribe()')+'" class="btn '+(on?'bgh':'bbl')+'" style="flex-shrink:0;width:auto;padding:8px 16px;font-size:13px">'+(on?'On — turn off':'Turn on')+'</button>'
   +'</div>';
 }
@@ -10464,14 +10472,14 @@ function _portalRenderSpendDashboard(){
 
   // Empty state — no income on file
   if(moneyIn<=0){
-    return'<div style="padding:32px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:40px;margin-bottom:12px">💰</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Welcome to Your Spending Pulse</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">Enter your income in <strong style="color:#5B9BFF">My Financial Data</strong> to unlock the live spending dashboard, bill calendar, and category insights.</div><div style="display:flex;justify-content:center;gap:18px;margin-top:18px;font-size:13px;color:var(--mu);font-family:var(--fh);font-weight:600">📊 Daily budget · 📅 Bill calendar · 🔔 Smart alerts</div></div>';
+    return'<div style="padding:32px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:40px;margin-bottom:12px">💰</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Welcome to Your Spending Pulse</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">Enter your income in <strong style="color:#5B9BFF">My Financial Data</strong> to unlock the live spending dashboard, bill calendar, and category insights.</div><div style="margin-bottom:6px"><button onclick="openImportWizard()" aria-label="Import transactions from Monarch, YNAB, Mint, or any bank CSV" style="padding:10px 20px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">⬆ Import from Monarch / YNAB / Mint</button></div><div style="display:flex;justify-content:center;gap:18px;margin-top:18px;font-size:13px;color:var(--mu);font-family:var(--fh);font-weight:600">📊 Daily budget · 📅 Bill calendar · 🔔 Smart alerts</div></div>';
   }
 
   // First-run snapshot prompt
   var snap=S.snapshot||{};
   var needsSnapshot=!snap.setupDate&&moneyIn>0;
   if(needsSnapshot){
-    return'<div style="padding:28px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:38px;margin-bottom:12px">📍</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Calibrate Your Starting Point</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">It\'s mid-month. Tell us where you stand right now so your spending dashboard is accurate from day one.</div><button onclick="_portalShowSnapshotSetup()" style="padding:11px 22px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:42px">Set My Starting Point →</button></div>';
+    return'<div style="padding:28px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:38px;margin-bottom:12px">📍</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Calibrate Your Starting Point</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">It\'s mid-month. Tell us where you stand right now so your spending dashboard is accurate from day one.</div><button onclick="_portalShowSnapshotSetup()" style="padding:11px 22px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:42px">Set My Starting Point →</button><div style="margin-top:12px"><button onclick="openImportWizard()" aria-label="Import transactions from Monarch, YNAB, Mint, or any bank CSV" style="padding:9px 18px;background:transparent;border:1px solid rgba(91,155,255,.3);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:38px">⬆ Import from Monarch / YNAB / Mint</button></div></div>';
   }
 
   var h='';
@@ -10526,6 +10534,9 @@ function _portalRenderSpendDashboard(){
   h+='<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">';
   h+='<button onclick="_portalOpenAddExpense()" style="flex:1;min-width:140px;padding:12px;background:linear-gradient(135deg,#0044BF,#1155D9);border:none;color:#fff;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:44px;letter-spacing:.04em;box-shadow:0 4px 14px rgba(0,68,191,.3)">+ Add Expense</button>';
   h+='<button onclick="if(typeof _clientOpenGoalModal===\'function\')_clientOpenGoalModal();" style="flex:1;min-width:140px;padding:12px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);color:var(--gr);font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:44px;letter-spacing:.04em">+ Savings Goal</button>';
+  // §4.3: Import lives on the (ungated) Spending screen so Monarch/YNAB/Mint migrants — who by definition
+  // have NO Plaid link — can actually reach it (the Reports-bar copy in renderReportsView is Plaid-tab-gated).
+  h+='<button onclick="openImportWizard()" aria-label="Import transactions from a CSV file (Monarch, YNAB, Mint, or any bank)" style="flex:1;min-width:140px;padding:12px;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:44px;letter-spacing:.04em">⬆ Import CSV</button>';
   h+='</div>';
 
   // ── Goals (manage existing: edit / add money / buckets) ──
