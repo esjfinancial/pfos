@@ -4474,6 +4474,9 @@ async function doLogout(){
     clearTimeout(redirectTimer);
     _forceRedirectToLogin();
   };
+  // M4 §4.1a: release this device's push subscription rows so a NEXT user on a shared browser never inherits
+  // this client's alert routing (best-effort, non-blocking — the claim RPC on the next subscribe also reassigns).
+  try{ if(APP.currentClientId && typeof db!=='undefined' && db) db.from('push_subscriptions').update({active:false}).eq('client_id',APP.currentClientId).then(function(){},function(){}); }catch(e){}
   // ══ SIGNAL THE IFRAME TO FLUSH + CLEAR ITS OWN STORAGE ══
   try{
     var frame=getPFOSFrame();
@@ -6128,6 +6131,64 @@ async function sendClientMessage(){
     await loadClientMessages();
   }catch(e){ setBtnLoading('clientMsgBtn',false,'Send Message'); _cpToast('Failed: '+e.message); }
 }
+// ── M4 §4.1 — Web Push opt-in (client side). Stores the PushSubscription RLS-scoped in push_subscriptions.
+// Metric-inert: never touches S / calc / the engine iframe. Lives ONLY on this authenticated portal (never the
+// public landing page — push permission is per-origin and we don't want a decline there to block it here).
+var _VAPID_PUBLIC='BLFz77rTLDbuK5ddA9cByIJxKlHQ9_XGE0QINvNHQeua2THXE4-eOWcSI1df6rKdvAdyeUbYXmQZJJrKhwQQNI0';
+function _pushSupported(){ return ('serviceWorker' in navigator)&&('PushManager' in window)&&('Notification' in window); }
+function _urlB64ToUint8(s){ var pad='='.repeat((4-(s.length%4))%4),b=(s+pad).replace(/-/g,'+').replace(/_/g,'/'),raw=atob(b),arr=new Uint8Array(raw.length); for(var i=0;i<raw.length;i++)arr[i]=raw.charCodeAt(i); return arr; }
+// serviceWorker.ready resolves ONLY when an active SW controls the page and NEVER rejects — so race it with a
+// timeout, else a stalled/absent SW (http/localhost, failed activation) hangs the whole notification render (5a).
+async function _pushReg(){ try{ return await Promise.race([navigator.serviceWorker.ready, new Promise(function(r){ setTimeout(function(){ r(null); }, 1500); })]); }catch(e){ return null; } }
+async function _pushCurrentSub(){ var reg=await _pushReg(); if(!reg||!reg.pushManager) return null; try{ return await reg.pushManager.getSubscription(); }catch(e){ return null; } }
+async function _pushIsOn(){ return _pushSupported()&&Notification.permission==='granted'&&!!(await _pushCurrentSub()); }
+// The endpoint is a per-device capability claimed atomically server-side (push_subscriptions_claim, SECURITY
+// DEFINER) so it can only ever belong to ONE client — no shared-device cross-delivery.
+function _pushClaimArgs(sub){ var j=sub.toJSON()||{},k=j.keys||{}; return { p_endpoint:sub.endpoint, p_p256dh:k.p256dh||'', p_auth:k.auth||'', p_ua:(navigator.userAgent||'').slice(0,300) }; }
+async function _pushSubscribe(){
+  if(!_pushSupported()){ if(typeof _cpToast==='function')_cpToast('Push isn\'t available on this device','error'); return false; }
+  if(!APP.currentClientId) return false;
+  if(Notification.permission==='denied'){ if(typeof _cpToast==='function')_cpToast('Notifications are blocked — turn them on in your browser settings, then try again','error'); return false; }
+  try{
+    var perm=Notification.permission==='granted'?'granted':await Notification.requestPermission();
+    if(perm!=='granted') return false;
+    var reg=await _pushReg(); if(!reg||!reg.pushManager) return false;
+    var sub=await reg.pushManager.getSubscription();
+    if(!sub) sub=await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:_urlB64ToUint8(_VAPID_PUBLIC)});
+    await db.rpc('push_subscriptions_claim', _pushClaimArgs(sub));
+    try{ localStorage.setItem('pfos_push_asked','1'); }catch(e){}
+    if(typeof _cpToast==='function')_cpToast('Alerts on — we’ll flag shortfalls, bills, and milestones','success');
+    if(typeof loadNotificationCenter==='function') loadNotificationCenter();
+    return true;
+  }catch(e){ if(typeof _cpToast==='function')_cpToast('Couldn’t enable alerts','error'); return false; }
+}
+async function _pushUnsubscribe(){
+  try{
+    var sub=await _pushCurrentSub();
+    if(sub){ var ep=sub.endpoint; try{ await sub.unsubscribe(); }catch(e){} if(APP.currentClientId) await db.from('push_subscriptions').update({active:false}).eq('client_id',APP.currentClientId).eq('endpoint',ep); }
+    if(typeof _cpToast==='function')_cpToast('Alerts off','success');
+    if(typeof loadNotificationCenter==='function') loadNotificationCenter();
+    return true;
+  }catch(e){ return false; }
+}
+// Auto-heal endpoint ownership: if permission's already granted and a browser subscription exists, (re)claim it
+// for the CURRENT client — so on a shared device or a re-login the active user owns the endpoint. Silent; never prompts.
+async function _pushAutoSync(){
+  try{
+    if(!_pushSupported()||!APP.currentClientId||Notification.permission!=='granted') return;
+    var sub=await _pushCurrentSub(); if(!sub) return;
+    await db.rpc('push_subscriptions_claim', _pushClaimArgs(sub));
+  }catch(e){}
+}
+async function _pushToggleRowHtml(){
+  if(!_pushSupported()) return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:10px;font-size:13px;color:var(--mu)">🔔 Push alerts aren’t available in this browser. Add PFOS to your home screen to enable them.</div>';
+  var on=await _pushIsOn();
+  return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:12px">'
+    +'<div><div style="font-size:14px;color:rgba(226,232,240,.9);font-weight:600">🔔 Push alerts</div><div style="font-size:12px;color:var(--mu);margin-top:2px">A heads-up before you’re short before payday, when bills are due, and when you hit a milestone.</div></div>'
+    +'<button onclick="'+(on?'_pushUnsubscribe()':'_pushSubscribe()')+'" class="btn '+(on?'bgh':'bbl')+'" style="flex-shrink:0;width:auto;padding:8px 16px;font-size:13px">'+(on?'On — turn off':'Turn on')+'</button>'
+  +'</div>';
+}
+
 async function loadNotificationCenter(){
   if(!APP.currentClientId) return;
   var el = document.getElementById('notificationCenterList'); if(!el) return;
@@ -6142,8 +6203,9 @@ async function loadNotificationCenter(){
     var notifs = data||[];
     var badge = document.getElementById('notifBadge');
     if(badge){ badge.textContent=notifs.length; badge.style.display=notifs.length>0?'inline':'none'; }
-    if(!notifs.length){ el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:20px 0">✅ No unread notifications.</div>'; return; }
-    el.innerHTML = notifs.map(function(n){
+    var pushRow=''; try{ await _pushAutoSync(); pushRow = await _pushToggleRowHtml(); }catch(e){} // never let the push toggle block/blank the list (5a)
+    if(!notifs.length){ el.innerHTML=pushRow+'<div style="color:var(--mu);font-size:14px;padding:20px 0">✅ No unread notifications.</div>'; return; }
+    el.innerHTML = pushRow + notifs.map(function(n){
       return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:8px;display:flex;align-items:flex-start;justify-content:space-between;gap:12px">'
         +'<div>'
           +'<div style="font-size:14px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:4px">'+esc(n.message)+'</div>'
@@ -45264,10 +45326,11 @@ async function _cpSendChangeRequest(i){
 }
 
 // Small toast notification helper — auto-dismiss after 2.5s
-function _cpToast(msg){
+function _cpToast(msg,type){
   if(!msg)return;
   var t=document.createElement('div');
-  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 18px;background:rgba(0,0,0,.85);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none;transition:opacity .3s';
+  var bg=type==='error'?'var(--rd)':(type==='success'?'var(--gr)':'rgba(0,0,0,.85)');
+  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 18px;background:'+bg+';color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none;transition:opacity .3s';
   t.textContent=msg;
   document.body.appendChild(t);
   setTimeout(function(){t.style.opacity='0';},2200);
