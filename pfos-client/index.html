@@ -6238,12 +6238,27 @@ async function _setNotifPref(type,on){
     return true;
   }catch(e){ return false; }
 }
+// §4.2c — per-alert-type toggles + the rail/smart-alert reconciliation. _railedAlertTypes = the alert_<type> the
+// sweep already wrote to the in-app rail TODAY; generateSmartAlerts suppresses the live dup so a subscribed user
+// never sees the same condition twice (sweep rail item + live smart-alert).
+var _railedAlertTypes={};
+var _NOTIF_LABELS={shortfall:'Cash shortfall warnings',bill_due:'Bill reminders',low_balance:'Low reserves',overspent:'Over-budget alerts',review:'Transactions to review'};
+async function _toggleNotifType(type){ try{ var p=await _loadNotifPrefs(); var on=((p.push||{})[type])!==false; await _setNotifPref(type,!on); if(typeof loadNotificationCenter==='function') loadNotificationCenter(); }catch(e){} }
+async function _pushPrefsPanelHtml(){
+  var master=await _pushToggleRowHtml();
+  if(!_pushSupported()||!(await _pushIsOn())) return master; // unsupported/off → just the master toggle
+  var prefs=(await _loadNotifPrefs()).push||{};
+  var rows=Object.keys(_NOTIF_LABELS).map(function(t){ var en=prefs[t]!==false;
+    return '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid var(--bd)">'
+      +'<span style="font-size:13px;color:rgba(226,232,240,.8)">'+_NOTIF_LABELS[t]+'</span>'
+      +'<button onclick="_toggleNotifType(\''+t+'\')" class="btn '+(en?'bbl':'bgh')+'" style="flex-shrink:0;width:auto;padding:3px 12px;font-size:11px">'+(en?'On':'Off')+'</button>'
+    +'</div>'; }).join('');
+  return master+'<div style="background:var(--bg-card);border:1px solid var(--bd);border-top:none;border-radius:0 0 2px 2px;margin:-10px 0 10px;padding:2px 13px 9px"><div style="font-size:11px;color:var(--mu);padding:7px 0 2px">Which alerts</div>'+rows+'</div>';
+}
 
 async function loadNotificationCenter(){
   if(!APP.currentClientId) return;
   var el = document.getElementById('notificationCenterList'); if(!el) return;
-  // Generate smart alerts
-  generateSmartAlerts();
   generateAdvisorCheckIn();
   generateAnniversaryMilestones();
   try{
@@ -6251,9 +6266,13 @@ async function loadNotificationCenter(){
       .eq('client_id',APP.currentClientId).eq('is_read',false)
       .order('created_at',{ascending:false}).limit(20);
     var notifs = data||[];
+    // §4.2c: which alert types the sweep already railed TODAY → suppress the live smart-alert dup (no double-display).
+    _railedAlertTypes={}; var _td=new Date().toISOString().slice(0,10);
+    notifs.forEach(function(n){ if(n&&n.type&&String(n.type).indexOf('alert_')===0&&String(n.created_at).slice(0,10)===_td) _railedAlertTypes[String(n.type).slice(6)]=true; });
+    generateSmartAlerts(); // suppression-aware (runs AFTER _railedAlertTypes is computed)
     var badge = document.getElementById('notifBadge');
     if(badge){ badge.textContent=notifs.length; badge.style.display=notifs.length>0?'inline':'none'; }
-    var pushRow=''; try{ await _pushAutoSync(); pushRow = await _pushToggleRowHtml(); }catch(e){} // never let the push toggle block/blank the list (5a)
+    var pushRow=''; try{ await _pushAutoSync(); pushRow = await _pushPrefsPanelHtml(); }catch(e){} // never let the push panel block/blank the list (5a)
     if(!notifs.length){ el.innerHTML=pushRow+'<div style="color:var(--mu);font-size:14px;padding:20px 0">✅ No unread notifications.</div>'; return; }
     el.innerHTML = pushRow + notifs.map(function(n){
       return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:8px;display:flex;align-items:flex-start;justify-content:space-between;gap:12px">'
@@ -6264,7 +6283,7 @@ async function loadNotificationCenter(){
         +'<button onclick="dismissNotification(\''+n.id+'\')" style="flex-shrink:0;background:none;border:1px solid var(--bd);color:var(--mu);font-size:13px;padding:4px 10px;border-radius:2px;cursor:pointer">✕ Dismiss</button>'
       +'</div>';
     }).join('');
-  }catch(e){ el.innerHTML='<div style="color:var(--rd);font-size:13px">Error loading notifications</div>'; }
+  }catch(e){ _railedAlertTypes={}; generateSmartAlerts(); el.innerHTML='<div style="color:var(--rd);font-size:13px">Error loading notifications</div>'; } // on a fetch error, still render smart-alerts (no suppression)
 }
 
 // ── SMART ALERTS (Batch 32) ─────────────────────────────
@@ -6276,8 +6295,8 @@ function generateSmartAlerts(){
   // Spending pattern alerts
   if((c.savingsRate||0)<5) alerts.push({icon:'🚨',col:'var(--rd)',msg:'Your savings rate is below 5%. Even small increases make a big difference — try saving an extra $50/month.'});
   if((c.dti||0)>43) alerts.push({icon:'⚠️',col:'var(--or)',msg:'Your debt-to-income ratio is above 43% — this can limit your ability to borrow. Consider accelerating debt payoff.'});
-  if((c.efMonths||0)<1) alerts.push({icon:'🛡️',col:'var(--rd)',msg:'You have less than 1 month of emergency fund. This is your top priority — build to 3 months before other goals.'});
-  if((c.netCF||0)<0) alerts.push({icon:'💸',col:'var(--rd)',msg:'You\'re spending more than you earn this month. Review your expenses for areas to cut back.'});
+  if((c.efMonths||0)<1 && !_railedAlertTypes.low_balance) alerts.push({icon:'🛡️',col:'var(--rd)',msg:'You have less than 1 month of emergency fund. This is your top priority — build to 3 months before other goals.'}); // §4.2c: suppressed if the sweep already railed low_balance today
+  if((c.netCF||0)<0 && !_railedAlertTypes.shortfall) alerts.push({icon:'💸',col:'var(--rd)',msg:'You\'re spending more than you earn this month. Review your expenses for areas to cut back.'}); // §4.2c: suppressed if the sweep already railed shortfall today
   // Positive alerts
   if((c.savingsRate||0)>=20) alerts.push({icon:'🌟',col:'var(--gr)',msg:'Savings rate above 20% — outstanding! You\'re building wealth faster than 85% of Americans.'});
   if((c.efMonths||0)>=6) alerts.push({icon:'🏰',col:'var(--gr)',msg:'6+ months emergency fund — excellent! Consider redirecting surplus to investments for higher returns.'});
