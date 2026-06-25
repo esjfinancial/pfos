@@ -540,11 +540,204 @@ function _issuesDetect(ctx){
 
     // ── Spouse pass — PROFILE-ONLY (ctx.spouse). Same call site + try/catch as source. ──
     if(ctx.spouse&&(ctx.spouse.householdType==='joint'||ctx.spouse.householdType==='hybrid'||ctx.spouse.householdType==='separate')){
-      try{ ctx.spouse.run(flags, rawS2, d); }catch(_sf){console.warn('Spouse flags (cards):',_sf); }
+      try{ _spouseFlags(flags, rawS2, d, ctx.spouse); }catch(_sf){console.warn('Spouse flags (cards):',_sf); }
     }
 
     return flags;
 }
+  // ── Income take-home helpers (M5.1b — ported VERBATIM from the shells; pure math). ──
+  function _checksPerMonth(freq){
+  return ({weekly:52/12,biweekly:26/12,semimonthly:2,monthly:1,irregular:1})[freq||'monthly']||1;
+}
+  function _incSrcMode(src){return (src&&src.mode==='detailed')?'detailed':'simple';}
+  function _incSrcMonthlyTakeHome(src){
+  if(!src)return 0;
+  if(_incSrcMode(src)==='detailed'){
+    return (parseFloat(src.take_home_per_check)||0)*_checksPerMonth(src.pay_frequency);
+  }
+  return parseFloat(src.amount)||0;
+}
+  // ── Spouse/partner red-flag scanner (M5.1b) — ported VERBATIM from pfos-client-profile
+  // _cpAppendSpouseFlags so the advisor profile AND the self-serve portal feed ONE scanner.
+  // Made pure (5b firewall): the partner object, household type, and plan allocations arrive
+  // via `sp` instead of being read off the page-global CPLAN. sp = { householdType, partner,
+  // allocations, [run] }. Back-compat: if a (stale) caller still passes sp.run, delegate to it.
+  function _spouseFlags(flags, rawS2, d, sp){
+    if(sp&&typeof sp.run==='function'){ return sp.run(flags, rawS2, d); }
+    sp = sp || {};
+    var _partner = sp.partner || null;
+    var _householdType = sp.householdType;
+    var _allocations = sp.allocations || [];
+
+  if(!rawS2)return;
+  var spName=(_partner&&_partner.firstName)||'Spouse';
+  function _sp(arr,field){return (arr||[]).filter(function(x){return x&&(x[field||'owner']||'personal')==='spouse';});}
+  // Data sourcing differs by household model:
+  //  • JOINT: both spouses share ONE row; spouse items are owner==='spouse' in rawS2.
+  //  • HYBRID + SEPARATE: each spouse has their OWN row; the partner's data is on
+  //    _partner (a separate profile), where their accounts are owner
+  //    'self'/'personal' on THEIR row. So for both we read straight from
+  //    _partner rather than filtering rawS2.
+  var _isHybridSp=((_householdType==='hybrid'||_householdType==='separate') && _partner);
+  var spIncSrcs, spInc, spRetAccts, spPolicies;
+  if(_isHybridSp){
+    spInc=Math.max(0, _partner.income||0);
+    spRetAccts=_partner.retAccounts||[];
+    spPolicies=_partner.policies||[];
+    // Hybrid/separate: partner's income sources live on THEIR own row. Set this so
+    // the single-income check below (spIncSrcs.length) doesn't throw on undefined —
+    // that crash aborted every spouse flag after it (single-income, LTC).
+    spIncSrcs=(_partner.incomeSources)||[];
+  } else {
+    // Spouse income (sum of spouse-owned income sources)
+    spIncSrcs=_sp(rawS2.incomeSources);
+    spInc=spIncSrcs.reduce(function(t,s){return t+_incSrcMonthlyTakeHome(s);},0);
+    spRetAccts=_sp(rawS2.retAccounts);
+    spPolicies=_sp(rawS2.policies&&rawS2.policies.length?rawS2.policies:rawS2.insurancePolicies);
+  }
+  var spAge=(_partner&&_partner.age)||parseInt(rawS2.profile&&rawS2.profile.spCurrentAge)||0;
+  var tag=' ['+spName+']';
+  // Helper: does the plan already have a spouse-owned allocation of these types with money?
+  function _spHasAlloc(types){
+    return _allocations.some(function(a){return a&&a.owner==='spouse'&&types.indexOf(a.type)>=0&&(parseFloat(a.amount)||0)>0;});
+  }
+  // ── Core financial-health flags (spouse) — only when we have the partner's OWN
+  // profile (hybrid + separate). Joint shares one row, so the primary extraction
+  // already covers the household. These mirror the four self "core" flags
+  // (cash-flow, emergency fund, debt, employer match) for the partner so Combined
+  // surfaces every gap for BOTH spouses. efTarget = 3 months of expenses (mirrors
+  // the self formula).
+  if(_isHybridSp){
+    var _pt=_partner;
+    var _ptInc=Math.max(0,_pt.income||0);
+    var _ptExp=Math.max(0,_pt.expenses||0);
+    var _ptEf=Math.max(0,_pt.efBal||0);
+    var _ptEfTarget=Math.round(_ptExp*3);
+    var _ptDebts=(_pt.debts||[]).filter(function(x){return x&&(parseFloat(x.balance)||0)>0;});
+    var _ptTotalDebt=_ptDebts.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);
+    // Cash flow
+    if(_ptInc>0&&_ptExp>=_ptInc){
+      flags.push({icon:'🚨',title:'Spending exceeds income'+tag,desc:spName+'\'s expenses ('+fmt(_ptExp)+'/mo) meet or exceed income ('+fmt(_ptInc)+'/mo). Trim spending or raise income before funding goals.',type:'warn',action:'cashflow_spouse',owner:'spouse'});
+    } else if(_ptInc>0&&(_ptInc-_ptExp)<200){
+      flags.push({icon:'⚠️',title:'Razor-thin cash flow'+tag,desc:spName+' has only '+fmt(_ptInc-_ptExp)+'/mo of buffer after expenses — a small surprise could mean new debt.',type:'warn',action:'cashflow_spouse',owner:'spouse'});
+    }
+    // Emergency fund
+    if(_ptEfTarget>0&&_ptEf<_ptEfTarget*0.25){
+      flags.push({icon:'🛟',title:'Emergency fund critically low'+tag,desc:spName+' has '+fmt(_ptEf)+' of a '+fmt(_ptEfTarget)+' target (3 months of expenses). Build this first.',type:'warn',action:'ef_spouse',owner:'spouse'});
+    } else if(_ptEfTarget>0&&_ptEf<_ptEfTarget){
+      flags.push({icon:'🛟',title:'Emergency fund below target'+tag,desc:spName+' needs '+fmt(_ptEfTarget)+' for 3 months of expenses ('+fmt(_ptEf)+' saved so far).',type:'opp',action:'ef_spouse',owner:'spouse'});
+    }
+    // High-interest / outstanding debt
+    var _ptHi=_ptDebts.filter(function(x){return (parseFloat(x.rate)||0)>=15;});
+    if(_ptHi.length>0){
+      var _ptHiTotal=_ptHi.reduce(function(t,x){return t+(parseFloat(x.balance)||0);},0);
+      flags.push({icon:'🔥',title:'High-interest debt'+tag+': '+fmtK(_ptHiTotal),desc:_ptHi.length+' account'+(_ptHi.length>1?'s':'')+' above 15% APR for '+spName+'. A payoff strategy could save thousands.',type:'warn',action:'debt_spouse',owner:'spouse'});
+    } else if(_ptTotalDebt>0){
+      flags.push({icon:'💳',title:'Outstanding debt'+tag+': '+fmtK(_ptTotalDebt),desc:_ptDebts.length+' account'+(_ptDebts.length>1?'s':'')+' for '+spName+' — a payoff strategy could save on interest.',type:'opp',action:'debt_spouse',owner:'spouse'});
+    }
+    // Employer 401(k) match (heuristic — mirrors the self fallback when match data
+    // isn't separately modeled for the partner: an employer + no active 401k).
+    var _ptHasEmployer=!!(_pt.employer&&String(_pt.employer).trim());
+    var _ptHas401kContrib=(_pt.retAccounts||[]).some(function(r){var t=(r.type||'').toLowerCase();return t.indexOf('401k')>=0&&(parseFloat(r.contrib)||0)>0;});
+    if(_ptHasEmployer&&!_ptHas401kContrib&&!_spHasAlloc(['401k','roth401k'])&&_ptInc>0){
+      flags.push({icon:'🎁',title:'Employer match likely available'+tag,desc:spName+' has an employer but no active 401(k) contribution. Capturing any employer match is an immediate, guaranteed return — fund this first.',type:'warn',action:'retirement_spouse',owner:'spouse'});
+    }
+  }
+  // ── No retirement savings (spouse) ──
+  // Count BOTH a spouse-owned retirement allocation in the plan AND an existing
+  // spouse-owned retirement account in the data (balance or current contribution).
+  // Without the existing-account check, a spouse with a real 401k that hasn't been
+  // seeded as a plan allocation yet was wrongly flagged "no retirement savings".
+  var _retTypesDetect=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','iul','wl','ibc','hsa'];
+  var _spHasExistingRet=spRetAccts.some(function(ra){
+    return ra && ((parseFloat(ra.balance)||0)>0 || (parseFloat(ra.contrib)||0)>0);
+  });
+  var _spHasExistingRetPolicy=spPolicies.some(function(p){var t=(p.type||'').toLowerCase();return (t.indexOf('iul')>=0||t.indexOf('whole')>=0||p.ibcFlag==='yes')&&(parseFloat(p.premium)||parseFloat(p.cashValue)||0)>0;});
+  if(!_spHasAlloc(_retTypesDetect)&&!_spHasExistingRet&&!_spHasExistingRetPolicy&&spAge>=25&&spInc>0)
+    flags.push({icon:'🕒',title:'No retirement savings active'+tag,desc:spName+' has no active retirement contribution. Starting now compounds significantly.',type:'warn',action:'retirement_spouse',owner:'spouse'});
+  else if(!_spHasAlloc(_retTypesDetect)&&(_spHasExistingRet||_spHasExistingRetPolicy)&&spAge>=25&&spInc>0)
+    flags.push({icon:'🎯',title:'Add to retirement savings'+tag,desc:spName+'\'s existing retirement is a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle.',type:'opp',action:'retirement_spouse',owner:'spouse'});
+  // ── Old/orphaned retirement accounts (spouse) ──
+  var spOld=spRetAccts.filter(function(ra){return ra.type&&ra.type.indexOf('_old')>=0&&(parseFloat(ra.balance)||0)>0;});
+  if(spOld.length>0){
+    var spOldBal=spOld.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+    flags.push({icon:'🔄',title:'Old retirement account'+(spOld.length>1?'s':'')+tag+': '+fmtK(spOldBal),desc:spOld.length+' orphaned account'+(spOld.length>1?'s':'')+' for '+spName+'. Consider rolling into a current IRA/401(k) or a Roth conversion.',type:'warn',action:'rollover_spouse',owner:'spouse'});
+  }
+  // ── HSA eligibility (spouse) — detect from the spouse's own income sources
+  //    (HSA payroll deduction / HDHP coverage) and the spouse profile flag. ──
+  var spHDHP=false;
+  if(_isHybridSp){
+    // Hybrid: read the partner's own profile/income sources.
+    var _pPR=(_partner&&_partner._rawProfile)||null;
+    if(_pPR&&_pPR.spHasHDHP)spHDHP=true; // (partner's own HDHP flag if captured)
+    var _pSrcsH=(_partner&&_partner.incomeSources)||[];
+    if(_pSrcsH.some(function(s){return (parseFloat(s&&s.deduction_hsa)||0)>0;}))spHDHP=true;
+  } else {
+    if(rawS2.profile&&rawS2.profile.spHasHDHP)spHDHP=true;
+    var _spSrcs=(rawS2.incomeSources||[]).filter(function(s){return (s&&s.owner)==='spouse';});
+    if(_spSrcs.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0;}))spHDHP=true;
+  }
+  if(spHDHP&&!_spHasAlloc(['hsa']))
+    flags.push({icon:'💊',title:'HSA eligible'+tag+' — triple tax advantage',desc:spName+'\'s HDHP unlocks the only triple-tax-advantaged account: tax-free in, growth, and medical withdrawals.',type:'opp',action:'hsa_spouse',owner:'spouse'});
+  // ── Life insurance gap (spouse) — detailed, calculated copy (mirrors primary) ──
+  var spHasLife=spPolicies.some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('life')>=0||t.indexOf('term')>=0||t.indexOf('whole')>=0||t.indexOf('iul')>=0;});
+  if(!spHasLife&&spInc>0){
+    var _spAnnInc=spInc*12;
+    var _spHasDeps=((d.children&&d.children.length>0)||d.marital==='Married');
+    var _spLifeMin,_spLifeMax,_spLifeDesc,_spLifeSev;
+    if(_spHasDeps){
+      _spLifeMin=Math.round(_spAnnInc*8);_spLifeMax=Math.round(_spAnnInc*12);_spLifeSev='warn';
+      _spLifeDesc='With dependents, a coverage gap on '+spName+' puts the household at financial risk. Industry-standard guidance is 8-12x annual income for breadwinners with dependents — about '+fmtK(_spLifeMin)+'-'+fmtK(_spLifeMax)+' of death benefit on '+spName+'\'s '+fmtK(_spAnnInc)+'/yr income. A 20- or 30-year level term policy is the standard structure. Get quotes from a licensed insurance professional.';
+    } else {
+      _spLifeMin=Math.round(_spAnnInc*5);_spLifeMax=Math.round(_spAnnInc*10);_spLifeSev='opp';
+      _spLifeDesc='Even without current dependents, term life on '+spName+' is worth evaluating now — premiums lock in at current age and health, covering final expenses and non-dischargeable debts, and getting term before future dependents is dramatically cheaper. Industry guidance for single filers is 5-10x annual income (about '+fmtK(_spLifeMin)+'-'+fmtK(_spLifeMax)+' on '+spName+'\'s '+fmtK(_spAnnInc)+'/yr income). A 20- or 30-year level term policy is standard. Get quotes from a licensed insurance professional.';
+    }
+    flags.push({icon:'🛡️',title:'No life insurance detected'+tag,desc:_spLifeDesc,type:_spLifeSev,action:'protection_spouse',owner:'spouse'});
+  }
+  // ── Disability coverage (spouse) — detailed, calculated copy (mirrors primary) ──
+  var spHasDisab=spPolicies.some(function(p){return(p.type||'').toLowerCase().indexOf('disab')>=0;});
+  if(!spHasDisab&&spInc>0){
+    var _spDisMonthly=Math.round(spInc*0.65);
+    flags.push({icon:'⚡',title:'No disability coverage detected'+tag,desc:spName+'\'s income ('+fmt(spInc)+'/mo) is their most valuable asset — long-term disability is statistically more likely than premature death during working years, and Social Security disability replaces only a fraction with strict eligibility. Industry-standard guidance is 60-70% income replacement (about '+fmt(_spDisMonthly)+'/mo for '+spName+'), own-occupation definition, benefit period to age 65. If their employer offers group LTD, verify the amount and definition. Get quotes from a licensed insurance professional.',type:'warn',action:'protection_spouse',owner:'spouse'});
+  }
+  // ── Existing IBC / WL / IUL policies (spouse) not in plan ──
+  var spIBC=spPolicies.filter(function(p){return p.ibcFlag==='yes';});
+  if(spIBC.length>0&&!_spHasAlloc(['ibc']))
+    flags.push({icon:'🏛️',title:'IBC policy not in plan'+tag,desc:spIBC.length+' policy marked for Infinite Banking on '+spName+' — incorporate for debt recapture, major purchases, retirement supplement.',type:'opp',action:'ibc_spouse',owner:'spouse'});
+  var spRetPol=spPolicies.filter(function(p){var t=(p.type||'').toLowerCase();return(t.indexOf('whole')>=0||t.indexOf('iul')>=0)&&p.ibcFlag!=='yes'&&(parseFloat(p.premium)||0)>0;});
+  if(spRetPol.length>0&&!_spHasAlloc(['iul','wl']))
+    flags.push({icon:'📋',title:'Existing '+spRetPol[0].type+' not in plan'+tag,desc:spName+'\'s cash value could supplement retirement — consider incorporating.',type:'opp',action:'existing_policy_spouse',owner:'spouse'});
+  // ── Single income source (spouse) — detailed copy (mirrors primary) ──
+  if(spIncSrcs.length===1&&spInc>0)
+    flags.push({icon:'📌',title:'Single income source'+tag,desc:spName+'\'s income comes from one source — a job loss eliminates that salary at once. Common mitigations, in order of immediacy: (1) build a deeper emergency fund (6-9 months instead of 3), (2) ensure disability insurance is in place (see the protection card), (3) develop a secondary income stream (consulting, rental, side business) over a 12-24 month timeline.',type:'info',action:'diversify_spouse',owner:'spouse'});
+  // ── Long-term care planning (spouse, age 50-65) ──
+  var spHasLTC=spPolicies.some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('long-term care')>=0||t.indexOf('ltc')>=0||t.indexOf('long term care')>=0;});
+  if(!spHasLTC&&spAge>=50&&spAge<=65&&spInc>0)
+    flags.push({icon:'🏥',title:'No long-term care planning'+tag,desc:'Premiums for '+spName+' are best locked 50-60 — nearly double after 65. Consider hybrid life/LTC.',type:'opp',action:'protection_spouse',owner:'spouse'});
+  // ── Estate documents (spouse) — PERSONAL: each spouse needs their OWN will & POA;
+  //    beneficiary designations are per-account. Only hybrid/separate (the partner
+  //    has their own row/docs); joint shares one row so the self extraction already
+  //    covers the household. action 'estate_spouse' → _cpSyncFlagsToUnassigned
+  //    normalizes to 'estate' and routes the card to the spouse (owner:'spouse').
+  //    (Umbrella + growth-diversification are HOUSEHOLD/plan-level — fired once on
+  //    the centered client, NOT duplicated per spouse.) ──
+  if(_isHybridSp && spInc>0){
+    var _ptEst=_partner||{};
+    var _ptHasDeps=((d&&d.children&&d.children.length>0)||(d&&d.marital==='Married'));
+    var _ptWill=_ptEst.willStatus||'';
+    if(!(_ptWill&&_ptWill!=='none'))
+      flags.push({icon:'📝',title:'No will on file'+tag,desc:spName+' has no will on file — '+(_ptHasDeps?'with dependents, the state decides guardianship and inheritance':'the state decides who inherits')+'. Typical attorney fee: $300-$1,500.',type:_ptHasDeps?'warn':'opp',action:'estate_spouse',owner:'spouse'});
+    var _ptPoa=(_ptEst.estateDocs&&_ptEst.estateDocs.poa)||'';
+    if(!(_ptPoa&&_ptPoa!=='none')&&spAge>=30)
+      flags.push({icon:'⚖️',title:'No power of attorney'+tag,desc:'A POA lets someone make healthcare and financial decisions for '+spName+' if incapacitated. Without one, family must petition the court.',type:'opp',action:'estate_spouse',owner:'spouse'});
+    var _ptHasRet=(spRetAccts||[]).some(function(ra){return ra&&(parseFloat(ra.balance)||0)>0;});
+    var _ptHasLifePol=spPolicies.some(function(p){var t=(p.type||'').toLowerCase();return t.indexOf('life')>=0||t.indexOf('term')>=0||t.indexOf('whole')>=0||t.indexOf('iul')>=0;});
+    var _ptBenRev=!!(_ptEst.estateDocs&&_ptEst.estateDocs.beneficiary);
+    if((_ptHasRet||_ptHasLifePol)&&!_ptBenRev)
+      flags.push({icon:'📋',title:'Beneficiary designations not reviewed'+tag,desc:spName+'’s beneficiary designations on retirement/insurance OVERRIDE the will — verify them after any marriage, divorce, birth, or death.',type:'warn',action:'estate_spouse',owner:'spouse'});
+  }
+
+  }
   function _issuesToCp(issue){ return issue; }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;

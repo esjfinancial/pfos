@@ -34391,7 +34391,11 @@ async function _cpLoadPartnerForAI(){
         clientId:partnerId,
         name:pName,
         firstName:_partnerFirstName,
-        age:parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35,
+        // M5.1b: spouse-age source of truth = the spouse field on the CENTERED client's OWN profile
+        // (S.profile.spCurrentAge), then the partner's own row — matching the advisor builder
+        // (pfos-client-profile:8013) so the age-gated spouse flags (retirement>=25, POA>=30, LTC 50-65)
+        // fire IDENTICALLY portal-vs-advisor. Without this the portal saw only the partner row and diverged.
+        age:parseInt(APP._portalFd&&APP._portalFd.S&&APP._portalFd.S.profile&&APP._portalFd.S.profile.spCurrentAge)||parseInt(pRawS.currentAge)||parseInt(pCalcs.age)||35,
         // Phase D multi-partner: retirement age + SS benefit from partner's own profile.
         // Defaults to 65 if not set so projections stay valid. Reads from partner's S.profile.retAge.
         retirementAge:parseInt(pProfile.retAge)||65,
@@ -34413,6 +34417,16 @@ async function _cpLoadPartnerForAI(){
         children:pRawS.children||pFd.children||[],
         incomeSources:pRawS.incomeSources||pFd.incomeSources||[],
         assets:pRawS.assets||pFd.assets||{},
+        // M5.1b: fields the shared spouse scanner (_spouseFlags, hybrid/separate path) reads off
+        // the partner — supplied here so the PORTAL produces the same spouse flags the ADVISOR does
+        // (mirrors pfos-client-profile:8026/8037-8039). efBal = partner's own depository + linked cash.
+        efBal:(pRawS.assets?(parseFloat(pRawS.assets.checking)||0)+(parseFloat(pRawS.assets.savings)||0):0)+((pRawS.linkedCash||[]).reduce(function(_t,_c){return _t+((_c&&_c.include!==false)?(parseFloat(_c.balance)||0):0);},0)),
+        willStatus:pRawS.willStatus,
+        estateDocs:pRawS.estateDocs,
+        // M5.1b: the spouse scanner reads ONLY _rawProfile.spHasHDHP — pass JUST that boolean, NOT the
+        // partner's full S.profile. This portal builder spreads _partner into the generate-recommendations
+        // AI payload (no scrub), so sending the whole profile would leak the partner's email/phone/DOB PII.
+        _rawProfile:{spHasHDHP:(pProfile&&pProfile.spHasHDHP)||false},
         currentAllocations:(pPlan.allocations||[]).slice()
       };
     }
@@ -39458,9 +39472,10 @@ function _cpExtractRedFlags(){
   if(!(window.PFOS_FLAGS&&PFOS_FLAGS.issuesDetect)) return _cpExtractRedFlags_LEGACY();
   var d=CPLAN;
   var rawS2=(APP._portalFd&&APP._portalFd.S)||{};
-  // M5.1a PHASE-2 — OWNER DECISION "portal matches advisor": assemble the owner-aware ctx so flipping issuesDetect ON
-  // makes the portal produce the ADVISOR's flags (personal-income insurance basis, retirement nudge, owner-aware HSA,
-  // mortgage-ignores-exclude). The spouse pass is DEFERRED to M5.1b (the 168-line _cpAppendSpouseFlags isn't in this shell).
+  // M5.1a PHASE-2 + M5.1b — OWNER DECISION "portal matches advisor": assemble the owner-aware ctx so flipping issuesDetect
+  // ON makes the portal produce the ADVISOR's flags (personal-income insurance basis, retirement nudge, owner-aware HSA,
+  // mortgage-ignores-exclude) AND the spouse/partner pass (M5.1b — the scanner now lives in pfos-shared.v6 as _spouseFlags;
+  // the ctx.spouse data bag below feeds it, so couples now get the FULL advisor flag set).
   var selfMonthlyIncome=(function(){
     try{ var _srcs=rawS2.incomeSources||[];
       if(!_srcs.length)return d.income||0;
@@ -39487,8 +39502,14 @@ function _cpExtractRedFlags(){
     _mortgageUsesInclDebts:false,            // match advisor: ignore the include:false toggle
     selfMonthlyIncome:selfMonthlyIncome,
     retExisting:retExisting,
-    hsaEligibleOwnerAware:hsaEligibleOwnerAware
-    // spouse: DEFERRED to M5.1b (port _cpAppendSpouseFlags into the shared engine first)
+    hsaEligibleOwnerAware:hsaEligibleOwnerAware,
+    // M5.1b: the spouse/partner scanner now lives in pfos-shared.v6 (_spouseFlags). Pass the SAME
+    // data bag the advisor profile does so couples get the FULL advisor flag set (the last deferred
+    // divergence, now closed). CPLAN._partner is hydrated by the eager _cpLoadPartnerForAI() + the
+    // re-render it triggers (pfos-client:26792/26879); for JOINT the scanner reads spouse items from
+    // rawS2 (owner==='spouse') and needs only _partner.firstName/age, so a cold null partner still
+    // degrades gracefully and the re-render fills it in.
+    spouse:{ householdType:CPLAN._householdType, partner:CPLAN._partner, allocations:CPLAN.allocations }
   };
   return PFOSIssues.detect(ctx).map(PFOSIssues.toCp);
 }
