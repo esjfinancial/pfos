@@ -5746,6 +5746,9 @@ async function loadClientDataIntoPFOS(clientId){
   _pfosDataLoaded=true;
   // Sync plan data to pfos-main iframe after plan initializes
   setTimeout(function(){_cpEnsurePlanLoaded();_syncPlanToMain();},500);
+  // §4.1c — surface the proactive push opt-in once the dashboard has settled (self-gated: once/session, capped,
+  // never after enabled/blocked; leads to the OS prompt only on the user's tap). Deferred so it doesn't race the load.
+  setTimeout(function(){ try{ if(typeof _maybePushSoftAsk==='function') _maybePushSoftAsk(); }catch(e){} },2800);
   // Chunk 14: act on webhook-set Plaid flags (needs_refresh drain / re-auth + new-account banners). Pro+ only;
   // no-ops otherwise. Deferred so it runs after the initial PFOS_LOAD hydration settles (the drain writes S).
   setTimeout(function(){ try{ if(typeof _cpCheckPlaidPending==='function') _cpCheckPlaidPending(); }catch(e){ console.warn('[plaid] pending-check failed:', e); } try{ if(typeof _cpCheckPlaidArchived==='function') _cpCheckPlaidArchived(); }catch(e){ console.warn('[plaid] archived-check failed:', e); } },1500);
@@ -6390,6 +6393,68 @@ async function _pushToggleRowHtml(){
     +'<button onclick="'+(on?'_pushUnsubscribe()':'_pushSubscribe()')+'" class="btn '+(on?'btn-gh':'btn-bl')+'" style="flex-shrink:0;width:auto;padding:8px 16px;font-size:13px">'+(on?'On — turn off':'Turn on')+'</button>'
   +'</div>';
 }
+
+// ── M4 §4.1c — proactive soft-ask opt-in (the discoverable "prompt"). A one-time modal after login that LEADS to
+// the OS permission dialog on a user TAP — it never auto-fires the OS prompt (iOS requires a gesture, and the OS
+// prompt is one-shot: a reflexive deny is permanent). Respectful: once per SESSION, lifetime-capped, never shown
+// once enabled or after an OS block. iOS-in-Safari (push unavailable because PFOS isn't an installed PWA) gets an
+// install hint instead of a dead Enable button. Metric-inert — touches only push + localStorage, never S/calc/engine.
+var _pushSoftAskShownSession=false;
+var _PUSH_ASK_MAX_DISMISS=3;
+function _pushAskState(){ try{ return JSON.parse(localStorage.getItem('pfos_pushask')||'{}')||{}; }catch(e){ return {}; } }
+function _pushAskStore(o){ try{ localStorage.setItem('pfos_pushask', JSON.stringify(o||{})); }catch(e){} }
+function _pushIsIOS(){ return /iPad|iPhone|iPod/.test(navigator.userAgent||''); }
+function _pushIsStandalone(){ return (window.navigator&&window.navigator.standalone===true)||(!!window.matchMedia&&window.matchMedia('(display-mode: standalone)').matches); }
+// Decide whether/what to show. Returns 'enable' | 'install' | null. Pure gating (the 5b/test seam).
+async function _pushSoftAskMode(){
+  if(!APP.currentClientId) return null;
+  var st=_pushAskState();
+  if(st.enabled) return null;                                  // already on (sticky) — never nag
+  if(_pushSupported()){
+    if(Notification.permission==='granted'){ if(await _pushIsOn()){ st.enabled=true; _pushAskStore(st); return null; } return (st.dismissed||0)>=_PUSH_ASK_MAX_DISMISS?null:'enable'; }
+    if(Notification.permission==='denied') return null;        // OS-blocked: can't re-ask, don't nag
+    return (st.dismissed||0)>=_PUSH_ASK_MAX_DISMISS?null:'enable';
+  }
+  if(_pushIsIOS()&&!_pushIsStandalone()) return (st.installShown||0)>=2?null:'install'; // educational hint, at most twice
+  return null;                                                 // unsupported desktop browser → nothing to offer
+}
+async function _maybePushSoftAsk(){
+  try{
+    if(_pushSoftAskShownSession) return;
+    var mode=await _pushSoftAskMode();
+    if(!mode) return;
+    if(mode==='install'){ var st=_pushAskState(); st.installShown=(st.installShown||0)+1; _pushAskStore(st); }
+    _pushSoftAskShownSession=true;
+    _showPushSoftAsk(mode);
+  }catch(e){}
+}
+function _showPushSoftAsk(mode){
+  _closePushSoftAsk();
+  var box=document.createElement('div'); box.id='pushSoftAskModal'; box.className='modal-bg open'; box.setAttribute('role','dialog'); box.setAttribute('aria-modal','true');
+  var inner, cta;
+  if(mode==='install'){
+    inner='To get alerts on your iPhone, add PFOS to your home screen — tap <strong style="color:var(--wh)">Share</strong>, then <strong style="color:var(--wh)">Add to Home Screen</strong>. Open PFOS from there to turn on alerts.';
+    cta='<button class="btn btn-bl" style="width:100%" onclick="_closePushSoftAsk()">Got it</button>';
+  } else {
+    inner='Get a heads-up before you’re short before payday, when a bill is due, or when you overspend a budget — so nothing catches you off guard.';
+    cta='<button class="btn btn-bl" style="width:100%;margin-bottom:8px" onclick="_acceptPushSoftAsk()">Enable alerts</button><button class="btn btn-gh" style="width:100%" onclick="_dismissPushSoftAsk()">Not now</button>';
+  }
+  box.innerHTML='<div class="modal" style="max-width:380px;text-align:center">'
+    +'<div style="font-size:42px;line-height:1;margin-bottom:10px">🔔</div>'
+    +'<div class="modal-title" style="margin-bottom:10px">'+(mode==='install'?'Add PFOS to enable alerts':'Stay ahead of your money')+'</div>'
+    +'<div style="font-size:14px;color:var(--mu);line-height:1.7;margin-bottom:20px">'+inner+'</div>'
+    +cta
+  +'</div>';
+  box.onclick=function(ev){ if(ev.target===box){ if(mode==='enable') _dismissPushSoftAsk(); else _closePushSoftAsk(); } };
+  document.body.appendChild(box); document.body.style.overflow='hidden';
+}
+async function _acceptPushSoftAsk(){
+  var ok=false; try{ ok=await _pushSubscribe(); }catch(e){}
+  if(ok){ var st=_pushAskState(); st.enabled=true; _pushAskStore(st); }
+  _closePushSoftAsk();
+}
+function _dismissPushSoftAsk(){ var st=_pushAskState(); st.dismissed=(st.dismissed||0)+1; _pushAskStore(st); _closePushSoftAsk(); }
+function _closePushSoftAsk(){ var el=document.getElementById('pushSoftAskModal'); if(el&&el.parentNode) el.parentNode.removeChild(el); document.body.style.overflow=''; }
 
 // ── M4 §4.2a — alert_state snapshot + channel prefs. The client computes the 6 alert signals via its EXISTING
 // single-source detectors (forecast/ledger/sim — no server re-implementation → no drift, 5e) and upserts a compact
