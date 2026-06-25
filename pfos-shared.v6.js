@@ -781,11 +781,26 @@ function _issuesDetect(ctx){
     var ranked=_issuesRank(flagCards.map(function(c){ return { action:c.flagAction, type:c.flagType, _a:c }; }));
     return ranked.map(function(w){ return w._a; }).concat(others);
   }
+  // ── M5.2b-2 — SELF-SERVE PORTAL spouse-issue VISIBILITY policy (household-aware privacy). The advisor
+  // always sees both spouses; in the self-serve portal what one spouse sees OF THE PARTNER is gated by
+  // household type: joint = ALL (merged finances, no privacy barrier); separate = NONE (independent —
+  // not this person's concern); hybrid = only HOUSEHOLD-IMPACTING categories (emergency fund, insurance/
+  // protection, estate) — hiding the partner's purely-personal money management (cash flow, debt,
+  // retirement, hsa, ...). `baseAction` is the _spouse-stripped action. NOTE: spouse flags carry no item
+  // reference, so there is no true per-item shared/private split — this is a CATEGORY allow-list, the
+  // realizable form of the owner's "partial visibility for hybrid" intent (owner added `ef` explicitly).
+  var _HYBRID_SPOUSE_SHOW = { ef:1, protection:1, estate:1 };
+  function _spouseVisibleSelfServe(baseAction, householdType){
+    if(householdType==='joint') return true;
+    if(householdType==='hybrid') return !!_HYBRID_SPOUSE_SHOW[baseAction];
+    return false;   // separate / individual / anything else → hide
+  }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;
   g.PFOSIssues.toCp = _issuesToCp;   // identity pass-through (per-shell transform seam)
   g.PFOSIssues.rank = _issuesRank;   // canonical engine-exact priority sort over {action,type} flags (M5.2a)
   g.PFOSIssues.rankCards = _issuesRankCards;   // rank unassigned plan cards by flagAction/flagType; goals trail (M5.2b)
+  g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (7-category)
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
   g.PFOSRecs   = g.PFOSRecs   || {};   // canonical Recommendation type + lifecycle

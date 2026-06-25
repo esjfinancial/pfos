@@ -30664,17 +30664,34 @@ function _cpSyncFlagsToUnassigned(){
   flags.forEach(function(f){
     var act=f.action;
     if(!act)return;
-    if(CPLAN._dismissedFlags[act])return;
+    // ── M5.2b-2 — spouse-issue VISIBILITY in the self-serve portal (household-aware privacy), dark-launched
+    // behind PFOS_FLAGS.spouseVisibility. OFF = drop every spouse flag exactly as before (no _spouse-suffixed
+    // action ever matched a map, so spouse flags were silently dropped). ON: strip the suffix to the base
+    // action, then gate by household type via PFOSIssues.spouseVisible — joint=ALL, separate=NONE,
+    // hybrid={ef,protection,estate}. (The advisor profile shows both spouses unconditionally — unchanged.)
+    var _isSpouseFlag=(f.owner==='spouse');
+    if(_isSpouseFlag){
+      if(!(window.PFOS_FLAGS&&PFOS_FLAGS.spouseVisibility)) return;
+      if(/_spouse$/.test(act)) act=act.replace(/_spouse$/,'');
+      if(!(typeof PFOSIssues!=='undefined'&&PFOSIssues.spouseVisible&&PFOSIssues.spouseVisible(act,CPLAN._householdType))) return;
+    }
+    if(CPLAN._dismissedFlags[f.action])return;   // dismiss key = ORIGINAL (suffixed) action so self/spouse don't collide
+    // Owner-scoped dedup (mirrors the advisor profile): a spouse flag only matches spouse-owned allocations;
+    // a self flag excludes spouse-owned. When spouseVisibility is OFF no spouse-owned cards exist, so this is
+    // identical to the prior raw CPLAN.allocations.some — the self path stays byte-identical.
+    function _ownerAllocSome(pred){
+      return CPLAN.allocations.some(function(a){ if(!a)return false; var ao=a.owner||'self'; if(_isSpouseFlag){if(ao!=='spouse')return false;}else{if(ao==='spouse')return false;} return pred(a); });
+    }
     // Already represented?
     var alreadyIn=false;
     if(chooserActions[act]){
-      if(act==='retirement') alreadyIn=CPLAN.allocations.some(function(a){return retTypes.indexOf(a.type)>=0&&a.amount>0;});
-      else if(act==='edu') alreadyIn=CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;});
-      else if(act==='rollover') alreadyIn=CPLAN.allocations.some(function(a){return rolloverDestTypes.indexOf(a.type)>=0;});
-      else if(act==='growth') alreadyIn=CPLAN.allocations.some(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
-      // Also count an existing placeholder for this same chooser action as "represented"
+      if(act==='retirement') alreadyIn=_ownerAllocSome(function(a){return retTypes.indexOf(a.type)>=0&&a.amount>0;});
+      else if(act==='edu') alreadyIn=_ownerAllocSome(function(a){return a.type==='edu'&&a.amount>0;});
+      else if(act==='rollover') alreadyIn=_ownerAllocSome(function(a){return rolloverDestTypes.indexOf(a.type)>=0;});
+      else if(act==='growth') alreadyIn=_ownerAllocSome(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
+      // Also count an existing placeholder for this same chooser action+owner as "represented"
       // so the placeholder doesn't multiply on re-renders.
-      if(!alreadyIn) alreadyIn=CPLAN.allocations.some(function(a){return a._chooserAction===act;});
+      if(!alreadyIn) alreadyIn=_ownerAllocSome(function(a){return a._chooserAction===act;});
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t=actionOnlyMap[act];
       if(t==null) return; // 'expenses' has no allocation type — handled separately if we add a card later
@@ -30686,14 +30703,14 @@ function _cpSyncFlagsToUnassigned(){
       // Other action-only types (umbrella, estate, diversify) keep the type-level
       // dedup since they don't have multiple sub-flavors.
       if(act==='protection'){
-        alreadyIn=CPLAN.allocations.some(function(a){return a.type===t&&a.flagTitle===f.title;});
+        alreadyIn=_ownerAllocSome(function(a){return a.type===t&&a.flagTitle===f.title;});
       } else {
-        alreadyIn=CPLAN.allocations.some(function(a){return a.type===t;});
+        alreadyIn=_ownerAllocSome(function(a){return a.type===t;});
       }
     } else if(directMap[act]){
-      alreadyIn=CPLAN.allocations.some(function(a){return a.type===directMap[act];});
+      alreadyIn=_ownerAllocSome(function(a){return a.type===directMap[act];});
     } else if(act==='401k'){
-      alreadyIn=CPLAN.allocations.some(function(a){return a.type==='401k';});
+      alreadyIn=_ownerAllocSome(function(a){return a.type==='401k';});
     }
     // Extended dedup: also treat a partner-shared card of a whitelisted type
     // as "already represented" so this sync doesn't recreate a duplicate every
@@ -30719,8 +30736,9 @@ function _cpSyncFlagsToUnassigned(){
       'Disability coverage gap':'Disability Coverage Gap Review',
       'No long-term care planning':'Long-Term Care Review'
     };
-    // Stage a new card with flag context + appropriate type/markers
-    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:'self',reason:f.desc||''};
+    // Stage a new card with flag context + appropriate type/markers. owner FOLLOWS the flag
+    // (M5.2b-2: spouse flags → spouse-owned card; self flags → 'self' as before).
+    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:(_isSpouseFlag?'spouse':'self'),reason:f.desc||''};
     // Allow disability-gap title which is dynamic ('Disability coverage gap: $X/mo')
     if(act==='protection'){
       var _customNm=_protectionTitleMap[f.title];
