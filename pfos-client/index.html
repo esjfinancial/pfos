@@ -4487,7 +4487,10 @@ function clientHasFeature(feature){
   var tier=APP.currentClient?getEffectiveTier(APP.currentClient):'none';
   var tiers={none:0,core:1,trial:2,pro:2,pro_plus:3,comp:3};
   var level=tiers[tier]||0;
-  var reqs={spending:1,calendar:1,payschedule:1,policies:2,estate:2,crossvalidation:2,tools_advanced:3,decision_engine:3,plaid:3};
+  // plan_builder (M5.2e): level 1 = behavior-neutral today — every tier that has a plan satisfies it, so
+  // the Core plan-tab teaser branch in _cpRenderPlanV2 never fires for a real user (and it's also flag-gated
+  // OFF). M0 raises this to the Planning level so Core users get the read-only teaser instead of the builder.
+  var reqs={spending:1,calendar:1,payschedule:1,policies:2,estate:2,crossvalidation:2,tools_advanced:3,decision_engine:3,plaid:3,plan_builder:1};
   // ── SANDBOX-TEST GATE (Plaid) ── While Plaid runs in PLAID_ENV=sandbox, restrict the account-linking
   // UI to KNOWN TEST ACCOUNTS so real Pro+/comp clients don't see "Link accounts" wired to fake sandbox
   // banks. REMOVE this entire block at the production cutover (PLAID_ENV=production), reverting Plaid to
@@ -29922,6 +29925,79 @@ function _cpRenderAdvisorPending(){
   root.innerHTML=h;
 }
 
+// ── CORE PLAN TEASER (M5.2e) ──────────────────────────────────────────────────────────────────────
+// DARK surface: only reachable when PFOS_FLAGS.planTeaser is ON *and* the user lacks the 'plan_builder'
+// feature (Core, post-M0). It shows the SAME ranked priority cards the Planning builder stages as its
+// unassigned column — READ-ONLY — plus an upgrade panel. The cards come from the same
+// _cpSyncFlagsToUnassigned + PFOSIssues.rankCards path the builder uses, so a Core user's preview is
+// exactly what becomes interactive after upgrading (cohesion by construction). Portal only.
+function _cpRenderPlanTeaser(){
+  var root=document.getElementById('cplanRoot');if(!root)return;
+  // Stage the flag-derived priority cards (same path as the builder's unassigned column). Read-only
+  // render — this never persists; staging is the in-memory sync the builder also runs every render.
+  try{ if(!CPLAN.hasAdvisor && typeof _cpSyncFlagsToUnassigned==='function') _cpSyncFlagsToUnassigned(); }catch(_e){}
+  var unassigned=CPLAN.allocations.filter(function(a){return a&&a.phase===0&&!(a._completed&&typeof _cpIsActionOnly==='function'&&_cpIsActionOnly(a));});
+  if(typeof PFOSIssues!=='undefined'&&PFOSIssues.rankCards) unassigned=PFOSIssues.rankCards(unassigned);
+  var top=unassigned.slice(0,5);
+  var h='';
+  h+='<div style="text-align:center;padding:30px 16px 18px">';
+  h+='<div style="font-family:var(--fh);font-size:22px;font-weight:800;color:var(--wh);margin-bottom:6px">Your Top Priorities</div>';
+  h+='<div style="font-size:14px;color:var(--mu);line-height:1.6;max-width:560px;margin:0 auto">'+(top.length?'Here\'s what to focus on next, ranked by impact.':'You\'re on track — no urgent priorities right now.')+'</div>';
+  h+='</div>';
+  if(top.length){ top.forEach(function(a){ h+=_cpTeaserCard(a); }); }
+  h+=_cpPlanUpgradePanel();
+  root.innerHTML=h;
+}
+// One read-only priority card — reuses _cpBuildCard's exact icon/color/name/reason/amount derivation
+// (the visual KEEP pieces) and OMITS every interactive control (sliders, inputs, owner toggles, phase
+// select, dismiss/apply). Kept visually identical to the builder card so the upgrade feels seamless.
+function _cpTeaserCard(a){
+  if(!a)return'';
+  var _rgba=(typeof _cpHex2Rgba==='function')?_cpHex2Rgba:function(hx){return hx;};
+  var icon=(typeof CP_IC!=='undefined'&&CP_IC[a.type])||'⭐';
+  var _ao=(typeof _cpIsActionOnly==='function')?_cpIsActionOnly(a):(a.type==='protection'||(a.type==='custom'&&!a.target&&!a.amount));
+  var color=_ao?'#94A3B8':((typeof CP_COL!=='undefined'&&CP_COL[a.type])||'#94A3B8');
+  var name=a.customName||((typeof CP_NM!=='undefined'&&CP_NM[a.type])||a.type);
+  var h='<div style="margin-bottom:10px;border-left:4px solid '+color+';background:'+_rgba(color,0.10)+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_rgba(color,0.18)+';border-right:1px solid '+_rgba(color,0.18)+';border-bottom:1px solid '+_rgba(color,0.18)+'">';
+  if(a.flagTitle){h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;padding:7px 10px;border-radius:3px;background:'+(a.flagType==='crit'?'rgba(239,68,68,.08)':'rgba(234,179,8,.05)')+';border:1px solid '+(a.flagType==='crit'?'rgba(239,68,68,.15)':'rgba(234,179,8,.12)')+'"><span style="font-size:13px">'+(a.flagIcon||'⚠️')+'</span><span style="font-size:12px;font-weight:600;color:'+(a.flagType==='crit'?'var(--rd)':'var(--yl)')+'">'+a.flagTitle+'</span></div>';}
+  h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px">';
+  h+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0"><div style="width:40px;height:40px;border-radius:10px;background:'+_rgba(color,0.15)+';display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+icon+'</div><div style="flex:1;min-width:0">';
+  h+='<div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh)">'+name+'</div>';
+  var _reason='';
+  if(a.reason){ _reason=String(a.reason).replace(/\{\{AMOUNT\}\}/g,'$'+fmt(a.amount||0)); }
+  else if(typeof _cpWhy==='function'){ _reason=_cpWhy(a.type)||''; }
+  if(_reason)h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+_reason+'</div>';
+  h+='</div></div>';
+  if(_ao){
+    h+='<div style="flex-shrink:0;padding:6px 10px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--yl);background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.18);border-radius:4px">ACTION</div>';
+  } else {
+    var _cur=0; if(typeof _cpMatchExisting==='function'){ try{ var _m=_cpMatchExisting(a); _cur=parseInt((_m&&_m.currentContrib)||0)||0; }catch(_e){} }
+    var _tot=_cur+(parseFloat(a.amount)||0);
+    h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_rgba(color,0.08)+';border-radius:4px"><div style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(_tot)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
+  }
+  h+='</div>';
+  h+='</div>';
+  return h;
+}
+// The upgrade panel. Emphasis is on the PLAN/PRODUCT upgrade (self-serve). The advisor option is a
+// deliberately understated secondary line so the teaser never reads as a funnel to sell advisory.
+function _cpPlanUpgradePanel(){
+  var h='<div style="margin:24px auto 0;max-width:560px;padding:28px 24px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.07),rgba(168,85,247,.05));border:1px solid rgba(168,85,247,.18);border-radius:8px">';
+  h+='<div style="font-size:34px;margin-bottom:10px">🗺️</div>';
+  h+='<div style="font-family:var(--fh);font-size:19px;font-weight:800;color:var(--wh);margin-bottom:8px">Build your detailed plan</div>';
+  h+='<div style="font-size:14px;color:var(--mu);line-height:1.7;margin-bottom:20px">Turn these priorities into a step-by-step plan: assign each to a phase, compare strategies side by side, and watch your financial-independence date move as you go.</div>';
+  h+='<button onclick="_cpUpgradeToPlanning()" class="btn" style="width:auto;padding:13px 32px;font-family:var(--fh);font-size:14px;font-weight:700;background:rgba(168,85,247,.16);border:1px solid rgba(168,85,247,.35);color:var(--pu);cursor:pointer;border-radius:4px;min-height:44px;letter-spacing:.03em">Unlock the full planner →</button>';
+  h+='<div style="margin-top:16px;font-size:12px;color:var(--mu);opacity:.7">Prefer a hand? <a href="javascript:void(0)" onclick="_cpOpenPlanInquiry()" style="color:var(--mu);text-decoration:underline">Message an advisor</a>.</div>';
+  h+='</div>';
+  return h;
+}
+// Primary upgrade CTA. M0 (§0.2 self-serve Stripe) repoints this to Checkout for PFOS Planning, returning
+// to this same Plan tab as the full builder. Until then it gives clear feedback (no dead-end, no advisor
+// dependency) — the seam is one function so M0 wires checkout in exactly one place.
+function _cpUpgradeToPlanning(){
+  if(typeof _cpToast==='function')_cpToast('PFOS Planning unlocks the full plan builder — assign phases, compare strategies, and project your future. Self-serve upgrade is coming soon.');
+}
+
 // ── PLAN STATUS INQUIRY: opens small modal to message advisor about plan status ──
 function _cpOpenPlanInquiry(){
   var ta=document.getElementById('planInquiryMsg');
@@ -35013,6 +35089,11 @@ function _cpRenderPlanV2(){
     if(_liveS.profile&&_liveS.profile.retIncome!=null)CPLAN.retIncome=parseFloat(_liveS.profile.retIncome)||0;
     if(_liveS.profile&&_liveS.profile.spRetIncome!=null)CPLAN.spRetIncome=parseFloat(_liveS.profile.spRetIncome)||0;
   }catch(e){}
+  // M5.2e — Core plan-tab teaser (DARK). PFOS_FLAGS.planTeaser OFF → this short-circuits and control
+  // falls through to the existing fork/builder unchanged (byte-identical). ON + a user WITHOUT the
+  // 'plan_builder' feature (Core, post-M0) → a READ-ONLY ranked-priority preview + upgrade panel instead
+  // of the interactive builder. Portal only — the advisor profile twin (_cpRenderPlanFull) must NEVER get this.
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.planTeaser&&typeof clientHasFeature==='function'&&!clientHasFeature('plan_builder')){_cpRenderPlanTeaser();return;}
   if(!CPLAN.allocations.length&&!CPLAN.hasAdvisor){_cpRenderFork();return;}
   var h='';
   // Sum of allocations representing THIS user's deployment. Three buckets:
