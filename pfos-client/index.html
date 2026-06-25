@@ -3486,7 +3486,7 @@ function _csvBuildEntry(row, map, tool, idx, expNeg){
   var dateISO=_csvParseDate(get('date')); if(!dateISO) return null;
   if(/transfer/i.test(get('type'))) return null;
   var amt, typ=get('type').toLowerCase();
-  if(tool==='ynab' && (map.outflow>=0||map.inflow>=0)){ var out=Math.abs(_csvParseAmount(get('outflow')))||0, inf=Math.abs(_csvParseAmount(get('inflow')))||0; amt=(out>0)?out:(inf>0?-inf:0); }
+  if(map.outflow>=0||map.inflow>=0){ var out=Math.abs(_csvParseAmount(get('outflow')))||0, inf=Math.abs(_csvParseAmount(get('inflow')))||0; amt=(out>0)?out:(inf>0?-inf:0); } // outflow/inflow (incl. Debit/Credit + manual remaps), any tool
   else { var raw=_csvParseAmount(get('amount')); if(isNaN(raw)) return null;
     if(tool==='mint') amt=(typ==='credit')?-Math.abs(raw):Math.abs(raw);
     else if(tool==='pfos') amt=(typ==='income')?-Math.abs(raw):Math.abs(raw);
@@ -3522,6 +3522,85 @@ function _csvImport(text, existing, overrideMap, overrideTool, overrideExpNeg){
   var deduped=_csvDedup(raw, existing); var dupes=raw.length-deduped.length;
   var byCategory={}; deduped.forEach(function(e){ byCategory[e.category]=(byCategory[e.category]||0)+1; });
   return { entries:deduped, tool:tool, map:map, header:p.header, total:rows.length, skipped:skipped, dupes:dupes, capped:capped, signRule:(expNeg?'negative_is_expense':'positive_is_expense'), byCategory:byCategory };
+}
+
+// ── M4 §4.3b — the import WIZARD (drives the §4.3a engine). Upload → review (+ the required SIGN-CONFIRM + column
+// remap) → import via PFOS_IMPORT_ENTRIES (the iframe stays the single S-writer). Reuses FileReader + toasts.
+var _importWiz=null;
+function _impEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function _importWizExisting(){ var S=(_lastPfosState&&_lastPfosState.state)||{}; return S.spendingEntries||[]; }
+function openImportWizard(){
+  _importWiz={ step:1, text:'', fileName:'', map:null, tool:null, expNeg:null, result:null };
+  var old=document.getElementById('_impWizModal'); if(old) old.remove();
+  var modal=document.createElement('div'); modal.id='_impWizModal';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px';
+  modal.onclick=function(e){ if(e.target===modal) closeImportWizard(); };
+  modal.innerHTML='<div id="_impWizBox" style="background:var(--bg-card);border:1px solid var(--bd);border-radius:8px;max-width:640px;width:100%;max-height:88vh;overflow:auto;padding:22px"></div>';
+  document.body.appendChild(modal); _importWizRender();
+}
+function closeImportWizard(){ var m=document.getElementById('_impWizModal'); if(m) m.remove(); _importWiz=null; }
+function _importWizRecompute(){ if(!_importWiz||!_importWiz.text) return; _importWiz.result=_csvImport(_importWiz.text, _importWizExisting(), _importWiz.map, _importWiz.tool, _importWiz.expNeg); }
+function _importWizFile(file){
+  if(!file||!_importWiz) return; _importWiz.fileName=file.name||'import.csv';
+  var rdr=new FileReader();
+  rdr.onload=function(){ try{ _importWiz.text=String(rdr.result||''); var pre=_csvImport(_importWiz.text, _importWizExisting());
+      if(pre.error){ if(typeof _cpToast==='function')_cpToast('That file looks malformed (a quote isn’t closed) — please re-export and try again.','error'); return; }
+      _importWiz.map=pre.map; _importWiz.tool=pre.tool; _importWiz.expNeg=null; _importWiz.result=pre; _importWiz.step=2; _importWizRender();
+    }catch(e){ if(typeof _cpToast==='function')_cpToast('Couldn’t read that file.','error'); } };
+  rdr.onerror=function(){ if(typeof _cpToast==='function')_cpToast('Couldn’t read that file.','error'); };
+  rdr.readAsText(file);
+}
+function _importWizSetCol(field, idxStr){ if(!_importWiz||!_importWiz.map) return; _importWiz.map[field]=parseInt(idxStr,10); _importWizRecompute(); _importWizRender(); }
+function _importWizFlipSign(){ if(!_importWiz||!_importWiz.result) return; _importWiz.expNeg=(_importWiz.result.signRule!=='negative_is_expense'); _importWizRecompute(); _importWizRender(); }
+function _importWizBack(){ if(_importWiz){ _importWiz.step=1; _importWizRender(); } }
+function _importWizImport(){
+  if(!_importWiz||!_importWiz.result||!_importWiz.result.entries.length) return;
+  // Gate on engine readiness — getPFOSFrame() can be null and the engine may not be hydrated yet (an import before
+  // PFOS_LOAD gets wiped). Without this the success toast lies + the import silently vanishes. _pfosDataLoaded flips
+  // true once the engine has PFOS_LOAD'd.
+  var fr=getPFOSFrame();
+  if(!fr||!fr.contentWindow||(typeof _pfosDataLoaded!=='undefined'&&!_pfosDataLoaded)){ if(typeof _cpToast==='function')_cpToast('Your financial data is still loading — open “My Financial Data” once, then try the import again.','error'); return; }
+  var ents=_importWiz.result.entries, n=ents.length;
+  try{ fr.contentWindow.postMessage({type:'PFOS_IMPORT_ENTRIES', entries:ents}, (typeof PFOS_ORIGIN!=='undefined'?PFOS_ORIGIN:'https://pfos.esjfinancial.com')); }
+  catch(e){ if(typeof _cpToast==='function')_cpToast('Couldn’t send the import — please try again.','error'); return; }
+  if(typeof _cpToast==='function')_cpToast('Importing '+n+' transaction'+(n!==1?'s':'')+'…','success'); // honest in-progress; the engine acks PFOS_IMPORT_DONE
+  closeImportWizard();
+}
+function _importWizRender(){
+  var box=document.getElementById('_impWizBox'); if(!box||!_importWiz) return;
+  if(_importWiz.step===1){
+    box.innerHTML='<div style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh);margin-bottom:6px">Import transactions</div>'
+      +'<div style="font-size:13px;color:var(--mu);line-height:1.6;margin-bottom:16px">Switch from Monarch, YNAB, Mint — or any bank. Export your transactions as a <strong>.csv</strong> and drop it here.</div>'
+      +'<div id="_impDrop" style="border:2px dashed var(--bd);border-radius:8px;padding:34px 18px;text-align:center;cursor:pointer;background:var(--bg)" onclick="document.getElementById(\'_impFile\').click()"><div style="font-size:34px;margin-bottom:8px">📄</div><div style="font-size:14px;color:rgba(226,232,240,.85)">Click to choose a CSV, or drag it here</div></div>'
+      +'<input type="file" id="_impFile" accept=".csv,text/csv" style="display:none" onchange="_importWizFile(this.files[0])">'
+      +'<div style="display:flex;gap:10px;margin-top:18px"><button class="btn bgh" style="flex:1" onclick="closeImportWizard()">Cancel</button></div>';
+    var drop=document.getElementById('_impDrop');
+    if(drop){ drop.ondragover=function(e){ e.preventDefault(); drop.style.borderColor='#5B9BFF'; }; drop.ondragleave=function(){ drop.style.borderColor='var(--bd)'; }; drop.ondrop=function(e){ e.preventDefault(); drop.style.borderColor='var(--bd)'; if(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]) _importWizFile(e.dataTransfer.files[0]); }; }
+    return;
+  }
+  var r=_importWiz.result||{}, ents=r.entries||[];
+  var toolName={monarch:'Monarch',ynab:'YNAB',mint:'Mint',pfos:'PFOS export',generic:'CSV'}[r.tool]||'CSV';
+  var signedTool=(r.tool==='monarch'||r.tool==='generic');
+  var fm=function(v){ return '$'+Math.abs(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
+  var expN=0,incN=0; ents.forEach(function(e){ if(e.amount<0)incN++; else expN++; });
+  var largest=ents.length?ents.slice().sort(function(a,b){return Math.abs(b.amount)-Math.abs(a.amount);})[0]:null;
+  var prev=ents.slice(0,6).map(function(e){ var inc=e.amount<0; return '<tr><td style="padding:4px 8px;color:var(--mu);white-space:nowrap">'+_impEsc(e.date)+'</td><td style="padding:4px 8px;color:rgba(226,232,240,.85);max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+_impEsc(e.description)+'</td><td style="padding:4px 8px;text-align:right;color:'+(inc?'var(--gr)':'var(--wh)')+'">'+(inc?'+':'')+fm(e.amount)+'</td><td style="padding:4px 8px;color:var(--mu)">'+_impEsc(e.category)+'</td></tr>'; }).join('');
+  var h='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px"><div style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh)">Review import</div><div style="font-size:12px;color:var(--mu)">'+_impEsc(_importWiz.fileName)+'</div></div>';
+  h+='<div style="font-size:13px;color:var(--mu);margin-bottom:14px">Detected <strong style="color:rgba(226,232,240,.9)">'+toolName+'</strong> · <strong style="color:rgba(226,232,240,.9)">'+ents.length+'</strong> to import'+(r.dupes?' · '+r.dupes+' duplicate'+(r.dupes!==1?'s':'')+' skipped':'')+(r.skipped?' · '+r.skipped+' unreadable skipped':'')+(r.capped?' · capped at 5000':'')+'</div>';
+  if(signedTool && ents.length){
+    h+='<div style="background:rgba(249,115,22,.08);border:1px solid rgba(249,115,22,.28);border-radius:6px;padding:11px 13px;margin-bottom:14px">'
+      +'<div style="font-size:13px;color:var(--wh);line-height:1.6">Importing <strong>'+expN+'</strong> as expenses, <strong>'+incN+'</strong> as income.'+(largest?' Largest: <strong>'+_impEsc(largest.description)+'</strong> '+fm(largest.amount)+' → '+(largest.amount<0?'INCOME':'EXPENSE'):'')+'</div>'
+      +'<button onclick="_importWizFlipSign()" class="btn bgh" style="width:auto;padding:4px 12px;font-size:12px;margin-top:8px">That’s backwards — flip income/expense</button></div>';
+  }
+  if(ents.length){ h+='<div style="overflow:auto;border:1px solid var(--bd);border-radius:6px;margin-bottom:6px"><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="background:var(--bg)"><th style="padding:5px 8px;text-align:left;color:var(--mu)">Date</th><th style="padding:5px 8px;text-align:left;color:var(--mu)">Description</th><th style="padding:5px 8px;text-align:right;color:var(--mu)">Amount</th><th style="padding:5px 8px;text-align:left;color:var(--mu)">Category</th></tr></thead><tbody>'+prev+'</tbody></table></div>'+(ents.length>6?'<div style="font-size:11px;color:var(--mu);margin-bottom:8px">+'+(ents.length-6)+' more</div>':''); }
+  else { h+='<div style="background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:14px;font-size:13px;color:var(--mu);margin-bottom:8px">No importable rows — check the column mapping below.</div>'; }
+  var hdr=(r.header||[]), colOpts=function(sel){ return '<option value="-1">—</option>'+hdr.map(function(hn,ix){ return '<option value="'+ix+'"'+(sel===ix?' selected':'')+'>'+_impEsc(hn)+'</option>'; }).join(''); };
+  var fields=[['date','Date'],['description','Description'],['amount','Amount'],['category','Category']];
+  if(_importWiz.map&&(_importWiz.map.outflow>=0||_importWiz.map.inflow>=0)){ fields.push(['outflow','Outflow/Debit'],['inflow','Inflow/Credit']); }
+  h+='<details style="margin:8px 0 14px"><summary style="cursor:pointer;font-size:12px;color:#5B9BFF">Columns look wrong? Map them</summary><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">'
+    +fields.map(function(f){ return '<label style="font-size:11px;color:var(--mu)">'+f[1]+'<select onchange="_importWizSetCol(\''+f[0]+'\',this.value)" style="display:block;width:100%;margin-top:3px;background:var(--bg);border:1px solid var(--bd);color:rgba(226,232,240,.9);border-radius:4px;padding:4px">'+colOpts(_importWiz.map?_importWiz.map[f[0]]:-1)+'</select></label>'; }).join('')+'</div></details>';
+  h+='<div style="display:flex;gap:10px"><button class="btn bgh" style="flex:1" onclick="_importWizBack()">← Back</button>'+(ents.length?'<button class="btn bbl" style="flex:2" onclick="_importWizImport()">Import '+ents.length+' transaction'+(ents.length!==1?'s':'')+'</button>':'<button class="btn bbl" style="flex:2;opacity:.5;cursor:default" disabled>Nothing to import</button>')+'</div>';
+  box.innerHTML=h;
 }
 
 function _cpCsvCell(v){
@@ -3615,7 +3694,8 @@ function renderReportsView(){
   h+='<input type="month" id="rptCustomStart" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(startKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
   h+='<span style="color:var(--mu)">→</span>';
   h+='<input type="month" id="rptCustomEnd" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(endKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
-  h+='<button onclick="_cpExportTransactionsCsv()" aria-label="Export transactions as CSV" style="margin-left:auto;padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬇ Export CSV</button>';
+  h+='<button onclick="openImportWizard()" aria-label="Import transactions from a CSV (Monarch, YNAB, Mint, or any bank)" style="margin-left:auto;padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬆ Import CSV</button>';
+  h+='<button onclick="_cpExportTransactionsCsv()" aria-label="Export transactions as CSV" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬇ Export CSV</button>';
   var _plaidLinked=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'));
   var _srcNote=(rep.source==='manual'&&_plaidLinked)?' · <span style="color:#EAB308">Plaid not yet synced — showing manual expenses</span>':'';
   var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile).</div>':'';
@@ -12314,14 +12394,17 @@ function renderOnboardingChecklist(){
     {label:'Run your financial analysis', done: calcs && calcs.cfScore>0}
   ];
   var allDone = steps.every(function(s){return s.done;});
-  if(allDone){ return; } // hide checklist if everything is done
+  if(allDone){ return; } // hide checklist when the CORE steps are done (the optional import step doesn't gate this)
+  // §4.3b: an optional one-tap "switch from Monarch/YNAB/Mint" import step (clickable → the import wizard).
+  steps.push({label:'Import from Monarch / YNAB / Mint (optional)', done: !!(S.spendingEntries && S.spendingEntries.some(function(e){return e&&e._source==='import';})), action:'openImportWizard()'});
   var el = document.getElementById('onboardingChecklist');
   var itemsEl = document.getElementById('checklistItems');
   if(!el||!itemsEl) return;
   itemsEl.innerHTML = steps.map(function(s){
-    return '<div style="display:flex;align-items:center;gap:10px;padding:5px 0;font-size:14px;color:'+(s.done?'var(--gr)':'rgba(226,232,240,.75)')+'">'
-      +'<span style="font-size:16px">'+(s.done?'✅':'⬜')+'</span>'
-      +'<span style="'+(s.done?'text-decoration:line-through;color:var(--mu)':'')+'">'+esc(s.label)+'</span>'
+    var clk=!!s.action;
+    return '<div '+(clk?'onclick="'+s.action+'" ':'')+'style="display:flex;align-items:center;gap:10px;padding:5px 0;font-size:14px;color:'+(s.done?'var(--gr)':'rgba(226,232,240,.75)')+(clk?';cursor:pointer':'')+'">'
+      +'<span style="font-size:16px">'+(s.done?'✅':(clk?'📥':'⬜'))+'</span>'
+      +'<span style="'+(s.done?'text-decoration:line-through;color:var(--mu)':'')+'">'+esc(s.label)+(clk&&!s.done?' <span style="color:#5B9BFF;font-size:12px">→</span>':'')+'</span>'
     +'</div>';
   }).join('');
   el.style.display='block';
@@ -13537,6 +13620,7 @@ window.addEventListener('message',async function(e){
     }catch(e){console.warn('[PFOS] policy_tracking deactivation failed:',e);}
     return;
   }
+  if(msg.type==='PFOS_IMPORT_DONE'){ if(typeof _cpToast==='function')_cpToast('Imported '+(msg.added||0)+' transaction'+((msg.added||0)!==1?'s':'')+' ✓','success'); return; } // §4.3b: the engine acks the REAL added count
   if(msg.type==='PFOS_DATA_CHANGE'){
     if(!APP.currentClientId) return;
     // ══ A3: Client switch race condition guard ══
