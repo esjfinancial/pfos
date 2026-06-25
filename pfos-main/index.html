@@ -15326,6 +15326,40 @@ function submitAdvisorRequestFromModal(){
       }catch(e){console.warn('PFOS_BULK_ENTRY:',e);}
       return;
     }
+    // ── PFOS_IMPORT_ENTRIES (§4.3a) — bulk-insert imported transactions in ONE calc()+sync (not N quick-adds).
+    // Accepts SIGNED amounts (positive=expense, negative=income — like the Plaid path, NOT quick-add's >0 rule);
+    // dedups by (date|amount|descLower) vs existing so a re-import / Plaid overlap can't double-count.
+    if(msg.type==='PFOS_IMPORT_ENTRIES'){
+      try{
+        var _imp=msg.entries; if(!Array.isArray(_imp)||!_imp.length)return;
+        if(_imp.length>5000)_imp=_imp.slice(0,5000); // cap a pathological import (mirrors the client _CSV_MAX_ROWS)
+        if(!S.spendingEntries)S.spendingEntries=[];
+        var _impKey=function(e){ return String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)+'|'+String(e.description||'').toLowerCase().trim().slice(0,40); };
+        var _iseen={}, _idseen={}; S.spendingEntries.forEach(function(e){ if(e){_iseen[_impKey(e)]=1; if(e.id!=null)_idseen[String(e.id)]=1;} });
+        var _iadded=0;
+        _imp.forEach(function(e){ if(!e)return; var _a=parseFloat(e.amount); if(isNaN(_a)||_a===0||!e.date)return;
+          var _k=_impKey(e); if(_iseen[_k])return; _iseen[_k]=1;
+          var _id=e.id||('imp_'+Date.now()+'_'+_iadded); while(_idseen[String(_id)]){ _id=String(_id)+'_'+_iadded; } _idseen[String(_id)]=1; // id never collides across batches
+          S.spendingEntries.push({
+            id:_id,
+            amount:Math.round(_a*100)/100,
+            description:String(e.description||'').slice(0,140),
+            category:e.category||'misc',
+            category_bucket:e.category_bucket||(typeof simplifyCategory==='function'?simplifyCategory(e.category||'misc'):'other'),
+            expense_type:e.expense_type||'regular',
+            payment_method:'debit', payment_detail:{}, couple_owner:'self',
+            is_recurring:false, recurrence_freq:'monthly',
+            date:String(e.date), created_at:new Date().toISOString(), _source:'import'
+          });
+          _iadded++;
+        });
+        if(_iadded){ if(!S._touched)S._touched={}; S._touched.spendingEntries=true; try{if(typeof calc==='function')calc();}catch(e){} clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+          if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+          else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+        }
+      }catch(e){console.warn('PFOS_IMPORT_ENTRIES:',e);}
+      return;
+    }
     // ── PFOS_RECONCILE (§1.6b) ──
     // Snapshot cash-flow reconcile: record a verified-balance baseline S.reconcile={balance,date} the client
     // compares later activity against, and mark every spending entry _cleared (the period up to now is now

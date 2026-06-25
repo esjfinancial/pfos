@@ -3411,6 +3411,119 @@ function _cpTrendDiff(cur, prior, idField){
 // internal quotes); and neutralize a CSV-injection formula (a leading =,+,-,@,TAB,CR)
 // by prefixing a single quote — but ONLY when the value isn't a (signed) number, so a
 // legitimate negative amount like -50.00 stays numeric.
+// ── M4 §4.3a — CSV IMPORT: parse + normalize + map (PURE). The wizard (§4.3b) drives these; the bulk insert goes
+// through the engine handler PFOS_IMPORT_ENTRIES so the iframe stays the single S-writer (5c). Internal sign:
+// POSITIVE amount = EXPENSE, NEGATIVE = INCOME (matches _cpExportRows). Inverse of _cpCsvCell below.
+function _csvPad2(n){ return (n<10?'0':'')+n; }
+// RFC-4180 parser → {header:[], rows:[[]]}. Handles "quoted, fields", ""escaped"" quotes, embedded newlines, CRLF/LF, BOM.
+function _csvParse(text){
+  text=String(text||'').replace(/^﻿/,'');
+  var rows=[], row=[], cur='', i=0, n=text.length, inQ=false;
+  while(i<n){ var ch=text[i];
+    if(inQ){ if(ch==='"'){ if(text[i+1]==='"'){ cur+='"'; i+=2; continue; } inQ=false; i++; continue; } cur+=ch; i++; continue; }
+    if(ch==='"'){ inQ=true; i++; continue; }
+    if(ch===','){ row.push(cur); cur=''; i++; continue; }
+    if(ch==='\r'){ if(text[i+1]==='\n')i++; row.push(cur); rows.push(row); row=[]; cur=''; i++; continue; }
+    if(ch==='\n'){ row.push(cur); rows.push(row); row=[]; cur=''; i++; continue; }
+    cur+=ch; i++;
+  }
+  if(cur!==''||row.length){ row.push(cur); rows.push(row); }
+  rows=rows.filter(function(r){ return r.length>1 || (r.length===1 && String(r[0]).trim()!==''); });
+  var res=(!rows.length)?{header:[], rows:[]}:{header:rows[0].map(function(h){return String(h).trim();}), rows:rows.slice(1)};
+  if(inQ) res.error='unterminated_quote'; // a stray quote swallowed the rest → caller must REFUSE, not import 1-of-N
+  return res;
+}
+// header names → field index map + a tool guess (the wizard lets the user override).
+function _csvDetectCols(header){
+  var h=(header||[]).map(function(x){return String(x||'').toLowerCase().trim();});
+  var find=function(){ for(var a=0;a<arguments.length;a++){ var idx=h.indexOf(arguments[a]); if(idx>=0) return idx; } return -1; };
+  var has=function(x){ return h.indexOf(x)>=0; };
+  var map={ date:find('date','transaction date','posted date','date posted'), description:find('description','payee','merchant','name','original description'),
+    merchant:find('merchant'), amount:find('amount'), category:find('category'), type:find('type','transaction type'),
+    outflow:find('outflow','debit','withdrawal'), inflow:find('inflow','credit','deposit') };
+  var tool='generic';
+  if(map.outflow>=0 && map.inflow>=0) tool='ynab';
+  else if(find('transaction type')>=0 && map.amount>=0) tool='mint';
+  else if(has('type') && has('status') && has('merchant')) tool='pfos';
+  else if(has('merchant') && map.amount>=0 && map.category>=0) tool='monarch';
+  return { map:map, tool:tool };
+}
+function _csvParseAmount(s){ if(s==null) return 0; var str=String(s).trim(); if(!str) return 0;
+  // EU comma-decimal (1.234,56 / 50,00) — DON'T silently mangle to 1.23456/5000; return NaN so the row is SKIPPED + counted (§4.3b can offer a locale toggle).
+  if(/^[^\d-]*\d{1,3}(\.\d{3})+,\d{1,2}[^\d]*$/.test(str) || /^[^\d-]*\d+,\d{2}$/.test(str)) return NaN;
+  var paren=/^\(.*\)$/.test(str), trail=/-\s*$/.test(str)&&!/^-/.test(str); // (50) and 50- are both negative
+  var num=Number(str.replace(/[$€£¥,()\s]/g,'').replace(/-\s*$/,'')); // strip a TRAILING minus first; Number() honors 5e2→500; NaN on junk → skip, never a mangled magnitude
+  if(isNaN(num)) return NaN;
+  if((paren||trail)&&num>0) num=-num;
+  return num;
+}
+function _csvParseDate(s){ if(s==null) return null; var str=String(s).trim(); if(!str) return null;
+  var m=str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if(m) return m[1]+'-'+_csvPad2(parseInt(m[2],10))+'-'+_csvPad2(parseInt(m[3],10));
+  m=str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if(m){ var a=parseInt(m[1],10),b=parseInt(m[2],10),y=m[3]; if(y.length===2) y='20'+y; var mo=a,da=b; if(a>12&&b<=12){ mo=b; da=a; } if(mo<1||mo>12||da<1||da>31) return null; return y+'-'+_csvPad2(mo)+'-'+_csvPad2(da); }
+  if(/^\d{5}$/.test(str)){ var d=new Date(Date.UTC(1899,11,30)); d.setUTCDate(d.getUTCDate()+parseInt(str,10)); return d.toISOString().slice(0,10); }
+  return null;
+}
+var _CSV_CATMAP={groceries:'food',restaurants:'food','restaurants & bars':'food',dining:'food','food & dining':'food','fast food':'food',coffee:'food',
+  gas:'transportation','gas & fuel':'transportation',fuel:'transportation',auto:'transportation','auto & transport':'transportation',transit:'transportation',parking:'transportation',rideshare:'transportation',
+  rent:'housing',mortgage:'housing','mortgage & rent':'housing','home improvement':'housing',
+  utilities:'utilities','bills & utilities':'utilities',electric:'utilities',internet:'utilities',phone:'utilities',
+  insurance:'insurance','health & fitness':'insurance',medical:'insurance',doctor:'insurance',
+  subscriptions:'subscriptions',streaming:'subscriptions',subscription:'subscriptions',
+  shopping:'discretionary',entertainment:'discretionary',travel:'discretionary','personal care':'discretionary',clothing:'discretionary',hobbies:'discretionary',gifts:'discretionary'};
+function _csvMapCategory(foreignCat){ var c=String(foreignCat||'').toLowerCase().trim(); if(!c) return 'misc';
+  if(_CSV_CATMAP[c]) return _CSV_CATMAP[c];
+  for(var k in _CSV_CATMAP){ if(c.indexOf(k)>=0) return _CSV_CATMAP[k]; }
+  if(['housing','utilities','food','transportation','insurance','subscriptions','discretionary','misc'].indexOf(c)>=0) return c;
+  return 'misc';
+}
+function _csvHash(s){ var h=5381,str=String(s||''); for(var i=0;i<str.length;i++){ h=((h<<5)+h+str.charCodeAt(i))>>>0; } return h.toString(36); }
+// row → normalized entry (PFOS-signed amount: positive=expense, negative=income). Returns null to SKIP (no date /
+// transfer / zero / un-parseable amount). expNeg (monarch/generic): true = source-negative is expense (default),
+// false = source-positive is expense (the §4.3a heuristic + the §4.3b user override set it).
+function _csvBuildEntry(row, map, tool, idx, expNeg){
+  var get=function(k){ var ix=map[k]; return (ix!=null&&ix>=0&&row[ix]!=null)?String(row[ix]):''; };
+  var dateISO=_csvParseDate(get('date')); if(!dateISO) return null;
+  if(/transfer/i.test(get('type'))) return null;
+  var amt, typ=get('type').toLowerCase();
+  if(tool==='ynab' && (map.outflow>=0||map.inflow>=0)){ var out=Math.abs(_csvParseAmount(get('outflow')))||0, inf=Math.abs(_csvParseAmount(get('inflow')))||0; amt=(out>0)?out:(inf>0?-inf:0); }
+  else { var raw=_csvParseAmount(get('amount')); if(isNaN(raw)) return null;
+    if(tool==='mint') amt=(typ==='credit')?-Math.abs(raw):Math.abs(raw);
+    else if(tool==='pfos') amt=(typ==='income')?-Math.abs(raw):Math.abs(raw);
+    else amt=(expNeg===false)?raw:-raw; // monarch/generic: expNeg true → source-negative is expense (PFOS=-raw); false → source-positive is expense (PFOS=raw)
+  }
+  if(!amt||isNaN(amt)) return null;
+  var desc=(get('description')||get('merchant')||'Imported').trim().slice(0,140);
+  return { id:'imp_'+idx+'_'+dateISO.replace(/-/g,'')+'_'+Math.round(Math.abs(amt)*100)+'_'+_csvHash(desc.toLowerCase()), amount:Math.round(amt*100)/100, description:desc, category:_csvMapCategory(get('category')), date:dateISO, _source:'import', expense_type:'regular' };
+}
+function _csvImpKey(e){ return String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)+'|'+String(e.description||'').toLowerCase().trim().slice(0,40); }
+// drop intra-import dups + vs-existing dups (exact date|amount|desc) + Plaid-overlap (date|amount only, since
+// Plaid stores the RAW bank string while Monarch/YNAB/Mint store a cleaned merchant → desc won't match).
+function _csvDedup(entries, existing){
+  var seen={}, plaidDA={};
+  (existing||[]).forEach(function(e){ if(!e) return; seen[_csvImpKey(e)]=1; if(e._source==='plaid') plaidDA[String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)]=1; });
+  var out=[]; (entries||[]).forEach(function(e){ if(!e) return; var k=_csvImpKey(e); if(seen[k]) return; if(plaidDA[String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)]) return; seen[k]=1; out.push(e); });
+  return out;
+}
+var _CSV_MAX_ROWS=5000; // cap one import (a single profile shouldn't ingest a pathological CSV in one shot)
+// parse a whole CSV → {entries, tool, signRule, header, total, skipped, dupes, capped, byCategory} OR {error}.
+function _csvImport(text, existing, overrideMap, overrideTool, overrideExpNeg){
+  var p=_csvParse(text);
+  if(p.error) return { error:p.error, entries:[], total:0 }; // unterminated quote etc. — REFUSE, don't import 1-of-N
+  var det=_csvDetectCols(p.header); var map=overrideMap||det.map, tool=overrideTool||det.tool;
+  var capped=false, rows=p.rows; if(rows.length>_CSV_MAX_ROWS){ rows=rows.slice(0,_CSV_MAX_ROWS); capped=true; }
+  // SIGN heuristic for the signed-amount tools (monarch/generic): if positives dominate the non-zero amounts, treat
+  // POSITIVE as expense (else negative). §4.3b surfaces signRule + lets the user override (overrideExpNeg).
+  var expNeg=true;
+  if((tool==='monarch'||tool==='generic') && map.amount>=0){ var neg=0,pos=0; rows.forEach(function(r){ var a=_csvParseAmount(r[map.amount]); if(isNaN(a)||a===0) return; if(a<0)neg++; else pos++; }); expNeg=(pos>neg)?false:true; }
+  if(overrideExpNeg!=null) expNeg=!!overrideExpNeg;
+  var raw=[], skipped=0;
+  rows.forEach(function(r,i){ var e=_csvBuildEntry(r,map,tool,i,expNeg); if(e) raw.push(e); else skipped++; });
+  var deduped=_csvDedup(raw, existing); var dupes=raw.length-deduped.length;
+  var byCategory={}; deduped.forEach(function(e){ byCategory[e.category]=(byCategory[e.category]||0)+1; });
+  return { entries:deduped, tool:tool, map:map, header:p.header, total:rows.length, skipped:skipped, dupes:dupes, capped:capped, signRule:(expNeg?'negative_is_expense':'positive_is_expense'), byCategory:byCategory };
+}
+
 function _cpCsvCell(v){
   var s=(v==null)?'':String(v);
   // Guard a leading formula char (allowing leading whitespace before it — Excel trims) UNLESS the
