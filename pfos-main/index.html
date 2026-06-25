@@ -6230,7 +6230,12 @@ function _oneActionForFlag(f,c){
     edu_gap:{title:'Fund Your Education Goal',u:'This year',col:'#5B9BFF'},
     beneficiary_audit:{title:'Review Your Beneficiaries',u:'This month',col:'var(--or)'},
     no_will:{title:'Create Your Will',u:'This month',col:'var(--or)'},
-    estate_tax:{title:'Plan for Estate Taxes',u:'This year',col:'#5B9BFF'}
+    estate_tax:{title:'Plan for Estate Taxes',u:'This year',col:'#5B9BFF'},
+    // M5.2d-2a — shared-only self flags (only reachable when BOTH sharedSelfFlags + priorityEngine are ON)
+    single_income:{title:'Diversify Your Income',u:'This quarter',col:'var(--or)'},
+    rollover:{title:'Consolidate Old Accounts',u:'This quarter',col:'var(--yl)'},
+    mortgage_in_retirement:{title:'Plan Your Mortgage Payoff',u:'This quarter',col:'var(--yl)'},
+    liquidity_locked:{title:'Build Liquid Savings',u:'This quarter',col:'var(--yl)'}
   };
   var cfg=M[f.id]||{};
   var desc=cfg.d?cfg.d(c):(f.desc||'');
@@ -13389,6 +13394,33 @@ function deDetectFlags(c){
     var exposure=Math.max(0,estateValue-estateExemption);
     var estTax=Math.round(exposure*0.40);
     DE.systemFlags.push({id:'estate_tax',level:4,levelName:'Growth',icon:'🏛️',severity:exposure>0?'high':'medium',urgency:'long_term',title:'Estate Tax Exposure: '+fmtK(estTax),desc:'Projected estate of '+fmtK(estateValue)+' approaches federal exemption of '+fmtK(estateExemption)+'.',impact:fmtK(estTax)+' potential estate tax',costOfNothing:'Estate tax at 40% on amounts above exemption.',strategies:['estate_trust','estate_gifting','estate_beneficiary'],service:'Estate Planning',confidence:'medium',status:'detected'});
+  }
+  // ── M5.2d-2a — shared-only SELF flags (engine parity). The engine detector now ALSO surfaces issues the
+  // shared PFOSIssues detector has but DE lacked (rollover, single-income, mortgage-past-retirement,
+  // low-liquidity), so the one-action card + Drift-Engine view cover them for an individual too. Dark-launched
+  // behind PFOS_FLAGS.sharedSelfFlags via ONE guarded block: when OFF the block is skipped entirely, so
+  // DE.systemFlags — and the badge count (:5519), deCalcAllocation weights, the sort, and the one-action pick —
+  // are byte-identical to today. Reads S + c only (no plan dependency, no over-fire). Tax-strategy items
+  // (tax-diversification → 5.2e Planning) and owner-decision items (underinsured-life suppression, umbrella
+  // broadening) are deferred; annuity/ibc-audit/rmd are follow-ups.
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.sharedSelfFlags){
+    var _oldRet=(S.retAccounts||[]).filter(function(a){return a.type&&a.type.indexOf('_old')>=0&&(parseFloat(a.balance)||0)>0;});
+    if(_oldRet.length){var _ob=_oldRet.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+      DE.systemFlags.push({id:'rollover',level:3,levelName:'Efficiency',icon:'🔄',severity:'medium',urgency:'medium_term',title:'Old Retirement Account'+(_oldRet.length>1?'s':'')+': '+fmtK(_ob),desc:_oldRet.length+' orphaned account'+(_oldRet.length>1?'s':'')+' from a previous employer. Consolidating or rolling into a current 401(k)/IRA simplifies management and may cut fees.',impact:fmtK(_ob)+' in stranded balances',costOfNothing:'Orphaned 401(k)s often sit in high-fee default funds, quietly eroding returns.',strategies:['roth_conversion','tax_advantaged'],service:'Account Consolidation / Rollover',confidence:'high',status:'detected'});}
+    if((S.incomeSources||[]).length===1&&c.inc>0)
+      DE.systemFlags.push({id:'single_income',level:2,levelName:'Risk Protection',icon:'📌',severity:'low',urgency:'medium_term',title:'Single Income Source',desc:'All household income comes from one source — a job loss eliminates 100% of income at once. Deepen the emergency fund (6-9mo), confirm disability coverage, and develop a secondary income stream over 12-24 months.',impact:'100% income concentration risk',costOfNothing:'One layoff or illness = total income loss with no second salary to absorb it.',strategies:['increase_income','disability_insurance','emergency_fund_build'],service:'Income Diversification',confidence:'medium',status:'detected'});
+    var _mAge=parseInt(S.currentAge)||0;
+    if(_mAge>=50){var _mInc=(S.debts||[]).filter(function(x){return !(x&&x.include===false);});var _morts=_mInc.filter(function(x){var t=(x.type||x.name||'').toLowerCase();return t.indexOf('mortgage')>=0||t.indexOf('home loan')>=0;});
+      if(_morts.length){var _mBal=_morts.reduce(function(t,m){return t+(parseFloat(m.balance)||0);},0);var _mAnn=c.inc*12;
+        if(_mBal>0&&_mAnn>0&&_mBal>_mAnn*5)
+          DE.systemFlags.push({id:'mortgage_in_retirement',level:3,levelName:'Efficiency',icon:'🏠',severity:'medium',urgency:'near_term',title:'Mortgage May Extend Past Retirement',desc:fmtK(_mBal)+' mortgage at age '+_mAge+'. At standard amortization this likely runs into retirement, layering fixed housing costs on reduced income. Consider accelerated payoff or a shorter-term refinance.',impact:'Fixed housing cost on retirement income',costOfNothing:'Carrying a large mortgage into retirement raises the income you must replace.',strategies:['debt_avalanche','debt_hybrid'],service:'Debt / Mortgage Planning',confidence:'medium',status:'detected'});}}
+    var _lAge=parseInt(S.currentAge)||0;var _lRet=(S.retAccounts||[]).reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+    if(_lRet>50000&&_lAge<55){
+      var _lLiq=parseFloat((S.assets&&S.assets.checking)||0)+parseFloat((S.assets&&S.assets.savings)||0);
+      if((S.investments||[]).length){_lLiq+=(S.investments||[]).reduce(function(t,iv){var ty=(iv&&iv.type||'').toLowerCase();return (ty==='brokerage'||ty==='mutual_fund'||ty==='robo_advisor')?t+(parseFloat(iv.balance)||0):t;},0);}else{_lLiq+=parseFloat((S.assets&&S.assets.invest)||0);}
+      var _lExp=(c.totalExp!=null?c.totalExp:(c.inc-(c.netCF||0)));var _lr=_lRet>0?_lLiq/_lRet:0;
+      if(_lr<0.15&&_lLiq<_lExp*6)
+        DE.systemFlags.push({id:'liquidity_locked',level:3,levelName:'Efficiency',icon:'🔒',severity:'medium',urgency:'medium_term',title:'Most Savings Locked Until Retirement',desc:fmtK(_lRet)+' in retirement accounts vs '+fmtK(_lLiq)+' liquid. Pre-59½ withdrawals trigger a 10% penalty plus tax. A taxable brokerage or HYSA buffer adds flexibility for pre-retirement goals.',impact:'Limited access to capital before 59½',costOfNothing:'A mid-life need (home, opportunity, emergency) could force a penalized early withdrawal.',strategies:['reallocate_cash','index_fund','money_market'],service:'Liquidity / Investment Allocation',confidence:'medium',status:'detected'});}
   }
   var sevOrd={critical:0,high:1,medium:2,low:3};
   DE.systemFlags.sort(function(a,b){return a.level-b.level||(sevOrd[a.severity]||3)-(sevOrd[b.severity]||3);});
