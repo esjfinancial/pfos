@@ -767,10 +767,25 @@ function _issuesDetect(ctx){
       .sort(function(a,b){ return (a.l-b.l) || (a.s-b.s) || (a.i-b.i); })
       .map(function(x){ return x.f; });
   }
+  // ── M5.2b — rank an array of UNASSIGNED PLAN CARDS by canonical priority. Each flag-sourced card
+  // already carries flagAction + flagType (set in _cpSyncFlagsToUnassigned), so we rank by those.
+  // Non-flag cards (e.g. savings_goal cards, which have no flagAction) are NOT ranked — they keep
+  // their order and trail the ranked flag cards, matching today's "flags then goals" layout. Pure:
+  // never mutates the cards (the {action,type,_a} wrapper is throwaway); returns a NEW array of the
+  // SAME card references. Used by the render sites behind PFOS_FLAGS.priorityEngine (OFF = no call).
+  function _issuesRankCards(cards){
+    if(!cards||!cards.length) return cards||[];
+    var flagCards=[], others=[];
+    for(var i=0;i<cards.length;i++){ var c=cards[i]; if(c&&c.flagAction) flagCards.push(c); else others.push(c); }
+    if(!flagCards.length) return cards.slice();
+    var ranked=_issuesRank(flagCards.map(function(c){ return { action:c.flagAction, type:c.flagType, _a:c }; }));
+    return ranked.map(function(w){ return w._a; }).concat(others);
+  }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;
   g.PFOSIssues.toCp = _issuesToCp;   // identity pass-through (per-shell transform seam)
-  g.PFOSIssues.rank = _issuesRank;   // canonical engine-exact priority sort (M5.2; registered, wired by 5.2b+)
+  g.PFOSIssues.rank = _issuesRank;   // canonical engine-exact priority sort over {action,type} flags (M5.2a)
+  g.PFOSIssues.rankCards = _issuesRankCards;   // rank unassigned plan cards by flagAction/flagType; goals trail (M5.2b)
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (7-category)
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
   g.PFOSRecs   = g.PFOSRecs   || {};   // canonical Recommendation type + lifecycle
