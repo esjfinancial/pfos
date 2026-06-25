@@ -6162,7 +6162,11 @@ function _leakFinder(opts){
   var now=new Date(), cutoff=new Date(now.getFullYear(),now.getMonth()-3,now.getDate()), bycat={}, earliest=null;
   entries.forEach(function(e){ if(!e) return; var amt=parseFloat(e.amount)||0; if(!(amt>0)) return; if(e.excluded||e.is_transfer||e.isTransfer) return;
     var dt=e.date?new Date(String(e.date)):null; if(dt&&!isNaN(dt.getTime())&&dt<cutoff) return;
-    var cat=_LEAK_AUTO[e.category_bucket]?e.category_bucket:(_LEAK_AUTO[e.category]?e.category:null); if(!cat) return; // robust: match whichever field holds the discretionary 8-key
+    // AUTO leaks key off the L1-leaf .category (the 8 PFOS keys). Manual entries store the L1 key there; the Plaid
+    // mirror (plaid-transactions-sync sets category = the FINE_TO_BUCKET L1 key, e.g. 'subscriptions'); split parents
+    // carry their L1 key. .category_bucket is the coarser 5-bucket (entertainment/other) and NEVER holds an 8-key,
+    // so matching it is dead weight — key off .category only.
+    var cat=_LEAK_AUTO[e.category]?e.category:null; if(!cat) return;
     bycat[cat]=(bycat[cat]||0)+amt; if(dt&&!isNaN(dt.getTime())&&(!earliest||dt<earliest)) earliest=dt; });
   var spanMo=earliest?Math.max(1,(now-earliest)/(86400000*30.4)):1; // floor 1mo so a single recent burst can't explode the rate
   var auto={}; Object.keys(bycat).forEach(function(k){ var m=Math.round(bycat[k]/spanMo); if(m>=50) auto[k]=m; }); // $50/mo floor
@@ -6178,8 +6182,13 @@ function _leakFinder(opts){
   }).filter(function(x){ return x.monthlyAmt>0; }).sort(function(x,y){ return y.monthlyAmt-x.monthlyAmt; });
   return { leaks:leaks, total:leaks.reduce(function(s,x){return s+x.monthlyAmt;},0) };
 }
-function buildOneActionHTML(){
-  var c=S.calcs; if(!c||!c.inc) return '';
+// SINGLE-SOURCE one-action decision tree (invariant 5e, no-drift). _pickOneAction selects the highest-impact next
+// step; BOTH live renderers delegate to it — buildOneActionHTML (Home Daily Pulse) and renderOneAction (the Analysis
+// "One Action This Month" card) — so the two surfaces can never disagree. The §3.2 leak-led P2P branch and the
+// $50-floored EF steps live here ONCE (previously duplicated + drifted: renderOneAction lacked the leak branch and
+// emitted an unfloored "$0/mo" EF step for a paycheck-to-paycheck user).
+function _pickOneAction(c){
+  if(!c||!c.inc) return null;
   var action=null;
   if(c.netCF<0) action={icon:'🚨',title:'Fix Negative Cash Flow',desc:'You are spending '+fmt(Math.abs(c.netCF))+'/mo more than you earn. Cut expenses or increase income before any other financial action.',urgency:'Do this today',col:'var(--rd)'};
   else if(c.savingsRate<5){ // §3.2 — tapped out / paycheck-to-paycheck: lead with WHERE to find money (the biggest justified leak), not a generic "$0/mo" save step
@@ -6191,15 +6200,20 @@ function buildOneActionHTML(){
     }
   }
   else if(c.efMonths<1) action={icon:'🛡️',title:'Start Your Emergency Fund',desc:'Open a high-yield savings account and automate '+fmt(Math.max(50,Math.min(c.netCF*0.5,500)))+'/mo transfers. Target: '+fmt(c.efT3)+' (3 months of expenses).',urgency:'This week',col:'var(--or)'};
-  else if(c.dti>43) action={icon:'💳',title:'Attack High-Interest Debt',desc:'Your DTI at '+c.dti.toFixed(0)+'% is critical. Put every extra dollar toward your highest-rate debt.',urgency:'This month',col:'var(--rd)'};
-  else if(c.efMonths<3) action={icon:'📈',title:'Build to 3-Month Emergency Fund',desc:'Continue saving until reserves reach '+fmt(c.efT3)+'. Currently '+c.efMonths.toFixed(1)+' months covered.',urgency:'Ongoing',col:'var(--yl)'};
+  else if(S.retAccounts&&S.retAccounts.some(function(a){var rt=RET_TYPES.find(function(t){return t.val===a.type;})||{};return rt.allowMatch&&(a.matchPct||0)>0&&(a.contrib||0)<((c.incGross||c.inc)*(a.matchPct/100));})) action={icon:'🆓',title:'Get Your Full Employer Match',desc:'Increase 401(k) contributions to capture the full employer match. This is a guaranteed 100% return — no other investment comes close.',urgency:'Next paycheck',col:'var(--gr)'};
+  else if(c.dti>43) action={icon:'💳',title:'Attack High-Interest Debt',desc:'Your DTI at '+c.dti.toFixed(0)+'% is critical. Put every extra dollar toward your highest-rate debt using the avalanche method.',urgency:'This month',col:'var(--rd)'};
+  else if(c.efMonths<3) action={icon:'📈',title:'Build to 3-Month Emergency Fund',desc:'Continue saving '+fmt(Math.max(50,Math.min(c.netCF*0.3,400)))+'/mo until reserves reach '+fmt(c.efT3)+'. Currently '+c.efMonths.toFixed(1)+' months covered.',urgency:'Ongoing',col:'var(--yl)'};
   else if(c.savingsRate<15) action={icon:'💰',title:'Boost Savings Rate to 15%',desc:'Current rate: '+c.savingsRate.toFixed(1)+'%. Increase by '+fmt(Math.round(c.inc*((15-c.savingsRate)/100)))+'/mo to hit the wealth-building threshold.',urgency:'This month',col:'var(--yl)'};
   else if(c.retGap>0) action={icon:'🎯',title:'Close Retirement Gap',desc:'Increase retirement contributions by '+fmt(c.requiredMonthlyIncrease||0)+'/mo. Gap: '+fmtK(c.retGap)+'.',urgency:'This quarter',col:'#5B9BFF'};
   else action={icon:'✅',title:'Stay the Course',desc:'Your financial fundamentals are solid. Focus on maintaining habits and reviewing quarterly.',urgency:'Keep going',col:'var(--gr)'};
-  return '<div style="padding:14px;background:'+action.col+'08;border:2px solid '+action.col+'30;border-radius:2px;margin-bottom:14px">'
+  return action;
+}
+function _oneActionCardHTML(action,mb){
+  return '<div style="padding:14px;background:'+action.col+'08;border:2px solid '+action.col+'30;border-radius:2px'+(mb?';margin-bottom:14px':'')+'">'
     +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="font-size:24px">'+action.icon+'</span><div><div style="font-family:var(--fh);font-size:14px;font-weight:800;color:var(--wh)">'+action.title+'</div><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+action.col+'">'+action.urgency+'</div></div></div>'
     +'<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7">'+action.desc+'</div></div>';
 }
+function buildOneActionHTML(){ var action=_pickOneAction(S.calcs); return action?_oneActionCardHTML(action,true):''; }
 function buildTCOLHTML(){
   var c=S.calcs; if(!c||!c.inc) return '';
   var annNorm=0;
@@ -11486,23 +11500,10 @@ function renderBehavioralFinance(){
 }
 
 function renderOneAction(){
-  var c=S.calcs; if(!c||!c.inc) return;
+  // Single-source: identical decision tree as buildOneActionHTML (invariant 5e). No margin on this card (it owns its box).
   var el=document.getElementById('oneActionBox'); if(!el) return;
-  // Pick the single highest-impact action
-  var action=null;
-  if(c.netCF<0) action={icon:'🚨',title:'Fix Negative Cash Flow',desc:'You are spending '+fmt(Math.abs(c.netCF))+'/mo more than you earn. Cut expenses or increase income by at least this amount before any other financial action.',urgency:'Do this today',col:'var(--rd)'};
-  else if(c.efMonths<1) action={icon:'🛡️',title:'Start Your Emergency Fund',desc:'Open a high-yield savings account and automate '+fmt(Math.min(c.netCF*0.5,500))+'/mo transfers. Target: '+fmt(c.efT3)+' (3 months of expenses).',urgency:'This week',col:'var(--or)'};
-  else if(S.retAccounts&&S.retAccounts.some(function(a){var rt=RET_TYPES.find(function(t){return t.val===a.type;})||{};return rt.allowMatch&&(a.matchPct||0)>0&&(a.contrib||0)<((c.incGross||c.inc)*(a.matchPct/100));})) action={icon:'🆓',title:'Get Your Full Employer Match',desc:'Increase 401(k) contributions to capture the full employer match. This is a guaranteed 100% return — no other investment comes close.',urgency:'Next paycheck',col:'var(--gr)'};
-  else if(c.dti>43) action={icon:'💳',title:'Attack High-Interest Debt',desc:'Your DTI at '+c.dti.toFixed(0)+'% is critical. Put every extra dollar toward your highest-rate debt using the avalanche method.',urgency:'This month',col:'var(--rd)'};
-  else if(c.efMonths<3) action={icon:'📈',title:'Build to 3-Month Emergency Fund',desc:'Continue saving '+fmt(Math.min(c.netCF*0.3,400))+'/mo until your reserves reach '+fmt(c.efT3)+'. You are '+c.efMonths.toFixed(1)+' months covered.',urgency:'Ongoing',col:'var(--yl)'};
-  else if(c.savingsRate<15) action={icon:'💰',title:'Boost Savings Rate to 15%',desc:'Current rate: '+c.savingsRate.toFixed(1)+'%. Increase by '+(15-c.savingsRate).toFixed(0)+'% ('+fmt(Math.round(c.inc*((15-c.savingsRate)/100)))+'/mo more) to hit the wealth-building threshold.',urgency:'This month',col:'var(--yl)'};
-  else if(c.retGap>0) action={icon:'🎯',title:'Close Retirement Gap',desc:'Increase retirement contributions by '+fmt(c.requiredMonthlyIncrease||0)+'/mo to retire at '+c.retAge+'. Gap: '+fmtK(c.retGap)+'.',urgency:'This quarter',col:'#5B9BFF'};
-  else action={icon:'✅',title:'Stay the Course',desc:'Your financial fundamentals are solid. Focus on maintaining habits, reviewing quarterly, and optimizing where possible.',urgency:'Keep going',col:'var(--gr)'};
-
-  el.innerHTML='<div style="padding:14px;background:'+action.col+'08;border:2px solid '+action.col+'30;border-radius:2px">'
-    +'<div style="display:flex;align-items:center;gap:8px;margin-bottom:8px"><span style="font-size:24px">'+action.icon+'</span><div><div style="font-family:var(--fh);font-size:14px;font-weight:800;color:var(--wh)">'+action.title+'</div><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+action.col+'">'+action.urgency+'</div></div></div>'
-    +'<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.7">'+action.desc+'</div>'
-    +'</div>';
+  var action=_pickOneAction(S.calcs); if(!action) return;
+  el.innerHTML=_oneActionCardHTML(action,false);
 }
 
 // ── PROTECTION ───────────────────────────────────────
