@@ -9,7 +9,7 @@
 //     be cached or users will see stale balances, plans, and policies.
 //   - External CDN scripts (cdnjs): cache-first with stale-while-revalidate.
 
-const CACHE_VERSION = 'pfos-v2';
+const CACHE_VERSION = 'pfos-v3';
 const RUNTIME_CACHE = 'pfos-runtime-v1';
 
 // Files to pre-cache on install. Keep this small — only the essentials needed
@@ -165,4 +165,58 @@ self.addEventListener('message', function(event) {
   if (event.data && event.data.type === 'SKIP_WAITING') {
     self.skipWaiting();
   }
+});
+
+// ── PUSH (M4 §4.1) ──
+// Receives a server-signed Web Push message and renders a native notification. Runs in the SW
+// context (no app state / no S / no calc — metric-inert by construction). Payload is JSON:
+// {title, body, url?, tag?, urgent?, badge_count?}. Falls back gracefully if data isn't JSON.
+self.addEventListener('push', function(event) {
+  var d = {};
+  try { d = event.data ? event.data.json() : {}; }
+  catch (e) { try { d = { body: event.data ? event.data.text() : '' }; } catch (e2) { d = {}; } }
+  var title = (d.title || 'PFOS').slice(0, 120);
+  var opts = {
+    body: (d.body || '').slice(0, 500),
+    icon: '/pfos-icon-192.png',
+    badge: '/pfos-icon-192.png',
+    tag: d.tag || 'pfos',
+    renotify: !!d.tag,
+    data: { url: d.url || '/pfos-client' },
+    requireInteraction: !!d.urgent
+  };
+  event.waitUntil(
+    self.registration.showNotification(title, opts).then(function() {
+      // App-icon badge (Android/Windows installed PWA). Best-effort; never throws.
+      if (typeof d.badge_count === 'number' && self.navigator && self.navigator.setAppBadge) {
+        try {
+          if (d.badge_count > 0) self.navigator.setAppBadge(d.badge_count);
+          else if (self.navigator.clearAppBadge) self.navigator.clearAppBadge();
+        } catch (e) {}
+      }
+    // Terminal catch so a render rejection (revoked permission / bad icon / quota) always settles the event.
+    }).catch(function(err) { console.warn('[SW] showNotification failed:', err); })
+  );
+});
+
+// ── NOTIFICATION CLICK (M4 §4.1) ──
+// Focus an existing PFOS tab (deep-linked to the notification's url) or open a new one.
+self.addEventListener('notificationclick', function(event) {
+  event.notification.close();
+  // Constrain the click target to a SAME-ORIGIN PFOS path. A forged/compromised payload could set data.url to an
+  // external / data: / protocol-relative URL → an openWindow phishing redirect. Collapse anything off-origin to a
+  // safe default, and match an open tab by pathname (not a loose substring).
+  var raw = (event.notification.data && event.notification.data.url) || '/pfos-client';
+  var target = '/pfos-client';
+  try { var u = new URL(raw, self.location.origin); if (u.origin === self.location.origin) target = u.pathname + u.search + u.hash; } catch (e) {}
+  var tpath = target.split('?')[0].split('#')[0];
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then(function(wins) {
+      for (var i = 0; i < wins.length; i++) {
+        var wp = ''; try { wp = new URL(wins[i].url).pathname; } catch (e) {}
+        if (wp === tpath && 'focus' in wins[i]) return wins[i].focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(target);
+    })
+  );
 });

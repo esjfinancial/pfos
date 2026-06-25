@@ -6289,7 +6289,7 @@ function renderHome(){
   var dayOfMonth=now.getDate();var daysLeft=daysInMonth-dayOfMonth;
   var _effDueH=function(b){return Math.min(Math.max(1,parseInt(b&&b.due_day)||1),daysInMonth);}; // #6: clamp due_day to month length so a 31st bill still surfaces in short months
   var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
-  var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
+  var moneyOut=monthEntries.reduce(function(t,e){var a=parseFloat(e.amount)||0;return t+(a>0?a:0);},0); // §4.3: income entries (amt<=0, e.g. imported paychecks) are not spend → don't reduce "Spent"
   // Money In = income source amount (user enters what hits their bank — already net)
   var moneyIn=Math.round(c.inc||0);
   var leftToSpend=Math.max(0,moneyIn-moneyOut);
@@ -6504,7 +6504,7 @@ function _acctSpendStatus(){
   var daysInMonth=new Date(curYear,curMonth+1,0).getDate();
   var dayOfMonth=now.getDate();
   var monthEntries=entries.filter(function(e){var d=new Date(e.date);return d.getMonth()===curMonth&&d.getFullYear()===curYear;});
-  var moneyOut=monthEntries.reduce(function(t,e){return t+(parseFloat(e.amount)||0);},0);
+  var moneyOut=monthEntries.reduce(function(t,e){var a=parseFloat(e.amount)||0;return t+(a>0?a:0);},0); // §4.3: income entries (amt<=0, e.g. imported paychecks) are not spend → don't reduce "Spent"
   var moneyIn=Math.round(c.inc||0);
   if(moneyIn<=0){return{severity:'ok',paceRatio:0,overspend:0,categories:[],reasons:[],projected:0,daysLeft:daysInMonth-dayOfMonth};}
 
@@ -15324,6 +15324,42 @@ function submitAdvisorRequestFromModal(){
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
         else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
       }catch(e){console.warn('PFOS_BULK_ENTRY:',e);}
+      return;
+    }
+    // ── PFOS_IMPORT_ENTRIES (§4.3a) — bulk-insert imported transactions in ONE calc()+sync (not N quick-adds).
+    // Accepts SIGNED amounts (positive=expense, negative=income — like the Plaid path, NOT quick-add's >0 rule);
+    // dedups by (date|amount|descLower) vs existing so a re-import / Plaid overlap can't double-count.
+    if(msg.type==='PFOS_IMPORT_ENTRIES'){
+      try{
+        var _imp=msg.entries; if(!Array.isArray(_imp)||!_imp.length)return;
+        if(_imp.length>5000)_imp=_imp.slice(0,5000); // cap a pathological import (mirrors the client _CSV_MAX_ROWS)
+        if(!S.spendingEntries)S.spendingEntries=[];
+        var _impKey=function(e){ return String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)+'|'+String(e.description||'').toLowerCase().trim().slice(0,40); };
+        var _iseen={}, _idseen={}; S.spendingEntries.forEach(function(e){ if(e){_iseen[_impKey(e)]=1; if(e.id!=null)_idseen[String(e.id)]=1;} });
+        var _iadded=0;
+        _imp.forEach(function(e){ if(!e)return; var _a=parseFloat(e.amount); if(isNaN(_a)||_a===0||!e.date)return;
+          var _k=_impKey(e); if(_iseen[_k])return; _iseen[_k]=1;
+          var _id=e.id||('imp_'+Date.now()+'_'+_iadded); while(_idseen[String(_id)]){ _id=String(_id)+'_'+_iadded; } _idseen[String(_id)]=1; // id never collides across batches
+          S.spendingEntries.push({
+            id:_id,
+            amount:Math.round(_a*100)/100,
+            description:String(e.description||'').slice(0,140),
+            category:e.category||'misc',
+            category_bucket:e.category_bucket||(typeof simplifyCategory==='function'?simplifyCategory(e.category||'misc'):'other'),
+            expense_type:e.expense_type||'regular',
+            payment_method:'debit', payment_detail:{}, couple_owner:'self',
+            is_recurring:false, recurrence_freq:'monthly',
+            date:String(e.date), created_at:new Date().toISOString(), _source:'import'
+          });
+          _iadded++;
+        });
+        if(_iadded){ if(!S._touched)S._touched={}; S._touched.spendingEntries=true; try{if(typeof calc==='function')calc();}catch(e){} clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
+          if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
+          else if(_currentSection==='finances'&&typeof renderFinances==='function'){try{renderFinances();}catch(e){}}
+        }
+        // ack the REAL added count back to the portal (§4.3b) so its toast is honest, not a blind success.
+        try{ if(window.parent&&window.parent!==window) window.parent.postMessage({type:'PFOS_IMPORT_DONE', added:_iadded}, 'https://pfos.esjfinancial.com'); }catch(e){}
+      }catch(e){console.warn('PFOS_IMPORT_ENTRIES:',e);}
       return;
     }
     // ── PFOS_RECONCILE (§1.6b) ──

@@ -2718,6 +2718,7 @@ function updateMobileTools(){
   renderClientTracking();
   loadSupabaseSnapshots();
   _cpLoadHoldings(); // §2.1 (M2): fire-and-forget RLS-scoped holdings read → APP._holdings[]; metric-inert
+  if(typeof _writeAlertStateSoon==='function') _writeAlertStateSoon(); // §4.2a (M4): debounced alert snapshot; coalesces with the data-change trigger (one write per settle); metric-inert
   if(typeof _trackLoadFromSupabase==='function')_trackLoadFromSupabase();
   if(typeof checkPartnerStatus==='function')checkPartnerStatus();
   var nwEl=document.getElementById('nwTickerVal');
@@ -3239,7 +3240,8 @@ function _cpApplyIncomeConfirm(streams,confirmMap){
 // land in-range (outflow = amount>0, excl. transfers/excluded), else the split-
 // expanded S.spendingEntries (avoids double-counting the same plaid data). Income
 // = the user's CONFIRMED linked deposits when source=linked + any are confirmed/
-// suggested (§2.4c), else the month's snapshot income (fallbackIncome when absent).
+// suggested (§2.4c); else imported/manual income (negative non-plaid entries, §4.3);
+// else the month's snapshot income (fallbackIncome when absent).
 // Returns per-month rows + totals + byCategory + savingsRate + incomeStreams. The
 // testable seam (no globals, no I/O).
 function _cpCashFlowReport(opts){
@@ -3271,6 +3273,12 @@ function _cpCashFlowReport(opts){
   var useLinkedIncome=_cpApplyIncomeConfirm(incomeStreams, opts.incomeStreams);
   var inflowByMonth={};
   if(useLinkedIncome){ txnsInRange.forEach(function(t){ var amt=parseFloat(t.amount)||0; if(amt>=0)return; var key=_cpIncomeStreamKey(t); var on=false; for(var i=0;i<incomeStreams.length;i++){ if(incomeStreams[i].key===key){ on=incomeStreams[i].confirmed; break; } } if(!on)return; var k=_cpMonthKey(t.date); if(k!=null&&k>=startKey&&k<=endKey) inflowByMonth[k]=(inflowByMonth[k]||0)+(-amt); }); }
+  // Imported/manual income (negative non-plaid spendingEntries — the app's "amt<0 = Income"
+  // convention, identical to _cpExportRows) is real per-month income, so a Monarch/YNAB migrant's
+  // imported paychecks are NOT dropped from cash-flow (they're never expenses — addExp rejects
+  // amt<=0). Ranks below confirmed linked inflow so a linked+imported month never double-counts.
+  var manualInflowByMonth={};
+  spendEntries.forEach(function(e){ if(!e||e._source==='plaid')return; var amt=parseFloat(e.amount)||0; if(amt>=0)return; var mk=_cpMonthKey(e.date); if(mk!=null&&mk>=startKey&&mk<=endKey) manualInflowByMonth[mk]=(manualInflowByMonth[mk]||0)+(-amt); });
   var rows=[], totalIncome=0, totalExpense=0, catTotals={}, estMonths=0;
   for(var k2=startKey;k2<=endKey;k2++){
     var m=months[k2], inc, incEst, hasSnap;
@@ -3278,6 +3286,7 @@ function _cpCashFlowReport(opts){
     // a linked month with expense but NO deposit (e.g. pre-link history) → snapshot income so its net stays
     // real (never a false deficit); a genuinely empty month (no deposit, no expense) → $0 (never phantom savings).
     if(useLinkedIncome&&inflowByMonth[k2]!=null){ inc=inflowByMonth[k2]; incEst=false; }
+    else if(manualInflowByMonth[k2]>0){ inc=manualInflowByMonth[k2]; incEst=false; } // §4.3: imported/manual income (real actuals) beats the profile fallback
     else if(useLinkedIncome&&!(m.expense>0)){ inc=0; incEst=false; }
     else { hasSnap=(snapByKey[k2]!=null); inc=hasSnap?snapByKey[k2]:fallbackIncome; incEst=!hasSnap; if(!hasSnap)estMonths++; }
     totalIncome+=inc; totalExpense+=m.expense;
@@ -3410,6 +3419,198 @@ function _cpTrendDiff(cur, prior, idField){
 // internal quotes); and neutralize a CSV-injection formula (a leading =,+,-,@,TAB,CR)
 // by prefixing a single quote — but ONLY when the value isn't a (signed) number, so a
 // legitimate negative amount like -50.00 stays numeric.
+// ── M4 §4.3a — CSV IMPORT: parse + normalize + map (PURE). The wizard (§4.3b) drives these; the bulk insert goes
+// through the engine handler PFOS_IMPORT_ENTRIES so the iframe stays the single S-writer (5c). Internal sign:
+// POSITIVE amount = EXPENSE, NEGATIVE = INCOME (matches _cpExportRows). Inverse of _cpCsvCell below.
+function _csvPad2(n){ return (n<10?'0':'')+n; }
+// RFC-4180 parser → {header:[], rows:[[]]}. Handles "quoted, fields", ""escaped"" quotes, embedded newlines, CRLF/LF, BOM.
+function _csvParse(text){
+  text=String(text||'').replace(/^﻿/,'');
+  var rows=[], row=[], cur='', i=0, n=text.length, inQ=false;
+  while(i<n){ var ch=text[i];
+    if(inQ){ if(ch==='"'){ if(text[i+1]==='"'){ cur+='"'; i+=2; continue; } inQ=false; i++; continue; } cur+=ch; i++; continue; }
+    if(ch==='"'){ inQ=true; i++; continue; }
+    if(ch===','){ row.push(cur); cur=''; i++; continue; }
+    if(ch==='\r'){ if(text[i+1]==='\n')i++; row.push(cur); rows.push(row); row=[]; cur=''; i++; continue; }
+    if(ch==='\n'){ row.push(cur); rows.push(row); row=[]; cur=''; i++; continue; }
+    cur+=ch; i++;
+  }
+  if(cur!==''||row.length){ row.push(cur); rows.push(row); }
+  rows=rows.filter(function(r){ return r.length>1 || (r.length===1 && String(r[0]).trim()!==''); });
+  var res=(!rows.length)?{header:[], rows:[]}:{header:rows[0].map(function(h){return String(h).trim();}), rows:rows.slice(1)};
+  if(inQ) res.error='unterminated_quote'; // a stray quote swallowed the rest → caller must REFUSE, not import 1-of-N
+  return res;
+}
+// header names → field index map + a tool guess (the wizard lets the user override).
+function _csvDetectCols(header){
+  var h=(header||[]).map(function(x){return String(x||'').toLowerCase().trim();});
+  var find=function(){ for(var a=0;a<arguments.length;a++){ var idx=h.indexOf(arguments[a]); if(idx>=0) return idx; } return -1; };
+  var has=function(x){ return h.indexOf(x)>=0; };
+  var map={ date:find('date','transaction date','posted date','date posted'), description:find('description','payee','merchant','name','original description'),
+    merchant:find('merchant'), amount:find('amount'), category:find('category'), type:find('type','transaction type'),
+    outflow:find('outflow','debit','withdrawal'), inflow:find('inflow','credit','deposit') };
+  var tool='generic';
+  if(map.outflow>=0 && map.inflow>=0) tool='ynab';
+  else if(find('transaction type')>=0 && map.amount>=0) tool='mint';
+  else if(has('type') && has('status') && has('merchant')) tool='pfos';
+  else if(has('merchant') && map.amount>=0 && map.category>=0) tool='monarch';
+  return { map:map, tool:tool };
+}
+function _csvParseAmount(s){ if(s==null) return 0; var str=String(s).trim(); if(!str) return 0;
+  // EU comma-decimal (1.234,56 / 50,00) — DON'T silently mangle to 1.23456/5000; return NaN so the row is SKIPPED + counted (§4.3b can offer a locale toggle).
+  if(/^[^\d-]*\d{1,3}(\.\d{3})+,\d{1,2}[^\d]*$/.test(str) || /^[^\d-]*\d+,\d{2}$/.test(str)) return NaN;
+  var paren=/^\(.*\)$/.test(str), trail=/-\s*$/.test(str)&&!/^-/.test(str); // (50) and 50- are both negative
+  var num=Number(str.replace(/[$€£¥,()\s]/g,'').replace(/-\s*$/,'')); // strip a TRAILING minus first; Number() honors 5e2→500; NaN on junk → skip, never a mangled magnitude
+  if(isNaN(num)) return NaN;
+  if((paren||trail)&&num>0) num=-num;
+  return num;
+}
+function _csvParseDate(s){ if(s==null) return null; var str=String(s).trim(); if(!str) return null;
+  var m=str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/); if(m) return m[1]+'-'+_csvPad2(parseInt(m[2],10))+'-'+_csvPad2(parseInt(m[3],10));
+  m=str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  if(m){ var a=parseInt(m[1],10),b=parseInt(m[2],10),y=m[3]; if(y.length===2) y='20'+y; var mo=a,da=b; if(a>12&&b<=12){ mo=b; da=a; } if(mo<1||mo>12||da<1||da>31) return null; return y+'-'+_csvPad2(mo)+'-'+_csvPad2(da); }
+  if(/^\d{5}$/.test(str)){ var d=new Date(Date.UTC(1899,11,30)); d.setUTCDate(d.getUTCDate()+parseInt(str,10)); return d.toISOString().slice(0,10); }
+  return null;
+}
+var _CSV_CATMAP={groceries:'food',restaurants:'food','restaurants & bars':'food',dining:'food','food & dining':'food','fast food':'food',coffee:'food',
+  gas:'transportation','gas & fuel':'transportation',fuel:'transportation',auto:'transportation','auto & transport':'transportation',transit:'transportation',parking:'transportation',rideshare:'transportation',
+  rent:'housing',mortgage:'housing','mortgage & rent':'housing','home improvement':'housing',
+  utilities:'utilities','bills & utilities':'utilities',electric:'utilities',internet:'utilities',phone:'utilities',
+  insurance:'insurance','health & fitness':'insurance',medical:'insurance',doctor:'insurance',
+  subscriptions:'subscriptions',streaming:'subscriptions',subscription:'subscriptions',
+  shopping:'discretionary',entertainment:'discretionary',travel:'discretionary','personal care':'discretionary',clothing:'discretionary',hobbies:'discretionary',gifts:'discretionary'};
+function _csvMapCategory(foreignCat){ var c=String(foreignCat||'').toLowerCase().trim(); if(!c) return 'misc';
+  if(_CSV_CATMAP[c]) return _CSV_CATMAP[c];
+  for(var k in _CSV_CATMAP){ if(c.indexOf(k)>=0) return _CSV_CATMAP[k]; }
+  if(['housing','utilities','food','transportation','insurance','subscriptions','discretionary','misc'].indexOf(c)>=0) return c;
+  return 'misc';
+}
+function _csvHash(s){ var h=5381,str=String(s||''); for(var i=0;i<str.length;i++){ h=((h<<5)+h+str.charCodeAt(i))>>>0; } return h.toString(36); }
+// row → normalized entry (PFOS-signed amount: positive=expense, negative=income). Returns null to SKIP (no date /
+// transfer / zero / un-parseable amount). expNeg (monarch/generic): true = source-negative is expense (default),
+// false = source-positive is expense (the §4.3a heuristic + the §4.3b user override set it).
+function _csvBuildEntry(row, map, tool, idx, expNeg){
+  var get=function(k){ var ix=map[k]; return (ix!=null&&ix>=0&&row[ix]!=null)?String(row[ix]):''; };
+  var dateISO=_csvParseDate(get('date')); if(!dateISO) return null;
+  if(/transfer/i.test(get('type'))) return null;
+  var amt, typ=get('type').toLowerCase();
+  if(map.outflow>=0||map.inflow>=0){ var out=Math.abs(_csvParseAmount(get('outflow')))||0, inf=Math.abs(_csvParseAmount(get('inflow')))||0; amt=(out>0)?out:(inf>0?-inf:0); } // outflow/inflow (incl. Debit/Credit + manual remaps), any tool
+  else { var raw=_csvParseAmount(get('amount')); if(isNaN(raw)) return null;
+    if(tool==='mint') amt=(typ==='credit')?-Math.abs(raw):Math.abs(raw);
+    else if(tool==='pfos') amt=(typ==='income')?-Math.abs(raw):Math.abs(raw);
+    else amt=(expNeg===false)?raw:-raw; // monarch/generic: expNeg true → source-negative is expense (PFOS=-raw); false → source-positive is expense (PFOS=raw)
+  }
+  if(!amt||isNaN(amt)) return null;
+  var desc=(get('description')||get('merchant')||'Imported').trim().slice(0,140);
+  return { id:'imp_'+idx+'_'+dateISO.replace(/-/g,'')+'_'+Math.round(Math.abs(amt)*100)+'_'+_csvHash(desc.toLowerCase()), amount:Math.round(amt*100)/100, description:desc, category:_csvMapCategory(get('category')), date:dateISO, _source:'import', expense_type:'regular' };
+}
+function _csvImpKey(e){ return String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)+'|'+String(e.description||'').toLowerCase().trim().slice(0,40); }
+// drop intra-import dups + vs-existing dups (exact date|amount|desc) + Plaid-overlap (date|amount only, since
+// Plaid stores the RAW bank string while Monarch/YNAB/Mint store a cleaned merchant → desc won't match).
+function _csvDedup(entries, existing){
+  var seen={}, plaidDA={};
+  (existing||[]).forEach(function(e){ if(!e) return; seen[_csvImpKey(e)]=1; if(e._source==='plaid') plaidDA[String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)]=1; });
+  var out=[]; (entries||[]).forEach(function(e){ if(!e) return; var k=_csvImpKey(e); if(seen[k]) return; if(plaidDA[String(e.date)+'|'+Math.round((parseFloat(e.amount)||0)*100)]) return; seen[k]=1; out.push(e); });
+  return out;
+}
+var _CSV_MAX_ROWS=5000; // cap one import (a single profile shouldn't ingest a pathological CSV in one shot)
+// parse a whole CSV → {entries, tool, signRule, header, total, skipped, dupes, capped, byCategory} OR {error}.
+function _csvImport(text, existing, overrideMap, overrideTool, overrideExpNeg){
+  var p=_csvParse(text);
+  if(p.error) return { error:p.error, entries:[], total:0 }; // unterminated quote etc. — REFUSE, don't import 1-of-N
+  var det=_csvDetectCols(p.header); var map=overrideMap||det.map, tool=overrideTool||det.tool;
+  var capped=false, rows=p.rows; if(rows.length>_CSV_MAX_ROWS){ rows=rows.slice(0,_CSV_MAX_ROWS); capped=true; }
+  // SIGN heuristic for the signed-amount tools (monarch/generic): if positives dominate the non-zero amounts, treat
+  // POSITIVE as expense (else negative). §4.3b surfaces signRule + lets the user override (overrideExpNeg).
+  var expNeg=true;
+  if((tool==='monarch'||tool==='generic') && map.amount>=0){ var neg=0,pos=0; rows.forEach(function(r){ var a=_csvParseAmount(r[map.amount]); if(isNaN(a)||a===0) return; if(a<0)neg++; else pos++; }); expNeg=(pos>neg)?false:true; }
+  if(overrideExpNeg!=null) expNeg=!!overrideExpNeg;
+  var raw=[], skipped=0;
+  rows.forEach(function(r,i){ var e=_csvBuildEntry(r,map,tool,i,expNeg); if(e) raw.push(e); else skipped++; });
+  var deduped=_csvDedup(raw, existing); var dupes=raw.length-deduped.length;
+  var byCategory={}; deduped.forEach(function(e){ byCategory[e.category]=(byCategory[e.category]||0)+1; });
+  return { entries:deduped, tool:tool, map:map, header:p.header, total:rows.length, skipped:skipped, dupes:dupes, capped:capped, signRule:(expNeg?'negative_is_expense':'positive_is_expense'), byCategory:byCategory };
+}
+
+// ── M4 §4.3b — the import WIZARD (drives the §4.3a engine). Upload → review (+ the required SIGN-CONFIRM + column
+// remap) → import via PFOS_IMPORT_ENTRIES (the iframe stays the single S-writer). Reuses FileReader + toasts.
+var _importWiz=null;
+function _impEsc(s){ return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function _importWizExisting(){ var S=(_lastPfosState&&_lastPfosState.state)||{}; return S.spendingEntries||[]; }
+function openImportWizard(){
+  _importWiz={ step:1, text:'', fileName:'', map:null, tool:null, expNeg:null, result:null };
+  var old=document.getElementById('_impWizModal'); if(old) old.remove();
+  var modal=document.createElement('div'); modal.id='_impWizModal';
+  modal.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:100000;display:flex;align-items:center;justify-content:center;padding:16px';
+  modal.onclick=function(e){ if(e.target===modal) closeImportWizard(); };
+  modal.innerHTML='<div id="_impWizBox" style="background:var(--bg-card);border:1px solid var(--bd);border-radius:8px;max-width:640px;width:100%;max-height:88vh;overflow:auto;padding:22px"></div>';
+  document.body.appendChild(modal); _importWizRender();
+}
+function closeImportWizard(){ var m=document.getElementById('_impWizModal'); if(m) m.remove(); _importWiz=null; }
+function _importWizRecompute(){ if(!_importWiz||!_importWiz.text) return; _importWiz.result=_csvImport(_importWiz.text, _importWizExisting(), _importWiz.map, _importWiz.tool, _importWiz.expNeg); }
+function _importWizFile(file){
+  if(!file||!_importWiz) return; _importWiz.fileName=file.name||'import.csv';
+  var rdr=new FileReader();
+  rdr.onload=function(){ try{ _importWiz.text=String(rdr.result||''); var pre=_csvImport(_importWiz.text, _importWizExisting());
+      if(pre.error){ if(typeof _cpToast==='function')_cpToast('That file looks malformed (a quote isn’t closed) — please re-export and try again.','error'); return; }
+      _importWiz.map=pre.map; _importWiz.tool=pre.tool; _importWiz.expNeg=null; _importWiz.result=pre; _importWiz.step=2; _importWizRender();
+    }catch(e){ if(typeof _cpToast==='function')_cpToast('Couldn’t read that file.','error'); } };
+  rdr.onerror=function(){ if(typeof _cpToast==='function')_cpToast('Couldn’t read that file.','error'); };
+  rdr.readAsText(file);
+}
+function _importWizSetCol(field, idxStr){ if(!_importWiz||!_importWiz.map) return; _importWiz.map[field]=parseInt(idxStr,10); _importWizRecompute(); _importWizRender(); }
+function _importWizFlipSign(){ if(!_importWiz||!_importWiz.result) return; _importWiz.expNeg=(_importWiz.result.signRule!=='negative_is_expense'); _importWizRecompute(); _importWizRender(); }
+function _importWizBack(){ if(_importWiz){ _importWiz.step=1; _importWizRender(); } }
+function _importWizImport(){
+  if(!_importWiz||!_importWiz.result||!_importWiz.result.entries.length) return;
+  // Gate on engine readiness — getPFOSFrame() can be null and the engine may not be hydrated yet (an import before
+  // PFOS_LOAD gets wiped). Without this the success toast lies + the import silently vanishes. _pfosDataLoaded flips
+  // true once the engine has PFOS_LOAD'd.
+  var fr=getPFOSFrame();
+  if(!fr||!fr.contentWindow||(typeof _pfosDataLoaded!=='undefined'&&!_pfosDataLoaded)){ if(typeof _cpToast==='function')_cpToast('Your financial data is still loading — open “My Financial Data” once, then try the import again.','error'); return; }
+  var ents=_importWiz.result.entries, n=ents.length;
+  try{ fr.contentWindow.postMessage({type:'PFOS_IMPORT_ENTRIES', entries:ents}, (typeof PFOS_ORIGIN!=='undefined'?PFOS_ORIGIN:'https://pfos.esjfinancial.com')); }
+  catch(e){ if(typeof _cpToast==='function')_cpToast('Couldn’t send the import — please try again.','error'); return; }
+  if(typeof _cpToast==='function')_cpToast('Importing '+n+' transaction'+(n!==1?'s':'')+'…','success'); // honest in-progress; the engine acks PFOS_IMPORT_DONE
+  closeImportWizard();
+}
+function _importWizRender(){
+  var box=document.getElementById('_impWizBox'); if(!box||!_importWiz) return;
+  if(_importWiz.step===1){
+    box.innerHTML='<div style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh);margin-bottom:6px">Import transactions</div>'
+      +'<div style="font-size:13px;color:var(--mu);line-height:1.6;margin-bottom:16px">Switch from Monarch, YNAB, Mint — or any bank. Export your transactions as a <strong>.csv</strong> and drop it here.</div>'
+      +'<div id="_impDrop" style="border:2px dashed var(--bd);border-radius:8px;padding:34px 18px;text-align:center;cursor:pointer;background:var(--bg)" onclick="document.getElementById(\'_impFile\').click()"><div style="font-size:34px;margin-bottom:8px">📄</div><div style="font-size:14px;color:rgba(226,232,240,.85)">Click to choose a CSV, or drag it here</div></div>'
+      +'<input type="file" id="_impFile" accept=".csv,text/csv" style="display:none" onchange="_importWizFile(this.files[0])">'
+      +'<div style="display:flex;gap:10px;margin-top:18px"><button class="btn btn-gh" style="flex:1" onclick="closeImportWizard()">Cancel</button></div>';
+    var drop=document.getElementById('_impDrop');
+    if(drop){ drop.ondragover=function(e){ e.preventDefault(); drop.style.borderColor='#5B9BFF'; }; drop.ondragleave=function(){ drop.style.borderColor='var(--bd)'; }; drop.ondrop=function(e){ e.preventDefault(); drop.style.borderColor='var(--bd)'; if(e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0]) _importWizFile(e.dataTransfer.files[0]); }; }
+    return;
+  }
+  var r=_importWiz.result||{}, ents=r.entries||[];
+  var toolName={monarch:'Monarch',ynab:'YNAB',mint:'Mint',pfos:'PFOS export',generic:'CSV'}[r.tool]||'CSV';
+  var signedTool=(r.tool==='monarch'||r.tool==='generic');
+  var fm=function(v){ return '$'+Math.abs(v).toLocaleString('en-US',{minimumFractionDigits:2,maximumFractionDigits:2}); };
+  var expN=0,incN=0; ents.forEach(function(e){ if(e.amount<0)incN++; else expN++; });
+  var largest=ents.length?ents.slice().sort(function(a,b){return Math.abs(b.amount)-Math.abs(a.amount);})[0]:null;
+  var prev=ents.slice(0,6).map(function(e){ var inc=e.amount<0; return '<tr><td style="padding:4px 8px;color:var(--mu);white-space:nowrap">'+_impEsc(e.date)+'</td><td style="padding:4px 8px;color:rgba(226,232,240,.85);max-width:190px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+_impEsc(e.description)+'</td><td style="padding:4px 8px;text-align:right;color:'+(inc?'var(--gr)':'var(--wh)')+'">'+(inc?'+':'')+fm(e.amount)+'</td><td style="padding:4px 8px;color:var(--mu)">'+_impEsc(e.category)+'</td></tr>'; }).join('');
+  var h='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px"><div style="font-family:var(--fh);font-size:18px;font-weight:800;color:var(--wh)">Review import</div><div style="font-size:12px;color:var(--mu)">'+_impEsc(_importWiz.fileName)+'</div></div>';
+  h+='<div style="font-size:13px;color:var(--mu);margin-bottom:14px">Detected <strong style="color:rgba(226,232,240,.9)">'+toolName+'</strong> · <strong style="color:rgba(226,232,240,.9)">'+ents.length+'</strong> to import'+(r.dupes?' · '+r.dupes+' duplicate'+(r.dupes!==1?'s':'')+' skipped':'')+(r.skipped?' · '+r.skipped+' unreadable skipped':'')+(r.capped?' · capped at 5000':'')+'</div>';
+  if(signedTool && ents.length){
+    h+='<div style="background:rgba(249,115,22,.08);border:1px solid rgba(249,115,22,.28);border-radius:6px;padding:11px 13px;margin-bottom:14px">'
+      +'<div style="font-size:13px;color:var(--wh);line-height:1.6">Importing <strong>'+expN+'</strong> as expenses, <strong>'+incN+'</strong> as income.'+(largest?' Largest: <strong>'+_impEsc(largest.description)+'</strong> '+fm(largest.amount)+' → '+(largest.amount<0?'INCOME':'EXPENSE'):'')+'</div>'
+      +'<button onclick="_importWizFlipSign()" class="btn btn-gh" style="width:auto;padding:4px 12px;font-size:12px;margin-top:8px">That’s backwards — flip income/expense</button></div>';
+  }
+  if(ents.length){ h+='<div style="overflow:auto;border:1px solid var(--bd);border-radius:6px;margin-bottom:6px"><table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr style="background:var(--bg)"><th style="padding:5px 8px;text-align:left;color:var(--mu)">Date</th><th style="padding:5px 8px;text-align:left;color:var(--mu)">Description</th><th style="padding:5px 8px;text-align:right;color:var(--mu)">Amount</th><th style="padding:5px 8px;text-align:left;color:var(--mu)">Category</th></tr></thead><tbody>'+prev+'</tbody></table></div>'+(ents.length>6?'<div style="font-size:11px;color:var(--mu);margin-bottom:8px">+'+(ents.length-6)+' more</div>':''); }
+  else { h+='<div style="background:var(--bg);border:1px solid var(--bd);border-radius:6px;padding:14px;font-size:13px;color:var(--mu);margin-bottom:8px">No importable rows — check the column mapping below.</div>'; }
+  var hdr=(r.header||[]), colOpts=function(sel){ return '<option value="-1">—</option>'+hdr.map(function(hn,ix){ return '<option value="'+ix+'"'+(sel===ix?' selected':'')+'>'+_impEsc(hn)+'</option>'; }).join(''); };
+  var fields=[['date','Date'],['description','Description'],['amount','Amount'],['category','Category']];
+  if(_importWiz.map&&(_importWiz.map.outflow>=0||_importWiz.map.inflow>=0)){ fields.push(['outflow','Outflow/Debit'],['inflow','Inflow/Credit']); }
+  h+='<details style="margin:8px 0 14px"><summary style="cursor:pointer;font-size:12px;color:#5B9BFF">Columns look wrong? Map them</summary><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px">'
+    +fields.map(function(f){ return '<label style="font-size:11px;color:var(--mu)">'+f[1]+'<select onchange="_importWizSetCol(\''+f[0]+'\',this.value)" style="display:block;width:100%;margin-top:3px;background:var(--bg);border:1px solid var(--bd);color:rgba(226,232,240,.9);border-radius:4px;padding:4px">'+colOpts(_importWiz.map?_importWiz.map[f[0]]:-1)+'</select></label>'; }).join('')+'</div></details>';
+  h+='<div style="display:flex;gap:10px"><button class="btn btn-gh" style="flex:1" onclick="_importWizBack()">← Back</button>'+(ents.length?'<button class="btn btn-bl" style="flex:2" onclick="_importWizImport()">Import '+ents.length+' transaction'+(ents.length!==1?'s':'')+'</button>':'<button class="btn btn-bl" style="flex:2;opacity:.5;cursor:default" disabled>Nothing to import</button>')+'</div>';
+  box.innerHTML=h;
+}
+
 function _cpCsvCell(v){
   var s=(v==null)?'':String(v);
   // Guard a leading formula char (allowing leading whitespace before it — Excel trims) UNLESS the
@@ -3501,7 +3702,8 @@ function renderReportsView(){
   h+='<input type="month" id="rptCustomStart" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(startKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
   h+='<span style="color:var(--mu)">→</span>';
   h+='<input type="month" id="rptCustomEnd" onchange="_cpSetReportCustom()" value="'+(isCustom?keyToMonthInput(endKey):'')+'" style="font-size:11px;padding:3px 6px;background:transparent;border:1px solid var(--bd);border-radius:3px;color:var(--wh);min-height:28px">';
-  h+='<button onclick="_cpExportTransactionsCsv()" aria-label="Export transactions as CSV" style="margin-left:auto;padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬇ Export CSV</button>';
+  h+='<button onclick="openImportWizard()" aria-label="Import transactions from a CSV (Monarch, YNAB, Mint, or any bank)" style="margin-left:auto;padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬆ Import CSV</button>';
+  h+='<button onclick="_cpExportTransactionsCsv()" aria-label="Export transactions as CSV" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬇ Export CSV</button>';
   var _plaidLinked=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'));
   var _srcNote=(rep.source==='manual'&&_plaidLinked)?' · <span style="color:#EAB308">Plaid not yet synced — showing manual expenses</span>':'';
   var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile).</div>':'';
@@ -4474,6 +4676,9 @@ async function doLogout(){
     clearTimeout(redirectTimer);
     _forceRedirectToLogin();
   };
+  // M4 §4.1a: release this device's push subscription rows so a NEXT user on a shared browser never inherits
+  // this client's alert routing (best-effort, non-blocking — the claim RPC on the next subscribe also reassigns).
+  try{ if(APP.currentClientId && typeof db!=='undefined' && db) db.from('push_subscriptions').update({active:false}).eq('client_id',APP.currentClientId).then(function(){},function(){}); }catch(e){}
   // ══ SIGNAL THE IFRAME TO FLUSH + CLEAR ITS OWN STORAGE ══
   try{
     var frame=getPFOSFrame();
@@ -6128,11 +6333,133 @@ async function sendClientMessage(){
     await loadClientMessages();
   }catch(e){ setBtnLoading('clientMsgBtn',false,'Send Message'); _cpToast('Failed: '+e.message); }
 }
+// ── M4 §4.1 — Web Push opt-in (client side). Stores the PushSubscription RLS-scoped in push_subscriptions.
+// Metric-inert: never touches S / calc / the engine iframe. Lives ONLY on this authenticated portal (never the
+// public landing page — push permission is per-origin and we don't want a decline there to block it here).
+var _VAPID_PUBLIC='BLFz77rTLDbuK5ddA9cByIJxKlHQ9_XGE0QINvNHQeua2THXE4-eOWcSI1df6rKdvAdyeUbYXmQZJJrKhwQQNI0';
+function _pushSupported(){ return ('serviceWorker' in navigator)&&('PushManager' in window)&&('Notification' in window); }
+function _urlB64ToUint8(s){ var pad='='.repeat((4-(s.length%4))%4),b=(s+pad).replace(/-/g,'+').replace(/_/g,'/'),raw=atob(b),arr=new Uint8Array(raw.length); for(var i=0;i<raw.length;i++)arr[i]=raw.charCodeAt(i); return arr; }
+// serviceWorker.ready resolves ONLY when an active SW controls the page and NEVER rejects — so race it with a
+// timeout, else a stalled/absent SW (http/localhost, failed activation) hangs the whole notification render (5a).
+async function _pushReg(){ try{ return await Promise.race([navigator.serviceWorker.ready, new Promise(function(r){ setTimeout(function(){ r(null); }, 1500); })]); }catch(e){ return null; } }
+async function _pushCurrentSub(){ var reg=await _pushReg(); if(!reg||!reg.pushManager) return null; try{ return await reg.pushManager.getSubscription(); }catch(e){ return null; } }
+async function _pushIsOn(){ return _pushSupported()&&Notification.permission==='granted'&&!!(await _pushCurrentSub()); }
+// The endpoint is a per-device capability claimed atomically server-side (push_subscriptions_claim, SECURITY
+// DEFINER) so it can only ever belong to ONE client — no shared-device cross-delivery.
+function _pushClaimArgs(sub){ var j=sub.toJSON()||{},k=j.keys||{}; return { p_endpoint:sub.endpoint, p_p256dh:k.p256dh||'', p_auth:k.auth||'', p_ua:(navigator.userAgent||'').slice(0,300) }; }
+async function _pushSubscribe(){
+  if(!_pushSupported()){ if(typeof _cpToast==='function')_cpToast('Push isn\'t available on this device','error'); return false; }
+  if(!APP.currentClientId) return false;
+  if(Notification.permission==='denied'){ if(typeof _cpToast==='function')_cpToast('Notifications are blocked — turn them on in your browser settings, then try again','error'); return false; }
+  try{
+    var perm=Notification.permission==='granted'?'granted':await Notification.requestPermission();
+    if(perm!=='granted') return false;
+    var reg=await _pushReg(); if(!reg||!reg.pushManager) return false;
+    var sub=await reg.pushManager.getSubscription();
+    if(!sub) sub=await reg.pushManager.subscribe({userVisibleOnly:true, applicationServerKey:_urlB64ToUint8(_VAPID_PUBLIC)});
+    await db.rpc('push_subscriptions_claim', _pushClaimArgs(sub));
+    try{ localStorage.setItem('pfos_push_asked','1'); }catch(e){}
+    if(typeof _cpToast==='function')_cpToast('Alerts on — we’ll flag shortfalls, bills, and overspending','success');
+    if(typeof loadNotificationCenter==='function') loadNotificationCenter();
+    return true;
+  }catch(e){ if(typeof _cpToast==='function')_cpToast('Couldn’t enable alerts','error'); return false; }
+}
+async function _pushUnsubscribe(){
+  try{
+    var sub=await _pushCurrentSub();
+    if(sub){ var ep=sub.endpoint; try{ await sub.unsubscribe(); }catch(e){} if(APP.currentClientId) await db.from('push_subscriptions').update({active:false}).eq('client_id',APP.currentClientId).eq('endpoint',ep); }
+    if(typeof _cpToast==='function')_cpToast('Alerts off','success');
+    if(typeof loadNotificationCenter==='function') loadNotificationCenter();
+    return true;
+  }catch(e){ return false; }
+}
+// Auto-heal endpoint ownership: if permission's already granted and a browser subscription exists, (re)claim it
+// for the CURRENT client — so on a shared device or a re-login the active user owns the endpoint. Silent; never prompts.
+async function _pushAutoSync(){
+  try{
+    if(!_pushSupported()||!APP.currentClientId||Notification.permission!=='granted') return;
+    var sub=await _pushCurrentSub(); if(!sub) return;
+    await db.rpc('push_subscriptions_claim', _pushClaimArgs(sub));
+  }catch(e){}
+}
+async function _pushToggleRowHtml(){
+  if(!_pushSupported()) return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:10px;font-size:13px;color:var(--mu)">🔔 Push alerts aren’t available in this browser. Add PFOS to your home screen to enable them.</div>';
+  var on=await _pushIsOn();
+  return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:10px;display:flex;align-items:center;justify-content:space-between;gap:12px">'
+    +'<div><div style="font-size:14px;color:rgba(226,232,240,.9);font-weight:600">🔔 Push alerts</div><div style="font-size:12px;color:var(--mu);margin-top:2px">A heads-up before you’re short before payday, when bills are due, and when you overspend a budget.</div></div>'
+    +'<button onclick="'+(on?'_pushUnsubscribe()':'_pushSubscribe()')+'" class="btn '+(on?'btn-gh':'btn-bl')+'" style="flex-shrink:0;width:auto;padding:8px 16px;font-size:13px">'+(on?'On — turn off':'Turn on')+'</button>'
+  +'</div>';
+}
+
+// ── M4 §4.2a — alert_state snapshot + channel prefs. The client computes the 6 alert signals via its EXISTING
+// single-source detectors (forecast/ledger/sim — no server re-implementation → no drift, 5e) and upserts a compact
+// snapshot row; the §4.2b cron reads it + watches dates/thresholds + sends. DERIVED — separate from financial_data.S,
+// never feeds calc (metric-inert 5b). RLS-scoped to the caller's own row (5d).
+function _alertCtx(){ var fd=(typeof APP!=='undefined'&&APP._portalFd)||{}; return { S:fd.S||(_lastPfosState&&_lastPfosState.state)||{}, calcs:fd.calcs||(_lastPfosState&&_lastPfosState.calcs)||{} }; }
+function _alertStateRow(ctx){
+  var S=(ctx&&ctx.S)||{}, calcs=(ctx&&ctx.calcs)||{}, row={ computed_at:new Date().toISOString() };
+  // 1) shortfall (the flagship) + the next upcoming bill — via _forecastCashFlow (read-only)
+  try{
+    var f=(typeof _forecastCashFlow==='function')?_forecastCashFlow(S,calcs):null;
+    if(f&&f.ok&&f.shortfall){ row.shortfall_date=f.shortfallDate||null; row.shortfall_amount=(f.shortfallAmount!=null?f.shortfallAmount:null); row.shortfall_bills=(f.offendingBills||[]).slice(0,5); }
+    else { row.shortfall_date=null; row.shortfall_amount=null; row.shortfall_bills=null; }
+    var nb=null; if(f&&f.ok&&Array.isArray(f.bills)){ f.bills.forEach(function(b){ if(b&&b.dueDate&&(nb===null||b.dueDate<nb.dueDate)) nb=b; }); }
+    row.next_bill_date=nb?nb.dueDate:null; row.next_bill_name=nb?String(nb.name||'Bill').slice(0,80):null; row.next_bill_amount=nb?nb.amount:null;
+  }catch(e){ row.shortfall_date=null; row.next_bill_date=null; }
+  // 2) emergency fund / low-balance
+  row.ef_months=(typeof calcs.efMonths==='number')?Math.round(calcs.efMonths*100)/100:null;
+  row.low_balance=(typeof calcs.efMonths==='number')?(calcs.efMonths<1):false;
+  // 3) overspent envelopes (this month) — via the §1.7b ledger (read-only)
+  try{ var led=(typeof _budgetLedger==='function')?_budgetLedger(new Date().toISOString().slice(0,7)):null; var ov=(led&&typeof _budgetOverspent==='function')?_budgetOverspent(led):[]; row.overspent=(ov&&ov.length)?ov.slice(0,8):null; }catch(e){ row.overspent=null; }
+  // 4) review queue depth
+  try{ row.review_count=(typeof _reviewCount==='function')?_reviewCount(S):0; }catch(e){ row.review_count=0; }
+  // 5) plan milestones — read the EXISTING cached sim (never re-run the sim here)
+  try{ var sim=(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN._sim)||null; row.milestone=sim?{ debtFreeMonth:(sim.debtFreeMonth||null), fullFundingMonth:(sim.fullFundingMonth||null) }:null; }catch(e){ row.milestone=null; }
+  return row;
+}
+async function _writeAlertState(){
+  try{
+    if(!APP.currentClientId||typeof db==='undefined'||!db) return;
+    var ctx=_alertCtx(); if(!ctx.calcs||!ctx.calcs.inc) return; // no real data yet → skip (untouched user stays byte-identical)
+    var row=_alertStateRow(ctx); row.client_id=APP.currentClientId;
+    await db.from('alert_state').upsert(row,{onConflict:'client_id'}); // payload omits prefs → prefs are PRESERVED on update (disjoint column sets)
+  }catch(e){}
+}
+var _alertWriteTimer=null;
+function _writeAlertStateSoon(){ try{ if(_alertWriteTimer)clearTimeout(_alertWriteTimer); _alertWriteTimer=setTimeout(function(){ _writeAlertState(); },2000); }catch(e){} }
+// Channel prefs — stored in alert_state.prefs (same RLS-scoped row, no clients-table update). Shape:
+// {push:{shortfall,bill_due,low_balance,overspent,review,milestone:bool}}. An ABSENT type defaults to ON.
+var _ALERT_TYPES=['shortfall','bill_due','low_balance','overspent','review','milestone'];
+async function _loadNotifPrefs(){ try{ if(!APP.currentClientId)return {}; var q=await db.from('alert_state').select('prefs').eq('client_id',APP.currentClientId).maybeSingle(); return (q&&q.data&&q.data.prefs)||{}; }catch(e){ return {}; } }
+async function _setNotifPref(type,on){
+  try{
+    if(!APP.currentClientId||_ALERT_TYPES.indexOf(type)<0) return false;
+    var cur=await _loadNotifPrefs(); var push=cur.push||{}; push[type]=!!on; cur.push=push;
+    await db.from('alert_state').upsert({client_id:APP.currentClientId, prefs:cur},{onConflict:'client_id'}); // payload omits signals → signals PRESERVED (disjoint column sets)
+    return true;
+  }catch(e){ return false; }
+}
+// §4.2c — per-alert-type toggles + the rail/smart-alert reconciliation. _railedAlertTypes = the alert_<type> the
+// sweep already wrote to the in-app rail TODAY; generateSmartAlerts suppresses the live dup so a subscribed user
+// never sees the same condition twice (sweep rail item + live smart-alert).
+var _railedAlertTypes={};
+var _NOTIF_LABELS={shortfall:'Cash shortfall warnings',bill_due:'Bill reminders',low_balance:'Low reserves',overspent:'Over-budget alerts',review:'Transactions to review'};
+async function _toggleNotifType(type){ try{ var p=await _loadNotifPrefs(); var on=((p.push||{})[type])!==false; await _setNotifPref(type,!on); if(typeof loadNotificationCenter==='function') loadNotificationCenter(); }catch(e){} }
+async function _pushPrefsPanelHtml(){
+  var master=await _pushToggleRowHtml();
+  if(!_pushSupported()||!(await _pushIsOn())) return master; // unsupported/off → just the master toggle
+  var prefs=(await _loadNotifPrefs()).push||{};
+  var rows=Object.keys(_NOTIF_LABELS).map(function(t){ var en=prefs[t]!==false;
+    return '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:7px 0;border-top:1px solid var(--bd)">'
+      +'<span style="font-size:13px;color:rgba(226,232,240,.8)">'+_NOTIF_LABELS[t]+'</span>'
+      +'<button onclick="_toggleNotifType(\''+t+'\')" class="btn '+(en?'btn-bl':'btn-gh')+'" style="flex-shrink:0;width:auto;padding:3px 12px;font-size:11px">'+(en?'On':'Off')+'</button>'
+    +'</div>'; }).join('');
+  return master+'<div style="background:var(--bg-card);border:1px solid var(--bd);border-top:none;border-radius:0 0 2px 2px;margin:-10px 0 10px;padding:2px 13px 9px"><div style="font-size:11px;color:var(--mu);padding:7px 0 2px">Which alerts</div>'+rows+'</div>';
+}
+
 async function loadNotificationCenter(){
   if(!APP.currentClientId) return;
   var el = document.getElementById('notificationCenterList'); if(!el) return;
-  // Generate smart alerts
-  generateSmartAlerts();
   generateAdvisorCheckIn();
   generateAnniversaryMilestones();
   try{
@@ -6140,10 +6467,15 @@ async function loadNotificationCenter(){
       .eq('client_id',APP.currentClientId).eq('is_read',false)
       .order('created_at',{ascending:false}).limit(20);
     var notifs = data||[];
+    // §4.2c: which alert types the sweep already railed TODAY → suppress the live smart-alert dup (no double-display).
+    _railedAlertTypes={}; var _td=new Date().toISOString().slice(0,10);
+    notifs.forEach(function(n){ if(n&&n.type&&String(n.type).indexOf('alert_')===0&&String(n.created_at).slice(0,10)===_td) _railedAlertTypes[String(n.type).slice(6)]=true; });
+    generateSmartAlerts(); // suppression-aware (runs AFTER _railedAlertTypes is computed)
     var badge = document.getElementById('notifBadge');
     if(badge){ badge.textContent=notifs.length; badge.style.display=notifs.length>0?'inline':'none'; }
-    if(!notifs.length){ el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:20px 0">✅ No unread notifications.</div>'; return; }
-    el.innerHTML = notifs.map(function(n){
+    var pushRow=''; try{ await _pushAutoSync(); pushRow = await _pushPrefsPanelHtml(); }catch(e){} // never let the push panel block/blank the list (5a)
+    if(!notifs.length){ el.innerHTML=pushRow+'<div style="color:var(--mu);font-size:14px;padding:20px 0">✅ No unread notifications.</div>'; return; }
+    el.innerHTML = pushRow + notifs.map(function(n){
       return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:13px;margin-bottom:8px;display:flex;align-items:flex-start;justify-content:space-between;gap:12px">'
         +'<div>'
           +'<div style="font-size:14px;color:rgba(226,232,240,.85);line-height:1.7;margin-bottom:4px">'+esc(n.message)+'</div>'
@@ -6152,7 +6484,7 @@ async function loadNotificationCenter(){
         +'<button onclick="dismissNotification(\''+n.id+'\')" style="flex-shrink:0;background:none;border:1px solid var(--bd);color:var(--mu);font-size:13px;padding:4px 10px;border-radius:2px;cursor:pointer">✕ Dismiss</button>'
       +'</div>';
     }).join('');
-  }catch(e){ el.innerHTML='<div style="color:var(--rd);font-size:13px">Error loading notifications</div>'; }
+  }catch(e){ _railedAlertTypes={}; generateSmartAlerts(); el.innerHTML='<div style="color:var(--rd);font-size:13px">Error loading notifications</div>'; } // on a fetch error, still render smart-alerts (no suppression)
 }
 
 // ── SMART ALERTS (Batch 32) ─────────────────────────────
@@ -6164,8 +6496,8 @@ function generateSmartAlerts(){
   // Spending pattern alerts
   if((c.savingsRate||0)<5) alerts.push({icon:'🚨',col:'var(--rd)',msg:'Your savings rate is below 5%. Even small increases make a big difference — try saving an extra $50/month.'});
   if((c.dti||0)>43) alerts.push({icon:'⚠️',col:'var(--or)',msg:'Your debt-to-income ratio is above 43% — this can limit your ability to borrow. Consider accelerating debt payoff.'});
-  if((c.efMonths||0)<1) alerts.push({icon:'🛡️',col:'var(--rd)',msg:'You have less than 1 month of emergency fund. This is your top priority — build to 3 months before other goals.'});
-  if((c.netCF||0)<0) alerts.push({icon:'💸',col:'var(--rd)',msg:'You\'re spending more than you earn this month. Review your expenses for areas to cut back.'});
+  if((c.efMonths||0)<1 && !_railedAlertTypes.low_balance) alerts.push({icon:'🛡️',col:'var(--rd)',msg:'You have less than 1 month of emergency fund. This is your top priority — build to 3 months before other goals.'}); // §4.2c: suppressed if the sweep already railed low_balance today
+  if((c.netCF||0)<0 && !_railedAlertTypes.shortfall) alerts.push({icon:'💸',col:'var(--rd)',msg:'You\'re spending more than you earn this month. Review your expenses for areas to cut back.'}); // §4.2c: suppressed if the sweep already railed shortfall today
   // Positive alerts
   if((c.savingsRate||0)>=20) alerts.push({icon:'🌟',col:'var(--gr)',msg:'Savings rate above 20% — outstanding! You\'re building wealth faster than 85% of Americans.'});
   if((c.efMonths||0)>=6) alerts.push({icon:'🏰',col:'var(--gr)',msg:'6+ months emergency fund — excellent! Consider redirecting surplus to investments for higher returns.'});
@@ -6687,7 +7019,7 @@ function _portalRenderCalendar(month,year,bills,entries,recurring){
   h+='</div>';
   // Legend + Export All button
   h+='<div style="display:flex;flex-wrap:wrap;align-items:center;gap:12px;margin-top:10px">';
-  h+='<button onclick="_portalExportAllBillsICS()" class="btn bbl" style="padding:8px 14px;font-size:13px;flex:0 0 auto">📅 Export All Bills</button>';
+  h+='<button onclick="_portalExportAllBillsICS()" class="btn btn-bl" style="padding:8px 14px;font-size:13px;flex:0 0 auto">📅 Export All Bills</button>';
   h+='<div style="display:flex;align-items:center;gap:4px;font-size:12px;color:var(--mu)"><span style="width:8px;height:8px;border-radius:50%;background:var(--gr);display:inline-block"></span> Pay Day</div>';
   h+='<div style="display:flex;align-items:center;gap:4px;font-size:12px;color:var(--mu)"><span style="width:8px;height:8px;border-radius:50%;background:var(--rd);display:inline-block"></span> Bill Due</div>';
   if(recurring&&recurring.length)h+='<div style="display:flex;align-items:center;gap:4px;font-size:12px;color:var(--mu)"><span style="width:8px;height:8px;border-radius:50%;background:#8B5CF6;display:inline-block"></span> Recurring</div>';
@@ -8267,8 +8599,9 @@ function _spendingCategoryAggregates(monthEntries){
   var totals={};
   (monthEntries||[]).forEach(function(e){
     _spendSplitParts(e).forEach(function(p){
+    var pa=parseFloat(p.amount)||0; if(pa<=0)return; // §4.3: income (amt<=0, e.g. an imported paycheck) is not spend
     var k=p.category||p.category_bucket||'misc';
-    totals[k]=(totals[k]||0)+(parseFloat(p.amount)||0);
+    totals[k]=(totals[k]||0)+pa;
     });
   });
   var slices=getL1Cats().map(function(c){
@@ -8638,7 +8971,7 @@ function _ledgerActivityMap(S,ym){
   var y=parseInt(ym.slice(0,4),10), m=parseInt(ym.slice(5,7),10)-1, map={};
   (S.spendingEntries||[]).forEach(function(e){
     if(!e)return; var d=new Date(e.date); if(d.getFullYear()!==y||d.getMonth()!==m)return;
-    _spendSplitParts(e).forEach(function(p){ var k=p.category||p.category_bucket||'misc'; map[k]=(map[k]||0)+(parseFloat(p.amount)||0); });
+    _spendSplitParts(e).forEach(function(p){ var pa=parseFloat(p.amount)||0; if(pa<=0)return; var k=p.category||p.category_bucket||'misc'; map[k]=(map[k]||0)+pa; }); // §4.3: income (amt<=0) is not spend activity
   });
   return map;
 }
@@ -8672,7 +9005,7 @@ function _ledgerActivityByMonth(S,months){
     if(!e)return; var d=new Date(e.date); if(isNaN(d.getTime()))return;
     var ym=d.getFullYear()+'-'+('0'+(d.getMonth()+1)).slice(-2); if(!want[ym])return;
     var bk=out[ym]||(out[ym]={});
-    _spendSplitParts(e).forEach(function(p){ var k=p.category||p.category_bucket||'misc'; bk[k]=(bk[k]||0)+(parseFloat(p.amount)||0); });
+    _spendSplitParts(e).forEach(function(p){ var pa=parseFloat(p.amount)||0; if(pa<=0)return; var k=p.category||p.category_bucket||'misc'; bk[k]=(bk[k]||0)+pa; }); // §4.3: income (amt<=0) is not spend activity
   });
   return out;
 }
@@ -10140,14 +10473,14 @@ function _portalRenderSpendDashboard(){
 
   // Empty state — no income on file
   if(moneyIn<=0){
-    return'<div style="padding:32px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:40px;margin-bottom:12px">💰</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Welcome to Your Spending Pulse</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">Enter your income in <strong style="color:#5B9BFF">My Financial Data</strong> to unlock the live spending dashboard, bill calendar, and category insights.</div><div style="display:flex;justify-content:center;gap:18px;margin-top:18px;font-size:13px;color:var(--mu);font-family:var(--fh);font-weight:600">📊 Daily budget · 📅 Bill calendar · 🔔 Smart alerts</div></div>';
+    return'<div style="padding:32px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:40px;margin-bottom:12px">💰</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Welcome to Your Spending Pulse</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">Enter your income in <strong style="color:#5B9BFF">My Financial Data</strong> to unlock the live spending dashboard, bill calendar, and category insights.</div><div style="margin-bottom:6px"><button onclick="openImportWizard()" aria-label="Import transactions from Monarch, YNAB, Mint, or any bank CSV" style="padding:10px 20px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.35);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:40px">⬆ Import from Monarch / YNAB / Mint</button></div><div style="display:flex;justify-content:center;gap:18px;margin-top:18px;font-size:13px;color:var(--mu);font-family:var(--fh);font-weight:600">📊 Daily budget · 📅 Bill calendar · 🔔 Smart alerts</div></div>';
   }
 
   // First-run snapshot prompt
   var snap=S.snapshot||{};
   var needsSnapshot=!snap.setupDate&&moneyIn>0;
   if(needsSnapshot){
-    return'<div style="padding:28px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:38px;margin-bottom:12px">📍</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Calibrate Your Starting Point</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">It\'s mid-month. Tell us where you stand right now so your spending dashboard is accurate from day one.</div><button onclick="_portalShowSnapshotSetup()" style="padding:11px 22px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:42px">Set My Starting Point →</button></div>';
+    return'<div style="padding:28px 20px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:38px;margin-bottom:12px">📍</div><div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:8px">Calibrate Your Starting Point</div><div style="font-size:13px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 16px">It\'s mid-month. Tell us where you stand right now so your spending dashboard is accurate from day one.</div><button onclick="_portalShowSnapshotSetup()" style="padding:11px 22px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:42px">Set My Starting Point →</button><div style="margin-top:12px"><button onclick="openImportWizard()" aria-label="Import transactions from Monarch, YNAB, Mint, or any bank CSV" style="padding:9px 18px;background:transparent;border:1px solid rgba(91,155,255,.3);color:#5B9BFF;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:38px">⬆ Import from Monarch / YNAB / Mint</button></div></div>';
   }
 
   var h='';
@@ -10202,6 +10535,9 @@ function _portalRenderSpendDashboard(){
   h+='<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap">';
   h+='<button onclick="_portalOpenAddExpense()" style="flex:1;min-width:140px;padding:12px;background:linear-gradient(135deg,#0044BF,#1155D9);border:none;color:#fff;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:44px;letter-spacing:.04em;box-shadow:0 4px 14px rgba(0,68,191,.3)">+ Add Expense</button>';
   h+='<button onclick="if(typeof _clientOpenGoalModal===\'function\')_clientOpenGoalModal();" style="flex:1;min-width:140px;padding:12px;background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.25);color:var(--gr);font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:44px;letter-spacing:.04em">+ Savings Goal</button>';
+  // §4.3: Import lives on the (ungated) Spending screen so Monarch/YNAB/Mint migrants — who by definition
+  // have NO Plaid link — can actually reach it (the Reports-bar copy in renderReportsView is Plaid-tab-gated).
+  h+='<button onclick="openImportWizard()" aria-label="Import transactions from a CSV file (Monarch, YNAB, Mint, or any bank)" style="flex:1;min-width:140px;padding:12px;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-family:var(--fh);font-size:14px;font-weight:700;border-radius:4px;cursor:pointer;min-height:44px;letter-spacing:.04em">⬆ Import CSV</button>';
   h+='</div>';
 
   // ── Goals (manage existing: edit / add money / buckets) ──
@@ -12070,14 +12406,17 @@ function renderOnboardingChecklist(){
     {label:'Run your financial analysis', done: calcs && calcs.cfScore>0}
   ];
   var allDone = steps.every(function(s){return s.done;});
-  if(allDone){ return; } // hide checklist if everything is done
+  if(allDone){ return; } // hide checklist when the CORE steps are done (the optional import step doesn't gate this)
+  // §4.3b: an optional one-tap "switch from Monarch/YNAB/Mint" import step (clickable → the import wizard).
+  steps.push({label:'Import from Monarch / YNAB / Mint (optional)', done: !!(S.spendingEntries && S.spendingEntries.some(function(e){return e&&e._source==='import';})), action:'openImportWizard()'});
   var el = document.getElementById('onboardingChecklist');
   var itemsEl = document.getElementById('checklistItems');
   if(!el||!itemsEl) return;
   itemsEl.innerHTML = steps.map(function(s){
-    return '<div style="display:flex;align-items:center;gap:10px;padding:5px 0;font-size:14px;color:'+(s.done?'var(--gr)':'rgba(226,232,240,.75)')+'">'
-      +'<span style="font-size:16px">'+(s.done?'✅':'⬜')+'</span>'
-      +'<span style="'+(s.done?'text-decoration:line-through;color:var(--mu)':'')+'">'+esc(s.label)+'</span>'
+    var clk=!!s.action;
+    return '<div '+(clk?'onclick="'+s.action+'" ':'')+'style="display:flex;align-items:center;gap:10px;padding:5px 0;font-size:14px;color:'+(s.done?'var(--gr)':'rgba(226,232,240,.75)')+(clk?';cursor:pointer':'')+'">'
+      +'<span style="font-size:16px">'+(s.done?'✅':(clk?'📥':'⬜'))+'</span>'
+      +'<span style="'+(s.done?'text-decoration:line-through;color:var(--mu)':'')+'">'+esc(s.label)+(clk&&!s.done?' <span style="color:#5B9BFF;font-size:12px">→</span>':'')+'</span>'
     +'</div>';
   }).join('');
   el.style.display='block';
@@ -13293,6 +13632,7 @@ window.addEventListener('message',async function(e){
     }catch(e){console.warn('[PFOS] policy_tracking deactivation failed:',e);}
     return;
   }
+  if(msg.type==='PFOS_IMPORT_DONE'){ if(typeof _cpToast==='function')_cpToast('Imported '+(msg.added||0)+' transaction'+((msg.added||0)!==1?'s':'')+' ✓','success'); return; } // §4.3b: the engine acks the REAL added count
   if(msg.type==='PFOS_DATA_CHANGE'){
     if(!APP.currentClientId) return;
     // ══ A3: Client switch race condition guard ══
@@ -13301,6 +13641,7 @@ window.addEventListener('message',async function(e){
       console.warn('[PFOS] ⛔ Client switch race: msg.clientId='+msg.clientId+' but current='+APP.currentClientId+' — dropping save');return;
     }
     if(!_pfosDataLoaded){console.log('[PFOS] Skipping save — data not loaded yet');return;}
+    if(typeof _writeAlertStateSoon==='function') _writeAlertStateSoon(); // §4.2a (M4): refresh the alert snapshot after the edit settles (debounced)
     try{
       var state=msg.state,calcs=state.calcs||{};
       // ══ FIRST-SAVE DATA PROTECTION ══
@@ -45264,10 +45605,11 @@ async function _cpSendChangeRequest(i){
 }
 
 // Small toast notification helper — auto-dismiss after 2.5s
-function _cpToast(msg){
+function _cpToast(msg,type){
   if(!msg)return;
   var t=document.createElement('div');
-  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 18px;background:rgba(0,0,0,.85);color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none;transition:opacity .3s';
+  var bg=type==='error'?'var(--rd)':(type==='success'?'var(--gr)':'rgba(0,0,0,.85)');
+  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);padding:10px 18px;background:'+bg+';color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;z-index:99999;box-shadow:0 4px 16px rgba(0,0,0,.3);pointer-events:none;transition:opacity .3s';
   t.textContent=msg;
   document.body.appendChild(t);
   setTimeout(function(){t.style.opacity='0';},2200);
