@@ -739,9 +739,38 @@ function _issuesDetect(ctx){
 
   }
   function _issuesToCp(issue){ return issue; }
+  // ── M5.2 — canonical PRIORITY RANK (engine-exact). Mirrors the engine's deDetectFlags ordering
+  // (pfos-main deDetectFlags): sort by LEVEL (1 Stability → 4 Growth) then severity then a stable
+  // tiebreak. PFOSIssues flags carry `action` + `type` (not DE's level/severity), so we map each
+  // action → the level DE assigns the equivalent concern, and derive severity from `type`. The
+  // within-level tiebreak is the ORIGINAL detector push-order (the authored ladder the unassigned
+  // cards already render by). PURE: reads only the flags' own fields, never mutates them (the
+  // push-index is captured in a throwaway wrapper). The `_spouse` action suffix is stripped so a
+  // spouse flag ranks at its base concern's level (so a spouse EF crit sorts with EF, not last).
+  var _ACTION_LEVEL = {
+    // Level 1 — Stability: cash flow, emergency fund, employer match (= free money, DE level 1 critical)
+    expenses:1, cashflow:1, ef:1, '401k':1,
+    // Level 2 — Risk Protection: life/disability/LTC protection, estate (will/beneficiary)
+    protection:2, estate:2,
+    // Level 3 — Efficiency: high-interest debt/DTI, umbrella, HSA, savings rate, rollover/consolidation
+    debt:3, protection_ext:3, hsa:3, savings:3, rollover:3,
+    // Level 4 — Growth & opportunities: retirement, education, growth/diversification, annuity/IBC/policy
+    retirement:4, edu:4, growth:4, annuity_research:4, ibc:4, ibc_audit:4, existing_policy:4, diversify:4
+  };
+  var _TYPE_SEV = { crit:0, warn:1, opp:2, info:3 };   // PFOSIssues `type` → DE severity rank (critical<high<medium<low)
+  function _issuesRank(issues){
+    if(!issues||!issues.length) return issues||[];
+    function baseAction(a){ a=a||''; var k=a.indexOf('_spouse'); return k>0 ? a.slice(0,k) : a; }
+    return issues
+      .map(function(f,i){ var l=_ACTION_LEVEL[baseAction(f&&f.action)]; var s=_TYPE_SEV[f&&f.type];
+        return { f:f, i:i, l:(l!=null?l:3), s:(s!=null?s:3) }; })
+      .sort(function(a,b){ return (a.l-b.l) || (a.s-b.s) || (a.i-b.i); })
+      .map(function(x){ return x.f; });
+  }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;
-  g.PFOSIssues.toCp = _issuesToCp;   // canonical red-flag / "what to do next" detector + ranking
+  g.PFOSIssues.toCp = _issuesToCp;   // identity pass-through (per-shell transform seam)
+  g.PFOSIssues.rank = _issuesRank;   // canonical engine-exact priority sort (M5.2; registered, wired by 5.2b+)
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (7-category)
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
   g.PFOSRecs   = g.PFOSRecs   || {};   // canonical Recommendation type + lifecycle
