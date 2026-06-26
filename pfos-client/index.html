@@ -24188,6 +24188,81 @@ async function _runSandwichGen(){
   el.innerHTML=h;
 }
 
+// ── M5.3b — PURCHASE → plan-impact. Returns a purchase's nest-egg + (for recurring) FI-date cost.
+// ONE-OFF → opportunity cost = the lump compounded to the user's retirement (the projection has no single-month
+// input). MONTHLY → the sim's retirement series is driven by ALLOCATION amounts, NOT raw surplus (surplus only
+// feeds the 0%-growth unallocated bucket = net worth, excluded from retirement). So a recurring purchase's plan
+// cost = the investing it competes with: on a CLONE, reduce funded GROWTH allocations by amt (marginal-first),
+// re-run the cascade, diff FI year + projRetValue vs a clean baseline — the proven _bridgeReduceDiff lever — then
+// RESTORE allocations/_sim in a finally (_cpRunSimulation never writes S.calcs ⇒ calcs byte-identical = 5b).
+// Nest-egg = the re-sim delta when the user actually invests, else the closed-form annuity opportunity cost (so a
+// non-investing user still sees the cost, never a false "Negligible"). 6.5% matches _portalSpendPlanImpact (the
+// portal's plan-impact sibling). NOT cached (a plan-sig cache would false-hit across amounts).
+function _bridgePurchaseImpact(amt, recurrence, calcs){
+  amt=Math.max(0,_lnum(amt)); if(amt<=0)return null;
+  var age=_lnum((typeof CPLAN!=='undefined'&&CPLAN.age)||0); if(age<=0)age=30;
+  var retAge=_lnum((typeof CPLAN!=='undefined'&&CPLAN.retirementAge)||65);
+  var yrs=Math.max(1,retAge-age), rate=0.065;
+  if(recurrence!=='monthly'){
+    return {recurrence:'once', amt:amt, yearsToRet:yrs, nestEggCost:Math.round(amt*Math.pow(1+rate,yrs)), fiComputable:false, fiMonthsDelta:0};
+  }
+  // MONTHLY — nest-egg defaults to the closed-form annuity opportunity cost; FI-date + a plan-accurate nest-egg
+  // come from the re-sim below when the user has funded growth allocations to reduce.
+  var mr=rate/12, months=yrs*12, annuityCost=Math.round(amt*((Math.pow(1+mr,months)-1)/mr));
+  var res={recurrence:'monthly', amt:amt, yearsToRet:yrs, nestEggCost:annuityCost, fiComputable:false,
+           fiAgeBefore:null, fiAgeAfter:null, fiYearsDelta:0, fiMonthsDelta:0};
+  if(typeof CPLAN==='undefined'||!Array.isArray(CPLAN.allocations)||typeof _cpRunSimulation!=='function')return res;
+  var fiNumber=_lnum((calcs&&calcs.fiNumber)||CPLAN.fiNumber||0);
+  var GROWTH={roth:1,'401k':1,roth401k:1,iul:1,wl:1,invest:1,edu:1,trad_ira:1,solo401k:1,sep_ira:1,hsa:1,ibc:1,custom:1};
+  var savedAllocs=CPLAN.allocations, savedSim=CPLAN._sim;
+  try{
+    // clean baseline (clone so the live array is never mutated)
+    CPLAN.allocations=JSON.parse(JSON.stringify(savedAllocs));
+    _cpRunSimulation(); var b=CPLAN._sim||{};
+    var fiB=_bridgeFiYearOf(b,fiNumber), prvB=_lnum(b.projRetValue), H=(Array.isArray(b.retirement)?b.retirement.length:31);
+    // perturbed: reduce funded growth allocations by amt, marginal-first (latest phase, smallest amount)
+    var clone=JSON.parse(JSON.stringify(savedAllocs)), order=[];
+    for(var i=0;i<clone.length;i++){ var a0=clone[i]; if(a0&&GROWTH[a0.type]&&_lnum(a0.amount)>0)order.push(i); }
+    order.sort(function(x,y){ var ax=clone[x],ay=clone[y],px=(ax.phase!=null?ax.phase:1),py=(ay.phase!=null?ay.phase:1); return px!==py?(py-px):(_lnum(ax.amount)-_lnum(ay.amount)); });
+    var toCut=amt; for(var j=0;j<order.length&&toCut>0;j++){ var aj=clone[order[j]], cur=_lnum(aj.amount), cut=Math.min(cur,toCut); aj.amount=cur-cut; toCut-=cut; }
+    CPLAN.allocations=clone;
+    _cpRunSimulation(); var a2=CPLAN._sim||{};
+    var fiA=_bridgeFiYearOf(a2,fiNumber), prvA=_lnum(a2.projRetValue);
+    var fiYD; if(fiB>=0&&fiA>=0)fiYD=fiA-fiB; else if(fiB>=0&&fiA<0)fiYD=H-fiB; else fiYD=0;
+    var simNest=Math.round(prvB-prvA);
+    res.fiComputable=(fiNumber>0);
+    res.fiAgeBefore=(fiB>=0&&age>0)?(age+fiB):null;
+    res.fiAgeAfter=(fiA>=0&&age>0)?(age+fiA):null;
+    res.fiYearsDelta=fiYD; res.fiMonthsDelta=Math.round(fiYD*12);
+    res.investCut=amt-toCut;
+    if(simNest>0)res.nestEggCost=simNest;   // plan-accurate (engine rate) when the user invests; else keep the annuity opportunity cost
+  }catch(_e){}
+  finally{ CPLAN.allocations=savedAllocs; CPLAN._sim=savedSim; }
+  return res;
+}
+// Render the plan-impact section for the Can-I-Afford modal. Reuses statTile + tokens (no one-off styling).
+function _ciPlanImpactHTML(pi){
+  if(!pi)return '';
+  var h='<div style="padding:12px 14px;background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.16);border-radius:6px;margin:12px 0">';
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--gr);margin-bottom:8px">🎯 Impact on your plan</div>';
+  if(pi.recurrence==='monthly'){
+    var tiles='';
+    if(pi.fiComputable&&pi.fiMonthsDelta>0){
+      var fiTxt=pi.fiMonthsDelta>=12?(Math.round(pi.fiMonthsDelta/12*10)/10)+' yr later':pi.fiMonthsDelta+' mo later';
+      tiles+=statTile(fiTxt,'FI date'+((pi.fiAgeBefore&&pi.fiAgeAfter)?' ('+pi.fiAgeBefore+'→'+pi.fiAgeAfter+')':''),'var(--or)');
+    }
+    if(pi.nestEggCost>0) tiles+=statTile('−'+fmtK(pi.nestEggCost),'Nest egg by retirement','var(--rd)');
+    if(!tiles) tiles=statTile('~$0','Negligible plan impact','var(--gr)');
+    h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px">'+tiles+'</div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:8px;line-height:1.5">A recurring '+fmt(pi.amt)+'/mo that isn’t invested compounds away — its modeled cost to your retirement nest egg'+(pi.fiMonthsDelta>0?' and financial-independence date':'')+'.</div>';
+  } else {
+    h+='<div style="display:grid;grid-template-columns:1fr;gap:6px">'+statTile('−'+fmtK(pi.nestEggCost),'Nest egg by retirement (in '+pi.yearsToRet+' yr)','var(--rd)')+'</div>';
+    h+='<div style="font-size:11px;color:var(--mu);margin-top:8px;line-height:1.5">Invested instead, this one-time '+fmt(pi.amt)+' would grow to about '+fmtK(pi.nestEggCost)+' by the time you retire — its true long-run cost.</div>';
+  }
+  h+='</div>';
+  return h;
+}
+
 // ═══ #65 — IBC Health Monitor (FLAGSHIP) ═══
 // ═══ #66 — Can I Afford This? (FLAGSHIP) ═══
 function renderCanIAfford(){
@@ -24210,7 +24285,10 @@ function renderCanIAfford(){
 
   // ── Inputs ──
   h+='<div class="row"><div class="fi"><label class="lb">Purchase Amount</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="cia_amt" value="200" oninput="calcCanIAfford()" style="padding-left:22px;min-height:36px"></div></div>';
-  h+='<div class="fi"><label class="lb">Need or Want?</label><select class="sel" id="cia_type" onchange="calcCanIAfford()" style="min-height:36px"><option value="want">Want</option><option value="need">Need</option></select></div></div>';
+  h+='<div class="fi"><label class="lb">Need or Want?</label><select class="sel" id="cia_type" onchange="calcCanIAfford()" style="min-height:36px"><option value="want">Want</option><option value="need">Need</option></select></div>';
+  // M5.3b — recurrence toggle (dark: only added when coreAids ON, so OFF the row is byte-identical)
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.coreAids) h+='<div class="fi"><label class="lb">How often?</label><select class="sel" id="cia_recur" onchange="calcCanIAfford()" style="min-height:36px"><option value="once">One-time</option><option value="monthly">Every month</option></select></div>';
+  h+='</div>';
 
   h+='<div id="cia_results"></div>';
   el.innerHTML=h;calcCanIAfford();
@@ -24269,6 +24347,14 @@ async function _runCanIAfford(){
     h+='</div>';
   }
 
+  // ── M5.3b — PLAN IMPACT (dark: PFOS_FLAGS.coreAids). What the purchase costs the user's long-term plan —
+  // nest-egg (always) + FI-date (recurring). Metric-inert (the bridge restores CPLAN in a finally). OFF, or no
+  // plan loaded → nothing appended (today's budget-only view is byte-identical). ──
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.coreAids){
+    var _ciRecur=gv('cia_recur')||'once';
+    var _ciPi=null; try{ _ciPi=_bridgePurchaseImpact(amt,_ciRecur,c); }catch(_e){}
+    if(_ciPi) h+=_ciPlanImpactHTML(_ciPi);
+  }
   h+=calcShareBtn();
   h+=calcDisclaim('Affordability based on current monthly surplus (income minus expenses). Does not account for upcoming irregular expenses, goal contributions, or debt payments beyond minimums.');
   el.innerHTML=h;
