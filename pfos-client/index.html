@@ -6656,7 +6656,34 @@ function generateAnniversaryMilestones(){
   el.innerHTML=h;
 }
 
-// ── COUPLE VIEW (Batch 33) ──────────────────────────────
+// ── Couple View helpers (redesign: account map, shared goals, contribution, timeline) ──
+// Collect itemized accounts from a financial state S, by ownership lens. 'personal' = the person's own
+// items (owner != 'joint') + their scalar cash; 'joint' = only items explicitly owner==='joint'.
+function _cvAccounts(S,lens){
+  S=S||{}; var out=[];
+  var isJoint=function(o){return String(o||'').toLowerCase()==='joint';};
+  var want=function(o){return lens==='joint'?isJoint(o):!isJoint(o);};
+  (S.debts||[]).forEach(function(d){ if(!d||!want(d.owner))return; var b=parseFloat(d.balance)||0; if(b<=0)return; out.push({name:d.name||d.type||'Debt',balance:b,kind:'debt'}); });
+  (S.investments||[]).forEach(function(i){ if(!i||!want(i.owner))return; if(String(i.type||'').toLowerCase()==='crypto')return; var b=parseFloat(i.balance)||0; if(b<=0)return; out.push({name:i.name||_cvInvLabel(i.type),balance:b,kind:'asset'}); });
+  (S.retAccounts||[]).forEach(function(r){ if(!r||!want(r.owner))return; var b=parseFloat(r.balance)||0; if(b<=0)return; out.push({name:r.name||r.type||'Retirement',balance:b,kind:'asset'}); });
+  (S.linkedCash||[]).forEach(function(lc){ if(!lc||lc.include===false||!want(lc.owner))return; var b=parseFloat(lc.balance)||0; if(b<=0)return; out.push({name:lc.name||lc.subtype||'Cash',balance:b,kind:'asset'}); });
+  if(lens==='personal'){ var a=S.assets||{}; var chk=parseFloat(a.checking)||0, sav=parseFloat(a.savings)||0; if(chk>0)out.push({name:'Checking',balance:chk,kind:'asset'}); if(sav>0)out.push({name:'Savings',balance:sav,kind:'asset'}); }
+  return out;
+}
+function _cvInvLabel(t){ var m={brokerage:'Brokerage','401k':'401(k)',roth401k:'Roth 401(k)',roth:'Roth IRA',trad_ira:'IRA',ira:'IRA',hsa:'HSA',invest:'Investment'}; return m[String(t||'').toLowerCase()]||(t||'Investment'); }
+function _cvAcctList(accts,emptyMsg){
+  if(!accts||!accts.length) return '<div style="font-size:12px;color:var(--mu);padding:8px 0">'+(emptyMsg||'No accounts listed.')+'</div>';
+  var net=0, h='';
+  accts.slice().sort(function(a,b){return b.balance-a.balance;}).forEach(function(a){ net+=(a.kind==='debt'?-1:1)*a.balance;
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><span style="color:var(--wh);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(a.kind==='debt'?'💳 ':'💰 ')+esc(a.name)+'</span><span style="color:'+(a.kind==='debt'?'var(--rd)':'var(--gr)')+';white-space:nowrap;font-family:var(--fh);font-weight:600">'+(a.kind==='debt'?'-':'')+fmt(a.balance)+'</span></div>';
+  });
+  h+='<div style="display:flex;justify-content:space-between;padding:6px 0 0;font-size:13px;font-weight:700"><span style="color:var(--mu)">Net</span><span style="color:'+(net>=0?'var(--gr)':'var(--rd)')+'">'+fmtK(net)+'</span></div>';
+  return h;
+}
+function _cvAgo(iso){ try{ var d=Math.floor((Date.now()-new Date(iso).getTime())/86400000); if(d<=0)return 'today'; if(d===1)return 'yesterday'; if(d<30)return d+' days ago'; var m=Math.floor(d/30); return m+' month'+(m>1?'s':'')+' ago'; }catch(e){ return ''; } }
+function _cvAcctTab(tid,which){ ['mine','theirs','ours'].forEach(function(w){ var c=document.getElementById(tid+'_'+w); if(c)c.style.display=(w===which)?'':'none'; var b=document.getElementById(tid+'_tab_'+w); if(b){var on=(w===which); b.style.border='1px solid '+(on?'rgba(91,155,255,.5)':'var(--bd)'); b.style.background=on?'rgba(91,155,255,.15)':'transparent'; b.style.color=on?'#5B9BFF':'var(--mu)';} }); }
+
+// ── COUPLE VIEW (Batch 33 · redesigned) ──────────────────────────────
 async function renderCoupleView(){
   var el=document.getElementById('coupleViewContent');if(!el) return;
   el.innerHTML='<div style="color:var(--mu);font-size:13px">Loading couple data...</div>';
@@ -6668,11 +6695,12 @@ async function renderCoupleView(){
     var _hh=link.household_type;
     // Load both profiles. maybeSingle (NOT single) — a JOINT household's client_b has NO profile row
     // (data lives under client_a), so single() errored/stalled the couple view for the joint primary.
-    var {data:myProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',APP.currentClientId).maybeSingle();
-    var {data:partnerProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',partnerId).maybeSingle();
+    var {data:myProfile}=await db.from('client_profiles').select('financial_data,scores,updated_at').eq('client_id',APP.currentClientId).maybeSingle();
+    var {data:partnerProfile}=await db.from('client_profiles').select('financial_data,scores,updated_at').eq('client_id',partnerId).maybeSingle();
     var {data:partnerClient}=await db.from('clients').select('name').eq('id',partnerId).maybeSingle();
-    var myFd=(myProfile&&myProfile.financial_data)?myProfile.financial_data:{};var myC=myFd.calcs||{};
-    var pFd=(partnerProfile&&partnerProfile.financial_data)?partnerProfile.financial_data:{};var pC=pFd.calcs||{};
+    var sharedGoals=[]; try{ var _sgR=await db.from('shared_goals').select('*').eq('couple_link_id',link.id); sharedGoals=(_sgR&&_sgR.data)||[]; }catch(_sgE){}
+    var myFd=(myProfile&&myProfile.financial_data)?myProfile.financial_data:{};var myC=myFd.calcs||{};var myS=myFd.S||{};
+    var pFd=(partnerProfile&&partnerProfile.financial_data)?partnerProfile.financial_data:{};var pC=pFd.calcs||{};var pS=pFd.S||{};
     var pName=(partnerClient&&partnerClient.name)?partnerClient.name.split(' ')[0]:'Partner';
     // Combined metrics
     var combInc=(myC.inc||0)+(pC.inc||0);
@@ -6693,43 +6721,55 @@ async function renderCoupleView(){
     h+='<div class="info-card" style="text-align:center;padding:12px"><div style="font-size:12px;color:var(--mu)">Combined Debt</div><div style="font-family:var(--fd);font-size:20px;color:var(--or)">'+fmtK(combDebt)+'</div></div>';
     h+='<div class="info-card" style="text-align:center;padding:12px"><div style="font-size:12px;color:var(--mu)">Combined Cash Flow</div><div style="font-family:var(--fd);font-size:20px;color:'+(combCF>=0?'var(--gr)':'var(--rd)')+'">'+fmt(combCF)+'/mo</div></div>';
     h+='</div>';
+    var _bothData=(_hh!=='joint'&&partnerProfile&&((pC.inc||0)||(pC.netWorth||0)||(pC.totalDebt||0)));
+    // ── [D] Alignment insight / household framing ──
     if(_hh==='joint'){
-      // Joint household: finances are merged under one profile, so a per-partner split/comparison would
-      // misleadingly read 0% / 100%. Show the combined totals (above) with a clear note instead.
-      h+='<div class="info-card" style="padding:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">Joint household — your finances are fully combined, so the totals above reflect your shared accounts (no separate per-partner split).</div></div>';
-    } else if(!partnerProfile){
-      // Separate/hybrid but the partner has not set up a profile yet — a per-partner split would misleadingly
-      // read "You 100% / Partner 0%". Show a clear note instead (the combined totals above are your finances).
-      h+='<div class="info-card" style="padding:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">Your partner has not set up their account yet — the totals above reflect your finances only. The per-partner comparison appears once they complete their profile.</div></div>';
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">Joint household — your finances are fully combined, so the totals above reflect your shared accounts (no separate per-partner split).</div></div>';
+    } else if(!_bothData){
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">'+esc(pName)+' hasn\'t set up their finances yet — the totals above reflect your data only. The per-partner split, comparison, and contribution view appear once they complete their profile.</div></div>';
     } else {
-    // Income contribution split
-    if(combInc>0){
-      var myPct=Math.round((myC.inc||0)/combInc*100);
-      h+='<div class="info-card" style="padding:14px;margin-bottom:14px">';
-      h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Income Split</div>';
-      h+='<div style="display:flex;gap:2px;height:12px;border-radius:6px;overflow:hidden;margin-bottom:6px">';
-      h+='<div style="width:'+myPct+'%;background:#5B9BFF" title="You: '+myPct+'%"></div>';
-      h+='<div style="width:'+(100-myPct)+'%;background:var(--or)" title="'+esc(pName)+': '+(100-myPct)+'%"></div>';
-      h+='</div>';
-      h+='<div style="display:flex;justify-content:space-between;font-size:13px">';
-      h+='<span style="color:#5B9BFF">You: '+myPct+'% ('+fmt(myC.inc||0)+')</span>';
-      h+='<span style="color:var(--or)">'+esc(pName)+': '+(100-myPct)+'% ('+fmt(pC.inc||0)+')</span>';
-      h+='</div></div>';
+      var _mySav=myC.savingsRate||0,_pSav=pC.savingsRate||0,_dd=Math.abs(_mySav-_pSav);
+      var _ins=(_dd>=10)?('💡 '+(_mySav>_pSav?'You\'re':(esc(pName)+' is'))+' saving '+Math.round(_dd)+' pts more than '+(_mySav>_pSav?esc(pName):'you')+' — '+(_mySav>_pSav?'you have':(esc(pName)+' has'))+' more slack to put toward shared goals.'):('💡 You and '+esc(pName)+' save at similar rates ('+_mySav.toFixed(0)+'% vs '+_pSav.toFixed(0)+'%) — nicely aligned.');
+      h+='<div class="info-card" style="padding:12px 14px;margin-bottom:14px;background:rgba(91,155,255,.05);border-color:rgba(91,155,255,.18)"><div style="font-size:13px;color:rgba(226,232,240,.88);line-height:1.5">'+_ins+'</div></div>';
     }
-    // Side-by-side comparison
-    h+='<div class="info-card" style="padding:14px">';
-    h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Individual Comparison</div>';
-    var metrics=[{k:'inc',l:'Income',fn:fmt},{k:'netCF',l:'Cash Flow',fn:fmt},{k:'netWorth',l:'Net Worth',fn:fmtK},{k:'totalDebt',l:'Total Debt',fn:fmtK},{k:'savingsRate',l:'Savings Rate',fn:function(v){return (v||0).toFixed(1)+'%';}},{k:'efMonths',l:'EF Months',fn:function(v){return (v||0).toFixed(1)+'mo';}}];
-    metrics.forEach(function(m){
-      var myV=myC[m.k]||0;var pV=pC[m.k]||0;
-      h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px">';
-      h+='<span style="width:80px;color:#5B9BFF;text-align:right">'+m.fn(myV)+'</span>';
-      h+='<span style="flex:1;text-align:center;color:var(--mu)">'+m.l+'</span>';
-      h+='<span style="width:80px;color:var(--or)">'+m.fn(pV)+'</span>';
+    // ── [A] Debt-free together ──
+    if(combDebt>0){ var _surplus=Math.max(0,combCF);
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:6px">🏁 Debt-Free Together</div>';
+      if(_surplus>0){ var _mo=Math.ceil(combDebt/_surplus); h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.6">Your combined <strong style="color:var(--or)">'+fmtK(combDebt)+'</strong> of debt clears in about <strong style="color:var(--gr)">'+(_mo>=12?((_mo/12).toFixed(1)+' years'):(_mo+' months'))+'</strong> if you put your combined <strong>'+fmt(_surplus)+'/mo</strong> surplus toward it. <span style="color:var(--mu);font-size:12px">Simple estimate — excludes interest.</span></div>'; }
+      else { h+='<div style="font-size:13px;color:var(--mu);line-height:1.6">Combined debt of <strong style="color:var(--or)">'+fmtK(combDebt)+'</strong>, with no monthly surplus to accelerate payoff yet — freeing up cash flow comes first.</div>'; }
       h+='</div>';
-    });
+    }
+    // ── [B] Shared goals ──
+    h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🎯 Shared Goals</div>';
+    var _sg=(sharedGoals||[]).filter(function(g){return g&&((parseFloat(g.target)||0)>0||(parseFloat(g.current)||0)>0);});
+    if(_sg.length){ _sg.sort(function(a,b){return (a.priority||99)-(b.priority||99);}).forEach(function(g){ var _t=parseFloat(g.target)||0,_cur=parseFloat(g.current)||0,_pct=_t>0?Math.min(100,Math.round(_cur/_t*100)):0,_bc=_pct>=100?'var(--gr)':(_pct>=60?'#5B9BFF':'var(--yl)');
+      h+='<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px;font-size:13px;margin-bottom:3px"><span style="color:var(--wh);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(g.name||'Goal')+(g.target_date?' <span style="color:var(--mu);font-size:11px">· by '+esc(String(g.target_date))+'</span>':'')+'</span><span style="color:var(--mu);white-space:nowrap">'+fmt(_cur)+' / '+fmt(_t)+' · '+_pct+'%</span></div><div style="height:6px;background:rgba(0,68,191,.08);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+_pct+'%;background:'+_bc+';border-radius:3px"></div></div></div>'; }); }
+    else { h+='<div style="font-size:13px;color:var(--mu);line-height:1.5">No shared goals yet — '+(_hh==='hybrid'?'mark a goal as joint':'create one you both save toward')+' (a house, a trip, an emergency fund) to track it here as a team.</div>'; }
     h+='</div>';
+    // ── [C] Who pays what (suggested split by income) ──
+    if(_hh!=='joint'&&combInc>0&&_bothData){ var _myPct=Math.round((myC.inc||0)/combInc*100);
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:4px">Who Pays What</div><div style="font-size:12px;color:var(--mu);margin-bottom:8px">A fair split of shared costs, proportional to income:</div><div style="display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden;margin-bottom:6px"><div style="width:'+_myPct+'%;background:#5B9BFF"></div><div style="width:'+(100-_myPct)+'%;background:var(--or)"></div></div><div style="display:flex;justify-content:space-between;font-size:13px"><span style="color:#5B9BFF">You: '+_myPct+'% ('+fmt(myC.inc||0)+'/mo)</span><span style="color:var(--or)">'+esc(pName)+': '+(100-_myPct)+'% ('+fmt(pC.inc||0)+'/mo)</span></div></div>';
     }
+    // ── [F] Mine / Theirs / Ours account map ──
+    if(_hh==='joint'){
+      var _all=_cvAccounts(myS,'personal').concat(_cvAccounts(myS,'joint')).concat(_cvAccounts(pS,'personal')).concat(_cvAccounts(pS,'joint'));
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🏦 Household Accounts</div>'+_cvAcctList(_all,'No itemized accounts yet — add accounts in My Financial Data.')+'</div>';
+    } else {
+      var _tid='cvacct_'+Math.random().toString(36).slice(2,8);
+      var _mine=_cvAccounts(myS,'personal'), _their=_cvAccounts(pS,'personal'), _ours=_cvAccounts(myS,'joint').concat(_cvAccounts(pS,'joint'));
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🏦 Accounts</div><div style="display:flex;gap:6px;margin-bottom:10px">';
+      [['mine','Mine'],['theirs',esc(pName)],['ours','Ours']].forEach(function(t,i){ h+='<button onclick="_cvAcctTab(\''+_tid+'\',\''+t[0]+'\')" id="'+_tid+'_tab_'+t[0]+'" style="flex:1;padding:6px;font-family:var(--fh);font-size:12px;font-weight:700;border:1px solid '+(i===0?'rgba(91,155,255,.5)':'var(--bd)')+';border-radius:3px;cursor:pointer;background:'+(i===0?'rgba(91,155,255,.15)':'transparent')+';color:'+(i===0?'#5B9BFF':'var(--mu)')+'">'+t[1]+'</button>'; });
+      h+='</div><div id="'+_tid+'_mine">'+_cvAcctList(_mine,'No personal accounts listed.')+'</div><div id="'+_tid+'_theirs" style="display:none">'+_cvAcctList(_their,esc(pName)+' has no accounts listed yet.')+'</div><div id="'+_tid+'_ours" style="display:none">'+_cvAcctList(_ours,'No shared (joint) accounts yet — mark an account as joint to see it here.')+'</div></div>';
+    }
+    // ── Individual comparison (detail behind the insight) ──
+    if(_bothData){
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Individual Comparison <span style="font-size:11px;color:var(--mu);font-weight:400">— you vs '+esc(pName)+'</span></div>';
+      var metrics=[{k:'inc',l:'Income',fn:fmt},{k:'netCF',l:'Cash Flow',fn:fmt},{k:'netWorth',l:'Net Worth',fn:fmtK},{k:'totalDebt',l:'Total Debt',fn:fmtK},{k:'savingsRate',l:'Savings Rate',fn:function(v){return (v||0).toFixed(1)+'%';}},{k:'efMonths',l:'EF Months',fn:function(v){return (v||0).toFixed(1)+'mo';}}];
+      metrics.forEach(function(m){ var myV=myC[m.k]||0,pV=pC[m.k]||0; h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><span style="width:80px;color:#5B9BFF;text-align:right">'+m.fn(myV)+'</span><span style="flex:1;text-align:center;color:var(--mu)">'+m.l+'</span><span style="width:80px;color:var(--or)">'+m.fn(pV)+'</span></div>'; });
+      h+='</div>';
+    }
+    // ── [E] Partner status ──
+    if(_hh!=='joint'){ var _upd=partnerProfile&&partnerProfile.updated_at; h+='<div class="info-card" style="padding:12px 14px;display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:'+(partnerProfile?'var(--gr)':'var(--mu)')+';flex-shrink:0"></div><div style="font-size:13px;color:var(--wh)">'+esc(pName)+(partnerProfile?(' — account active'+(_upd?', updated '+_cvAgo(_upd):'')):(' — hasn\'t set up their account yet'))+'</div></div>'; }
     el.innerHTML=h;
   }catch(e){
     el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:20px;text-align:center">Couple view is not available. Ask your advisor to link your accounts.</div>';
