@@ -916,12 +916,41 @@ function _issuesDetect(ctx){
     for (var i = 0; i < recs.length; i++) { if (recs[i] && recs[i].id === id) { var c = _recsClone(recs[i]); c.status = st; if (ts) c.updatedAt = ts; recs[i] = c; break; } }
     return recs;
   }
+  // ── M5.4 U2 — stable ISSUE IDENTITY. An issue's id = its base concern, made stable + collision-free:
+  // protection fires for multiple sub-flavors (life/disability/LTC/umbrella) sharing action='protection', so it
+  // is discriminated by a title keyword (funding life insurance must NOT suppress the disability issue); every
+  // other concern uses its base action — will/POA/beneficiary (all action 'estate') collapse to one 'estate' id
+  // matching today's estate card; estate_tax keeps its OWN id (a distinct action + L4 concern — trusts/gifting is
+  // not a basic will, so completing basic estate docs never hides estate-tax exposure; the plan card's type-dedup
+  // folds it into the estate card regardless, so the distinct id has no plan-card effect either way).
+  // Self vs spouse is derived from owner (or a trailing _spouse on the action) so they never cross-suppress. PURE:
+  // reads only its arg. Callable with a RAW detector flag (suffixed action) OR a STAGED card (stripped action +
+  // owner) — both yield the same id.
+  function _issueId(f) {
+    if (!f) return '';
+    var a = String(f.action || '');
+    var base = a.replace(/_spouse$/, '');
+    var sp = (f.owner === 'spouse') || /_spouse$/.test(a);
+    var id;
+    if (base.indexOf('protection') === 0) {
+      var t = String(f.title || '').toLowerCase(), d = 'other';
+      if (t.indexOf('disab') >= 0) d = 'disability';
+      else if (t.indexOf('ltc') >= 0 || t.indexOf('long-term care') >= 0 || t.indexOf('long term care') >= 0) d = 'ltc';
+      else if (t.indexOf('umbrella') >= 0) d = 'umbrella';
+      else if (t.indexOf('life') >= 0) d = 'life';
+      id = base + ':' + d;
+    } else {
+      id = base;
+    }
+    return sp ? (id + ':spouse') : id;
+  }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;
   g.PFOSIssues.toCp = _issuesToCp;   // identity pass-through (per-shell transform seam)
   g.PFOSIssues.rank = _issuesRank;   // canonical engine-exact priority sort over {action,type} flags (M5.2a)
   g.PFOSIssues.rankCards = _issuesRankCards;   // rank unassigned plan cards by flagAction/flagType; goals trail (M5.2b)
   g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
+  g.PFOSIssues.issueId = _issueId;   // M5.4 U2 — stable issue identity for addressesIssueId linkage + funded-state suppression
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (7-category)
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
   g.PFOSImpact.allocate = _impactAllocate;   // M5.3a — pure surplus → buffer + level-weighted tier split (rough-guide teaser)
