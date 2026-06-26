@@ -3142,6 +3142,7 @@ function renderPortfolioView(){
 // calls calc/computeCalcs/postMessage).
 var _nwHorizon=10;                 // default forward years shown (toggle: 10/20/30)
 var _nwTimelineTarget='nwTimeline';
+var _nwHover=null;                 // {pts:[{x,y,v,age,t,fut}], svgW} for the slide-through hover tooltip
 function _nwSetHorizon(h){ _nwHorizon=h; renderNetWorthTimeline(_nwTimelineTarget); }
 // Catmull-Rom → cubic-bezier smooth path through points [{x,y}] (premium curve, not straight segments).
 function _nwSmooth(pts){
@@ -3201,6 +3202,18 @@ function renderNetWorthTimeline(targetId){
   svg+='<text x="'+(padL-6)+'" y="'+(yOf(loV0)+3).toFixed(1)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(loV0)+'</text>';
   if(hasPast)svg+='<text x="'+padL+'" y="'+(H-7)+'" fill="var(--mu)" font-size="9" text-anchor="start">'+_cpEscHtml(past[0].label)+'</text>';
   if(hasFuture)svg+='<text x="'+(W-padR)+'" y="'+(H-7)+'" fill="var(--mu)" font-size="9" text-anchor="end">+'+(future.length-1)+'y</text>';
+  // ── slide-through hover: crosshair + focus dot + (amount, age) tooltip that tracks the cursor ──
+  var curAge=(typeof CPLAN!=='undefined'&&CPLAN&&isFinite(parseFloat(CPLAN.age)))?parseFloat(CPLAN.age):null;
+  var hpts=[];
+  if(hasPast)past.forEach(function(p,i){ hpts.push({x:xPast(i),y:yOf(p.v),v:p.v,age:(curAge!=null?Math.round(curAge-(past.length-1-i)/12):null),t:p.label,fut:false}); });
+  if(hasFuture)future.forEach(function(f,i){ hpts.push({x:xFut(i),y:yOf(f.v),v:f.v,age:(curAge!=null?Math.round(curAge+f.year):null),t:(f.year===0?'Today':'+'+f.year+'y'),fut:true}); });
+  _nwHover={pts:hpts,svgW:W};
+  svg+='<g class="nwHov" style="pointer-events:none">';
+  svg+='<line class="nwCross" x1="0" y1="'+padT+'" x2="0" y2="'+baseY+'" stroke="var(--mu)" stroke-width="1" stroke-dasharray="2 2" opacity="0"/>';
+  svg+='<circle class="nwFocus" cx="-9" cy="-9" r="4" fill="#0B1437" stroke="#5B9BFF" stroke-width="2" opacity="0"/>';
+  svg+='<g class="nwTip" opacity="0"><rect class="nwTipBg" x="0" y="0" width="98" height="36" rx="4" fill="#0B1437" stroke="rgba(91,155,255,.4)"/><text class="nwTipA" x="0" y="0" text-anchor="middle" fill="#fff" font-size="12" font-weight="700" font-family="var(--fd)"></text><text class="nwTipB" x="0" y="0" text-anchor="middle" fill="#9FB2D8" font-size="10" font-family="var(--fh)"></text></g>';
+  svg+='</g>';
+  svg+='<rect x="'+padL+'" y="'+padT+'" width="'+plotW+'" height="'+plotH+'" fill="transparent" style="cursor:crosshair" onmousemove="_nwHoverMove(event)" onmouseleave="_nwHoverOut(event)"/>';
   svg+='</svg>';
   var tog='';
   if(hasFuture&&fullYears>10){
@@ -3213,6 +3226,32 @@ function renderNetWorthTimeline(targetId){
   leg+='</div>';
   var xlink=(hasPast&&!hasFuture)?'<div style="text-align:center;margin-top:6px"><a href="javascript:showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="color:#5B9BFF;font-size:12px">Project it forward with My Plan →</a></div>':'';
   el.innerHTML=svg+tog+leg+xlink;
+}
+// Slide-through hover: map cursor x → nearest plotted point → show the crosshair, focus dot,
+// and a floating tooltip (net worth + age). Scoped to the hovered SVG via querySelector (so the
+// Investments + Reports copies never collide). Display-only.
+function _nwHoverMove(event){
+  try{
+    var Hd=_nwHover; if(!Hd||!Hd.pts||!Hd.pts.length)return;
+    var svg=event.target.ownerSVGElement||(event.target.closest&&event.target.closest('svg')); if(!svg)return;
+    var r=svg.getBoundingClientRect(); if(!r.width)return;
+    var mx=(event.clientX-r.left)/r.width*Hd.svgW;
+    var best=Hd.pts[0],bd=Math.abs(best.x-mx);
+    for(var i=1;i<Hd.pts.length;i++){var d=Math.abs(Hd.pts[i].x-mx);if(d<bd){bd=d;best=Hd.pts[i];}}
+    var cross=svg.querySelector('.nwCross'),focus=svg.querySelector('.nwFocus'),tip=svg.querySelector('.nwTip'),tA=svg.querySelector('.nwTipA'),tB=svg.querySelector('.nwTipB'),tBg=svg.querySelector('.nwTipBg');
+    if(cross){cross.setAttribute('x1',best.x);cross.setAttribute('x2',best.x);cross.setAttribute('opacity','0.45');}
+    if(focus){focus.setAttribute('cx',best.x);focus.setAttribute('cy',best.y);focus.setAttribute('stroke',best.fut?'#22C55E':'#5B9BFF');focus.setAttribute('opacity','1');}
+    if(tip&&tA&&tB&&tBg){
+      var tw=98,th=36,tx=Math.max(2,Math.min(best.x-tw/2,Hd.svgW-tw-2)),ty=(best.y-th-12<2?best.y+12:best.y-th-12);
+      tBg.setAttribute('x',tx);tBg.setAttribute('y',ty);
+      tA.setAttribute('x',tx+tw/2);tA.setAttribute('y',ty+15);tA.textContent=(typeof fmtK==='function'?fmtK(best.v):Math.round(best.v));
+      tB.setAttribute('x',tx+tw/2);tB.setAttribute('y',ty+29);tB.textContent=(best.age!=null?'Age '+best.age:best.t)+(best.fut&&best.age!=null?'':'');
+      tip.setAttribute('opacity','1');
+    }
+  }catch(_e){}
+}
+function _nwHoverOut(event){
+  try{var svg=event&&(event.target.ownerSVGElement||(event.target.closest&&event.target.closest('svg')));if(!svg)return;['.nwCross','.nwFocus','.nwTip'].forEach(function(s){var el=svg.querySelector(s);if(el)el.setAttribute('opacity','0');});}catch(_e){}
 }
 
 // ── §2.4a (M2) Reports: 24-mo transactions read + custom-range cash-flow ──────
