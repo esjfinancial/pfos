@@ -1337,7 +1337,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
     <!-- Client Overview -->
     <div class="pg active" id="cpg-overview">
       <div class="pg-title">Dashboard</div>
-      <div class="pg-sub">Your latest financial snapshot prepared by your advisor</div>
+      <div class="pg-sub" id="cpgOverviewSub">Your latest financial snapshot</div>
 
       <!-- Phase I: Advisor Request Banner — rendered when advisor has requested
            spending access. Hidden when no pending request, or when already granted. -->
@@ -3295,7 +3295,11 @@ function _cpCashFlowReport(opts){
   }
   var net=totalIncome-totalExpense;
   var byCategory=Object.keys(catTotals).map(function(c){ return {key:c, total:Math.round(catTotals[c])}; }).sort(function(a,b){ return b.total-a.total; });
-  return { months:rows, monthsCount:rows.length, totalIncome:Math.round(totalIncome), totalExpense:Math.round(totalExpense), net:Math.round(net), savingsRate:(totalIncome>0?Math.round(net/totalIncome*100):null), byCategory:byCategory, source:(useTxns?'linked':'manual'), incomeSource:(useLinkedIncome?'linked':'snapshot'), incomeStreams:incomeStreams, estimatedMonths:estMonths, hasExpense:(totalExpense>0) };
+  // Savings rate must NOT be computed against estimated (profile-fallback) income — sparse recorded expenses
+  // against full estimated income produce a misleading ~90% that contradicts the dashboard's canonical rate.
+  // Only report it when every month in range has REAL (linked/manual) income; otherwise null → render shows "—".
+  var _savingsRate=(estMonths>0||totalIncome<=0)?null:Math.round(net/totalIncome*100);
+  return { months:rows, monthsCount:rows.length, totalIncome:Math.round(totalIncome), totalExpense:Math.round(totalExpense), net:Math.round(net), savingsRate:_savingsRate, byCategory:byCategory, source:(useTxns?'linked':'manual'), incomeSource:(useLinkedIncome?'linked':'snapshot'), incomeStreams:incomeStreams, estimatedMonths:estMonths, hasExpense:(totalExpense>0) };
 }
 
 // Spending-category palette (mirrors the Historical donut catMap so Reports anchors visually).
@@ -3706,7 +3710,7 @@ function renderReportsView(){
   h+='<button onclick="_cpExportTransactionsCsv()" aria-label="Export transactions as CSV" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬇ Export CSV</button>';
   var _plaidLinked=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'));
   var _srcNote=(rep.source==='manual'&&_plaidLinked)?' · <span style="color:#EAB308">Plaid not yet synced — showing manual expenses</span>':'';
-  var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile).</div>':'';
+  var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile)'+(rep.savingsRate==null?' — savings rate hidden until income is confirmed':'')+'.</div>':'';
   h+='</div><div style="font-size:11px;color:var(--mu);margin-top:8px">'+ev(rep.months.length?(rep.months[0].label+' – '+rep.months[rep.months.length-1].label):'—')+' · '+(rep.source==='linked'?'linked transactions':'manual entries')+_srcNote+'</div>'+_estNote+'</div>';
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="stat-grid" style="gap:6px;margin-bottom:0">';
   h+=statTile(fmtK(rep.totalIncome),'Income','#22C55E');
@@ -5873,6 +5877,10 @@ function freshCalcs(fd){
 }
 async function loadClientPortalData(){
   if(!APP.currentClientId) return;
+  // Product (self-serve) clients have no advisor — drop advisor-framed dashboard copy so a no-advisor
+  // user never sees "prepared by your advisor" or a dead-end pointing at an advisor report.
+  var _isProduct=(APP.currentClient&&APP.currentClient.client_type==='product');
+  try{var _sub=document.getElementById('cpgOverviewSub');if(_sub)_sub.textContent=_isProduct?'Your latest financial snapshot':'Your latest financial snapshot prepared by your advisor';}catch(_){}
   try{
   // For joint couples, financial data is stored under the primary (client_a)
   await loadCouples();
@@ -5963,7 +5971,9 @@ async function loadClientPortalData(){
       if(scores[k]!==undefined){var vv=scores[k];scH+=kv(sm[k],vv+'/10',vv>=7?'var(--gr)':vv>=5?'var(--yl)':'var(--rd)',k);}
     });
     set('clientScoresData',scH||'<div style="color:var(--mu);font-size:13px">Scores not yet available</div>');
-    set('clientPriorityData','<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">View your full action plan in your latest report.</div>');
+    set('clientPriorityData', _isProduct
+      ? '<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7;margin-bottom:8px">Build your plan to see your prioritized next steps.</div><button onclick="showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;padding:8px 14px;border-radius:4px;cursor:pointer;min-height:36px">Go to My Financial Plan →</button>'
+      : '<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">View your full action plan in your latest report.</div>');
     // Update mobile tools with current financial data
     _lastPfosState={state:fd.S||{},calcs:fd.calcs||{}};
     updateMobileTools();
@@ -6646,10 +6656,12 @@ async function renderCoupleView(){
     var {data:link}=await db.from('couple_links').select('*').or('client_a_id.eq.'+APP.currentClientId+',client_b_id.eq.'+APP.currentClientId).limit(1).maybeSingle();
     if(!link){el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:20px;text-align:center">You are not currently linked with a partner. Ask your advisor to set up a couple link.</div>';return;}
     var partnerId=link.client_a_id===APP.currentClientId?link.client_b_id:link.client_a_id;
-    // Load both profiles
-    var {data:myProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',APP.currentClientId).single();
-    var {data:partnerProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',partnerId).single();
-    var {data:partnerClient}=await db.from('clients').select('name').eq('id',partnerId).single();
+    var _hh=link.household_type;
+    // Load both profiles. maybeSingle (NOT single) — a JOINT household's client_b has NO profile row
+    // (data lives under client_a), so single() errored/stalled the couple view for the joint primary.
+    var {data:myProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',APP.currentClientId).maybeSingle();
+    var {data:partnerProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',partnerId).maybeSingle();
+    var {data:partnerClient}=await db.from('clients').select('name').eq('id',partnerId).maybeSingle();
     var myFd=(myProfile&&myProfile.financial_data)?myProfile.financial_data:{};var myC=myFd.calcs||{};
     var pFd=(partnerProfile&&partnerProfile.financial_data)?partnerProfile.financial_data:{};var pC=pFd.calcs||{};
     var pName=(partnerClient&&partnerClient.name)?partnerClient.name.split(' ')[0]:'Partner';
@@ -6672,6 +6684,15 @@ async function renderCoupleView(){
     h+='<div class="info-card" style="text-align:center;padding:12px"><div style="font-size:12px;color:var(--mu)">Combined Debt</div><div style="font-family:var(--fd);font-size:20px;color:var(--or)">'+fmtK(combDebt)+'</div></div>';
     h+='<div class="info-card" style="text-align:center;padding:12px"><div style="font-size:12px;color:var(--mu)">Combined Cash Flow</div><div style="font-family:var(--fd);font-size:20px;color:'+(combCF>=0?'var(--gr)':'var(--rd)')+'">'+fmt(combCF)+'/mo</div></div>';
     h+='</div>';
+    if(_hh==='joint'){
+      // Joint household: finances are merged under one profile, so a per-partner split/comparison would
+      // misleadingly read 0% / 100%. Show the combined totals (above) with a clear note instead.
+      h+='<div class="info-card" style="padding:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">Joint household — your finances are fully combined, so the totals above reflect your shared accounts (no separate per-partner split).</div></div>';
+    } else if(!partnerProfile){
+      // Separate/hybrid but the partner has not set up a profile yet — a per-partner split would misleadingly
+      // read "You 100% / Partner 0%". Show a clear note instead (the combined totals above are your finances).
+      h+='<div class="info-card" style="padding:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">Your partner has not set up their account yet — the totals above reflect your finances only. The per-partner comparison appears once they complete their profile.</div></div>';
+    } else {
     // Income contribution split
     if(combInc>0){
       var myPct=Math.round((myC.inc||0)/combInc*100);
@@ -6699,6 +6720,7 @@ async function renderCoupleView(){
       h+='</div>';
     });
     h+='</div>';
+    }
     el.innerHTML=h;
   }catch(e){
     el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:20px;text-align:center">Couple view is not available. Ask your advisor to link your accounts.</div>';
@@ -6708,8 +6730,15 @@ async function renderCoupleView(){
 async function checkCoupleLink(){
   if(!APP.currentClientId) return;
   try{
-    var {data}=await db.from('couple_links').select('id').or('client_a_id.eq.'+APP.currentClientId+',client_b_id.eq.'+APP.currentClientId).limit(1);
-    if(data&&data.length>0){var nav=document.getElementById('cnav-couple');if(nav)nav.style.display='flex';}
+    // Prefer the in-memory couples (loadCouples is awaited earlier in loadClientPortalData, so this is
+    // reliable) — the bare couple_links query here used to race the session on login and leave the nav
+    // hidden for genuinely-coupled clients. Fall back to the DB query only if couples aren't loaded yet.
+    var _linked=(typeof getCoupleForClient==='function')&&!!getCoupleForClient(APP.currentClientId);
+    if(!_linked){
+      var {data}=await db.from('couple_links').select('id').or('client_a_id.eq.'+APP.currentClientId+',client_b_id.eq.'+APP.currentClientId).limit(1);
+      _linked=!!(data&&data.length>0);
+    }
+    if(_linked){var nav=document.getElementById('cnav-couple');if(nav)nav.style.display='flex';}
   }catch(e){}
 }
 async function dismissNotification(notifId){
@@ -6824,6 +6853,9 @@ function _portalSpendStatus(viewCtx){
     severity='caution';
     reasons.push('On pace to overspend by $'+overspend.toLocaleString()+' this month.');
   }
+  // Capture month-level severity BEFORE per-category escalation, so the dashboard card can tell whether
+  // the alarm is the whole month vs only one category (avoids an "OVER BUDGET" header over healthy month totals).
+  var monthSeverity=severity;
   // Per-category check
   var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]=c.label;}); // §1.4 dynamic — custom categories get pace-checked
   var catSpend={};
@@ -6865,7 +6897,7 @@ function _portalSpendStatus(viewCtx){
     }
   });
   return{
-    severity:severity,paceRatio:Math.round(paceRatio*100)/100,
+    severity:severity,monthSeverity:monthSeverity,paceRatio:Math.round(paceRatio*100)/100,
     pctSpent:pctSpent,pctOfMonthGone:pctOfMonthGone,
     moneyIn:moneyIn,moneyOut:Math.round(moneyOut),
     projected:projected,overspend:Math.round(overspend),
@@ -7643,10 +7675,16 @@ function _portalRecsList(){
 function _portalRecsGetActive(){
   var now=Date.now();
   var maxAgeMs=_PFOS_RECS_CONFIG.expireAfterDays*24*60*60*1000;
+  var _seen={};
   return _portalRecsList().filter(function(r){
     if(!r||r.status!=='pending')return false;
     var created=r.createdAt?new Date(r.createdAt).getTime():0;
-    return (now-created)<maxAgeMs;
+    if((now-created)>=maxAgeMs)return false;
+    // Collapse duplicate active recs (same type + payload) so an identical card never shows twice or
+    // inflates the badge — covers pre-existing dupes the creation-time guard in _portalRecsCreate can't remove.
+    var _sig=r.type+'|';try{_sig+=JSON.stringify(r.payload);}catch(_s){_sig+=String(r.payload);}
+    if(_seen[_sig])return false; _seen[_sig]=true;
+    return true;
   });
 }
 
@@ -7704,6 +7742,13 @@ function _portalRecsUpdateBadge(){
 
 function _portalRecsCreate(rec){
   if(!rec||!rec.type||!rec.payload)return null;
+  // Dedup: never create a second ACTIVE rec identical to an existing one (same type + payload signature).
+  // Guards against a double detection run (or cloned data) surfacing the same recommendation card twice.
+  try{
+    var _sig=rec.type+'|'+JSON.stringify(rec.payload);
+    var _act=(typeof _portalRecsGetActive==='function')?_portalRecsGetActive():[];
+    if(_act&&_act.some&&_act.some(function(r){return r&&(r.type+'|'+JSON.stringify(r.payload))===_sig;}))return null;
+  }catch(_dup){}
   rec.id=rec.id||('rec_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));
   rec.status=rec.status||'pending';
   rec.createdAt=rec.createdAt||new Date().toISOString();
@@ -7720,16 +7765,28 @@ function _portalRecsUpdate(id,mutation){
   });
 }
 
+// Apply a terminal status change to the target rec AND any siblings sharing its type+payload signature, so
+// dismissing/accepting one collapses pre-existing duplicates instead of leaving a hidden dupe to resurface
+// (the read-level dedup in _portalRecsGetActive only hides dupes; this resolves them).
+function _portalRecsApplyToSiblings(id,mut){
+  _portalRecsWrite(function(list){
+    var tgt=null,i;
+    for(i=0;i<list.length;i++){if(list[i]&&list[i].id===id){tgt=list[i];break;}}
+    if(!tgt)return;
+    var _sig=tgt.type+'|';try{_sig+=JSON.stringify(tgt.payload);}catch(_s){_sig+=String(tgt.payload);}
+    list.forEach(function(r){if(!r)return;var rs=r.type+'|';try{rs+=JSON.stringify(r.payload);}catch(_s2){rs+=String(r.payload);}if(rs===_sig)mut(r);});
+  });
+}
 function _portalRecsDismiss(id){
-  _portalRecsUpdate(id,function(r){r.status='dismissed';r.appliedAt=new Date().toISOString();});
+  _portalRecsApplyToSiblings(id,function(r){r.status='dismissed';r.appliedAt=new Date().toISOString();});
 }
 
 function _portalRecsAccept(id){
-  _portalRecsUpdate(id,function(r){r.status='accepted';r.appliedAt=new Date().toISOString();});
+  _portalRecsApplyToSiblings(id,function(r){r.status='accepted';r.appliedAt=new Date().toISOString();});
 }
 
 function _portalRecsExpire(id){
-  _portalRecsUpdate(id,function(r){r.status='expired';});
+  _portalRecsApplyToSiblings(id,function(r){r.status='expired';});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8909,13 +8966,22 @@ function _portalSvgDonut(data,size,label,opts){
   // pfos-main. Each path slice carries data-tip="<html>" with the tooltip
   // body; helpers compute position relative to the position:relative wrapper.
   var _donutId='donut_'+Math.random().toString(36).slice(2,9);
-  var svg='<style>.'+_donutId+' path{cursor:pointer;transition:opacity 0.15s, filter 0.15s}.'+_donutId+' path:hover{opacity:0.85;filter:brightness(1.15)}</style>';
+  var svg='<style>.'+_donutId+' path,.'+_donutId+' circle[data-tip]{cursor:pointer;transition:opacity 0.15s, filter 0.15s}.'+_donutId+' path:hover,.'+_donutId+' circle[data-tip]:hover{opacity:0.85;filter:brightness(1.15)}</style>';
   svg+='<div style="position:relative;display:inline-block;max-width:'+size+'px">';
   svg+='<svg class="'+_donutId+'" viewBox="0 0 '+size+' '+size+'" style="width:100%;height:auto;max-width:'+size+'px">';
   var angle=0;
   data.forEach(function(d){
     if(d.v<=0)return;
     var slice=d.v/total*360;var large=slice>180?1:0;
+    // A single ~360° slice is a degenerate arc (start point == end point → nothing renders). Draw the ring
+    // as concentric circles so single-holding / 100% donuts show a ring instead of an empty box.
+    if(slice>=359.9){
+      var _pct1=Math.round(d.v/total*100);
+      var _tip1='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:4px">'+(d.l||'Unlabeled').replace(/</g,'&lt;').replace(/"/g,'&quot;')+'</div><div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">'+fmt(Math.round(d.v))+_amtSuf+'</div><div style="font-size:11px;color:var(--mu)">'+_pct1+'% of total</div>';
+      svg+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="'+d.c+'" stroke="var(--bg)" stroke-width="1" data-tip="'+_tip1.replace(/"/g,'&quot;')+'" onmouseenter="_donutTip(\''+_donutId+'\',event,this)" onmousemove="_donutTip(\''+_donutId+'\',event,this)" onmouseleave="_donutTipHide(\''+_donutId+'\')"></circle>';
+      svg+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r2+'" fill="var(--bg)" pointer-events="none"></circle>';
+      angle+=slice;return;
+    }
     var x1=cx+r*Math.cos((angle-90)*Math.PI/180);var y1=cy+r*Math.sin((angle-90)*Math.PI/180);
     var x2=cx+r*Math.cos((angle+slice-90)*Math.PI/180);var y2=cy+r*Math.sin((angle+slice-90)*Math.PI/180);
     var ix1=cx+r2*Math.cos((angle-90)*Math.PI/180);var iy1=cy+r2*Math.sin((angle-90)*Math.PI/180);
@@ -9154,7 +9220,7 @@ function _portalWhereEveryDollarGoesBlock(){
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px" class="trk-grid-2">';
   // Left: Spending by category bars
   h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">';
-  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;letter-spacing:.12em;text-transform:uppercase;margin-bottom:8px">SPENDING BY CATEGORY</div>';
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;letter-spacing:.12em;text-transform:uppercase;margin-bottom:8px">BUDGET BY CATEGORY</div>';
   var sortedExp=expData.slice().sort(function(a,b){return b.v-a.v;});
   var maxExp=sortedExp.length?sortedExp[0].v:1;
   sortedExp.forEach(function(d){
@@ -12560,6 +12626,10 @@ function _clientRenderSpendPulse(){
     over:{bg:'rgba(239,68,68,.06)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️',label:'Over budget'}
   };
   var t=theme[status.severity]||theme.ok;
+  // When the alarm is driven ONLY by a single category (the month itself is on-track), the header must say
+  // so — otherwise an "Over budget" header sits over healthy month totals ("18% spent · $5,310 left").
+  var _catDriven=(status.monthSeverity==='ok'&&status.severity!=='ok');
+  var _hdrLabel=_catDriven?(status.severity==='over'?'Category over budget':'Category watch'):t.label;
   var barCol=pctSpent>=100?'var(--rd)':pctSpent>90?'var(--rd)':pctSpent>70?'var(--or)':'var(--gr)';
   // Top line — "Day X of Y" + spent / income
   var monthShort=new Date().toLocaleDateString('en-US',{month:'short'});
@@ -12569,7 +12639,7 @@ function _clientRenderSpendPulse(){
   h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">';
   h+='<div style="display:flex;align-items:center;gap:6px">';
   h+='<span style="font-size:13px">'+t.icon+'</span>';
-  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+t.label+'</span>';
+  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+_hdrLabel+'</span>';
   h+='</div>';
   h+='<span style="font-family:var(--fh);font-size:12px;color:var(--mu)">'+monthShort+' · day '+status.dayOfMonth+' of '+status.daysInMonth+'</span>';
   h+='</div>';
@@ -12662,9 +12732,15 @@ function renderSpendingAnalysis(){
     var ed=expData[cat.key];
     var amt=0;
     if(ed){
-      if(ed.total!=null) amt=ed.total;
-      else if(ed.subs){
-        Object.keys(ed.subs).forEach(function(sk){amt+=(ed.subs[sk]||0);});
+      // Mirror the engine's canonical getMonthlyExp (pfos-main): total → amount(period-adjusted) → subs.
+      // (Previously read only ed.total/ed.subs and IGNORED ed.amount, so the canonical {amount,period}
+      //  expData shape computed 0 for every category and showed "No expense categories found".)
+      if(ed.total!=null&&!isNaN(parseFloat(ed.total))) amt=parseFloat(ed.total);
+      else {
+        var _base=parseFloat(ed.amount)||0; if(ed.period==='annual')_base=_base/12;
+        var _sub=0;
+        if(ed.subs)Object.keys(ed.subs).forEach(function(sk){var s=ed.subs[sk];var sv=parseFloat(s&&s.amount!=null?s.amount:s)||0;if(s&&s.period==='annual')sv=sv/12;_sub+=sv;});
+        amt=_sub>0?_sub:_base;
       }
     }
     if(amt>0) catData.push({key:cat.key,label:cat.label,icon:cat.icon,amount:amt,leaked:ed&&ed.leakTagged});
@@ -12697,7 +12773,7 @@ function renderSpendingAnalysis(){
   if(catData.length===0){
     h+='<div style="color:var(--mu);font-size:14px;padding:12px 0">No expense categories found. Enter expense data to see your breakdown.</div>';
   } else {
-    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Spending by Category</div>';
+    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Budget by Category</div>';
     catData.forEach(function(c){
       var pct=maxCat>0?(c.amount/maxCat*100):0;
       var pctOfInc=(c.amount/inc*100).toFixed(1);
@@ -12717,7 +12793,10 @@ function renderSpendingAnalysis(){
   if(leakCount>0){
     h+='<div style="margin-top:14px;padding:12px;background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.18);border-radius:2px">';
     h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--rd);margin-bottom:6px">💡 Spending Leak Tip</div>';
-    h+='<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">Your advisor flagged '+leakCount+' spending leak'+(leakCount>1?'s':'')+'. These are expenses that may be reduced or eliminated. Review the flagged categories above and discuss with your advisor for strategies to redirect this money toward your goals.</div>';
+    var _lkProd=(APP.currentClient&&APP.currentClient.client_type==='product');
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">'+(_lkProd
+      ? 'We flagged '+leakCount+' spending leak'+(leakCount>1?'s':'')+'. These are expenses that may be reduced or eliminated. Review the flagged categories above to redirect this money toward your goals.'
+      : 'Your advisor flagged '+leakCount+' spending leak'+(leakCount>1?'s':'')+'. These are expenses that may be reduced or eliminated. Review the flagged categories above and discuss with your advisor for strategies to redirect this money toward your goals.')+'</div>';
     h+='</div>';
   }
 
@@ -26979,6 +27058,9 @@ async function checkPartnerStatus(){
   var couple=getCoupleForClient(APP.currentClientId);
   if(!couple){card.style.display='none';return;}
   card.style.display='';
+  // Reveal the Couple View nav here too: getCoupleForClient reads the in-memory couples (reliable),
+  // whereas checkCoupleLink's login-time couple_links query can race the session and leave the nav hidden.
+  var _cnavCouple=document.getElementById('cnav-couple');if(_cnavCouple)_cnavCouple.style.display='flex';
   var partnerId=couple.client_a_id===APP.currentClientId?couple.client_b_id:couple.client_a_id;
   var partnerName='Partner';
   var partnerClient=null;
@@ -29071,7 +29153,7 @@ function _renderAnnualReviewDetail(d){
   if(ir){
     h+=secHead(ir.applicable?'Income Rider':'Income Rider — Not Active');
     var irC='';
-    if(!ir.applicable){irC+='<div style="color:var(--yl)">No income rider attached. Discuss with advisor whether to add one or plan for systematic withdrawals.</div>';if(ir.incomeWithoutRider)irC+='<br>Systematic 4%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal4Pct)+'/yr. 5%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal5Pct)+'/yr (not guaranteed).<br>';}
+    if(!ir.applicable){irC+='<div style="color:var(--yl)">'+((APP.currentClient&&APP.currentClient.client_type==='product')?'No income rider attached. Consider adding one or planning for systematic withdrawals.':'No income rider attached. Discuss with advisor whether to add one or plan for systematic withdrawals.')+'</div>';if(ir.incomeWithoutRider)irC+='<br>Systematic 4%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal4Pct)+'/yr. 5%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal5Pct)+'/yr (not guaranteed).<br>';}
     else{irC+='<strong style="color:var(--wh)">Income Base:</strong> '+fmt(ir.incomeBase)+' (contract: '+fmt(ir.contractValue)+', divergence: '+fmt(ir.divergence)+')<br>';if(ir.rollupRate)irC+='<strong style="color:var(--wh)">Rollup:</strong> '+pct(ir.rollupRate)+(ir.rollupActive?' (active)':' (expired)')+'<br>';irC+='<strong style="color:var(--wh)">Rider Fee:</strong> '+fmt(ir.riderFeeAmount)+'/yr ('+pct(ir.riderFeeAsPercentOfContractValue)+' of contract value)<br>';if(ir.projectedIncomeAtStartAge){var pi=ir.projectedIncomeAtStartAge;irC+='<br><strong style="color:var(--wh)">Projected at Age '+pi.startAge+':</strong> '+fmt(pi.guaranteedMonthly)+'/mo ('+fmt(pi.guaranteedAnnual)+'/yr)<br>';}}
     if(ir.explanation)irC+='<div style="margin-top:6px;font-size:13px;color:var(--mu)">'+escH(ir.explanation)+'</div>';
     h+=secBox(irC);
