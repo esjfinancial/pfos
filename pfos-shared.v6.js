@@ -818,6 +818,55 @@ function _issuesDetect(ctx){
     if(householdType==='hybrid') return !!_HYBRID_SPOUSE_SHOW[baseAction];
     return false;   // separate / individual / anything else → hide
   }
+  // ── M5.3a — pure surplus-allocation TEASER. Given a surplus, a buffer %, and the user's detected
+  // priority flags (each carrying an `action`), reserves the buffer then splits the remaining pool across
+  // the top priorities WEIGHTED BY LEVEL (L1=50,L2=25,L3=15,else10) — the same Rule-2 math as the engine's
+  // deCalcAllocation (pfos-main). PURE: reads only ctx + the closure-const _ACTION_LEVEL; no S/CPLAN/DE/
+  // computeCalcs reads, mutates nothing, returns a NEW object (the 5b firewall). SIMPLIFIED per owner: it
+  // OMITS the engine's impure Rules 1/3/4 (employer-match-off-top, EF<1mo cap, pre-tax gross-up), so it is
+  // a "rough guide" awareness teaser — NOT the authoritative allocator (that stays in the Planning builder).
+  // ctx = {surplus:Number, bufferPct:Number, flags:[{action,title,icon}], maxRows?:Number(default 5)}.
+  function _impactAllocate(ctx){
+    ctx = ctx || {};
+    var surplus = Math.max(0, Math.round(parseFloat(ctx.surplus) || 0));
+    var pct = Math.max(0, Math.min(100, parseFloat(ctx.bufferPct) || 0));
+    var maxRows = ctx.maxRows > 0 ? ctx.maxRows : 5;
+    var bufferAmt = Math.round(surplus * pct / 100);
+    var pool = surplus - bufferAmt;
+    var rows = [];
+    if (surplus <= 0) return { surplus: 0, buffer: 0, pool: 0, rows: [] };
+    rows.push({ label: 'Safety cushion (' + pct + '%)', amt: bufferAmt, level: 0, icon: '🛡️', flagId: '_buffer' });
+    if (pool <= 0) return { surplus: surplus, buffer: bufferAmt, pool: 0, rows: rows };
+    function baseAction(a){ a = a || ''; var k = a.indexOf('_spouse'); return k > 0 ? a.slice(0, k) : a; }
+    function lvlOf(a){ var l = _ACTION_LEVEL[baseAction(a)]; return l != null ? l : 3; }
+    function wt(l){ return l === 1 ? 50 : l === 2 ? 25 : l === 3 ? 15 : 10; }
+    // map flags → distinct concerns (dedup self/spouse + repeats), highest priority (lowest level) first
+    var seen = {}, leveled = [];
+    (ctx.flags || []).forEach(function(f){
+      if (!f || !f.action) return;
+      var base = baseAction(f.action);
+      if (seen[base]) return;
+      seen[base] = 1;
+      leveled.push({ id: base, level: lvlOf(f.action), title: ((f.title || '').split(':')[0] || base), icon: f.icon || '•' });
+    });
+    leveled.sort(function(a, b){ return a.level - b.level; });
+    var top = leveled.slice(0, maxRows);
+    if (!top.length){
+      rows.push({ label: 'Additional savings & investing', amt: pool, level: 4, icon: '📈', flagId: '_extra' });
+      return { surplus: surplus, buffer: bufferAmt, pool: pool, rows: rows };
+    }
+    var totalWeight = 0; top.forEach(function(f){ totalWeight += wt(f.level); });
+    var assigned = 0;
+    top.forEach(function(f){
+      var slice = Math.round(pool * (wt(f.level) / Math.max(1, totalWeight)));
+      if (slice <= 0) return;
+      assigned += slice;
+      rows.push({ label: f.title, amt: slice, level: f.level, icon: f.icon, flagId: f.id });
+    });
+    var leftover = pool - assigned;
+    if (leftover > 10) rows.push({ label: 'Additional savings & investing', amt: leftover, level: 4, icon: '📈', flagId: '_extra' });
+    return { surplus: surplus, buffer: bufferAmt, pool: pool, rows: rows };
+  }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;
   g.PFOSIssues.toCp = _issuesToCp;   // identity pass-through (per-shell transform seam)
@@ -826,6 +875,7 @@ function _issuesDetect(ctx){
   g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (7-category)
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
+  g.PFOSImpact.allocate = _impactAllocate;   // M5.3a — pure surplus → buffer + level-weighted tier split (rough-guide teaser)
   g.PFOSRecs   = g.PFOSRecs   || {};   // canonical Recommendation type + lifecycle
   g.PFOS_FLAGS = g.PFOS_FLAGS || {};   // dark-launch bag — each M5 sub-section gates here; default OFF = byte-identical
   g.PFOSShared.PFOSIssues = g.PFOSIssues;
