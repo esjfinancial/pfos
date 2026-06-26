@@ -867,6 +867,55 @@ function _issuesDetect(ctx){
     if (leftover > 10) rows.push({ label: 'Additional savings & investing', amt: leftover, level: 4, icon: '📈', flagId: '_extra' });
     return { surplus: surplus, buffer: bufferAmt, pool: pool, rows: rows };
   }
+  // ── M5.4 — canonical RECOMMENDATION type + status vocabulary. PURE (the 5b firewall): every fn reads only
+  // its args, never S/CPLAN/computeCalcs, and returns NEW values (no mutation). ONE Recommendation shape feeds
+  // the unified card across sources (ai | behavioral | advisor). STATUS is the 4-value set the live
+  // advisor_recommendations DB CHECK enforces (pending/in_progress/completed/dismissed — verified against the
+  // live DB; the in-repo schema doc block is STALE) — so a normalized status is ALSO always a valid DB value;
+  // _recsNormalizeStatus folds the scattered legacy labels onto it. The advisor DE pipeline is detected→drafted→
+  // proposed→agreed→submitted→implemented→active: agreed/submitted (post-agreement, in-flight) → in_progress;
+  // implemented/active → completed; detected/drafted/proposed (pre-agreement) → pending.
+  var _RECS_STATUS = { PENDING: 'pending', IN_PROGRESS: 'in_progress', COMPLETED: 'completed', DISMISSED: 'dismissed' };
+  function _recsNormalizeStatus(s) {
+    s = (s == null ? '' : String(s)).toLowerCase();
+    if (s === 'in_progress' || s === 'agreed' || s === 'submitted' || s === 'approved' || s === 'accepted' || s === 'modified' || s === 'started' || s === 'reviewed') return 'in_progress';
+    if (s === 'completed' || s === 'complete' || s === 'implemented' || s === 'active' || s === 'done' || s === 'funded') return 'completed';
+    if (s === 'dismissed' || s === 'rejected' || s === 'declined' || s === 'deferred' || s === 'denied' || s === 'cancelled') return 'dismissed';
+    return 'pending';   // pending / drafted / draft / suggested / new / sent / viewed / '' → pending
+  }
+  function _recsClone(o) { var c = {}, k; for (k in o) { if (Object.prototype.hasOwnProperty.call(o, k)) c[k] = o[k]; } return c; }
+  // Recommendation factory. Minimal canonical shape; impactForecast is a placeholder M5.6 fills. created/updatedAt
+  // default to 0 so make() is deterministic (the caller stamps the browser timestamp). id defaults to a stable
+  // source:issue key so re-running a producer upserts in place instead of duplicating.
+  function _recsMake(f) {
+    f = f || {};
+    var src = f.source || 'behavioral';
+    var id = f.id || (src + ':' + (f.addressesIssueId || f.allocationRef || f.key || ''));
+    return {
+      id: id,
+      source: src,                                                   // ai | behavioral | advisor
+      addressesIssueId: (f.addressesIssueId != null ? f.addressesIssueId : null),
+      allocationRef: (f.allocationRef != null ? f.allocationRef : null),
+      status: _recsNormalizeStatus(f.status || _RECS_STATUS.PENDING),
+      impactForecast: (f.impactForecast != null ? f.impactForecast : null),   // {metric,before,after,deltaText}|null (M5.6)
+      title: f.title || '',                                          // optional display text (behavioral carries its own)
+      created: f.created || 0,
+      updatedAt: f.updatedAt || 0
+    };
+  }
+  function _recsFind(recs, id) { if (!recs || !recs.length) return null; for (var i = 0; i < recs.length; i++) { if (recs[i] && recs[i].id === id) return recs[i]; } return null; }
+  function _recsUpsert(recs, rec) {
+    recs = (recs && recs.slice) ? recs.slice() : [];
+    if (!rec || !rec.id) return recs;
+    for (var i = 0; i < recs.length; i++) { if (recs[i] && recs[i].id === rec.id) { recs[i] = rec; return recs; } }
+    recs.push(rec); return recs;
+  }
+  function _recsSetStatus(recs, id, status, ts) {
+    recs = (recs && recs.slice) ? recs.slice() : [];
+    var st = _recsNormalizeStatus(status);
+    for (var i = 0; i < recs.length; i++) { if (recs[i] && recs[i].id === id) { var c = _recsClone(recs[i]); c.status = st; if (ts) c.updatedAt = ts; recs[i] = c; break; } }
+    return recs;
+  }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;
   g.PFOSIssues.toCp = _issuesToCp;   // identity pass-through (per-shell transform seam)
@@ -877,6 +926,12 @@ function _issuesDetect(ctx){
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
   g.PFOSImpact.allocate = _impactAllocate;   // M5.3a — pure surplus → buffer + level-weighted tier split (rough-guide teaser)
   g.PFOSRecs   = g.PFOSRecs   || {};   // canonical Recommendation type + lifecycle
+  g.PFOSRecs.STATUS = _RECS_STATUS;                 // M5.4 — canonical 4-value status (DB-CHECK-aligned)
+  g.PFOSRecs.normalizeStatus = _recsNormalizeStatus;   // fold legacy labels (drafted/agreed/implemented/...) → canonical
+  g.PFOSRecs.make = _recsMake;                      // Recommendation factory (minimal shape)
+  g.PFOSRecs.find = _recsFind;                      // find by id (pure)
+  g.PFOSRecs.upsert = _recsUpsert;                  // replace-by-id or append; returns a NEW array (pure)
+  g.PFOSRecs.setStatus = _recsSetStatus;            // normalized status change; returns a NEW array (pure)
   g.PFOS_FLAGS = g.PFOS_FLAGS || {};   // dark-launch bag — each M5 sub-section gates here; default OFF = byte-identical
   g.PFOSShared.PFOSIssues = g.PFOSIssues;
   g.PFOSShared.PFOSHealth = g.PFOSHealth;

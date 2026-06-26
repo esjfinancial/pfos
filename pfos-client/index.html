@@ -8874,6 +8874,23 @@ function _portalSvgDonut(data,size,label,opts){
   return '<div style="text-align:center">'+svg+leg+'</div>';
 }
 // Master block builder — same shape as pfos-main renderHome() "WHERE EVERY DOLLAR GOES"
+// ── M5.4 — unified recommendation store accessors (client-owned allocation_plan.recs[]; dark: recStore). Thin
+// wrappers over the PURE PFOSRecs (v6). CPLAN._recs is the in-memory copy; cplanSave is the ONLY DB writer (RLS-
+// scoped to the caller's own client_profiles row). Defined-but-unreferenced in U1 — producers wire in later units.
+function _cpRecsAll(){ return (typeof CPLAN!=='undefined'&&CPLAN._recs)||[]; }
+function _cpRecsUpsert(rec){
+  if(typeof PFOSRecs==='undefined'||typeof PFOSRecs.upsert!=='function'||typeof PFOSRecs.make!=='function'||typeof CPLAN==='undefined')return;
+  // Route through make() so the store ALWAYS holds a fresh, canonical-shape, status-normalized rec — even if a
+  // producer hands in a reused/hand-built object (make() is idempotent on its own output, so make()-d recs are unaffected).
+  CPLAN._recs=PFOSRecs.upsert(CPLAN._recs||[],PFOSRecs.make(rec));
+  if(typeof cplanSave==='function')cplanSave();
+}
+function _cpRecsSetStatus(id,status){
+  if(typeof PFOSRecs==='undefined'||typeof PFOSRecs.setStatus!=='function'||typeof CPLAN==='undefined')return;
+  CPLAN._recs=PFOSRecs.setStatus(CPLAN._recs||[],id,status,Date.now());
+  if(typeof cplanSave==='function')cplanSave();
+}
+
 // ── M5.3a — CORE surplus-deploy teaser (dark: PFOS_FLAGS.coreAids). "You have $X/mo to put to work —
 // here's roughly how to spread it across your priorities." Reuses the PURE PFOSImpact.allocate (v6) over the
 // user's detected flags (_cpExtractRedFlags), with a user-adjustable cushion slider backed by the SHARED
@@ -26859,6 +26876,8 @@ function _cpEnsurePlanLoaded(){
   }catch(_hh){console.warn('Early household type detect:',_hh);}
   if(CPLAN.allocations&&CPLAN.allocations.length&&CPLAN._sim)return true;
   var saved=APP._portalFd&&APP._portalFd.allocation_plan;
+  // M5.4 — hydrate the unified rec store (dark: recStore). OFF → CPLAN._recs untouched (undefined) = byte-identical.
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.recStore)CPLAN._recs=(saved&&saved.recs)||[];
   // ── Hybrid couples with no own plan ──
   // A Hybrid spouse may not have generated their own plan yet, but if the
   // partner has shared cards (joint or self-shared), we should still proceed
@@ -32829,6 +32848,12 @@ async function _cpSelectApproachHybrid(key,aiData){
     planStartDate:CPLAN._planStartDate||nowIso,
     originalProjection:CPLAN._originalProjection||null,
     catchUpBoosts:CPLAN._catchUpBoosts||[],
+    // M5.4 — carry the requesting user's unified rec store into the State-C dual-plan SELF write so a couples
+    // plan regeneration (a second allocation_plan writer, via the state_c_dual_plan_write RPC) doesn't strip
+    // recs once recStore is live. Dark: OFF → undefined → omitted by JSON = byte-identical. NOTE: partnerPlan
+    // (above) intentionally does NOT carry recs — the partner's recs are THEIR data, created in the partner's
+    // own session; whether a dual-plan regen should preserve them is a producer-era couples follow-up.
+    recs:(window.PFOS_FLAGS&&PFOS_FLAGS.recStore)?(CPLAN._recs||[]):undefined,
     _extrasSemantics:true
   };
 
@@ -48507,7 +48532,10 @@ function cplanSave(){
     // EXTRAS SEMANTICS marker. Set on every save under the new system. Plans saved
     // before this flag existed are treated as legacy "total" semantics and migrated
     // on load — see _cpMigrateAllocationsToExtras.
-    _extrasSemantics:true
+    _extrasSemantics:true,
+    // M5.4 — unified client-owned recommendation store (dark: PFOS_FLAGS.recStore). OFF → value is undefined,
+    // which JSON.stringify OMITS, so the serialized/persisted bytes are byte-identical to today.
+    recs:(window.PFOS_FLAGS&&PFOS_FLAGS.recStore)?(CPLAN._recs||[]):undefined
   };
   // Always save to localStorage as backup
   try{localStorage.setItem('pfos_plan_backup',JSON.stringify(plan));}catch(e){}
