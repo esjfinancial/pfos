@@ -8191,6 +8191,9 @@ function _portalAiRecCard(rec){
   if(rec.status==='in_progress')h+='<span style="margin-left:auto;font-size:10px;font-weight:700;color:var(--gr)">✓ In your plan</span>';
   h+='</div>';
   h+='<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:12px">'+esc(rec.title||'Recommendation')+'</div>';
+  // M5.6 — pre-accept impact forecast (dark: impactForecast). Show this funded plan move's contribution to
+  // FI / nest egg / debt-free, live-computed via the metric-inert bridge. OFF / no-match / non-AI → no chip.
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.impactForecast&&typeof _cpForecastRecImpact==='function'){ var _fc=_cpForecastRecImpact(rec); if(_fc){ var _fch=_portalRecImpactChip(_fc); if(_fch)h+=_fch; } }
   // Not a dead-end: the move is editable in the plan builder. Reuse the behavioral card's Modify-button
   // style + the existing plan nav (mirrors the #cnav-plan onclick) so this card has a clear next step.
   h+='<div style="display:flex;gap:8px;flex-wrap:wrap">';
@@ -10020,6 +10023,47 @@ function _bridgeComputeImpacts(calcs){
   finally{ CPLAN.allocations=savedAllocs; CPLAN._sim=savedSim; }
   _bridgeCache={sig:sig,simRef:savedSim,data:data};
   return data;
+}
+// ── M5.6 — pre-accept impact forecast (dark: impactForecast). A funded AI plan move's CONTRIBUTION to the
+// projection: resolve the rec's allocationRef → its CPLAN.allocations index, read the per-envelope delta the
+// (memoized, metric-inert) bridge already computes — _bridgeComputeImpacts.chips[idx] is the reduce-to-0 diff =
+// what you'd LOSE without this envelope = its contribution. Client-only (needs _cpRunSimulation; the 5b firewall
+// keeps it out of pure v6). Live-computed per render, NEVER persisted — rec.impactForecast stays a documented
+// null hook, since the sim depends on the CURRENT plan and a stored value would go stale the moment allocations
+// change (the M5.3b no-cache decision). Behavioral recs (allocationRef null) are not sim-forecastable → no chip.
+function _cpResolveAllocRef(ref){
+  if(!ref||typeof CPLAN==='undefined'||!Array.isArray(CPLAN.allocations))return -1;
+  var allocs=CPLAN.allocations;
+  for(var i=0;i<allocs.length;i++){ var a=allocs[i]; if(!a)continue;
+    // rebuild each candidate's ref exactly as _cpMirrorAiRecsToStore stamped it (v6 line ~9005)
+    var r=a._sharedId||(a.type+'#'+String(a.customName||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,30)+'#'+(a.owner||'self')+'#'+i);
+    if(r===ref)return i;
+  }
+  return -1;
+}
+function _cpForecastRecImpact(rec){
+  if(!rec||rec.source!=='ai'||!rec.allocationRef||typeof _bridgeComputeImpacts!=='function')return null;
+  var idx=_cpResolveAllocRef(rec.allocationRef); if(idx<0)return null;
+  var calcs=(typeof _lastPfosState!=='undefined'&&_lastPfosState&&_lastPfosState.calcs)||null;
+  var impacts; try{ impacts=_bridgeComputeImpacts(calcs); }catch(_e){ return null; } // metric-inert: clone+finally-restore
+  if(!impacts||!impacts.fiComputable)return null;
+  var chip=impacts.chips&&impacts.chips[idx]; if(!chip)return null; // not among the bounded top movers → no chip
+  return {fiAge:impacts.fiAge,fiYearsDelta:_lnum(chip.fiYearsDelta),projRetValueDelta:_lnum(chip.projRetValueDelta),debtFreeMonthsDelta:_lnum(chip.debtFreeMonthsDelta),fiComputable:true};
+}
+// The impact chip — this funded move's contribution (FI sooner, nest egg higher, debt-free sooner). Reuses the
+// statTile component + the green-accent box of _ciPlanImpactHTML (rule 9 — no one-off styling). The bridge deltas
+// are "without this envelope" diffs: fiYearsDelta>0 = FI that-much later without it (so the move brings it sooner);
+// projRetValueDelta<0 = nest egg that-much lower without it (so the move adds it); debtFreeMonthsDelta>0 = sooner.
+function _portalRecImpactChip(f){
+  if(!f||!f.fiComputable)return '';
+  var tiles=[];
+  if(f.fiYearsDelta>0){ var t=f.fiYearsDelta>=1?((Math.round(f.fiYearsDelta*10)/10)+' yr'):(Math.round(f.fiYearsDelta*12)+' mo'); tiles.push(statTile(t+' sooner','FI date'+(f.fiAge!=null?(' (age '+Math.round(f.fiAge)+')'):''),'var(--gr)')); }
+  var nest=-f.projRetValueDelta; if(nest>0)tiles.push(statTile('+'+fmtK(nest),'Nest egg by retirement','var(--gr)'));
+  if(f.debtFreeMonthsDelta>0)tiles.push(statTile(f.debtFreeMonthsDelta+' mo sooner','Debt-free','var(--gr)'));
+  if(!tiles.length)return '';
+  return '<div style="padding:12px 14px;background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.16);border-radius:6px;margin:0 0 12px">'
+    +'<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--gr);margin-bottom:8px">🎯 This move’s impact</div>'
+    +'<div style="display:grid;grid-template-columns:repeat('+Math.min(tiles.length,2)+',1fr);gap:6px">'+tiles.join('')+'</div></div>';
 }
 // The always-visible headline: current FI age (from the live cascade) + projected nest egg + debt-free horizon.
 function _bridgeHeadlineBlock(impacts){
