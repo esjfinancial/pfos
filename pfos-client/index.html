@@ -5671,6 +5671,7 @@ async function loadClientDataIntoPFOS(clientId){
       // Map DB columns to DE format
       recommendations = (recs || []).map(function(r){
         return {
+          id: r.id,
           section: r.section, priority: r.priority,
           recommendation: r.recommendation, status: r.status,
           createdAt: r.created_at
@@ -6141,11 +6142,17 @@ function showCelebration(title,sub){
   overlay.style.display='block';
   setTimeout(function(){overlay.style.display='none';},2500);
 }
+// M5.5 U1 — push an advisor-rec status change into the embedded engine (pfos-main) so its read-only
+// advisor-rec list updates immediately instead of showing a stale status. Display-only / metric-inert.
+function _cpReflectRecStatus(recId, status){
+  try{ var fr=getPFOSFrame(); if(fr&&fr.contentWindow) fr.contentWindow.postMessage({type:'PFOS_REC_STATUS',recId:recId,status:status},(typeof PFOS_ORIGIN!=='undefined'?PFOS_ORIGIN:'https://pfos.esjfinancial.com')); }catch(_e){}
+}
 async function clientUpdateRecStatus(recId, newStatus){
   var rec = (APP_RECS||[]).find(function(r){ return r.id===recId; });
   if(rec && rec.is_locked){ _cpToast('This recommendation is locked by your advisor and cannot be changed.'); return; }
   try{
     await db.from('advisor_recommendations').update({status:newStatus,updated_at:new Date().toISOString()}).eq('id',recId);
+    _cpReflectRecStatus(recId,newStatus);
     loadClientRecommendations(APP.currentClientId);
   } catch(e){ console.warn('clientUpdateRecStatus:', e); }
 }
@@ -6153,10 +6160,13 @@ async function clientMarkImplemented(recId){
   try{
     // Capture current calcs as before-snapshot
     var calcsBefore = (_lastPfosState&&_lastPfosState.calcs)?_lastPfosState.calcs:null;
+    // 'completed' is the live advisor_recommendations.status CHECK value ('implemented' is rejected); the
+    // implementation_log keeps its own action vocab ('implemented'/'reverted'), unchanged.
     await db.from('advisor_recommendations')
-      .update({status:'implemented', updated_at:new Date().toISOString()})
+      .update({status:'completed', updated_at:new Date().toISOString()})
       .eq('id', recId);
     await _saveImplLog(recId,'implemented','client',calcsBefore);
+    _cpReflectRecStatus(recId,'completed');
     await loadClientRecommendations(APP.currentClientId);
     showCelebration('Way to Go!','You completed a recommendation — your financial future thanks you');
   }catch(e){ console.warn('clientMarkImplemented:', e); _cpToast('Could not update: '+e.message); }
@@ -6176,6 +6186,7 @@ async function clientRevertImplemented(recId){
       .update({status:'in_progress', updated_at:new Date().toISOString()})
       .eq('id', recId);
     await _saveImplLog(recId,'reverted','client',calcsBefore);
+    _cpReflectRecStatus(recId,'in_progress');
     await loadClientRecommendations(APP.currentClientId);
   }catch(e){ console.warn('clientRevertImplemented:', e); _cpToast('Could not update: '+e.message); }
 }
