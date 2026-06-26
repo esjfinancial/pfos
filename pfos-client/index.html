@@ -3328,7 +3328,7 @@ function _cpCashFlowBars(months,W,H){
 // Right = top-8 categories (+ Other remainder + Saved when net>0). Conservation:
 // Σleft == Σright == total (income+max(0,-net) == expense+max(0,net)). Null when
 // there's nothing to show. The testable seam (reads only the report object).
-function _cpSankeyModel(rep){
+function _cpSankeyModel(rep,opts){
   if(!rep) return null;
   var income=Math.round(rep.totalIncome||0), expense=Math.round(rep.totalExpense||0);
   var net=(rep.net==null?(income-expense):Math.round(rep.net)), saved=Math.max(0,net);
@@ -3337,7 +3337,9 @@ function _cpSankeyModel(rep){
   var rights=cats.map(function(c){ var m=_cpSpendCatMeta(c.key); return {label:m.l,value:Math.round(c.total),color:m.c}; });
   var other=expense-shown;
   if(other>0.5) rights.push({label:'Other',value:Math.round(other),color:'#94A3B8'});
-  if(saved>0.5) rights.push({label:'Saved',value:Math.round(saved),color:'#64748B'}); // muted slate — keep spending colors the focus of "Where It Went"
+  // When expense data is incomplete (caller flags it), the positive "net" is mostly UN-tracked spend, not real
+  // savings — label it honestly as "Untracked" so the Sankey doesn't overstate savings.
+  if(saved>0.5) rights.push({label:(opts&&opts.savedIsUntracked)?'Untracked':'Saved',value:Math.round(saved),color:(opts&&opts.savedIsUntracked)?'#94A3B8':'#64748B'}); // muted slate — keep spending colors the focus of "Where It Went"
   if(!rights.length) return null;
   // CONSERVATION by construction: total = Σrights (the actual drawn sum), then the LEFT side is DERIVED to
   // match — Income covers what it can, the remainder is the Deficit. This stays balanced regardless of the
@@ -3712,12 +3714,19 @@ function renderReportsView(){
   var _srcNote=(rep.source==='manual'&&_plaidLinked)?' · <span style="color:#EAB308">Plaid not yet synced — showing manual expenses</span>':'';
   var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile)'+(rep.savingsRate==null?' — savings rate hidden until income is confirmed':'')+'.</div>':'';
   h+='</div><div style="font-size:11px;color:var(--mu);margin-top:8px">'+ev(rep.months.length?(rep.months[0].label+' – '+rep.months[rep.months.length-1].label):'—')+' · '+(rep.source==='linked'?'linked transactions':'manual entries')+_srcNote+'</div>'+_estNote+'</div>';
+  // Reports cash-flow honesty: when the tracked monthly spend is well under the user's typical spend (engine
+  // baseExp), the expense data is incomplete, so Net Cash Flow / the Sankey "Saved" band overstate. Suppress
+  // the precise Net + flag it, and the Sankey relabels the remainder "Untracked" (below).
+  var _expMonthly=calcs.baseExp||0, _repMonthly=(rep.monthsCount>0?rep.totalExpense/rep.monthsCount:rep.totalExpense);
+  var _expenseSparse=(_expMonthly>0&&rep.totalExpense>0&&_repMonthly<_expMonthly*0.6);
+  var _cfUnreliable=_expenseSparse||rep.estimatedMonths>0;
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="stat-grid" style="gap:6px;margin-bottom:0">';
   h+=statTile(fmtK(rep.totalIncome),'Income','#22C55E');
-  h+=statTile(fmtK(rep.totalExpense),'Expenses','#EF4444');
-  h+=statTile((rep.net>=0?'+':'')+fmtK(rep.net),'Net Cash Flow',rep.net>=0?'var(--gr)':'var(--rd)');
+  h+=statTile(fmtK(rep.totalExpense),_expenseSparse?'Expenses (partial)':'Expenses','#EF4444');
+  h+=statTile(_cfUnreliable?'—':((rep.net>=0?'+':'')+fmtK(rep.net)),'Net Cash Flow',_cfUnreliable?'var(--mu)':(rep.net>=0?'var(--gr)':'var(--rd)'));
   h+=statTile(rep.savingsRate==null?'—':(rep.savingsRate+'%'),'Savings Rate',rep.savingsRate==null?'var(--mu)':(rep.savingsRate>=0?'var(--gr)':'var(--rd)'));
   h+='</div>';
+  if(_expenseSparse) h+='<div style="font-size:11px;color:#EAB308;margin-top:8px;line-height:1.5">📊 Only '+fmt(Math.round(_repMonthly))+'/mo of your ~'+fmt(Math.round(_expMonthly))+'/mo typical spending is tracked here, so Net Cash Flow is hidden and the untracked remainder shows as &ldquo;Untracked&rdquo;. Link or import your spending for complete cash-flow reports.</div>';
   // label the Income number's SOURCE (linked deposits vs profile estimate) so a source switch is never silent
   var _incOn=0; (rep.incomeStreams||[]).forEach(function(s){ if(s.confirmed)_incOn++; });
   if(rep.incomeStreams&&rep.incomeStreams.length){ h+='<div style="font-size:11px;color:var(--mu);margin-top:8px">'+(rep.incomeSource==='linked'?('💵 Income = '+_incOn+' confirmed deposit source'+(_incOn===1?'':'s')+' (confirm below)'):'📊 Income estimated from your profile — confirm your deposits below for accurate cash flow')+'</div>'; }
@@ -3734,7 +3743,7 @@ function renderReportsView(){
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Monthly Net Cash Flow</div>'+_cpCashFlowBars(rep.months,600,200)+'</div>';
   h+='<div class="info-card" style="padding:14px"><div class="info-card-title" style="margin-bottom:8px">Where It Went</div>';
   if(rep.byCategory.length){
-    var _sankey=(rep.totalIncome>0&&rep.totalExpense>0)?_cpSankeyModel(rep):null; // §2.4b income→category flow
+    var _sankey=(rep.totalIncome>0&&rep.totalExpense>0)?_cpSankeyModel(rep,{savedIsUntracked:_cfUnreliable}):null; // §2.4b income→category flow
     if(_sankey) h+='<div style="margin-bottom:10px">'+_cpRenderSankey(_sankey,600,210)+'</div>';
     var maxCat=rep.byCategory[0].total||1;
     rep.byCategory.slice(0,10).forEach(function(c){ var meta=_cpSpendCatMeta(c.key), pct=rep.totalExpense>0?Math.round(c.total/rep.totalExpense*100):0;
