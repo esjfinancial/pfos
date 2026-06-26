@@ -3140,47 +3140,79 @@ function renderPortfolioView(){
 // past-only + a cross-link to the plan (no dead-end). READ-ONLY / metric-inert
 // (reads APP._supabaseSnapshots + CPLAN._sim; never runs the sim, mutates S, or
 // calls calc/computeCalcs/postMessage).
+var _nwHorizon=10;                 // default forward years shown (toggle: 10/20/30)
+var _nwTimelineTarget='nwTimeline';
+function _nwSetHorizon(h){ _nwHorizon=h; renderNetWorthTimeline(_nwTimelineTarget); }
+// Catmull-Rom → cubic-bezier smooth path through points [{x,y}] (premium curve, not straight segments).
+function _nwSmooth(pts){
+  if(!pts.length) return '';
+  if(pts.length<3){ var d='M'+pts[0].x.toFixed(1)+','+pts[0].y.toFixed(1); for(var k=1;k<pts.length;k++)d+=' L'+pts[k].x.toFixed(1)+','+pts[k].y.toFixed(1); return d; }
+  var d='M'+pts[0].x.toFixed(1)+','+pts[0].y.toFixed(1);
+  for(var i=0;i<pts.length-1;i++){
+    var p0=pts[i-1]||pts[i], p1=pts[i], p2=pts[i+1], p3=pts[i+2]||p2;
+    var c1x=p1.x+(p2.x-p0.x)/6, c1y=p1.y+(p2.y-p0.y)/6;
+    var c2x=p2.x-(p3.x-p1.x)/6, c2y=p2.y-(p3.y-p1.y)/6;
+    d+=' C'+c1x.toFixed(1)+','+c1y.toFixed(1)+' '+c2x.toFixed(1)+','+c2y.toFixed(1)+' '+p2.x.toFixed(1)+','+p2.y.toFixed(1);
+  }
+  return d;
+}
 function renderNetWorthTimeline(targetId){
-  var el=document.getElementById(targetId||'nwTimeline'); if(!el) return;
+  _nwTimelineTarget=targetId||'nwTimeline';
+  var el=document.getElementById(_nwTimelineTarget); if(!el) return;
   var snaps=(APP._supabaseSnapshots||[]).filter(function(s){return s&&isFinite(parseFloat(s.netWorth));});
   var past=snaps.map(function(s){return {label:String(s.label||s.date||''),v:parseFloat(s.netWorth)};});
   var simNW=(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN._sim&&Array.isArray(CPLAN._sim.netWorth)&&CPLAN._sim.netWorth.length>1)?CPLAN._sim.netWorth:null;
-  var future=simNW?simNW.map(function(v,i){var n=parseFloat(v); return {year:i,v:(isFinite(n)?n:0)};}):null; // isFinite guard: a broken sim emitting Infinity would NaN the whole y-scale
-  var hasPast=past.length>=2, hasFuture=!!future;
+  var future=null, fullYears=0;
+  if(simNW){ fullYears=simNW.length-1; var hz=Math.min(_nwHorizon,fullYears); future=simNW.slice(0,hz+1).map(function(v,i){var n=parseFloat(v); return {year:i,v:(isFinite(n)?n:0)};}); } // slice to the chosen horizon: a full 30y compound curve crushes the near-term flat
+  var hasPast=past.length>=2, hasFuture=!!(future&&future.length>1);
   if(!hasPast&&!hasFuture){ el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:16px 0;text-align:center">Your net-worth timeline builds as monthly snapshots accumulate. Open <a href="javascript:showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="color:#5B9BFF">My Financial Plan</a> to project it forward.</div>'; return; }
-  var W=600,H=240,padL=54,padR=18,padT=18,padB=30,plotW=W-padL-padR,plotH=H-padT-padB;
+  var W=600,H=250,padL=54,padR=18,padT=22,padB=28,plotW=W-padL-padR,plotH=H-padT-padB,baseY=padT+plotH;
   var allV=[]; past.forEach(function(p){allV.push(p.v);}); if(future)future.forEach(function(f){allV.push(f.v);});
-  var loV=Math.min.apply(null,allV.concat([0])), hiV=Math.max.apply(null,allV), range=(hiV-loV)||1;
-  var pastW=(hasPast&&hasFuture)?Math.round(plotW*0.32):(hasPast?plotW:0), futW=plotW-pastW, divX=padL+pastW;
+  var loV0=Math.min.apply(null,allV.concat([0])), hiV0=Math.max.apply(null,allV);
+  var rpad=(hiV0-loV0)*0.08||1, loV=loV0-rpad, hiV=hiV0+rpad, range=(hiV-loV)||1; // breathing room so the line isn't glued to an edge
+  var pastW=(hasPast&&hasFuture)?Math.round(plotW*0.34):(hasPast?plotW:0), futW=plotW-pastW, divX=padL+pastW;
   function yOf(v){ return padT+plotH-((v-loV)/range)*plotH; }
+  function xPast(i){ return past.length>1?padL+(i/(past.length-1))*pastW:padL+pastW; }
+  function xFut(i){ return future.length>1?divX+(i/(future.length-1))*futW:divX+futW; }
   var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto" role="img" aria-label="Net worth over time">';
-  if(loV<0){ var zy=yOf(0); svg+='<line x1="'+padL+'" y1="'+zy+'" x2="'+(W-padR)+'" y2="'+zy+'" stroke="var(--bd)" stroke-width="1" stroke-dasharray="2 3"/>'; }
-  if(hasPast&&hasFuture){ svg+='<line x1="'+divX+'" y1="'+padT+'" x2="'+divX+'" y2="'+(padT+plotH)+'" stroke="var(--mu)" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>'; } // TODAY divider drawn as a BACKGROUND reference so the boundary dot stays legible on top
+  svg+='<defs><linearGradient id="nwGradPast" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5B9BFF" stop-opacity="0.33"/><stop offset="1" stop-color="#5B9BFF" stop-opacity="0"/></linearGradient>'
+    +'<linearGradient id="nwGradFut" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#22C55E" stop-opacity="0.30"/><stop offset="1" stop-color="#22C55E" stop-opacity="0"/></linearGradient></defs>';
+  if(loV0<0&&hiV0>0){ var zy=yOf(0); svg+='<line x1="'+padL+'" y1="'+zy.toFixed(1)+'" x2="'+(W-padR)+'" y2="'+zy.toFixed(1)+'" stroke="var(--bd)" stroke-width="1" stroke-dasharray="2 3"/><text x="'+(padL-6)+'" y="'+(zy+3).toFixed(1)+'" fill="var(--mu)" font-size="8" text-anchor="end">$0</text>'; }
+  if(hasPast&&hasFuture){ svg+='<line x1="'+divX+'" y1="'+padT+'" x2="'+divX+'" y2="'+baseY+'" stroke="var(--mu)" stroke-width="1" stroke-dasharray="3 3" opacity="0.5"/>'; }
   if(hasPast){
-    var ppts=past.map(function(p,i){ var x=past.length>1?padL+(i/(past.length-1))*pastW:padL+pastW; return x+','+yOf(p.v); });
-    svg+='<polyline points="'+ppts.join(' ')+'" fill="none" stroke="#5B9BFF" stroke-width="2" stroke-linejoin="round"/>';
-    var _pstep=Math.max(1,Math.ceil(past.length/12)); // cap visible dots so a long history doesn't blob (polyline stays full-resolution)
-    past.forEach(function(p,i){ if(i%_pstep!==0&&i!==past.length-1)return; var x=past.length>1?padL+(i/(past.length-1))*pastW:padL+pastW; svg+='<circle cx="'+x+'" cy="'+yOf(p.v)+'" r="2.4" fill="#5B9BFF"><title>'+_cpEscHtml(p.label)+': '+fmt(Math.round(p.v))+'</title></circle>'; });
+    var pp=past.map(function(p,i){return {x:xPast(i),y:yOf(p.v)};}), pLine=_nwSmooth(pp);
+    svg+='<path d="'+pLine+' L'+pp[pp.length-1].x.toFixed(1)+','+baseY+' L'+pp[0].x.toFixed(1)+','+baseY+' Z" fill="url(#nwGradPast)" stroke="none"/>';
+    svg+='<path d="'+pLine+'" fill="none" stroke="#5B9BFF" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>';
+    var _pstep=Math.max(1,Math.ceil(past.length/8));
+    past.forEach(function(p,i){ if(i%_pstep!==0&&i!==past.length-1)return; svg+='<circle cx="'+xPast(i).toFixed(1)+'" cy="'+yOf(p.v).toFixed(1)+'" r="2.6" fill="#5B9BFF"><title>'+_cpEscHtml(p.label)+': '+fmt(Math.round(p.v))+'</title></circle>'; });
   }
   if(hasFuture){
-    var fpts=future.map(function(f,i){ var x=future.length>1?divX+(i/(future.length-1))*futW:divX+futW; return x+','+yOf(f.v); });
-    svg+='<polyline points="'+fpts.join(' ')+'" fill="none" stroke="#22C55E" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>';
-    future.forEach(function(f,i){ if(i===0)return; if(i%5!==0&&i!==future.length-1)return; var x=future.length>1?divX+(i/(future.length-1))*futW:divX+futW; svg+='<circle cx="'+x+'" cy="'+yOf(f.v)+'" r="2.4" fill="#22C55E"><title>Year +'+f.year+': '+fmt(Math.round(f.v))+'</title></circle>'; }); // skip i=0: the past[last] dot + divider already mark today
+    var fp=future.map(function(f,i){return {x:xFut(i),y:yOf(f.v)};}), fLine=_nwSmooth(fp);
+    svg+='<path d="'+fLine+' L'+fp[fp.length-1].x.toFixed(1)+','+baseY+' L'+fp[0].x.toFixed(1)+','+baseY+' Z" fill="url(#nwGradFut)" stroke="none"/>';
+    svg+='<path d="'+fLine+'" fill="none" stroke="#22C55E" stroke-width="2.4" stroke-dasharray="6 4" stroke-linejoin="round" stroke-linecap="round"/>';
+    var _fstep=Math.max(1,Math.ceil(future.length/6));
+    future.forEach(function(f,i){ if(i===0)return; if(i%_fstep!==0&&i!==future.length-1)return; svg+='<circle cx="'+xFut(i).toFixed(1)+'" cy="'+yOf(f.v).toFixed(1)+'" r="2.6" fill="#22C55E"><title>Year +'+f.year+': '+fmt(Math.round(f.v))+'</title></circle>'; });
   }
   if(hasPast&&hasFuture){
-    svg+='<text x="'+divX+'" y="'+(padT-5)+'" fill="var(--mu)" font-size="9" font-weight="700" text-anchor="middle" font-family="var(--fh)">TODAY</text>'; // divider line is drawn earlier (background layer)
+    svg+='<circle cx="'+divX.toFixed(1)+'" cy="'+yOf(past[past.length-1].v).toFixed(1)+'" r="3.4" fill="#0B1437" stroke="#5B9BFF" stroke-width="1.6"/>';
+    svg+='<text x="'+divX+'" y="'+(padT-7)+'" fill="var(--mu)" font-size="9" font-weight="700" text-anchor="middle" font-family="var(--fh)">TODAY</text>';
   }
-  svg+='<text x="'+(padL-6)+'" y="'+(yOf(hiV)+3)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(hiV)+'</text>';
-  svg+='<text x="'+(padL-6)+'" y="'+(yOf(loV)+3)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(loV)+'</text>';
-  if(hasPast)svg+='<text x="'+padL+'" y="'+(H-8)+'" fill="var(--mu)" font-size="9" text-anchor="start">'+_cpEscHtml(past[0].label)+'</text>';
-  if(hasFuture)svg+='<text x="'+(W-padR)+'" y="'+(H-8)+'" fill="var(--mu)" font-size="9" text-anchor="end">+'+(future.length-1)+'y</text>';
+  svg+='<text x="'+(padL-6)+'" y="'+(yOf(hiV0)+3).toFixed(1)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(hiV0)+'</text>';
+  svg+='<text x="'+(padL-6)+'" y="'+(yOf(loV0)+3).toFixed(1)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(loV0)+'</text>';
+  if(hasPast)svg+='<text x="'+padL+'" y="'+(H-7)+'" fill="var(--mu)" font-size="9" text-anchor="start">'+_cpEscHtml(past[0].label)+'</text>';
+  if(hasFuture)svg+='<text x="'+(W-padR)+'" y="'+(H-7)+'" fill="var(--mu)" font-size="9" text-anchor="end">+'+(future.length-1)+'y</text>';
   svg+='</svg>';
-  var leg='<div style="display:flex;gap:14px;justify-content:center;margin-top:4px;font-size:11px;color:var(--mu)">';
-  if(hasPast)leg+='<span><span style="display:inline-block;width:14px;height:2px;background:#5B9BFF;vertical-align:middle;margin-right:4px"></span>Actual</span>';
-  if(hasFuture)leg+='<span><span style="display:inline-block;width:14px;border-top:2px dashed #22C55E;vertical-align:middle;margin-right:4px"></span>Projected</span>';
+  var tog='';
+  if(hasFuture&&fullYears>10){
+    var opts=[10,20,30].filter(function(h){return h<=fullYears;});
+    tog='<div style="display:flex;gap:6px;justify-content:center;margin-top:8px">'+opts.map(function(h){var on=(Math.min(_nwHorizon,fullYears)===h);return '<button onclick="_nwSetHorizon('+h+')" style="padding:3px 11px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;border-radius:3px;cursor:pointer;min-height:24px;background:'+(on?'rgba(34,197,94,.16)':'transparent')+';color:'+(on?'#22C55E':'var(--mu)')+'">'+h+'Y</button>';}).join('')+'</div>';
+  }
+  var leg='<div style="display:flex;gap:14px;justify-content:center;margin-top:'+(tog?'6':'8')+'px;font-size:11px;color:var(--mu)">';
+  if(hasPast)leg+='<span><span style="display:inline-block;width:14px;height:3px;border-radius:2px;background:#5B9BFF;vertical-align:middle;margin-right:5px"></span>Actual</span>';
+  if(hasFuture)leg+='<span><span style="display:inline-block;width:14px;border-top:2px dashed #22C55E;vertical-align:middle;margin-right:5px"></span>Projected</span>';
   leg+='</div>';
   var xlink=(hasPast&&!hasFuture)?'<div style="text-align:center;margin-top:6px"><a href="javascript:showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="color:#5B9BFF;font-size:12px">Project it forward with My Plan →</a></div>':'';
-  el.innerHTML=svg+leg+xlink;
+  el.innerHTML=svg+tog+leg+xlink;
 }
 
 // ── §2.4a (M2) Reports: 24-mo transactions read + custom-range cash-flow ──────
