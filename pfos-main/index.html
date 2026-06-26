@@ -4240,6 +4240,28 @@ function _postJointItemsWrite(){
 // unlinked users — they have no couple_links row to write to. Goals remain
 // in S.goals (with owner='joint') for the existing renderSavingsGoals path;
 // the _jointItems.goals copy is the canonical cross-spouse store.
+// Merge joint goals from couple_links.joint_financial_data (jfd) into S.goals — the single source for both
+// the PFOS_LOAD and the realtime joint-sync handlers (previously copy-pasted, which let them drift).
+// Dedups jfd by goal id (joint_financial_data can carry duplicate copies) and treats jfd as authoritative:
+// drops any local goal — including a stale PERSONAL copy sharing the id — before re-adding, so a shared goal
+// never renders 2-3× (the hybrid goals-triplication bug). id-less jfd goals are preserved (can't dedup).
+function _applyJointGoals(jfd){
+  if(!Array.isArray(S.goals)) S.goals=[];
+  if(!jfd || !Array.isArray(jfd.goals) || !jfd.goals.length) return;
+  // Drop existing joint goals (re-added authoritatively from jfd below); KEEP every non-joint goal — never
+  // drop a personal goal, so unsynced local edits can't be lost. (The PFOS_LOAD path also restores local-only
+  // joint goals via __preDropLocalJoint around this call.)
+  S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
+  // Dedup the re-add by id against goals already present (a personal copy of a now-shared goal) AND against
+  // earlier jfd entries (joint_financial_data can carry duplicate ids) — so a shared goal never renders 2-3×.
+  var _seen={};
+  S.goals.forEach(function(g){ if(g && g.id) _seen[g.id]=true; });
+  jfd.goals.forEach(function(jg){
+    if(!jg) return;
+    if(jg.id){ if(_seen[jg.id]) return; _seen[jg.id]=true; }
+    var c=Object.assign({}, jg); c.owner='joint'; S.goals.push(c);
+  });
+}
 function _syncJointGoalsToCoupleLinks(){
   if(S.householdType !== 'hybrid' || !S.coupleLinkId) return;
   if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
@@ -15064,16 +15086,7 @@ function submitAdvisorRequestFromModal(){
           // see it on next refresh (PFOS_LOAD has the same guard, so actually
           // they keep their local copy; an explicit refresh after both spouses
           // have synced is the cleanest way to reconcile delete-to-zero).
-          if(!Array.isArray(S.goals)) S.goals=[];
-          if(Array.isArray(jfd.goals) && jfd.goals.length){
-            S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
-            jfd.goals.forEach(function(jg){
-              if(!jg) return;
-              var copy = Object.assign({}, jg);
-              copy.owner = 'joint';
-              S.goals.push(copy);
-            });
-          }
+          _applyJointGoals(jfd);
           // Re-render all panels that read from _jointItems
           try{ if(typeof renderIncomeRow === 'function') renderIncomeRow(); }catch(e){}
           try{ if(typeof renderRetAccounts === 'function') renderRetAccounts(); }catch(e){}
@@ -16292,16 +16305,7 @@ function submitAdvisorRequestFromModal(){
             var __jfdGoalIds = (Array.isArray(jfd.goals)?jfd.goals:[]).map(function(g){return g && g.id;}).filter(Boolean);
             __preDropLocalJoint = S.goals.filter(function(g){return g && g.owner==='joint' && g.id && __jfdGoalIds.indexOf(g.id) === -1;});
           }
-          if(Array.isArray(jfd.goals) && jfd.goals.length){
-            if(!Array.isArray(S.goals)) S.goals=[];
-            S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
-            jfd.goals.forEach(function(jg){
-              if(!jg) return;
-              var copy = Object.assign({}, jg);
-              copy.owner = 'joint';
-              S.goals.push(copy);
-            });
-          }
+          _applyJointGoals(jfd);
           // Restore the captured local-only joint goals
           if(__preDropLocalJoint.length){
             if(!Array.isArray(S.goals)) S.goals=[];
