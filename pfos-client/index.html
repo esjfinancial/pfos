@@ -8903,6 +8903,38 @@ function _cpIssueAddressed(iid){
   if(Array.isArray(rl)){ for(var j=0;j<rl.length;j++){ var r=rl[j]; if(r&&r.addressesIssueId===iid&&r.status==='completed')return true; } }
   return false;
 }
+// ── M5.4 U4 — AI plan → unified rec store. Map an AI-converted allocation to the stable issue id it addresses
+// (vehicle type → concern action → PFOSIssues.issueId). Vehicles that span concerns (iul/wl/ibc) and custom
+// goals have no clean issue link → null (the rec still tracks via allocationRef).
+var _AI_TYPE_ACTION={ef:'ef',debt:'debt',protection:'protection',roth:'retirement','401k':'retirement',roth401k:'retirement',trad_ira:'retirement',solo401k:'retirement',sep_ira:'retirement',invest:'growth',edu:'edu',hsa:'hsa',rollover:'rollover'};
+function _cpAiIssueId(a){
+  if(!a)return null;
+  var act=_AI_TYPE_ACTION[a.type];
+  if(!act||typeof PFOSIssues==='undefined'||!PFOSIssues.issueId)return null;
+  return PFOSIssues.issueId({action:act,title:a.customName||a.flagTitle||'',owner:a.owner||'self'});
+}
+// Mirror the CURRENT AI plan into CPLAN._recs as source:'ai' Recommendations (one per allocation), stamping the
+// issue link onto each AI allocation. A regeneration SUPERSEDES prior AI recs (drop source==='ai' first);
+// behavioral/advisor recs (other sources) are preserved. Idempotent — upsert by a stable per-allocation id.
+function _cpMirrorAiRecsToStore(){
+  // Skip during a 3-approach COMPARISON preview: the fork (_cpProjectApproachWithSim) sims each non-selected
+  // approach through _cpConvertAIRecs and restores allocations/_sim in its finally but NOT _recs — so without
+  // this guard the store would end up reflecting a preview approach the user never chose. The store must mirror
+  // only the user's REAL plan.
+  if(typeof CPLAN==='undefined'||CPLAN._projectionMode==='preview'||typeof PFOSRecs==='undefined'||!PFOSRecs.make||!PFOSRecs.upsert)return;
+  CPLAN._recs=(CPLAN._recs||[]).filter(function(r){return r&&r.source!=='ai';});
+  var _now=(typeof Date!=='undefined'&&Date.now)?Date.now():0;
+  (CPLAN.allocations||[]).forEach(function(a,_i){
+    if(!a||(a._sharedOwnerClientId&&typeof APP!=='undefined'&&a._sharedOwnerClientId!==APP.currentClientId))return; // skip partner-owned
+    var _aiid=_cpAiIssueId(a);
+    if(_aiid&&!a.addressesIssueId)a.addressesIssueId=_aiid; // flag-derived allocations already carry it (U2)
+    var _amt=parseFloat(a.amount)||0;
+    // stable per-allocation ref. _sharedId for joint/shared (stable cross-render); else type#nameslug#owner#index
+    // — the index keeps two same-type/same-title cards DISTINCT (1:1 alloc↔rec; AI recs are regenerated wholesale).
+    var _ref=a._sharedId||(a.type+'#'+String(a.customName||'').toLowerCase().replace(/[^a-z0-9]+/g,'-').slice(0,30)+'#'+(a.owner||'self')+'#'+_i);
+    CPLAN._recs=PFOSRecs.upsert(CPLAN._recs,PFOSRecs.make({id:'ai:'+_ref,source:'ai',addressesIssueId:_aiid,allocationRef:_ref,title:a.customName||'',status:(a._completed?'completed':(_amt>0?'in_progress':'pending')),created:_now,updatedAt:_now}));
+  });
+}
 
 // ── M5.3a — CORE surplus-deploy teaser (dark: PFOS_FLAGS.coreAids). "You have $X/mo to put to work —
 // here's roughly how to spread it across your priorities." Reuses the PURE PFOSImpact.allocate (v6) over the
@@ -32590,6 +32622,8 @@ function _cpConvertAIRecs(aiData){
   // unlinked retirement/invest allocations and sets _aiLinked=true so the
   // Apply path uses REPLACE semantics for these cards. Idempotent.
   try{if(typeof _cpLinkAIAllocationsToAccounts==='function')_cpLinkAIAllocationsToAccounts();}catch(e){console.warn('[ai-link] failed:',e);}
+  // M5.4 U4 — mirror this generated AI plan into the unified rec store (dark: recStore; OFF → no-op = byte-identical).
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.recStore){try{_cpMirrorAiRecsToStore();}catch(_e){}}
 }
 
 // ── Select an approach from the 3 generated options ──
