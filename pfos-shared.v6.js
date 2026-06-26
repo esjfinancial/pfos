@@ -944,6 +944,44 @@ function _issuesDetect(ctx){
     }
     return sp ? (id + ':spouse') : id;
   }
+  // ── M5.7a — PFOSHealth.score: the ONE canonical 0–10 lineage-A health rollup (the 4 engine cats + up to 3 NEW
+  // read-only cats). PURE (ctx-in; never reads S/CPLAN/computeCalcs = the 5b firewall). Reproduces EACH render
+  // site's OWN legacy averager — ctx.averager 'mean' = computeHealthScore's (non-zero cats → mean, ×10 round /10),
+  // 'div4' = pfos-main's (sum of 4, missing→0)/4 — so a wired site is byte-identical to its legacy path when the
+  // new cats are empty. New cats are ADDITIVE and counted only when PRESENT (v!=null); a helper returns null ONLY
+  // when its source is empty (untouched user) → empty cats never enter the divisor → byte-identical. (The 0–100
+  // edge lineage stays edge-authoritative — NOT owned here. The averager divergence is preserved, not unified.)
+  function _healthScore(ctx){
+    if(!ctx)return null;
+    var eng=[ctx.cfScore,ctx.protScore,ctx.growScore,ctx.effScore].map(function(v){return parseFloat(v)||0;});
+    var nc=ctx.newCats||{}, extra=[];
+    ['debt','implementation','goalProgress'].forEach(function(k){ var v=nc[k]; if(v!=null)extra.push(parseFloat(v)||0); }); // present (incl 0) counts; null excluded
+    if(ctx.averager==='div4'){
+      var s4=eng[0]+eng[1]+eng[2]+eng[3], c4=4;            // pfos-main badge: /4, no rounding; new cats extend num+den
+      extra.forEach(function(v){ s4+=v; c4+=1; });
+      return s4/c4;
+    }
+    var vals=eng.filter(function(v){return v>0;}).concat(extra);   // computeHealthScore: non-zero engine cats, then the present new cats
+    if(!vals.length)return null;
+    return Math.round(vals.reduce(function(s,v){return s+v;},0)/vals.length*10)/10;
+  }
+  // The 3 NEW read-only category sub-scores (each 0–10, or NULL when the source is EMPTY → excluded → byte-identical).
+  // PURE: each takes the raw data the SHELL reads (the shell keeps the 5b firewall; these never reach into CPLAN/S).
+  function _healthDebtScore(dti){ var d=parseFloat(dti)||0; if(d<=0)return null; return d<20?10:d<28?8:d<36?6:d<43?3:1; }
+  function _healthImplScore(recs){
+    if(!Array.isArray(recs)||!recs.length)return null;
+    var active=0,done=0;
+    recs.forEach(function(r){ if(!r||r.status==='dismissed')return; active++; if(r.status==='completed')done++; });
+    if(!active)return null;                 // recs exist but all dismissed → empty (not 0); present-with-0-completed → 0
+    return Math.round(done/active*10);
+  }
+  function _healthGoalScore(goals){
+    if(!Array.isArray(goals)||!goals.length)return null;
+    var pts=[];
+    goals.forEach(function(gl){ var t=parseFloat(gl&&gl.target)||0; if(t>0)pts.push(Math.min(1,(parseFloat(gl.current)||0)/t)); });
+    if(!pts.length)return null;             // no goal with a target → empty
+    return Math.round(pts.reduce(function(s,v){return s+v;},0)/pts.length*10);
+  }
   g.PFOSIssues = g.PFOSIssues || {};
   g.PFOSIssues.detect = _issuesDetect;
   g.PFOSIssues.toCp = _issuesToCp;   // identity pass-through (per-shell transform seam)
@@ -952,6 +990,10 @@ function _issuesDetect(ctx){
   g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
   g.PFOSIssues.issueId = _issueId;   // M5.4 U2 — stable issue identity for addressesIssueId linkage + funded-state suppression
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (7-category)
+  g.PFOSHealth.score = _healthScore;                 // M5.7a — 0–10 lineage-A rollup (4 engine + ≤3 new), per-site averager, pure
+  g.PFOSHealth.debtScore = _healthDebtScore;         // new cat: DTI → 0–10 | null
+  g.PFOSHealth.implScore = _healthImplScore;         // new cat: completed-rec ratio → 0–10 | null
+  g.PFOSHealth.goalProgressScore = _healthGoalScore; // new cat: mean goal progress → 0–10 | null
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
   g.PFOSImpact.allocate = _impactAllocate;   // M5.3a — pure surplus → buffer + level-weighted tier split (rough-guide teaser)
   g.PFOSRecs   = g.PFOSRecs   || {};   // canonical Recommendation type + lifecycle
