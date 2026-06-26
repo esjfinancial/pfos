@@ -1396,6 +1396,12 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
           <div id="cfPlanDeploy" style="display:none;margin-top:8px;padding:8px;background:rgba(0,68,191,.04);border-radius:2px;border:1px solid rgba(0,68,191,.06)"></div>
         </div>
       </div>
+      <!-- §2.3 Net Worth Over Time (top hero) — past actuals + forward projection,
+           filled by _renderDashNwTimeline on landing (warms CPLAN._sim first). -->
+      <div id="dashNwCard" class="info-card" style="margin-bottom:12px;padding:14px">
+        <div class="info-card-title" style="margin-bottom:8px">Net Worth Over Time</div>
+        <div id="dashNwTimeline"></div>
+      </div>
       <!-- Phase G: Spending Pulse — live this-month status. Updates on data sync.
            Click to jump to My Spending tab for the full dashboard. -->
       <div id="spendPulseCard" style="margin-bottom:12px"></div>
@@ -2874,6 +2880,9 @@ async function loadSupabaseSnapshots(){
         };
       });
       renderClientTracking();
+      // §2.3: past data just loaded → re-render the dashboard net-worth timeline
+      // so the actual (blue) series joins the projected (green) overlay.
+      try{ if(typeof _renderDashNwTimeline==='function')_renderDashNwTimeline(); }catch(e){}
     }
   }catch(e){console.warn('loadSupabaseSnapshots:',e);}
 }
@@ -3178,6 +3187,45 @@ function renderNetWorthTimeline(targetId){
   leg+='</div>';
   var xlink=(hasPast&&!hasFuture)?'<div style="text-align:center;margin-top:6px"><a href="javascript:showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="color:#5B9BFF;font-size:12px">Project it forward with My Plan →</a></div>':'';
   el.innerHTML=svg+leg+xlink;
+}
+
+// ── §2.3 dashboard hook: warm the forward projection + render the top-hero chart ──
+// _cpHydrateOnly: when true, initClientPlan hydrates CPLAN from the profile but
+// SKIPS the plan-page render + the check-in flow — so the dashboard can reuse the
+// SAME hydration (single source) to warm CPLAN._sim without side effects. Default
+// false, so initClientPlan is byte-identical in normal use.
+var _cpHydrateOnly=false;
+// Warm CPLAN._sim (the 30yr forward net-worth projection) for the dashboard
+// timeline. Reuses initClientPlan's hydration, runs the sim, then RESTORES global
+// CPLAN to its pre-warm state — leaving only the freshly-computed _sim the chart
+// reads (renderNetWorthTimeline reads only CPLAN._sim.netWorth). So no other
+// dashboard read of CPLAN is perturbed before the user opens the Plan tab.
+// Idempotent (bails if already warmed) and metric-inert (the sim never touches
+// S/calc/computeCalcs/postMessage).
+function _cpWarmSim(){
+  try{
+    if(typeof CPLAN==='undefined'||!CPLAN) return;
+    if(CPLAN._sim&&CPLAN._sim.netWorth&&CPLAN._sim.netWorth.length>1) return; // already warmed (e.g. user opened the plan)
+    if(!APP._portalFd||!APP._portalFd.S) return; // no profile → chart shows past-only / empty-state (no dead-end)
+    if(typeof initClientPlan!=='function'||typeof _cpRunSimulation!=='function') return;
+    var _keys=Object.keys(CPLAN), _save={}; _keys.forEach(function(k){_save[k]=CPLAN[k];});
+    var _sim=null;
+    _cpHydrateOnly=true;
+    try{ initClientPlan(); _cpRunSimulation(); _sim=CPLAN._sim; }
+    finally{
+      _cpHydrateOnly=false;
+      Object.keys(CPLAN).forEach(function(k){ if(!_save.hasOwnProperty(k)) delete CPLAN[k]; });
+      _keys.forEach(function(k){ CPLAN[k]=_save[k]; });
+      CPLAN._sim=_sim||_save._sim;
+    }
+  }catch(e){ console.warn('warm sim:',e); }
+}
+// Render the dashboard top-hero "Net Worth Over Time" chart: warm the projection
+// first so the forward overlay shows on landing (not only after a plan visit).
+function _renderDashNwTimeline(){
+  if(!document.getElementById('dashNwTimeline')) return;
+  try{ _cpWarmSim(); }catch(e){}
+  if(typeof renderNetWorthTimeline==='function') renderNetWorthTimeline('dashNwTimeline');
 }
 
 // ── §2.4a (M2) Reports: 24-mo transactions read + custom-range cash-flow ──────
@@ -5986,11 +6034,16 @@ async function loadClientPortalData(){
     // Update mobile tools with current financial data
     _lastPfosState={state:fd.S||{},calcs:fd.calcs||{}};
     updateMobileTools();
+    // §2.3 top-hero net-worth chart (past+future). Renders future-first now; the
+    // past series fills in when loadSupabaseSnapshots resolves (it re-renders).
+    try{ _renderDashNwTimeline(); }catch(e){}
   } else {
     // No profile data yet — show prompts to get started
     set('clientSnapshotData','<div style="color:var(--mu);font-size:13px;padding:4px 0">No financial data yet. Open <strong style="color:#5B9BFF">My Financial Data</strong> to get started.</div>');
     set('clientScoresData','<div style="color:var(--mu);font-size:13px">Scores will appear after entering your financial details.</div>');
     set('clientPriorityData','');
+    // No profile yet → nothing to project; hide the net-worth chart (the prompts above cover the empty state).
+    var _dnc=document.getElementById('dashNwCard');if(_dnc)_dnc.style.display='none';
   }
   var rData = await db.from('reports').select('*').eq('client_id',APP.currentClientId).order('created_at',{ascending:false});
   var reports = rData.data || [];
@@ -42345,6 +42398,9 @@ function initClientPlan(){
   }
   CPLAN.mode=localStorage.getItem('pfos_ui_mode')||'guided';
   CPLAN.mode=localStorage.getItem('pfos_ui_mode')||'guided';
+  // The dashboard net-worth chart warms CPLAN._sim via this SAME hydration (single
+  // source) but must NOT render the plan page or fire the check-in flow.
+  if(_cpHydrateOnly)return;
   // Determine view: advisor-pending / fork / plan view (Plan Workflow)
   if(CPLAN.hasAdvisor){
     // Advisor client: only show plan if published. Drafts are invisible to client.
