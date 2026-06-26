@@ -944,8 +944,8 @@ function _issuesDetect(ctx){
     }
     return sp ? (id + ':spouse') : id;
   }
-  // ── M5.7a — PFOSHealth.score: the ONE canonical 0–10 lineage-A health rollup (the 4 engine cats + up to 3 NEW
-  // read-only cats). PURE (ctx-in; never reads S/CPLAN/computeCalcs = the 5b firewall). Reproduces EACH render
+  // ── M5.7a — PFOSHealth.score: the ONE canonical 0–10 lineage-A health rollup (the 4 engine cats + up to 2 NEW
+  // read-only cats: implementation + goal-progress). PURE (ctx-in; never reads S/CPLAN/computeCalcs = the 5b firewall). Reproduces EACH render
   // site's OWN legacy averager — ctx.averager 'mean' = computeHealthScore's (non-zero cats → mean, ×10 round /10),
   // 'div4' = pfos-main's (sum of 4, missing→0)/4 — so a wired site is byte-identical to its legacy path when the
   // new cats are empty. New cats are ADDITIVE and counted only when PRESENT (v!=null); a helper returns null ONLY
@@ -955,7 +955,7 @@ function _issuesDetect(ctx){
     if(!ctx)return null;
     var eng=[ctx.cfScore,ctx.protScore,ctx.growScore,ctx.effScore].map(function(v){return parseFloat(v)||0;});
     var nc=ctx.newCats||{}, extra=[];
-    ['debt','implementation','goalProgress'].forEach(function(k){ var v=nc[k]; if(v!=null)extra.push(parseFloat(v)||0); }); // present (incl 0) counts; null excluded
+    ['implementation','goalProgress'].forEach(function(k){ var v=nc[k]; if(v!=null)extra.push(parseFloat(v)||0); }); // present (incl 0) counts; null excluded
     if(ctx.averager==='div4'){
       var s4=eng[0]+eng[1]+eng[2]+eng[3], c4=4;            // pfos-main badge: /4, no rounding; new cats extend num+den
       extra.forEach(function(v){ s4+=v; c4+=1; });
@@ -965,9 +965,10 @@ function _issuesDetect(ctx){
     if(!vals.length)return null;
     return Math.round(vals.reduce(function(s,v){return s+v;},0)/vals.length*10)/10;
   }
-  // The 3 NEW read-only category sub-scores (each 0–10, or NULL when the source is EMPTY → excluded → byte-identical).
+  // The 2 NEW read-only category sub-scores (each 0–10, or NULL when the source is EMPTY → excluded → byte-identical).
+  // (A `debt` cat was considered but DROPPED per owner decision — DTI already counts via effScore/Efficiency, so a
+  // standalone debt cat would double-count + break byte-identity for any user with debt.)
   // PURE: each takes the raw data the SHELL reads (the shell keeps the 5b firewall; these never reach into CPLAN/S).
-  function _healthDebtScore(dti){ var d=parseFloat(dti)||0; if(d<=0)return null; return d<20?10:d<28?8:d<36?6:d<43?3:1; }
   function _healthImplScore(recs){
     if(!Array.isArray(recs)||!recs.length)return null;
     var active=0,done=0;
@@ -989,9 +990,8 @@ function _issuesDetect(ctx){
   g.PFOSIssues.rankCards = _issuesRankCards;   // rank unassigned plan cards by flagAction/flagType; goals trail (M5.2b)
   g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
   g.PFOSIssues.issueId = _issueId;   // M5.4 U2 — stable issue identity for addressesIssueId linkage + funded-state suppression
-  g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (7-category)
-  g.PFOSHealth.score = _healthScore;                 // M5.7a — 0–10 lineage-A rollup (4 engine + ≤3 new), per-site averager, pure
-  g.PFOSHealth.debtScore = _healthDebtScore;         // new cat: DTI → 0–10 | null
+  g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (6-category: 4 engine + 2 new)
+  g.PFOSHealth.score = _healthScore;                 // M5.7a — 0–10 lineage-A rollup (4 engine + ≤2 new), per-site averager, pure
   g.PFOSHealth.implScore = _healthImplScore;         // new cat: completed-rec ratio → 0–10 | null
   g.PFOSHealth.goalProgressScore = _healthGoalScore; // new cat: mean goal progress → 0–10 | null
   g.PFOSImpact = g.PFOSImpact || {};   // canonical $-impact / cascade-bridge forecaster
