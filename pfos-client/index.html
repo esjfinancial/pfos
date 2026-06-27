@@ -8365,7 +8365,7 @@ function _portalLinkedIncomeDismiss(streamId){
 // _portalRecCard) + the AI plan's moves (a compact source-badged card), from _cpUnifiedRecs(). Active only
 // (pending/in_progress). Advisory clients' advisor recs stay in their own (iframe) surface — unchanged.
 function _portalRenderUnifiedRecs(){
-  var unified=((typeof _cpUnifiedRecs==='function')?_cpUnifiedRecs():[]).filter(function(r){return r&&(r.status==='pending'||r.status==='in_progress');});
+  var unified=((typeof _cpUnifiedRecs==='function')?_cpUnifiedRecs():[]).filter(function(r){return r&&r.source!=='committed'&&(r.status==='pending'||r.status==='in_progress');});   // Section F — 'committed' recs are tracked in the headline, NOT this product rec list (would render empty + inflate the count). No-op when none exist (byte-identical).
   if(!unified.length)return '';
   var h='<div class="sec-group" style="background:linear-gradient(180deg,rgba(91,155,255,.06),transparent);border:1px solid rgba(91,155,255,.22);border-radius:8px;padding:14px 14px 4px;margin-bottom:16px;box-shadow:0 0 0 1px rgba(91,155,255,.06),0 6px 22px rgba(91,155,255,.08)">';
   h+='<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">';
@@ -30829,6 +30829,92 @@ function _cpOpportunityCardHTML(card){
   h+='</div>';
   return h;
 }
+// ── Section F (decisionCards + decisionCardsCommit, co-requires recStore) — the COMMIT → TRACK → ADAPT loop.
+// Per-card Commit / Adjust / Not now drive the recStore lifecycle (pending → in_progress → dismissed) via the
+// existing _cpRecsUpsert/_cpRecsSetStatus. Adherence is read from monthly client_snapshots (METRIC-INERT — never
+// calc/computeCalcs/_cpRunSimulation). Dismissal sets CPLAN._dismissedFlags[flagAction] (the exact key
+// _cpSyncFlagsToUnassigned honors at ~31694 → never resurfaced). Inline onclick can only carry a string, so the
+// handlers take the flagAction and re-find the staged card. Dark/byte-identical OFF; committed recs are excluded
+// from the unified product rec list (tracked here, not there).
+function _cpDecisionId(a){
+  var base=(a&&(a.addressesIssueId||a.flagAction||a.type))||'';
+  if(a&&a.owner==='spouse'&&String(base).indexOf(':spouse')<0) base+=':spouse';   // owner-qualified so self/spouse same-action cards get DISTINCT rec ids (no cross-fire / id collision)
+  return 'committed:'+base;
+}
+function _cpFindStagedCard(flagAction,owner){
+  owner=owner||'self';
+  var al=(typeof CPLAN!=='undefined'&&CPLAN.allocations)||[];
+  for(var i=0;i<al.length;i++){ var c=al[i]; if(c&&c.phase===0&&((c.flagAction||c.type)===flagAction)&&((c.owner||'self')===owner)) return c; }
+  return null;
+}
+function _cpFindStagedCardById(decId){
+  var al=(typeof CPLAN!=='undefined'&&CPLAN.allocations)||[];
+  for(var i=0;i<al.length;i++){ if(al[i]&&al[i].phase===0&&_cpDecisionId(al[i])===decId) return al[i]; }
+  return null;
+}
+function _cpCardStatus(a){
+  if(a&&typeof CPLAN!=='undefined'&&CPLAN._dismissedFlags){
+    var dk=(a.flagAction||'')+((a.owner==='spouse')?'_spouse':'');   // suffixed key (Not now) + the stripped key (legacy _cpRemove) — catch both dismiss paths
+    if(CPLAN._dismissedFlags[dk]||CPLAN._dismissedFlags[a.flagAction]) return 'dismissed';
+  }
+  var id=_cpDecisionId(a), recs=(typeof _cpRecsAll==='function')?_cpRecsAll():[];
+  for(var i=0;i<recs.length;i++){ if(recs[i]&&recs[i].id===id) return recs[i].status||'pending'; }
+  return 'pending';
+}
+function _cpCommitCard(flagAction,owner){
+  var a=_cpFindStagedCard(flagAction,owner); if(!a||typeof _cpRecsUpsert!=='function') return;
+  _cpRecsUpsert({ id:_cpDecisionId(a), source:'committed', addressesIssueId:(a.addressesIssueId||null), status:'in_progress', title:(a.customName||(typeof CP_NM!=='undefined'&&CP_NM[a.type])||a.flagAction||a.type) });
+  if(typeof _cpRenderPlanTeaser==='function')_cpRenderPlanTeaser();
+}
+function _cpAdjustCard(flagAction,owner){
+  var a=_cpFindStagedCard(flagAction,owner); if(!a||typeof _cpRecsSetStatus!=='function') return;
+  _cpRecsSetStatus(_cpDecisionId(a),'pending');
+  if(typeof _cpRenderPlanTeaser==='function')_cpRenderPlanTeaser();
+}
+function _cpNotNowCard(flagAction,owner){
+  owner=owner||'self';
+  var a=_cpFindStagedCard(flagAction,owner)||{ flagAction:flagAction, owner:owner };
+  var dismissKey=flagAction+((owner==='spouse')?'_spouse':'');   // the SUFFIXED action key _cpSyncFlagsToUnassigned honors (self/spouse stay distinct → dismiss the RIGHT card)
+  if(typeof CPLAN!=='undefined'){ if(!CPLAN._dismissedFlags)CPLAN._dismissedFlags={}; CPLAN._dismissedFlags[dismissKey]=true; }
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.recStore&&typeof _cpRecsSetStatus==='function')_cpRecsSetStatus(_cpDecisionId(a),'dismissed');
+  if(typeof _cpToast==='function')_cpToast(((a.flagTitle||a.customName||'This')+' set aside — we won\'t resurface it.')+(a.reason?(' '+String(a.reason)):''));
+  if(typeof cplanSave==='function')cplanSave();
+  if(typeof _cpRenderPlanTeaser==='function')_cpRenderPlanTeaser();
+}
+function _cpCardAdherence(a){
+  var snaps=(typeof APP!=='undefined'&&APP._supabaseSnapshots)||[];   // camelCase (mapped at loadSupabaseSnapshots); METRIC-INERT — snapshots only
+  if(snaps.length<2) return { state:'new', deltaText:'' };
+  var first=snaps[0], curr=snaps[snaps.length-1], base=(a&&(a.flagAction||a.type))||'';
+  if(base==='debt'){ var paid=_lnum(first.totalDebt)-_lnum(curr.totalDebt); return paid>0?{ state:'on_track', deltaText:fmtK(paid)+' paid' }:{ state:'behind', deltaText:'' }; }
+  if(base==='ef'){ var ef=_lnum(curr.efMonths)-_lnum(first.efMonths); return ef>0?{ state:'on_track', deltaText:'+'+ef.toFixed(1)+' mo' }:{ state:'behind', deltaText:'' }; }
+  if(base==='retirement'){ var ret=_lnum(curr.retBal)-_lnum(first.retBal); return ret>0?{ state:'on_track', deltaText:'growing' }:{ state:'behind', deltaText:'' }; }
+  var nw=_lnum(curr.netWorth)-_lnum(first.netWorth); return nw>0?{ state:'on_track', deltaText:'net worth up' }:{ state:'behind', deltaText:'' };
+}
+function _cpDecisionControls(a){
+  if(!a) return '';
+  var st=_cpCardStatus(a);
+  if(st==='dismissed'||st==='completed') return '';
+  var fa=String((a.flagAction||a.type)||'').split("'").join("\\'"), ow=String((a.owner||'self')).split("'").join("\\'");
+  var _b=function(lbl,fn,col,bg){ return '<button onclick="event.stopPropagation();'+fn+'(\''+fa+'\',\''+ow+'\')" style="cursor:pointer;font-family:var(--fh);font-size:12px;font-weight:700;padding:7px 12px;border-radius:4px;min-height:36px;border:1px solid '+col+';background:'+bg+';color:'+col+'">'+lbl+'</button>'; };
+  var h='<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;align-items:center">';
+  if(st==='in_progress'){
+    var ad=_cpCardAdherence(a), bd=(ad.state==='on_track'?{t:'On track ✓',c:'var(--gr)',b:'rgba(34,197,94,.12)'}:ad.state==='behind'?{t:'Behind',c:'var(--yl)',b:'rgba(234,179,8,.10)'}:{t:'Committed',c:'#5B9BFF',b:'rgba(91,155,255,.10)'});
+    h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;padding:7px 12px;border-radius:4px;color:'+bd.c+';background:'+bd.b+'">'+bd.t+(ad.deltaText?(' · '+ad.deltaText):'')+'</span>';
+    h+=_b('Adjust','_cpAdjustCard','var(--mu)','transparent');
+  } else {
+    h+=_b('Commit','_cpCommitCard','var(--gr)','rgba(34,197,94,.12)');
+    h+=_b('Not now','_cpNotNowCard','var(--mu)','transparent');
+  }
+  h+='</div>';
+  return h;
+}
+function _cpLivingHeadlineAdherence(){
+  var recs=((typeof _cpRecsAll==='function')?_cpRecsAll():[]).filter(function(r){ return r && r.source==='committed' && r.status==='in_progress'; });
+  if(!recs.length) return '';
+  var onTrack=0;
+  recs.forEach(function(r){ var a=_cpFindStagedCardById(r.id); if(!a || _cpCardAdherence(a).state==='on_track') onTrack++; });   // match by the owner-qualified rec id; committed but no longer staged (addressed) → on track
+  return '<div style="font-size:12px;color:var(--gr);font-weight:600">✓ '+onTrack+' of '+recs.length+' committed priorit'+(recs.length===1?'y':'ies')+' on track</div>';
+}
 function _cpRenderPlanTeaser(){
   var root=document.getElementById('cplanRoot');if(!root)return;
   // Stage the flag-derived priority cards (same path as the builder's unassigned column). Read-only
@@ -30848,6 +30934,7 @@ function _cpRenderPlanTeaser(){
   h+='<div style="font-family:var(--fh);font-size:22px;font-weight:800;color:var(--wh);margin-bottom:6px">Your Top Priorities</div>';
   h+='<div style="font-size:14px;color:var(--mu);line-height:1.6;max-width:560px;margin:0 auto">'+(top.length?'Here\'s what to focus on next, ranked by impact.':'You\'re on track — no urgent priorities right now.')+'</div>';
   h+='</div>';
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.decisionCards&&PFOS_FLAGS.decisionCardsCommit&&PFOS_FLAGS.recStore&&typeof _cpLivingHeadlineAdherence==='function'){ var _ah=_cpLivingHeadlineAdherence(); if(_ah)h+='<div style="text-align:center;margin:-8px 0 14px">'+_ah+'</div>'; }   // Section F — "N of M committed on track"
   if(top.length){ top.forEach(function(a){ h+=_cpTeaserCard(a); }); }
   h+=_cpPlanUpgradePanel();
   root.innerHTML=h;
@@ -30876,6 +30963,7 @@ function _cpRenderDecisionCard(a,dc){
   if(dc.nextAction&&dc.nextAction.projectionText){ h+='<div style="font-size:13px;font-weight:600;color:'+color+';line-height:1.5;margin-top:8px">▸ '+dc.nextAction.projectionText+'</div>'; }
   if(dc.priority&&dc.priority.why){ h+='<div style="font-size:12px;color:var(--mu);opacity:.85;line-height:1.5;margin-top:8px">'+dc.priority.why+'</div>'; }
   if(dc.impact&&dc.impact.text){ h+='<div style="font-size:12px;color:var(--mu);opacity:.7;line-height:1.5;margin-top:4px">'+dc.impact.text+'</div>'; }
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.decisionCards&&PFOS_FLAGS.decisionCardsCommit&&PFOS_FLAGS.recStore&&typeof _cpDecisionControls==='function'){ h+=_cpDecisionControls(a); }   // Section F — Commit / Adjust / Not now (needs recStore for durability)
   h+='</div>';
   return h;
 }

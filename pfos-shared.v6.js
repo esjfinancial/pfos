@@ -1097,7 +1097,7 @@ function _issuesDetect(ctx){
   function _healthImplScore(recs){
     if(!Array.isArray(recs)||!recs.length)return null;
     var active=0,done=0;
-    recs.forEach(function(r){ if(!r||r.status==='dismissed')return; active++; if(r.status==='completed')done++; });
+    recs.forEach(function(r){ if(!r||r.status==='dismissed'||r.source==='committed')return; active++; if(r.status==='completed')done++; });   // 'committed' recs (Section F user card-commitments) are tracked via adherence, NOT the implementation score (they have no completed path → would only drag it down)
     if(!active)return null;                 // recs exist but all dismissed → empty (not 0); present-with-0-completed → 0
     return Math.round(done/active*10);
   }
