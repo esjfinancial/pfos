@@ -804,6 +804,68 @@ function _issuesDetect(ctx){
     var ranked=_issuesRank(flagCards.map(function(c){ return { action:c.flagAction, type:c.flagType, _a:c }; }));
     return ranked.map(function(w){ return w._a; }).concat(others);
   }
+  // ── Section A (decisionCards) — pure spec-format DECISION-CARD builder. Maps a detected ISSUE + the
+  // pre-computed calcs into the canonical Decision-card view-model: diagnosis {current/target/gap} ·
+  // priority {level/severity/why} · nextAction {$/mo + timeline + projection} · impact. PURE (the 5b
+  // firewall): reads ONLY issue + calcs, never S/CPLAN/computeCalcs/DOM, mutates nothing, returns a NEW
+  // object (or null → callers fall through to the legacy card). card.id === _issueId(issue) (the RAW
+  // issue id; recs link via addressesIssueId === this — prefixed rec ids NEVER appear here). Section A
+  // fills the EF + Retirement families from calcs; debt/protection/estate/other return a shell with null
+  // diagnosis/nextAction/impact for B/D/E to fill ADDITIVELY (never renaming these fields). All $ copy is
+  // built here with the shared fmt (which includes the '$').
+  function _dcFamily(act){
+    if(act==='ef')return'ef';
+    if(act==='retirement'||act==='edu'||act==='growth'||act==='diversify')return'retirement';
+    if(act==='debt')return'debt';
+    if(act==='protection'||act==='protection_ext')return'protection';
+    if(act==='estate'||act==='estate_tax')return'estate';
+    return'other';
+  }
+  function _dcNum(v){ var n=parseFloat(v); return isFinite(n)?n:0; }
+  function _decisionCard(issue, calcs){
+    if(!issue) return null;
+    var a=String(issue.action||'').replace(/_spouse$/,'');   // _spouse-strip (mirrors _issuesRank:786 / _issueId:932)
+    var fam=_dcFamily(a);
+    var lvl=_ACTION_LEVEL[a]; lvl=(lvl!=null?lvl:3);
+    var sev=_TYPE_SEV[issue.type]; sev=(sev!=null?sev:3);
+    var card={
+      id:_issueId(issue), family:fam, action:a, type:(issue.type||'info'),
+      title:(issue.title||''), icon:(issue.icon||''),
+      diagnosis:null,
+      priority:{ level:lvl, severity:sev, why:'' },
+      nextAction:null, impact:null
+    };
+    var c=calcs||{};
+    if(fam==='ef'){
+      var ecur=_dcNum(c.efBal), etgt=_dcNum(c.efT3);
+      var egap=(c.efS3!=null?_dcNum(c.efS3):Math.max(0,etgt-ecur));
+      var emo=(c.efBuildMonths3>0?c.efBuildMonths3:3);                 // EF framing LOCKED: one consistent pair
+      var esugg=Math.max(0,Math.ceil(egap/Math.max(1,c.efBuildMonths3||3)));  // suggest = gap/efBuildMonths3, timeline = efBuildMonths3
+      card.diagnosis={ metric:'Emergency fund', current:ecur, target:etgt, gap:egap, unit:'money',
+        text:'You have '+fmt(ecur)+' of a '+fmt(etgt)+' (3-month) target — '+fmt(egap)+' short.' };
+      card.nextAction={ suggestedMonthly:esugg, timelineMonths:emo,
+        timelineText:'~'+emo+' month'+(emo===1?'':'s')+' at '+fmt(esugg)+'/mo',
+        projectionText:'Set aside '+fmt(esugg)+'/mo → fully funded in about '+emo+' month'+(emo===1?'':'s')+'.' };
+      card.impact={ text:'A full 3-month cushion lets you invest for the future without raiding it in an emergency.' };
+      card.priority.why='Stability first — without a cushion, one surprise expense forces you into debt.';
+    } else if(fam==='retirement'){
+      var rcur=_dcNum(c.projRetBal), rtgt=_dcNum(c.fiNumber);
+      var rgap=(c.retGap!=null?Math.max(0,_dcNum(c.retGap)):Math.max(0,rtgt-rcur));
+      var rsugg=Math.max(0,_dcNum(c.requiredMonthlyIncrease));
+      var ryrs=(c.yearsToRetire>0?c.yearsToRetire:0), rage=_dcNum(c.retAge);
+      card.diagnosis={ metric:'Retirement savings', current:rcur, target:rtgt, gap:rgap, unit:'money',
+        text:'Projected '+fmt(rcur)+' vs a '+fmt(rtgt)+' FI target'+(rgap>0?(' — '+fmt(rgap)+' short.'):' — on track.') };
+      card.nextAction={ suggestedMonthly:rsugg, timelineMonths:ryrs*12,
+        timelineText:(rsugg>0?'add '+fmt(rsugg)+'/mo over '+ryrs+' year'+(ryrs===1?'':'s'):'on track'),
+        projectionText:(rsugg>0?'Add '+fmt(rsugg)+'/mo → closes the '+fmt(rgap)+' gap by age '+rage+'.':'On track to reach your FI number by age '+rage+'.') };
+      card.impact={ text:(rsugg>0?'Adding '+fmt(rsugg)+'/mo keeps you on track to be financially independent at age '+rage+' instead of falling '+fmt(rgap)+' short.':'You are on track for financial independence at age '+rage+'.') };
+      card.priority.why='Growth lever — closing this gap is what makes work optional on time.';
+    } else {
+      // debt/protection/estate/other — shell only; B/D/E fill diagnosis/nextAction/impact ADDITIVELY.
+      card.priority.why=(lvl===1?'Stability first — secure the basics before anything else.':lvl===2?'Protect what you have before optimizing.':lvl===3?'An efficiency win — free up money working against you.':'A growth opportunity once the essentials are covered.');
+    }
+    return card;
+  }
   // ── M5.2b-2 — SELF-SERVE PORTAL spouse-issue VISIBILITY policy (household-aware privacy). The advisor
   // always sees both spouses; in the self-serve portal what one spouse sees OF THE PARTNER is gated by
   // household type: joint = ALL (merged finances, no privacy barrier); separate = NONE (independent —
@@ -990,6 +1052,7 @@ function _issuesDetect(ctx){
   g.PFOSIssues.rankCards = _issuesRankCards;   // rank unassigned plan cards by flagAction/flagType; goals trail (M5.2b)
   g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
   g.PFOSIssues.issueId = _issueId;   // M5.4 U2 — stable issue identity for addressesIssueId linkage + funded-state suppression
+  g.PFOSIssues.decisionCard = _decisionCard;   // Section A — pure spec-format decision-card builder (diagnosis/priority/nextAction/impact); consumed by B/C/D/E behind PFOS_FLAGS.decisionCards
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (6-category: 4 engine + 2 new)
   g.PFOSHealth.score = _healthScore;                 // M5.7a — 0–10 lineage-A rollup (4 engine + ≤2 new), per-site averager, pure
   g.PFOSHealth.implScore = _healthImplScore;         // new cat: completed-rec ratio → 0–10 | null
