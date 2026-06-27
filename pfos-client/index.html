@@ -6058,6 +6058,7 @@ async function loadClientPortalData(){
     set('clientPriorityData', _isProduct
       ? '<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7;margin-bottom:8px">Build your plan to see your prioritized next steps.</div><button onclick="showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;padding:8px 14px;border-radius:4px;cursor:pointer;min-height:36px">Go to My Financial Plan →</button>'
       : '<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">View your full action plan in your latest report.</div>');
+    if(window.PFOS_FLAGS&&PFOS_FLAGS.decisionCards&&PFOS_FLAGS.decisionCardsHeadline&&typeof _cpRenderLivingHeadline==='function'){ _cpRenderLivingHeadline(); }   // Section C — living headline supersedes the static CTA when ON
     // Update mobile tools with current financial data
     _lastPfosState={state:fd.S||{},calcs:fd.calcs||{}};
     updateMobileTools();
@@ -6066,6 +6067,7 @@ async function loadClientPortalData(){
     set('clientSnapshotData','<div style="color:var(--mu);font-size:13px;padding:4px 0">No financial data yet. Open <strong style="color:#5B9BFF">My Financial Data</strong> to get started.</div>');
     set('clientScoresData','<div style="color:var(--mu);font-size:13px">Scores will appear after entering your financial details.</div>');
     set('clientPriorityData','');
+    if(window.PFOS_FLAGS&&PFOS_FLAGS.decisionCards&&PFOS_FLAGS.decisionCardsHeadline&&typeof _cpRenderLivingHeadline==='function'){ _cpRenderLivingHeadline(); }   // Section C — no-data: model yields empty → stays ''
   }
   var rData = await db.from('reports').select('*').eq('client_id',APP.currentClientId).order('created_at',{ascending:false});
   var reports = rData.data || [];
@@ -10275,6 +10277,117 @@ function _bridgeHeadlineBlock(impacts){
   h+='<div style="display:flex;align-items:center;gap:8px"><span style="font-size:17px">🌉</span><span style="font-family:var(--fd);font-size:18px;font-weight:800;color:'+accent+'">'+ev(headline)+'</span></div>';
   h+='<div style="font-size:11px;color:var(--mu);margin-top:4px">'+ev(sub)+'</div></div>';
   return h;
+}
+// ── Section C (decisionCards + decisionCardsHeadline) — the LIVING HEADLINE for the dashboard priority panel.
+// Replaces the dead #clientPriorityData CTA with the three retention hooks: (a) WHERE YOU'RE HEADED (the Bridge
+// FI date when the plan is live, else a calcs-based soft banner), (b) THIS MONTH'S MOVE (surplus → allocator
+// split), (c) PROGRESS / WHAT CHANGED (month-over-month snapshot deltas + % to FI). CRITICAL: the Bridge
+// (_bridgeComputeImpacts) clones+runs the sim and needs a HYDRATED plan; CPLAN is a default {allocations:[],age:30,
+// income:0} until the user opens My Plan — so the CPLAN guard is CENTRALIZED in _cpHeadlineModel and the Bridge is
+// NEVER called unless CPLAN.allocations.length>0 (else source:'calcs', fiAge:null). Read-only/metric-inert (the Bridge restores
+// CPLAN in its finally). Reuses _bridgeHeadlineBlock, PFOSImpact.allocate (shared), APP._supabaseSnapshots, set().
+// Called only behind the flag → OFF byte-identical (the static priority string is untouched).
+function _cpSnapshotDeltas(prev,curr){
+  // MoM delta truth table (mirrors pfos-main buildTrackingHTML): green when good; "up is good" flips for debt.
+  var defs=[
+    { l:'Net worth', o:prev.netWorth, n:curr.netWorth, up:true },
+    { l:'Debt', o:prev.totalDebt, n:curr.totalDebt, up:false },
+    { l:'Savings rate', o:prev.savingsRate, n:curr.savingsRate, up:true, pct:true },
+    { l:'Cash flow', o:prev.netCF, n:curr.netCF, up:true }
+  ];
+  return defs.map(function(d){
+    var diff=_lnum(d.n)-_lnum(d.o), good=d.up?(diff>=0):(diff<=0);
+    var arrow=diff>0?'▲':diff<0?'▼':'■', disp=d.pct?(Math.abs(diff).toFixed(1)+'%'):fmtK(Math.abs(diff));
+    return { l:d.l, diff:diff, good:good, text:arrow+' '+disp };
+  });
+}
+function _cpHeadlineModel(calcs){
+  var c=calcs||{};
+  // (a) where you're headed — calcs baseline, UPGRADED to the live Bridge only when a HYDRATED plan exists. CPLAN
+  // is a default {allocations:[], age:30, income:0} at parse time, so guarding on mere existence would run the
+  // Bridge over an un-hydrated plan at overview and render a false "FI not reached" banner — guard on a real,
+  // non-empty plan (allocations.length, matching the rest of the file's "is there a plan" convention).
+  var headed={ source:'calcs', fiComputable:(_lnum(c.fiNumber)>0), fiAge:null, retAge:(_lnum(c.retAge)||0),
+    retStatus:(c.retStatus||''), projRetValue:_lnum(c.projRetBal), fiNumber:_lnum(c.fiNumber),
+    debtFreeMonth:0, horizon:30, hasLoRateDebt:false, _imp:null };
+  if(typeof CPLAN!=='undefined' && CPLAN && CPLAN.allocations && CPLAN.allocations.length && typeof _bridgeComputeImpacts==='function'){
+    try{
+      var imp=_bridgeComputeImpacts(c);
+      if(imp){ headed.source='bridge'; headed._imp=imp; headed.fiComputable=!!imp.fiComputable; headed.fiAge=imp.fiAge;
+        headed.projRetValue=_lnum(imp.projRetValue); headed.debtFreeMonth=_lnum(imp.debtFreeMonth);
+        headed.horizon=_lnum(imp.horizon)||30; headed.hasLoRateDebt=!!imp.hasLoRateDebt; if(_lnum(imp.fiNumber)>0) headed.fiNumber=_lnum(imp.fiNumber); }
+    }catch(_e){}
+  }
+  // (b) this month's move — surplus split via the shared allocator (named rows when red flags are available)
+  var move={ surplus:0, rows:[], hasMove:false };
+  var surplus=Math.max(0, Math.round(_lnum(c.netCF)));
+  if(surplus>0 && typeof PFOSImpact!=='undefined' && PFOSImpact.allocate){
+    var flags=[]; try{ if(typeof _cpExtractRedFlags==='function') flags=_cpExtractRedFlags()||[]; }catch(_e){ flags=[]; }
+    try{
+      var plan=PFOSImpact.allocate({ surplus:surplus, bufferPct:0, flags:flags, maxRows:3 });   // bufferPct:0 → the shown rows sum to the headline surplus (no hidden 15% cushion mismatch)
+      var rows=((plan&&plan.rows)||[]).filter(function(r){ return r && r.flagId!=='_buffer' && _lnum(r.amt)>0; });
+      move={ surplus:surplus, rows:rows, hasMove:rows.length>0 };
+    }catch(_e){}
+  }
+  // (c) progress / what changed — MoM snapshot deltas + % to FI
+  var progress={ hasSnapshots:false, deltas:[], pctToFI:null, periodLabel:'' };
+  var snaps=(typeof APP!=='undefined' && APP._supabaseSnapshots) || [];
+  if(snaps.length>=2){
+    var prev=snaps[snaps.length-2], curr=snaps[snaps.length-1];
+    progress.hasSnapshots=true; progress.periodLabel=(prev.label||'')+' → '+(curr.label||'');
+    progress.deltas=_cpSnapshotDeltas(prev,curr);
+  }
+  // % to FI: projRetValue and fiNumber are BOTH future-dollar values (a coherent ratio = 1 − retGap/fiNumber).
+  // Only show it when we have a real projection — NEVER mix present net worth against a future target (apples/oranges).
+  if(headed.fiNumber>0 && headed.projRetValue>0){
+    progress.pctToFI=Math.max(0, Math.min(100, Math.round(headed.projRetValue/headed.fiNumber*100)));
+  }
+  return { headed:headed, move:move, progress:progress };
+}
+function _cpHeadlineHeadedSoft(headed){
+  if(!headed.fiComputable && !(headed.retAge>0)) return '';
+  var line, sub;
+  if(headed.retAge>0){
+    var st=(headed.retStatus==='on-track'?'on track':headed.retStatus==='close'?'within reach':headed.retStatus==='behind'?'a gap to close':'');
+    var pieces=[];
+    if(headed.projRetValue>0) pieces.push('projected nest egg '+fmtK(headed.projRetValue)+(headed.fiNumber>0?(' of a '+fmtK(headed.fiNumber)+' target'):''));
+    if(st) pieces.push(st);
+    line='Headed for retirement at age '+headed.retAge;
+    sub=(pieces.length?pieces.join(' · ')+'. ':'')+'Open your plan to see your exact FI date — and move it.';
+  } else {
+    line='Your FI number is '+fmtK(headed.fiNumber);
+    sub='Open your plan to project your path and your financial-independence date.';
+  }
+  return '<div style="padding:12px 14px;background:linear-gradient(135deg,rgba(34,197,94,.10),rgba(0,68,191,.06));border:1px solid var(--gr);border-radius:6px;margin-bottom:12px"><div style="display:flex;align-items:center;gap:8px"><span style="font-size:17px">🌉</span><span style="font-family:var(--fd);font-size:18px;font-weight:800;color:var(--gr)">'+line+'</span></div><div style="font-size:11px;color:var(--mu);margin-top:4px">'+sub+'</div></div>';
+}
+function _cpRenderLivingHeadline(){
+  try{
+    var calcs=(APP._portalCalcs)||(_lastPfosState&&_lastPfosState.calcs)||{};
+    var m=_cpHeadlineModel(calcs), h='';
+    // (a) where you're headed
+    if(m.headed._imp && typeof _bridgeHeadlineBlock==='function'){ h+=_bridgeHeadlineBlock(m.headed._imp); }
+    else { h+=_cpHeadlineHeadedSoft(m.headed); }
+    // (b) this month's move
+    if(m.move.hasMove){
+      var parts=m.move.rows.map(function(r){ return (r.icon?r.icon+' ':'')+r.label+' '+fmt(r.amt); });
+      h+='<div style="padding:10px 14px;background:rgba(0,68,191,.06);border:1px solid rgba(0,68,191,.14);border-radius:6px;margin-bottom:12px"><div style="font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:4px">This month\'s move</div><div style="font-size:13px;color:var(--wh);line-height:1.6"><span style="font-weight:700">'+fmt(m.move.surplus)+'</span> to put to work → '+parts.join(' · ')+'</div></div>';
+    }
+    // (c) progress / what changed
+    if(m.progress.hasSnapshots || m.progress.pctToFI!=null){
+      h+='<div style="padding:10px 14px;background:rgba(148,163,184,.06);border:1px solid rgba(148,163,184,.14);border-radius:6px;margin-bottom:4px">';
+      h+='<div style="font-size:10px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">Progress'+(m.progress.periodLabel?(' · '+m.progress.periodLabel):'')+'</div>';
+      if(m.progress.hasSnapshots && m.progress.deltas.length){
+        h+='<div style="display:flex;flex-wrap:wrap;gap:12px;font-size:12px">';
+        m.progress.deltas.forEach(function(d){ h+='<span style="color:var(--mu)">'+d.l+' <span style="color:'+(d.good?'var(--gr)':'var(--rd)')+';font-weight:700">'+d.text+'</span></span>'; });
+        h+='</div>';
+      }
+      if(m.progress.pctToFI!=null){
+        h+='<div style="margin-top:'+(m.progress.hasSnapshots?'8px':'0')+'"><div style="display:flex;justify-content:space-between;font-size:11px;color:var(--mu);margin-bottom:3px"><span>Progress to your FI number</span><span style="font-weight:700;color:var(--wh)">'+m.progress.pctToFI+'%</span></div><div style="height:6px;background:rgba(148,163,184,.15);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+m.progress.pctToFI+'%;background:linear-gradient(90deg,#22C55E,#5B9BFF)"></div></div></div>';
+      }
+      h+='</div>';
+    }
+    if(h) set('clientPriorityData', h);
+  }catch(_e){}
 }
 // A per-envelope chip: how much THIS envelope pulls FI (and, for debt, the payoff date) forward. fiYearsDelta =
 // years FI slips if you stopped funding it = its acceleration; debtFreeMonthsDelta>0 = months it pulls payoff in.
