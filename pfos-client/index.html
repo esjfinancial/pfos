@@ -30683,6 +30683,66 @@ function _cpDebtSubstanceLine(a){
     return h;
   }catch(_e){ return ''; }
 }
+// ── Section B (decisionCards) — FILL A's debt/protection decision-card SHELLS with real values client-side.
+// The pure shared _decisionCard only has `calcs`; debt needs CPLAN.debts + the local sim. These conform to A's
+// contract — they fill the null diagnosis/nextAction/impact slots, NEVER rename A's fields — and
+// _cpRenderDecisionCard renders the result. If the data isn't computable, diagnosis stays null → the card falls
+// through to the legacy render (e.g. Section D's consolidated protection card). DEBT reuses the genuinely-local
+// _cpDebtSort/_cpDebtSimulate. PROTECTION uses a transparent income-multiple TEASER estimate — the precise DIME
+// engine (insNeeds) is NOT in the slim client bundle (it lives in the pfos-calc edge fn), and the render is
+// synchronous, so the full DIME + premium is the PLANNING upsell, not a duplicated client copy. All sync.
+function _cpProtInput(calcs){
+  var c=calcs||{}, S=(typeof window!=='undefined'&&window.S)||{};
+  var policies=(S.insurancePolicies)||[];
+  var lifeCov=policies.filter(function(p){return String((p&&p.type)||'').toLowerCase().indexOf('life')>=0;}).reduce(function(t,p){return t+_lnum(p&&p.coverage);},0);   // same parse as calcInsNeeds (index ~19810)
+  var disCov=policies.filter(function(p){return String((p&&p.type)||'').toLowerCase().indexOf('disab')>=0;}).reduce(function(t,p){return t+_lnum(p&&p.coverage);},0);
+  var deps=_lnum((S.children&&S.children.length)||S.dependents||0);
+  return { income:Math.round(_lnum(c.inc)*12), deps:deps, totalDebt:_lnum(c.totalDebt), lifeCov:lifeCov, disCov:disCov };
+}
+function _cpFillDebtCard(dc,a){
+  if(typeof _cpDebtSort!=='function'||typeof _cpDebtSimulate!=='function') return;
+  var all=((typeof CPLAN!=='undefined'&&CPLAN.debts)||[]).filter(function(d){return _lnum(d.balance)>0;});
+  if(!all.length) return;
+  var hi=all.filter(function(d){return _lnum(d.rate)>15;}), debts=hi.length?hi:all, multi=debts.length>1;   // scope to the high-interest debts the flag is about (matches _cpDebtSubstanceLine)
+  var sorted=_cpDebtSort(debts,'avalanche'), d0=sorted[0]||{}, target=d0.name||d0.type||'your highest-rate debt', rate=_lnum(d0.rate);
+  var totalBal=debts.reduce(function(t,d){return t+_lnum(d.balance);},0), rTxt=(rate>0?(Math.round(rate*10)/10)+'%':'');
+  var extra=_lnum(a&&a.amount)||Math.max(0,Math.round(((typeof CPLAN!=='undefined'&&_lnum(CPLAN.surplus))||0)*0.5));
+  var base=_cpDebtSimulate(sorted,0), opt=(extra>0?_cpDebtSimulate(sorted,extra):base);
+  var months=_lnum(opt.months), intSaved=Math.max(0,_lnum(base.interest)-_lnum(opt.interest));
+  dc.diagnosis={ metric:(hi.length?'High-interest debt':'Debt'), current:totalBal, target:0, gap:totalBal, unit:'money',
+    text:fmtK(totalBal)+' across '+debts.length+' '+(hi.length?'high-interest ':'')+'debt'+(multi?'s':'')+(rTxt?(' at up to '+rTxt+' APR'):'')+'.' };
+  dc.nextAction={ suggestedMonthly:extra, timelineMonths:months, timelineText:(extra>0?('Avalanche '+fmt(extra)+'/mo'):'pay above the minimums'),
+    projectionText:(extra>0?('Avalanche '+fmt(extra)+'/mo → '+(multi?'high-interest debt gone':'paid off')+' in '+months+' month'+(months===1?'':'s')+'.'):('Pay off '+_cpEscHtml(target)+' first — extra payments shrink the balance and the interest.')) };
+  dc.impact={ text:(intSaved>0?('Saves '+fmt(intSaved)+' in interest vs minimum payments.'):'Frees up cash flow you can redirect to investing.') };
+  dc.priority.why='High-interest debt is a guaranteed '+(rTxt||'high')+' return to clear — attack it before lower-priority goals.';
+}
+function _cpFillProtectionCard(dc,a,calcs){
+  var p=_cpProtInput(calcs);
+  if(p.income<=0) return;   // no income basis → fall through to the consolidated/legacy card
+  var mult=(p.deps>0?12:10);
+  var lifeNeed=Math.round(p.income*mult + p.totalDebt);   // standard income-replacement (10–12x) + debt payoff — a transparent rule-of-thumb TEASER; the precise DIME + premium is Planning
+  var lifeGap=Math.max(0, lifeNeed-p.lifeCov);
+  var diNeed=Math.round(p.income/12*0.65), diGap=Math.max(0, diNeed-p.disCov);
+  if(lifeGap<=0 && diGap<=0) return;   // adequately covered → fall through (no false card)
+  var lifePct=(p.lifeCov>0?Math.min(100,Math.round(p.lifeCov/lifeNeed*100)):0);
+  var risk=(lifePct>=70?'Low':lifePct>=40?'Moderate':'High');
+  if(lifeGap>0){
+    dc.diagnosis={ metric:'Life insurance', current:p.lifeCov, target:lifeNeed, gap:lifeGap, unit:'money',
+      text:'Needed ~'+fmtK(lifeNeed)+' ('+mult+'× income + debt) · Have '+fmtK(p.lifeCov)+' · Gap '+fmtK(lifeGap)+(diGap>0?(' · disability '+fmt(diGap)+'/mo short'):'')+'.' };
+    dc.nextAction={ suggestedMonthly:0, timelineMonths:0, timelineText:'increase your coverage',
+      projectionText:'Close the '+fmtK(lifeGap)+' gap — level term is usually the cheapest fix. Get a quote.' };
+  } else {
+    dc.diagnosis={ metric:'Disability insurance', current:p.disCov, target:diNeed, gap:diGap, unit:'money',
+      text:'Disability: ~'+fmt(diNeed)+'/mo needed (65% of income) · '+fmt(p.disCov)+'/mo now · '+fmt(diGap)+'/mo short.' };
+    dc.nextAction={ suggestedMonthly:0, timelineMonths:0, timelineText:'add disability coverage',
+      projectionText:'Add ~'+fmt(diGap)+'/mo of disability coverage to protect your paycheck.' };
+  }
+  dc.impact={ text:'Replaces your income and clears debt for your family if something happens to you.' };
+  dc.priority.why='Risk: '+risk+(lifeGap>0?(' — a '+fmtK(lifeGap)+' coverage gap leaves your dependents exposed.'):' — your paycheck isn\'t protected.');
+}
+function _cpFillDecisionCard(dc,a,calcs){
+  try{ if(!dc)return; if(dc.family==='debt') _cpFillDebtCard(dc,a); else if(dc.family==='protection') _cpFillProtectionCard(dc,a,calcs); }catch(_e){}
+}
 function _cpRenderPlanTeaser(){
   var root=document.getElementById('cplanRoot');if(!root)return;
   // Stage the flag-derived priority cards (same path as the builder's unassigned column). Read-only
@@ -30734,7 +30794,10 @@ function _cpTeaserCard(a){
   if(typeof PFOS_FLAGS!=='undefined'&&PFOS_FLAGS.decisionCards&&typeof PFOSIssues!=='undefined'&&PFOSIssues.decisionCard){
     var _dcCalcs=(APP._portalCalcs)||(_lastPfosState&&_lastPfosState.calcs)||{};
     var _dcRes=PFOSIssues.decisionCard(_cpCardToIssue(a),_dcCalcs);
-    if(_dcRes&&_dcRes.diagnosis){ var _dcHtml=_cpRenderDecisionCard(a,_dcRes); if(_dcHtml) return _dcHtml; }
+    if(_dcRes){
+      if((_dcRes.family==='debt'||_dcRes.family==='protection')&&typeof _cpFillDecisionCard==='function'){ _cpFillDecisionCard(_dcRes,a,_dcCalcs); }   // Section B — fill debt/protection client-side (needs CPLAN/insNeeds)
+      if(_dcRes.diagnosis){ var _dcHtml=_cpRenderDecisionCard(a,_dcRes); if(_dcHtml) return _dcHtml; }
+    }
   }
   var _rgba=(typeof _cpHex2Rgba==='function')?_cpHex2Rgba:function(hx){return hx;};
   var icon=(typeof CP_IC!=='undefined'&&CP_IC[a.type])||'⭐';
