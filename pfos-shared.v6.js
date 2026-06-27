@@ -866,6 +866,69 @@ function _issuesDetect(ctx){
     }
     return card;
   }
+  // ── Section D (decisionCards) — shared PRESENTATION-layer balancer for the staged plan CARDS. Promotes
+  // the teaser-only _cpRebalanceTop into ONE canonical fn used by every priority surface. Three jobs, all
+  // DISPLAY-only (the canonical _ACTION_LEVEL rank is untouched — NO re-level, NO v7 bump): (1) CONSOLIDATE
+  // the protection sub-flags (life/disability/LTC/umbrella) into ONE Protection card per owner, and the
+  // estate docs (will/POA/beneficiary) into ONE Estate card per owner — collapsing the "wall of insurance"
+  // (estate_tax stays its OWN L4 card); (2) CAP at ≤1 protection + ≤1 estate card per owner; (3) lead with
+  // MONEY-MOVES — weave the L2 cards in AFTER the L1 stability block so a genuine L1 EF/cash-flow crit is
+  // never demoted (the fix over _cpRebalanceTop's blind position-1 insert), and protection leads index 0
+  // ONLY when no money-move exists (it is genuinely the top risk). PURE: returns a NEW array; consolidated
+  // survivors are NEW objects with addressesIssueId=null (display-only — the granular staged cards keep
+  // their per-issue ids so funded-state suppression still works); existing cards pass by reference, never
+  // mutated. Does NOT slice — the caller keeps its top-N cap.
+  function _dcHumanList(a){ a=a||[]; if(a.length<=1) return a[0]||''; if(a.length===2) return a[0]+' and '+a[1]; return a.slice(0,-1).join(', ')+', and '+a[a.length-1]; }
+  function _balBaseAct(c){ var a=(c&&(c.flagAction||c.type))||''; var k=a.indexOf('_spouse'); return k>0?a.slice(0,k):a; }
+  function _balFam(b){ if(b==='protection'||b==='protection_ext') return 'protection'; if(b==='estate') return 'estate'; return ''; }
+  function _consolidateFamily(members, fam, owner){
+    var best=members[0], bestSev=99;
+    members.forEach(function(m){ var s=_TYPE_SEV[m.flagType]; s=(s!=null?s:3); if(s<bestSev){ bestSev=s; best=m; } });
+    var titles=[]; members.forEach(function(m){ if(m.flagTitle) titles.push(m.flagTitle); });
+    var isEstate=(fam==='estate'), reason;
+    if(isEstate){
+      reason='Your estate basics — will, power of attorney, and beneficiaries — need attention.';
+    } else {
+      var flavors=[]; members.forEach(function(m){ var f=(_issueId({ action:(m.flagAction||m.type), title:m.flagTitle, owner:m.owner }).split(':')[1]||''); if(f&&f!=='other'&&flavors.indexOf(f)<0) flavors.push(f); });   // map CARD→issue shape (cards carry flagAction/flagTitle; _issueId reads action/title)
+      reason=flavors.length?('Gaps in your '+_dcHumanList(flavors)+' coverage — worth getting quotes.'):(best.reason||'Review your insurance coverage.');
+    }
+    return {
+      type:(isEstate?'estate':'protection'), flagAction:(isEstate?'estate':'protection'),
+      flagType:(best.flagType||'warn'), flagIcon:(isEstate?'📝':'🛡️'),
+      flagTitle:(members.length+' '+(isEstate?'estate':'protection')+' gap'+(members.length===1?'':'s')),
+      customName:(isEstate?'Estate planning':'Protection review'), reason:reason, owner:owner,
+      amount:0, target:0, phase:0,
+      _consolidated:titles, _mergedCount:members.length, addressesIssueId:null   // display-only; granular cards keep per-issue ids
+    };
+  }
+  function _issuesBalance(cards){
+    if(!cards||cards.length<2) return cards||[];
+    var ranked=_issuesRankCards(cards);                       // STEP 1 — canonical (level,severity) order
+    // STEP 2/3 — collapse each protection/estate family to ONE card per owner, at its highest-ranked slot
+    var groups={}, out1=[];
+    ranked.forEach(function(c){
+      var fam=_balFam(_balBaseAct(c));
+      if(!fam){ out1.push(c); return; }
+      var key=fam+'|'+((c&&c.owner==='spouse')?'spouse':'self');
+      if(!groups[key]){ groups[key]={ fam:fam, owner:((c&&c.owner==='spouse')?'spouse':'self'), members:[], idx:out1.length }; out1.push({ __g:key }); }
+      groups[key].members.push(c);
+    });
+    for(var key in groups){ if(!Object.prototype.hasOwnProperty.call(groups,key)) continue;
+      var g=groups[key];
+      out1[g.idx]=(g.members.length===1)?g.members[0]:_consolidateFamily(g.members, g.fam, g.owner);
+    }
+    // STEP 4 — lead with money-moves; weave the consolidated L2 cards in AFTER the L1 block (don't demote L1)
+    var money=[], prot=[];
+    out1.forEach(function(c){ (_balFam(_balBaseAct(c))?prot:money).push(c); });
+    if(!prot.length||!money.length) return out1;
+    var L1=0; money.forEach(function(c){ if(_ACTION_LEVEL[_balBaseAct(c)]===1) L1++; });
+    var p=Math.max(L1,1);                                     // protection inserts AFTER all L1 cards (≥1 so a money-move can lead)
+    var out=money.slice();
+    out.splice(Math.min(p,out.length),0,prot[0]);
+    if(prot.length>1) out.splice(Math.min(p+2,out.length),0,prot[1]);   // weave a 2nd L2 card (estate / other owner) with a money-move between
+    for(var i=2;i<prot.length;i++) out.push(prot[i]);                   // any remaining L2 cards trail
+    return out;
+  }
   // ── M5.2b-2 — SELF-SERVE PORTAL spouse-issue VISIBILITY policy (household-aware privacy). The advisor
   // always sees both spouses; in the self-serve portal what one spouse sees OF THE PARTNER is gated by
   // household type: joint = ALL (merged finances, no privacy barrier); separate = NONE (independent —
@@ -1053,6 +1116,7 @@ function _issuesDetect(ctx){
   g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
   g.PFOSIssues.issueId = _issueId;   // M5.4 U2 — stable issue identity for addressesIssueId linkage + funded-state suppression
   g.PFOSIssues.decisionCard = _decisionCard;   // Section A — pure spec-format decision-card builder (diagnosis/priority/nextAction/impact); consumed by B/C/D/E behind PFOS_FLAGS.decisionCards
+  g.PFOSIssues.balance = _issuesBalance;   // Section D — shared presentation balancer: consolidate protection/estate per owner + cap + lead-with-money-moves (display-only; canonical rank untouched); behind PFOS_FLAGS.decisionCards
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (6-category: 4 engine + 2 new)
   g.PFOSHealth.score = _healthScore;                 // M5.7a — 0–10 lineage-A rollup (4 engine + ≤2 new), per-site averager, pure
   g.PFOSHealth.implScore = _healthImplScore;         // new cat: completed-rec ratio → 0–10 | null
