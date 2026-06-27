@@ -23,6 +23,9 @@
 <meta name="theme-color" content="#09092E">
 </head>
 <body>
+<!-- Global metric-tooltip popup: filled + positioned by showTip() (fixed-position overlay,
+     hidden until .show is added). Was missing, which silently broke every metric "?" tooltip. -->
+<div id="tipPopup" class="tip-pop"></div>
 <script src="/pfos-shared.v6.js"></script>
 <script>
 // ── Service Worker registration ──
@@ -1337,7 +1340,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
     <!-- Client Overview -->
     <div class="pg active" id="cpg-overview">
       <div class="pg-title">Dashboard</div>
-      <div class="pg-sub">Your latest financial snapshot prepared by your advisor</div>
+      <div class="pg-sub" id="cpgOverviewSub">Your latest financial snapshot</div>
 
       <!-- Phase I: Advisor Request Banner — rendered when advisor has requested
            spending access. Hidden when no pending request, or when already granted. -->
@@ -3020,7 +3023,6 @@ function renderPortfolioView(){
   var holdings=APP._holdings||[];
   var S=(_lastPfosState&&_lastPfosState.state)||{};
   var h='';
-  var _nwCard='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Net Worth Over Time</div><div id="nwTimeline"></div></div>'; // §2.3 fused past+future timeline (filled after innerHTML)
   if(holdings.length){
     var totalAll=_cpHoldingsValue(holdings,true);
     var totalExCrypto=_cpHoldingsValue(holdings,false);
@@ -3096,7 +3098,7 @@ function renderPortfolioView(){
     h+='</tbody></table></div>';
     if(perf&&perf.dataSuspect){ h+='<div style="font-size:11px;color:var(--yl);margin-top:8px">⚠ Some cost-basis figures look incomplete, so per-holding returns may be overstated.</div>'; }
     h+='</div>';
-    el.innerHTML=_nwCard+h; renderNetWorthTimeline('nwTimeline');
+    el.innerHTML=h;
     return;
   }
   // ── Fallback: balance-level manual / synced investments (no per-holding data) ──
@@ -3116,17 +3118,16 @@ function renderPortfolioView(){
       h+='<div style="display:flex;justify-content:space-between;padding:6px 0;border-top:1px solid var(--bd)"><span style="color:var(--wh)"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'+_acColor(x.type)+';margin-right:6px"></span>'+ev(_acLabel(x.type))+own+'</span><span style="font-family:var(--fd);color:var(--wh)">'+fmt(Math.round(parseFloat(x.balance)||0))+'</span></div>';
     });
     h+='</div>';
-    el.innerHTML=_nwCard+h; renderNetWorthTimeline('nwTimeline');
+    el.innerHTML=h;
     return;
   }
   // ── Empty state (no holdings, no manual investments) — never a dead-end ──
-  el.innerHTML=_nwCard+'<div class="info-card" style="padding:24px;text-align:center">'
+  el.innerHTML='<div class="info-card" style="padding:24px;text-align:center">'
     +'<div style="font-size:32px;margin-bottom:8px">📈</div>'
     +'<div style="color:var(--wh);font-family:var(--fh);font-weight:700;margin-bottom:6px">No investments yet</div>'
     +'<div style="color:var(--mu);font-size:13px;line-height:1.6;margin-bottom:14px">Link a brokerage or retirement account to see your holdings, allocation, and gains here — or add investments manually in My Financial Data.</div>'
     +'<button class="btn btn-bl" aria-label="Add or link investments" onclick="showClientPage(\'pfos\')" style="max-width:280px;margin:0 auto">ADD OR LINK INVESTMENTS</button>'
     +'</div>';
-  renderNetWorthTimeline('nwTimeline');
 }
 
 // ── §2.3 (M2) Net Worth over time — ONE chart fusing PAST actuals + FUTURE plan ──
@@ -3137,47 +3138,118 @@ function renderPortfolioView(){
 // past-only + a cross-link to the plan (no dead-end). READ-ONLY / metric-inert
 // (reads APP._supabaseSnapshots + CPLAN._sim; never runs the sim, mutates S, or
 // calls calc/computeCalcs/postMessage).
+var _nwHorizon=10;                 // default forward years shown (toggle: 10/20/30)
+var _nwTimelineTarget='nwTimeline';
+var _nwHover=null;                 // {pts:[{x,y,v,age,t,fut}], svgW} for the slide-through hover tooltip
+function _nwSetHorizon(h){ _nwHorizon=h; renderNetWorthTimeline(_nwTimelineTarget); }
+// Catmull-Rom → cubic-bezier smooth path through points [{x,y}] (premium curve, not straight segments).
+function _nwSmooth(pts){
+  if(!pts.length) return '';
+  if(pts.length<3){ var d='M'+pts[0].x.toFixed(1)+','+pts[0].y.toFixed(1); for(var k=1;k<pts.length;k++)d+=' L'+pts[k].x.toFixed(1)+','+pts[k].y.toFixed(1); return d; }
+  var d='M'+pts[0].x.toFixed(1)+','+pts[0].y.toFixed(1);
+  for(var i=0;i<pts.length-1;i++){
+    var p0=pts[i-1]||pts[i], p1=pts[i], p2=pts[i+1], p3=pts[i+2]||p2;
+    var c1x=p1.x+(p2.x-p0.x)/6, c1y=p1.y+(p2.y-p0.y)/6;
+    var c2x=p2.x-(p3.x-p1.x)/6, c2y=p2.y-(p3.y-p1.y)/6;
+    d+=' C'+c1x.toFixed(1)+','+c1y.toFixed(1)+' '+c2x.toFixed(1)+','+c2y.toFixed(1)+' '+p2.x.toFixed(1)+','+p2.y.toFixed(1);
+  }
+  return d;
+}
 function renderNetWorthTimeline(targetId){
-  var el=document.getElementById(targetId||'nwTimeline'); if(!el) return;
+  _nwTimelineTarget=targetId||'nwTimeline';
+  var el=document.getElementById(_nwTimelineTarget); if(!el) return;
   var snaps=(APP._supabaseSnapshots||[]).filter(function(s){return s&&isFinite(parseFloat(s.netWorth));});
   var past=snaps.map(function(s){return {label:String(s.label||s.date||''),v:parseFloat(s.netWorth)};});
   var simNW=(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN._sim&&Array.isArray(CPLAN._sim.netWorth)&&CPLAN._sim.netWorth.length>1)?CPLAN._sim.netWorth:null;
-  var future=simNW?simNW.map(function(v,i){var n=parseFloat(v); return {year:i,v:(isFinite(n)?n:0)};}):null; // isFinite guard: a broken sim emitting Infinity would NaN the whole y-scale
-  var hasPast=past.length>=2, hasFuture=!!future;
+  var future=null, fullYears=0;
+  if(simNW){ fullYears=simNW.length-1; var hz=Math.min(_nwHorizon,fullYears); future=simNW.slice(0,hz+1).map(function(v,i){var n=parseFloat(v); return {year:i,v:(isFinite(n)?n:0)};}); } // slice to the chosen horizon: a full 30y compound curve crushes the near-term flat
+  var hasPast=past.length>=2, hasFuture=!!(future&&future.length>1);
   if(!hasPast&&!hasFuture){ el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:16px 0;text-align:center">Your net-worth timeline builds as monthly snapshots accumulate. Open <a href="javascript:showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="color:#5B9BFF">My Financial Plan</a> to project it forward.</div>'; return; }
-  var W=600,H=240,padL=54,padR=18,padT=18,padB=30,plotW=W-padL-padR,plotH=H-padT-padB;
+  var W=600,H=250,padL=54,padR=18,padT=22,padB=28,plotW=W-padL-padR,plotH=H-padT-padB,baseY=padT+plotH;
   var allV=[]; past.forEach(function(p){allV.push(p.v);}); if(future)future.forEach(function(f){allV.push(f.v);});
-  var loV=Math.min.apply(null,allV.concat([0])), hiV=Math.max.apply(null,allV), range=(hiV-loV)||1;
-  var pastW=(hasPast&&hasFuture)?Math.round(plotW*0.32):(hasPast?plotW:0), futW=plotW-pastW, divX=padL+pastW;
+  var loV0=Math.min.apply(null,allV.concat([0])), hiV0=Math.max.apply(null,allV);
+  var rpad=(hiV0-loV0)*0.08||1, loV=loV0-rpad, hiV=hiV0+rpad, range=(hiV-loV)||1; // breathing room so the line isn't glued to an edge
+  var pastW=(hasPast&&hasFuture)?Math.round(plotW*0.34):(hasPast?plotW:0), futW=plotW-pastW, divX=padL+pastW;
   function yOf(v){ return padT+plotH-((v-loV)/range)*plotH; }
+  function xPast(i){ return past.length>1?padL+(i/(past.length-1))*pastW:padL+pastW; }
+  function xFut(i){ return future.length>1?divX+(i/(future.length-1))*futW:divX+futW; }
   var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto" role="img" aria-label="Net worth over time">';
-  if(loV<0){ var zy=yOf(0); svg+='<line x1="'+padL+'" y1="'+zy+'" x2="'+(W-padR)+'" y2="'+zy+'" stroke="var(--bd)" stroke-width="1" stroke-dasharray="2 3"/>'; }
-  if(hasPast&&hasFuture){ svg+='<line x1="'+divX+'" y1="'+padT+'" x2="'+divX+'" y2="'+(padT+plotH)+'" stroke="var(--mu)" stroke-width="1" stroke-dasharray="3 3" opacity="0.6"/>'; } // TODAY divider drawn as a BACKGROUND reference so the boundary dot stays legible on top
+  svg+='<defs><linearGradient id="nwGradPast" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#5B9BFF" stop-opacity="0.33"/><stop offset="1" stop-color="#5B9BFF" stop-opacity="0"/></linearGradient>'
+    +'<linearGradient id="nwGradFut" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#22C55E" stop-opacity="0.30"/><stop offset="1" stop-color="#22C55E" stop-opacity="0"/></linearGradient></defs>';
+  if(loV0<0&&hiV0>0){ var zy=yOf(0); svg+='<line x1="'+padL+'" y1="'+zy.toFixed(1)+'" x2="'+(W-padR)+'" y2="'+zy.toFixed(1)+'" stroke="var(--bd)" stroke-width="1" stroke-dasharray="2 3"/><text x="'+(padL-6)+'" y="'+(zy+3).toFixed(1)+'" fill="var(--mu)" font-size="8" text-anchor="end">$0</text>'; }
+  if(hasPast&&hasFuture){ svg+='<line x1="'+divX+'" y1="'+padT+'" x2="'+divX+'" y2="'+baseY+'" stroke="var(--mu)" stroke-width="1" stroke-dasharray="3 3" opacity="0.5"/>'; }
   if(hasPast){
-    var ppts=past.map(function(p,i){ var x=past.length>1?padL+(i/(past.length-1))*pastW:padL+pastW; return x+','+yOf(p.v); });
-    svg+='<polyline points="'+ppts.join(' ')+'" fill="none" stroke="#5B9BFF" stroke-width="2" stroke-linejoin="round"/>';
-    var _pstep=Math.max(1,Math.ceil(past.length/12)); // cap visible dots so a long history doesn't blob (polyline stays full-resolution)
-    past.forEach(function(p,i){ if(i%_pstep!==0&&i!==past.length-1)return; var x=past.length>1?padL+(i/(past.length-1))*pastW:padL+pastW; svg+='<circle cx="'+x+'" cy="'+yOf(p.v)+'" r="2.4" fill="#5B9BFF"><title>'+_cpEscHtml(p.label)+': '+fmt(Math.round(p.v))+'</title></circle>'; });
+    var pp=past.map(function(p,i){return {x:xPast(i),y:yOf(p.v)};}), pLine=_nwSmooth(pp);
+    svg+='<path d="'+pLine+' L'+pp[pp.length-1].x.toFixed(1)+','+baseY+' L'+pp[0].x.toFixed(1)+','+baseY+' Z" fill="url(#nwGradPast)" stroke="none"/>';
+    svg+='<path d="'+pLine+'" fill="none" stroke="#5B9BFF" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round"/>';
+    var _pstep=Math.max(1,Math.ceil(past.length/8));
+    past.forEach(function(p,i){ if(i%_pstep!==0&&i!==past.length-1)return; svg+='<circle cx="'+xPast(i).toFixed(1)+'" cy="'+yOf(p.v).toFixed(1)+'" r="2.6" fill="#5B9BFF"><title>'+_cpEscHtml(p.label)+': '+fmt(Math.round(p.v))+'</title></circle>'; });
   }
   if(hasFuture){
-    var fpts=future.map(function(f,i){ var x=future.length>1?divX+(i/(future.length-1))*futW:divX+futW; return x+','+yOf(f.v); });
-    svg+='<polyline points="'+fpts.join(' ')+'" fill="none" stroke="#22C55E" stroke-width="2" stroke-dasharray="5 4" stroke-linejoin="round"/>';
-    future.forEach(function(f,i){ if(i===0)return; if(i%5!==0&&i!==future.length-1)return; var x=future.length>1?divX+(i/(future.length-1))*futW:divX+futW; svg+='<circle cx="'+x+'" cy="'+yOf(f.v)+'" r="2.4" fill="#22C55E"><title>Year +'+f.year+': '+fmt(Math.round(f.v))+'</title></circle>'; }); // skip i=0: the past[last] dot + divider already mark today
+    var fp=future.map(function(f,i){return {x:xFut(i),y:yOf(f.v)};}), fLine=_nwSmooth(fp);
+    svg+='<path d="'+fLine+' L'+fp[fp.length-1].x.toFixed(1)+','+baseY+' L'+fp[0].x.toFixed(1)+','+baseY+' Z" fill="url(#nwGradFut)" stroke="none"/>';
+    svg+='<path d="'+fLine+'" fill="none" stroke="#22C55E" stroke-width="2.4" stroke-dasharray="6 4" stroke-linejoin="round" stroke-linecap="round"/>';
+    var _fstep=Math.max(1,Math.ceil(future.length/6));
+    future.forEach(function(f,i){ if(i===0)return; if(i%_fstep!==0&&i!==future.length-1)return; svg+='<circle cx="'+xFut(i).toFixed(1)+'" cy="'+yOf(f.v).toFixed(1)+'" r="2.6" fill="#22C55E"><title>Year +'+f.year+': '+fmt(Math.round(f.v))+'</title></circle>'; });
   }
   if(hasPast&&hasFuture){
-    svg+='<text x="'+divX+'" y="'+(padT-5)+'" fill="var(--mu)" font-size="9" font-weight="700" text-anchor="middle" font-family="var(--fh)">TODAY</text>'; // divider line is drawn earlier (background layer)
+    svg+='<circle cx="'+divX.toFixed(1)+'" cy="'+yOf(past[past.length-1].v).toFixed(1)+'" r="3.4" fill="#0B1437" stroke="#5B9BFF" stroke-width="1.6"/>';
+    svg+='<text x="'+divX+'" y="'+(padT-7)+'" fill="var(--mu)" font-size="9" font-weight="700" text-anchor="middle" font-family="var(--fh)">TODAY</text>';
   }
-  svg+='<text x="'+(padL-6)+'" y="'+(yOf(hiV)+3)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(hiV)+'</text>';
-  svg+='<text x="'+(padL-6)+'" y="'+(yOf(loV)+3)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(loV)+'</text>';
-  if(hasPast)svg+='<text x="'+padL+'" y="'+(H-8)+'" fill="var(--mu)" font-size="9" text-anchor="start">'+_cpEscHtml(past[0].label)+'</text>';
-  if(hasFuture)svg+='<text x="'+(W-padR)+'" y="'+(H-8)+'" fill="var(--mu)" font-size="9" text-anchor="end">+'+(future.length-1)+'y</text>';
+  svg+='<text x="'+(padL-6)+'" y="'+(yOf(hiV0)+3).toFixed(1)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(hiV0)+'</text>';
+  svg+='<text x="'+(padL-6)+'" y="'+(yOf(loV0)+3).toFixed(1)+'" fill="var(--mu)" font-size="9" text-anchor="end">'+fmtK(loV0)+'</text>';
+  if(hasPast)svg+='<text x="'+padL+'" y="'+(H-7)+'" fill="var(--mu)" font-size="9" text-anchor="start">'+_cpEscHtml(past[0].label)+'</text>';
+  if(hasFuture)svg+='<text x="'+(W-padR)+'" y="'+(H-7)+'" fill="var(--mu)" font-size="9" text-anchor="end">+'+(future.length-1)+'y</text>';
+  // ── slide-through hover: crosshair + focus dot + (amount, age) tooltip that tracks the cursor ──
+  var curAge=(typeof CPLAN!=='undefined'&&CPLAN&&isFinite(parseFloat(CPLAN.age)))?parseFloat(CPLAN.age):null;
+  var hpts=[];
+  if(hasPast)past.forEach(function(p,i){ hpts.push({x:xPast(i),y:yOf(p.v),v:p.v,age:(curAge!=null?Math.round(curAge-(past.length-1-i)/12):null),t:p.label,fut:false}); });
+  if(hasFuture)future.forEach(function(f,i){ hpts.push({x:xFut(i),y:yOf(f.v),v:f.v,age:(curAge!=null?Math.round(curAge+f.year):null),t:(f.year===0?'Today':'+'+f.year+'y'),fut:true}); });
+  _nwHover={pts:hpts,svgW:W};
+  svg+='<g class="nwHov" style="pointer-events:none">';
+  svg+='<line class="nwCross" x1="0" y1="'+padT+'" x2="0" y2="'+baseY+'" stroke="var(--mu)" stroke-width="1" stroke-dasharray="2 2" opacity="0"/>';
+  svg+='<circle class="nwFocus" cx="-9" cy="-9" r="4" fill="#0B1437" stroke="#5B9BFF" stroke-width="2" opacity="0"/>';
+  svg+='<g class="nwTip" opacity="0"><rect class="nwTipBg" x="0" y="0" width="98" height="36" rx="4" fill="#0B1437" stroke="rgba(91,155,255,.4)"/><text class="nwTipA" x="0" y="0" text-anchor="middle" fill="#fff" font-size="12" font-weight="700" font-family="var(--fd)"></text><text class="nwTipB" x="0" y="0" text-anchor="middle" fill="#9FB2D8" font-size="10" font-family="var(--fh)"></text></g>';
+  svg+='</g>';
+  svg+='<rect x="'+padL+'" y="'+padT+'" width="'+plotW+'" height="'+plotH+'" fill="transparent" style="cursor:crosshair" onmousemove="_nwHoverMove(event)" onmouseleave="_nwHoverOut(event)"/>';
   svg+='</svg>';
-  var leg='<div style="display:flex;gap:14px;justify-content:center;margin-top:4px;font-size:11px;color:var(--mu)">';
-  if(hasPast)leg+='<span><span style="display:inline-block;width:14px;height:2px;background:#5B9BFF;vertical-align:middle;margin-right:4px"></span>Actual</span>';
-  if(hasFuture)leg+='<span><span style="display:inline-block;width:14px;border-top:2px dashed #22C55E;vertical-align:middle;margin-right:4px"></span>Projected</span>';
+  var tog='';
+  if(hasFuture&&fullYears>10){
+    var opts=[10,20,30].filter(function(h){return h<=fullYears;});
+    tog='<div style="display:flex;gap:6px;justify-content:center;margin-top:8px">'+opts.map(function(h){var on=(Math.min(_nwHorizon,fullYears)===h);return '<button onclick="_nwSetHorizon('+h+')" style="padding:3px 11px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;border-radius:3px;cursor:pointer;min-height:24px;background:'+(on?'rgba(34,197,94,.16)':'transparent')+';color:'+(on?'#22C55E':'var(--mu)')+'">'+h+'Y</button>';}).join('')+'</div>';
+  }
+  var leg='<div style="display:flex;gap:14px;justify-content:center;margin-top:'+(tog?'6':'8')+'px;font-size:11px;color:var(--mu)">';
+  if(hasPast)leg+='<span><span style="display:inline-block;width:14px;height:3px;border-radius:2px;background:#5B9BFF;vertical-align:middle;margin-right:5px"></span>Actual</span>';
+  if(hasFuture)leg+='<span><span style="display:inline-block;width:14px;border-top:2px dashed #22C55E;vertical-align:middle;margin-right:5px"></span>Projected</span>';
   leg+='</div>';
   var xlink=(hasPast&&!hasFuture)?'<div style="text-align:center;margin-top:6px"><a href="javascript:showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="color:#5B9BFF;font-size:12px">Project it forward with My Plan →</a></div>':'';
-  el.innerHTML=svg+leg+xlink;
+  el.innerHTML=svg+tog+leg+xlink;
+}
+// Slide-through hover: map cursor x → nearest plotted point → show the crosshair, focus dot,
+// and a floating tooltip (net worth + age). Scoped to the hovered SVG via querySelector (so the
+// Investments + Reports copies never collide). Display-only.
+function _nwHoverMove(event){
+  try{
+    var Hd=_nwHover; if(!Hd||!Hd.pts||!Hd.pts.length)return;
+    var svg=event.target.ownerSVGElement||(event.target.closest&&event.target.closest('svg')); if(!svg)return;
+    var r=svg.getBoundingClientRect(); if(!r.width)return;
+    var mx=(event.clientX-r.left)/r.width*Hd.svgW;
+    var best=Hd.pts[0],bd=Math.abs(best.x-mx);
+    for(var i=1;i<Hd.pts.length;i++){var d=Math.abs(Hd.pts[i].x-mx);if(d<bd){bd=d;best=Hd.pts[i];}}
+    var cross=svg.querySelector('.nwCross'),focus=svg.querySelector('.nwFocus'),tip=svg.querySelector('.nwTip'),tA=svg.querySelector('.nwTipA'),tB=svg.querySelector('.nwTipB'),tBg=svg.querySelector('.nwTipBg');
+    if(cross){cross.setAttribute('x1',best.x);cross.setAttribute('x2',best.x);cross.setAttribute('opacity','0.45');}
+    if(focus){focus.setAttribute('cx',best.x);focus.setAttribute('cy',best.y);focus.setAttribute('stroke',best.fut?'#22C55E':'#5B9BFF');focus.setAttribute('opacity','1');}
+    if(tip&&tA&&tB&&tBg){
+      var tw=98,th=36,tx=Math.max(2,Math.min(best.x-tw/2,Hd.svgW-tw-2)),ty=(best.y-th-12<2?best.y+12:best.y-th-12);
+      tBg.setAttribute('x',tx);tBg.setAttribute('y',ty);
+      tA.setAttribute('x',tx+tw/2);tA.setAttribute('y',ty+15);tA.textContent=(typeof fmtK==='function'?fmtK(best.v):Math.round(best.v));
+      tB.setAttribute('x',tx+tw/2);tB.setAttribute('y',ty+29);tB.textContent=(best.age!=null?'Age '+best.age:best.t)+(best.fut&&best.age!=null?'':'');
+      tip.setAttribute('opacity','1');
+    }
+  }catch(_e){}
+}
+function _nwHoverOut(event){
+  try{var svg=event&&(event.target.ownerSVGElement||(event.target.closest&&event.target.closest('svg')));if(!svg)return;['.nwCross','.nwFocus','.nwTip'].forEach(function(s){var el=svg.querySelector(s);if(el)el.setAttribute('opacity','0');});}catch(_e){}
 }
 
 // ── §2.4a (M2) Reports: 24-mo transactions read + custom-range cash-flow ──────
@@ -3295,7 +3367,11 @@ function _cpCashFlowReport(opts){
   }
   var net=totalIncome-totalExpense;
   var byCategory=Object.keys(catTotals).map(function(c){ return {key:c, total:Math.round(catTotals[c])}; }).sort(function(a,b){ return b.total-a.total; });
-  return { months:rows, monthsCount:rows.length, totalIncome:Math.round(totalIncome), totalExpense:Math.round(totalExpense), net:Math.round(net), savingsRate:(totalIncome>0?Math.round(net/totalIncome*100):null), byCategory:byCategory, source:(useTxns?'linked':'manual'), incomeSource:(useLinkedIncome?'linked':'snapshot'), incomeStreams:incomeStreams, estimatedMonths:estMonths, hasExpense:(totalExpense>0) };
+  // Savings rate must NOT be computed against estimated (profile-fallback) income — sparse recorded expenses
+  // against full estimated income produce a misleading ~90% that contradicts the dashboard's canonical rate.
+  // Only report it when every month in range has REAL (linked/manual) income; otherwise null → render shows "—".
+  var _savingsRate=(estMonths>0||totalIncome<=0)?null:Math.round(net/totalIncome*100);
+  return { months:rows, monthsCount:rows.length, totalIncome:Math.round(totalIncome), totalExpense:Math.round(totalExpense), net:Math.round(net), savingsRate:_savingsRate, byCategory:byCategory, source:(useTxns?'linked':'manual'), incomeSource:(useLinkedIncome?'linked':'snapshot'), incomeStreams:incomeStreams, estimatedMonths:estMonths, hasExpense:(totalExpense>0) };
 }
 
 // Spending-category palette (mirrors the Historical donut catMap so Reports anchors visually).
@@ -3324,7 +3400,7 @@ function _cpCashFlowBars(months,W,H){
 // Right = top-8 categories (+ Other remainder + Saved when net>0). Conservation:
 // Σleft == Σright == total (income+max(0,-net) == expense+max(0,net)). Null when
 // there's nothing to show. The testable seam (reads only the report object).
-function _cpSankeyModel(rep){
+function _cpSankeyModel(rep,opts){
   if(!rep) return null;
   var income=Math.round(rep.totalIncome||0), expense=Math.round(rep.totalExpense||0);
   var net=(rep.net==null?(income-expense):Math.round(rep.net)), saved=Math.max(0,net);
@@ -3333,7 +3409,9 @@ function _cpSankeyModel(rep){
   var rights=cats.map(function(c){ var m=_cpSpendCatMeta(c.key); return {label:m.l,value:Math.round(c.total),color:m.c}; });
   var other=expense-shown;
   if(other>0.5) rights.push({label:'Other',value:Math.round(other),color:'#94A3B8'});
-  if(saved>0.5) rights.push({label:'Saved',value:Math.round(saved),color:'#64748B'}); // muted slate — keep spending colors the focus of "Where It Went"
+  // When expense data is incomplete (caller flags it), the positive "net" is mostly UN-tracked spend, not real
+  // savings — label it honestly as "Untracked" so the Sankey doesn't overstate savings.
+  if(saved>0.5) rights.push({label:(opts&&opts.savedIsUntracked)?'Untracked':'Saved',value:Math.round(saved),color:(opts&&opts.savedIsUntracked)?'#94A3B8':'#64748B'}); // muted slate — keep spending colors the focus of "Where It Went"
   if(!rights.length) return null;
   // CONSERVATION by construction: total = Σrights (the actual drawn sum), then the LEFT side is DERIVED to
   // match — Income covers what it can, the remainder is the Deficit. This stays balanced regardless of the
@@ -3686,6 +3764,7 @@ function renderReportsView(){
   var ev=_cpEscHtml;
   if(APP._txns===undefined){ el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:24px 0;text-align:center">Loading your reports…</div>'; if(typeof _cpLoadTransactions==='function'){ _cpLoadTransactions(24).then(function(){ if(APP._txns===undefined)APP._txns=[]; if(_currentClientPage==='insights') renderReportsView(); }); } else { APP._txns=[]; renderReportsView(); } return; }
   var S=(_lastPfosState&&_lastPfosState.state)||{};
+  if(typeof _cpEnsurePlanLoaded==='function')try{_cpEnsurePlanLoaded();}catch(_e){} // §2.3: warm CPLAN._sim so the Net Worth Over Time projection renders here (reuses the Projections-page helper)
   var calcs=(APP._portalCalcs)||(_lastPfosState&&_lastPfosState.calcs)||{};
   var snaps=(S.snapshots&&S.snapshots.length)?S.snapshots:(APP._supabaseSnapshots||[]);
   var now=new Date(), curKey=now.getFullYear()*12+now.getMonth();
@@ -3695,6 +3774,7 @@ function renderReportsView(){
   var rep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey, endKey:endKey, fallbackIncome:calcs.inc||0, incomeStreams:_incomeConfirm});
   function keyToMonthInput(k){ var y=Math.floor(k/12), m=(k%12)+1; return y+'-'+(m<10?'0'+m:m); }
   var h='';
+  h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Net Worth Over Time</div><div id="reportsNwTimeline"></div></div>';
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center">';
   [['3mo','3mo'],['6mo','6mo'],['12mo','12mo'],['24mo','24mo']].forEach(function(o){ var sel=(!isCustom&&String(rng)===o[0]);
     h+='<button onclick="_cpSetReportRange(\''+o[0]+'\')" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid '+(sel?'rgba(91,155,255,.5)':'var(--bd)')+';border-radius:3px;cursor:pointer;background:'+(sel?'rgba(91,155,255,.18)':'transparent')+';color:'+(sel?'#5B9BFF':'var(--mu)')+';min-height:28px">'+o[1]+'</button>'; });
@@ -3706,14 +3786,21 @@ function renderReportsView(){
   h+='<button onclick="_cpExportTransactionsCsv()" aria-label="Export transactions as CSV" style="padding:5px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:1px solid var(--bd);border-radius:3px;cursor:pointer;background:transparent;color:var(--mu);min-height:28px">⬇ Export CSV</button>';
   var _plaidLinked=(typeof clientHasFeature==='function'&&clientHasFeature('plaid'));
   var _srcNote=(rep.source==='manual'&&_plaidLinked)?' · <span style="color:#EAB308">Plaid not yet synced — showing manual expenses</span>':'';
-  var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile).</div>':'';
+  var _estNote=(rep.estimatedMonths>0)?'<div style="font-size:11px;color:var(--mu);margin-top:4px">📊 '+rep.estimatedMonths+' month'+(rep.estimatedMonths>1?'s':'')+' use estimated income (from your profile)'+(rep.savingsRate==null?' — savings rate hidden until income is confirmed':'')+'.</div>':'';
   h+='</div><div style="font-size:11px;color:var(--mu);margin-top:8px">'+ev(rep.months.length?(rep.months[0].label+' – '+rep.months[rep.months.length-1].label):'—')+' · '+(rep.source==='linked'?'linked transactions':'manual entries')+_srcNote+'</div>'+_estNote+'</div>';
+  // Reports cash-flow honesty: when the tracked monthly spend is well under the user's typical spend (engine
+  // baseExp), the expense data is incomplete, so Net Cash Flow / the Sankey "Saved" band overstate. Suppress
+  // the precise Net + flag it, and the Sankey relabels the remainder "Untracked" (below).
+  var _expMonthly=calcs.baseExp||0, _repMonthly=(rep.monthsCount>0?rep.totalExpense/rep.monthsCount:rep.totalExpense);
+  var _expenseSparse=(_expMonthly>0&&rep.totalExpense>0&&_repMonthly<_expMonthly*0.6);
+  var _cfUnreliable=_expenseSparse||rep.estimatedMonths>0;
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="stat-grid" style="gap:6px;margin-bottom:0">';
   h+=statTile(fmtK(rep.totalIncome),'Income','#22C55E');
-  h+=statTile(fmtK(rep.totalExpense),'Expenses','#EF4444');
-  h+=statTile((rep.net>=0?'+':'')+fmtK(rep.net),'Net Cash Flow',rep.net>=0?'var(--gr)':'var(--rd)');
+  h+=statTile(fmtK(rep.totalExpense),_expenseSparse?'Expenses (partial)':'Expenses','#EF4444');
+  h+=statTile(_cfUnreliable?'—':((rep.net>=0?'+':'')+fmtK(rep.net)),'Net Cash Flow',_cfUnreliable?'var(--mu)':(rep.net>=0?'var(--gr)':'var(--rd)'));
   h+=statTile(rep.savingsRate==null?'—':(rep.savingsRate+'%'),'Savings Rate',rep.savingsRate==null?'var(--mu)':(rep.savingsRate>=0?'var(--gr)':'var(--rd)'));
   h+='</div>';
+  if(_expenseSparse) h+='<div style="font-size:11px;color:#EAB308;margin-top:8px;line-height:1.5">📊 Only '+fmt(Math.round(_repMonthly))+'/mo of your ~'+fmt(Math.round(_expMonthly))+'/mo typical spending is tracked here, so Net Cash Flow is hidden and the untracked remainder shows as &ldquo;Untracked&rdquo;. Link or import your spending for complete cash-flow reports.</div>';
   // label the Income number's SOURCE (linked deposits vs profile estimate) so a source switch is never silent
   var _incOn=0; (rep.incomeStreams||[]).forEach(function(s){ if(s.confirmed)_incOn++; });
   if(rep.incomeStreams&&rep.incomeStreams.length){ h+='<div style="font-size:11px;color:var(--mu);margin-top:8px">'+(rep.incomeSource==='linked'?('💵 Income = '+_incOn+' confirmed deposit source'+(_incOn===1?'':'s')+' (confirm below)'):'📊 Income estimated from your profile — confirm your deposits below for accurate cash flow')+'</div>'; }
@@ -3730,7 +3817,7 @@ function renderReportsView(){
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Monthly Net Cash Flow</div>'+_cpCashFlowBars(rep.months,600,200)+'</div>';
   h+='<div class="info-card" style="padding:14px"><div class="info-card-title" style="margin-bottom:8px">Where It Went</div>';
   if(rep.byCategory.length){
-    var _sankey=(rep.totalIncome>0&&rep.totalExpense>0)?_cpSankeyModel(rep):null; // §2.4b income→category flow
+    var _sankey=(rep.totalIncome>0&&rep.totalExpense>0)?_cpSankeyModel(rep,{savedIsUntracked:_cfUnreliable}):null; // §2.4b income→category flow
     if(_sankey) h+='<div style="margin-bottom:10px">'+_cpRenderSankey(_sankey,600,210)+'</div>';
     var maxCat=rep.byCategory[0].total||1;
     rep.byCategory.slice(0,10).forEach(function(c){ var meta=_cpSpendCatMeta(c.key), pct=rep.totalExpense>0?Math.round(c.total/rep.totalExpense*100):0;
@@ -3762,6 +3849,7 @@ function renderReportsView(){
   } else { h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">No category data in this range.</div>'; }
   h+='</div>';
   el.innerHTML=h;
+  if(typeof renderNetWorthTimeline==='function')try{renderNetWorthTimeline('reportsNwTimeline');}catch(_e){} // §2.3 fused past+future chart into the card above (after innerHTML so the div exists)
 }
 
 function checkAffordability(){
@@ -5873,6 +5961,10 @@ function freshCalcs(fd){
 }
 async function loadClientPortalData(){
   if(!APP.currentClientId) return;
+  // Product (self-serve) clients have no advisor — drop advisor-framed dashboard copy so a no-advisor
+  // user never sees "prepared by your advisor" or a dead-end pointing at an advisor report.
+  var _isProduct=(APP.currentClient&&APP.currentClient.client_type==='product');
+  try{var _sub=document.getElementById('cpgOverviewSub');if(_sub)_sub.textContent=_isProduct?'Your latest financial snapshot':'Your latest financial snapshot prepared by your advisor';}catch(_){}
   try{
   // For joint couples, financial data is stored under the primary (client_a)
   await loadCouples();
@@ -5963,7 +6055,9 @@ async function loadClientPortalData(){
       if(scores[k]!==undefined){var vv=scores[k];scH+=kv(sm[k],vv+'/10',vv>=7?'var(--gr)':vv>=5?'var(--yl)':'var(--rd)',k);}
     });
     set('clientScoresData',scH||'<div style="color:var(--mu);font-size:13px">Scores not yet available</div>');
-    set('clientPriorityData','<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">View your full action plan in your latest report.</div>');
+    set('clientPriorityData', _isProduct
+      ? '<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7;margin-bottom:8px">Build your plan to see your prioritized next steps.</div><button onclick="showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan()" style="background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;padding:8px 14px;border-radius:4px;cursor:pointer;min-height:36px">Go to My Financial Plan →</button>'
+      : '<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">View your full action plan in your latest report.</div>');
     // Update mobile tools with current financial data
     _lastPfosState={state:fd.S||{},calcs:fd.calcs||{}};
     updateMobileTools();
@@ -6637,7 +6731,36 @@ function generateAnniversaryMilestones(){
   el.innerHTML=h;
 }
 
-// ── COUPLE VIEW (Batch 33) ──────────────────────────────
+// ── Couple View helpers (redesign: account map, shared goals, contribution, timeline) ──
+// Collect itemized accounts from a financial state S, by ownership lens. 'personal' = the person's own
+// items (owner != 'joint', INCLUDING a missing/null owner — conservative default) + their scalar cash;
+// 'joint' = only items explicitly owner==='joint'. balance is parseFloat||0 then >0-filtered, so a
+// non-numeric balance is dropped (never reaches the renderer as NaN).
+function _cvAccounts(S,lens){
+  S=S||{}; var out=[];
+  var isJoint=function(o){return String(o||'').toLowerCase()==='joint';};
+  var want=function(o){return lens==='joint'?isJoint(o):!isJoint(o);};
+  (S.debts||[]).forEach(function(d){ if(!d||!want(d.owner))return; var b=parseFloat(d.balance)||0; if(b<=0)return; out.push({name:d.name||d.type||'Debt',balance:b,kind:'debt'}); });
+  (S.investments||[]).forEach(function(i){ if(!i||!want(i.owner))return; if(String(i.type||'').toLowerCase()==='crypto')return; var b=parseFloat(i.balance)||0; if(b<=0)return; out.push({name:i.name||_cvInvLabel(i.type),balance:b,kind:'asset'}); });
+  (S.retAccounts||[]).forEach(function(r){ if(!r||!want(r.owner))return; var b=parseFloat(r.balance)||0; if(b<=0)return; out.push({name:r.name||r.type||'Retirement',balance:b,kind:'asset'}); });
+  (S.linkedCash||[]).forEach(function(lc){ if(!lc||lc.include===false||!want(lc.owner))return; var b=parseFloat(lc.balance)||0; if(b<=0)return; out.push({name:lc.name||lc.subtype||'Cash',balance:b,kind:'asset'}); });
+  if(lens==='personal'){ var a=S.assets||{}; var chk=parseFloat(a.checking)||0, sav=parseFloat(a.savings)||0; if(chk>0)out.push({name:'Checking',balance:chk,kind:'asset'}); if(sav>0)out.push({name:'Savings',balance:sav,kind:'asset'}); }
+  return out;
+}
+function _cvInvLabel(t){ var m={brokerage:'Brokerage','401k':'401(k)',roth401k:'Roth 401(k)',roth:'Roth IRA',trad_ira:'IRA',ira:'IRA',hsa:'HSA',invest:'Investment'}; return m[String(t||'').toLowerCase()]||(t||'Investment'); }
+function _cvAcctList(accts,emptyMsg){
+  if(!accts||!accts.length) return '<div style="font-size:12px;color:var(--mu);padding:8px 0">'+(emptyMsg||'No accounts listed.')+'</div>';
+  var net=0, h='';
+  accts.slice().sort(function(a,b){return b.balance-a.balance;}).forEach(function(a){ net+=(a.kind==='debt'?-1:1)*a.balance;
+    h+='<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><span style="color:var(--wh);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+(a.kind==='debt'?'💳 ':'💰 ')+esc(a.name)+'</span><span style="color:'+(a.kind==='debt'?'var(--rd)':'var(--gr)')+';white-space:nowrap;font-family:var(--fh);font-weight:600">'+(a.kind==='debt'?'-':'')+fmt(a.balance)+'</span></div>';
+  });
+  h+='<div style="display:flex;justify-content:space-between;padding:6px 0 0;font-size:13px;font-weight:700"><span style="color:var(--mu)">Net</span><span style="color:'+(net>=0?'var(--gr)':'var(--rd)')+'">'+fmtK(net)+'</span></div>';
+  return h;
+}
+function _cvAgo(iso){ try{ var d=Math.floor((Date.now()-new Date(iso).getTime())/86400000); if(d<=0)return 'today'; if(d===1)return 'yesterday'; if(d<30)return d+' days ago'; var m=Math.floor(d/30); return m+' month'+(m>1?'s':'')+' ago'; }catch(e){ return ''; } }
+function _cvAcctTab(tid,which){ ['mine','theirs','ours'].forEach(function(w){ var c=document.getElementById(tid+'_'+w); if(c)c.style.display=(w===which)?'':'none'; var b=document.getElementById(tid+'_tab_'+w); if(b){var on=(w===which); b.style.border='1px solid '+(on?'rgba(91,155,255,.5)':'var(--bd)'); b.style.background=on?'rgba(91,155,255,.15)':'transparent'; b.style.color=on?'#5B9BFF':'var(--mu)';} }); }
+
+// ── COUPLE VIEW (Batch 33 · redesigned) ──────────────────────────────
 async function renderCoupleView(){
   var el=document.getElementById('coupleViewContent');if(!el) return;
   el.innerHTML='<div style="color:var(--mu);font-size:13px">Loading couple data...</div>';
@@ -6646,13 +6769,16 @@ async function renderCoupleView(){
     var {data:link}=await db.from('couple_links').select('*').or('client_a_id.eq.'+APP.currentClientId+',client_b_id.eq.'+APP.currentClientId).limit(1).maybeSingle();
     if(!link){el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:20px;text-align:center">You are not currently linked with a partner. Ask your advisor to set up a couple link.</div>';return;}
     var partnerId=link.client_a_id===APP.currentClientId?link.client_b_id:link.client_a_id;
-    // Load both profiles
-    var {data:myProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',APP.currentClientId).single();
-    var {data:partnerProfile}=await db.from('client_profiles').select('financial_data,scores').eq('client_id',partnerId).single();
-    var {data:partnerClient}=await db.from('clients').select('name').eq('id',partnerId).single();
-    var myFd=(myProfile&&myProfile.financial_data)?myProfile.financial_data:{};var myC=myFd.calcs||{};
-    var pFd=(partnerProfile&&partnerProfile.financial_data)?partnerProfile.financial_data:{};var pC=pFd.calcs||{};
-    var pName=(partnerClient&&partnerClient.name)?partnerClient.name.split(' ')[0]:'Partner';
+    var _hh=link.household_type;
+    // Load both profiles. maybeSingle (NOT single) — a JOINT household's client_b has NO profile row
+    // (data lives under client_a), so single() errored/stalled the couple view for the joint primary.
+    var {data:myProfile}=await db.from('client_profiles').select('financial_data,scores,updated_at').eq('client_id',APP.currentClientId).maybeSingle();
+    var {data:partnerProfile}=await db.from('client_profiles').select('financial_data,scores,updated_at').eq('client_id',partnerId).maybeSingle();
+    var {data:partnerClient}=await db.from('clients').select('name').eq('id',partnerId).maybeSingle();
+    var sharedGoals=[]; try{ var _sgR=await db.from('shared_goals').select('*').eq('couple_link_id',link.id); sharedGoals=(_sgR&&_sgR.data)||[]; }catch(_sgE){}
+    var myFd=(myProfile&&myProfile.financial_data)?myProfile.financial_data:{};var myC=myFd.calcs||{};var myS=myFd.S||{};
+    var pFd=(partnerProfile&&partnerProfile.financial_data)?partnerProfile.financial_data:{};var pC=pFd.calcs||{};var pS=pFd.S||{};
+    var pName=(partnerClient&&partnerClient.name)?String(partnerClient.name).split(' ')[0]:'Partner';
     // Combined metrics
     var combInc=(myC.inc||0)+(pC.inc||0);
     var combNW=(myC.netWorth||0)+(pC.netWorth||0);
@@ -6672,33 +6798,55 @@ async function renderCoupleView(){
     h+='<div class="info-card" style="text-align:center;padding:12px"><div style="font-size:12px;color:var(--mu)">Combined Debt</div><div style="font-family:var(--fd);font-size:20px;color:var(--or)">'+fmtK(combDebt)+'</div></div>';
     h+='<div class="info-card" style="text-align:center;padding:12px"><div style="font-size:12px;color:var(--mu)">Combined Cash Flow</div><div style="font-family:var(--fd);font-size:20px;color:'+(combCF>=0?'var(--gr)':'var(--rd)')+'">'+fmt(combCF)+'/mo</div></div>';
     h+='</div>';
-    // Income contribution split
-    if(combInc>0){
-      var myPct=Math.round((myC.inc||0)/combInc*100);
-      h+='<div class="info-card" style="padding:14px;margin-bottom:14px">';
-      h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Income Split</div>';
-      h+='<div style="display:flex;gap:2px;height:12px;border-radius:6px;overflow:hidden;margin-bottom:6px">';
-      h+='<div style="width:'+myPct+'%;background:#5B9BFF" title="You: '+myPct+'%"></div>';
-      h+='<div style="width:'+(100-myPct)+'%;background:var(--or)" title="'+esc(pName)+': '+(100-myPct)+'%"></div>';
-      h+='</div>';
-      h+='<div style="display:flex;justify-content:space-between;font-size:13px">';
-      h+='<span style="color:#5B9BFF">You: '+myPct+'% ('+fmt(myC.inc||0)+')</span>';
-      h+='<span style="color:var(--or)">'+esc(pName)+': '+(100-myPct)+'% ('+fmt(pC.inc||0)+')</span>';
-      h+='</div></div>';
+    var _bothData=(_hh!=='joint'&&partnerProfile&&((pC.inc||0)||(pC.netWorth||0)||(pC.totalDebt||0)));
+    // ── [D] Alignment insight / household framing ──
+    if(_hh==='joint'){
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">Joint household — your finances are fully combined, so the totals above reflect your shared accounts (no separate per-partner split).</div></div>';
+    } else if(!_bothData){
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px;text-align:center"><div style="font-size:13px;color:var(--mu);line-height:1.6">'+esc(pName)+' hasn\'t set up their finances yet — the totals above reflect your data only. The per-partner split, comparison, and contribution view appear once they complete their profile.</div></div>';
+    } else {
+      var _mySav=myC.savingsRate||0,_pSav=pC.savingsRate||0,_dd=Math.abs(_mySav-_pSav);
+      var _ins=(_dd>=10)?('💡 '+(_mySav>_pSav?'You\'re':(esc(pName)+' is'))+' saving '+Math.round(_dd)+' pts more than '+(_mySav>_pSav?esc(pName):'you')+' — '+(_mySav>_pSav?'you have':(esc(pName)+' has'))+' more slack to put toward shared goals.'):('💡 You and '+esc(pName)+' save at similar rates ('+_mySav.toFixed(0)+'% vs '+_pSav.toFixed(0)+'%) — nicely aligned.');
+      h+='<div class="info-card" style="padding:12px 14px;margin-bottom:14px;background:rgba(91,155,255,.05);border-color:rgba(91,155,255,.18)"><div style="font-size:13px;color:rgba(226,232,240,.88);line-height:1.5">'+_ins+'</div></div>';
     }
-    // Side-by-side comparison
-    h+='<div class="info-card" style="padding:14px">';
-    h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Individual Comparison</div>';
-    var metrics=[{k:'inc',l:'Income',fn:fmt},{k:'netCF',l:'Cash Flow',fn:fmt},{k:'netWorth',l:'Net Worth',fn:fmtK},{k:'totalDebt',l:'Total Debt',fn:fmtK},{k:'savingsRate',l:'Savings Rate',fn:function(v){return (v||0).toFixed(1)+'%';}},{k:'efMonths',l:'EF Months',fn:function(v){return (v||0).toFixed(1)+'mo';}}];
-    metrics.forEach(function(m){
-      var myV=myC[m.k]||0;var pV=pC[m.k]||0;
-      h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px">';
-      h+='<span style="width:80px;color:#5B9BFF;text-align:right">'+m.fn(myV)+'</span>';
-      h+='<span style="flex:1;text-align:center;color:var(--mu)">'+m.l+'</span>';
-      h+='<span style="width:80px;color:var(--or)">'+m.fn(pV)+'</span>';
+    // ── [A] Debt-free together ──
+    if(combDebt>0){ var _surplus=Math.max(0,combCF);
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:6px">🏁 Debt-Free Together</div>';
+      if(_surplus>0){ var _mo=Math.ceil(combDebt/_surplus); h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.6">Your combined <strong style="color:var(--or)">'+fmtK(combDebt)+'</strong> of debt clears in about <strong style="color:var(--gr)">'+(_mo>=12?((_mo/12).toFixed(1)+' years'):(_mo+' months'))+'</strong> if you put your combined <strong>'+fmt(_surplus)+'/mo</strong> surplus toward it. <span style="color:var(--mu);font-size:12px">Simple estimate — excludes interest.</span></div>'; }
+      else { h+='<div style="font-size:13px;color:var(--mu);line-height:1.6">Combined debt of <strong style="color:var(--or)">'+fmtK(combDebt)+'</strong>, with no monthly surplus to accelerate payoff yet — freeing up cash flow comes first.</div>'; }
       h+='</div>';
-    });
+    }
+    // ── [B] Shared goals ──
+    h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🎯 Shared Goals</div>';
+    var _sg=(sharedGoals||[]).filter(function(g){return g&&((parseFloat(g.target)||0)>0||(parseFloat(g.current)||0)>0);});
+    if(_sg.length){ _sg.sort(function(a,b){return (a.priority||99)-(b.priority||99);}).forEach(function(g){ var _t=parseFloat(g.target)||0,_cur=parseFloat(g.current)||0,_pct=_t>0?Math.min(100,Math.round(_cur/_t*100)):0,_bc=_pct>=100?'var(--gr)':(_pct>=60?'#5B9BFF':'var(--yl)');
+      h+='<div style="margin-bottom:10px"><div style="display:flex;justify-content:space-between;gap:8px;font-size:13px;margin-bottom:3px"><span style="color:var(--wh);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+esc(g.name||'Goal')+(g.target_date?' <span style="color:var(--mu);font-size:11px">· by '+esc(String(g.target_date))+'</span>':'')+'</span><span style="color:var(--mu);white-space:nowrap">'+fmt(_cur)+' / '+fmt(_t)+' · '+_pct+'%</span></div><div style="height:6px;background:rgba(0,68,191,.08);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+_pct+'%;background:'+_bc+';border-radius:3px"></div></div></div>'; }); }
+    else { h+='<div style="font-size:13px;color:var(--mu);line-height:1.5">No shared goals yet — '+(_hh==='hybrid'?'mark a goal as joint':'create one you both save toward')+' (a house, a trip, an emergency fund) to track it here as a team.</div>'; }
     h+='</div>';
+    // ── [C] Who pays what (suggested split by income) ──
+    if(_hh!=='joint'&&combInc>0&&_bothData){ var _myPct=Math.round((myC.inc||0)/combInc*100);
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:4px">Who Pays What</div><div style="font-size:12px;color:var(--mu);margin-bottom:8px">A fair split of shared costs, proportional to income:</div><div style="display:flex;gap:2px;height:14px;border-radius:7px;overflow:hidden;margin-bottom:6px"><div style="width:'+_myPct+'%;background:#5B9BFF"></div><div style="width:'+(100-_myPct)+'%;background:var(--or)"></div></div><div style="display:flex;justify-content:space-between;font-size:13px"><span style="color:#5B9BFF">You: '+_myPct+'% ('+fmt(myC.inc||0)+'/mo)</span><span style="color:var(--or)">'+esc(pName)+': '+(100-_myPct)+'% ('+fmt(pC.inc||0)+'/mo)</span></div></div>';
+    }
+    // ── [F] Mine / Theirs / Ours account map ──
+    if(_hh==='joint'){
+      var _all=_cvAccounts(myS,'personal').concat(_cvAccounts(myS,'joint')).concat(_cvAccounts(pS,'personal')).concat(_cvAccounts(pS,'joint'));
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🏦 Household Accounts</div>'+_cvAcctList(_all,'No itemized accounts yet — add accounts in My Financial Data.')+'</div>';
+    } else {
+      var _tid='cvacct_'+Math.random().toString(36).slice(2,8);
+      var _mine=_cvAccounts(myS,'personal'), _their=_cvAccounts(pS,'personal'), _ours=_cvAccounts(myS,'joint').concat(_cvAccounts(pS,'joint'));
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🏦 Accounts</div><div style="display:flex;gap:6px;margin-bottom:10px">';
+      [['mine','Mine'],['theirs',esc(pName)],['ours','Ours']].forEach(function(t,i){ h+='<button onclick="_cvAcctTab(\''+_tid+'\',\''+t[0]+'\')" id="'+_tid+'_tab_'+t[0]+'" style="flex:1;padding:6px;font-family:var(--fh);font-size:12px;font-weight:700;border:1px solid '+(i===0?'rgba(91,155,255,.5)':'var(--bd)')+';border-radius:3px;cursor:pointer;background:'+(i===0?'rgba(91,155,255,.15)':'transparent')+';color:'+(i===0?'#5B9BFF':'var(--mu)')+'">'+t[1]+'</button>'; });
+      h+='</div><div id="'+_tid+'_mine">'+_cvAcctList(_mine,'No personal accounts listed.')+'</div><div id="'+_tid+'_theirs" style="display:none">'+_cvAcctList(_their,esc(pName)+' has no accounts listed yet.')+'</div><div id="'+_tid+'_ours" style="display:none">'+_cvAcctList(_ours,'No shared (joint) accounts yet — mark an account as joint to see it here.')+'</div></div>';
+    }
+    // ── Individual comparison (detail behind the insight) ──
+    if(_bothData){
+      h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">Individual Comparison <span style="font-size:11px;color:var(--mu);font-weight:400">— you vs '+esc(pName)+'</span></div>';
+      var metrics=[{k:'inc',l:'Income',fn:fmt},{k:'netCF',l:'Cash Flow',fn:fmt},{k:'netWorth',l:'Net Worth',fn:fmtK},{k:'totalDebt',l:'Total Debt',fn:fmtK},{k:'savingsRate',l:'Savings Rate',fn:function(v){return (v||0).toFixed(1)+'%';}},{k:'efMonths',l:'EF Months',fn:function(v){return (v||0).toFixed(1)+'mo';}}];
+      metrics.forEach(function(m){ var myV=myC[m.k]||0,pV=pC[m.k]||0; h+='<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid rgba(0,68,191,.06);font-size:13px"><span style="width:80px;color:#5B9BFF;text-align:right">'+m.fn(myV)+'</span><span style="flex:1;text-align:center;color:var(--mu)">'+m.l+'</span><span style="width:80px;color:var(--or)">'+m.fn(pV)+'</span></div>'; });
+      h+='</div>';
+    }
+    // ── [E] Partner status ──
+    if(_hh!=='joint'){ var _upd=partnerProfile&&partnerProfile.updated_at; h+='<div class="info-card" style="padding:12px 14px;display:flex;align-items:center;gap:8px"><div style="width:8px;height:8px;border-radius:50%;background:'+(partnerProfile?'var(--gr)':'var(--mu)')+';flex-shrink:0"></div><div style="font-size:13px;color:var(--wh)">'+esc(pName)+(partnerProfile?(' — account active'+(_upd?', updated '+_cvAgo(_upd):'')):(' — hasn\'t set up their account yet'))+'</div></div>'; }
     el.innerHTML=h;
   }catch(e){
     el.innerHTML='<div style="color:var(--mu);font-size:14px;padding:20px;text-align:center">Couple view is not available. Ask your advisor to link your accounts.</div>';
@@ -6708,8 +6856,15 @@ async function renderCoupleView(){
 async function checkCoupleLink(){
   if(!APP.currentClientId) return;
   try{
-    var {data}=await db.from('couple_links').select('id').or('client_a_id.eq.'+APP.currentClientId+',client_b_id.eq.'+APP.currentClientId).limit(1);
-    if(data&&data.length>0){var nav=document.getElementById('cnav-couple');if(nav)nav.style.display='flex';}
+    // Prefer the in-memory couples (loadCouples is awaited earlier in loadClientPortalData, so this is
+    // reliable) — the bare couple_links query here used to race the session on login and leave the nav
+    // hidden for genuinely-coupled clients. Fall back to the DB query only if couples aren't loaded yet.
+    var _linked=(typeof getCoupleForClient==='function')&&!!getCoupleForClient(APP.currentClientId);
+    if(!_linked){
+      var {data}=await db.from('couple_links').select('id').or('client_a_id.eq.'+APP.currentClientId+',client_b_id.eq.'+APP.currentClientId).limit(1);
+      _linked=!!(data&&data.length>0);
+    }
+    if(_linked){var nav=document.getElementById('cnav-couple');if(nav)nav.style.display='flex';}
   }catch(e){}
 }
 async function dismissNotification(notifId){
@@ -6731,12 +6886,12 @@ var TOOLTIPS={
   netcf:'Net Cash Flow is what\'s left after all expenses. Positive means you\'re spending less than you earn. Negative means you\'re spending more — a red flag that needs immediate attention.',
   networth:'Net Worth = everything you own (assets) minus everything you owe (debts). This is the single best measure of financial health. Growing net worth over time is the goal.',
   totaldebt:'The total of all outstanding debts — credit cards, student loans, auto loans, mortgage, and any other balances. Lower is better, but not all debt is bad (e.g., a reasonable mortgage).',
-  savingsRate:'The percentage of income going to savings and investments. Financial experts recommend 15-20%. Below 10% may not be enough to build long-term wealth.',
+  savingsRate:'The share of your income going to savings and investing — INCLUDING retirement contributions like a 401(k). That\'s why it can read higher than your take-home surplus (Net Cash Flow): pre-tax retirement money counts as saving but never appears in your cash flow. 15-20% is the common target; below 10% may not build enough long-term wealth.',
   dti:'Debt-to-Income ratio — your monthly debt payments divided by monthly income. Below 28% is healthy, 28-36% is manageable, above 36% is a warning sign, and above 43% can limit your borrowing options.',
-  efMonths:'How many months your cash reserves (checking + savings) would cover your expenses if all income stopped. 3 months is the minimum target, 6 months is ideal for most people.',
+  efMonths:'How many months your emergency reserves would cover your expenses if income stopped. Counts all savings, plus any checking balance above $5,000 (the first $5k of checking is set aside for monthly bills, not emergencies). 3 months is the minimum, 6 is ideal for most people.',
   cfScore:'Cash Flow Score (0-10) measures how well you manage the money flowing in and out. Higher scores mean more surplus, better savings habits, and stronger financial cushion.',
   protScore:'Protection Score (0-10) measures how well you\'re insured against unexpected events. It considers life insurance coverage, emergency fund, credit score, and whether your family would be financially safe.',
-  growScore:'Growth Score (0-10) measures how effectively you\'re building wealth. It looks at savings rate, retirement contributions, investment assets, and whether your money is working for you.',
+  growScore:'Growth Score (0-10) measures your wealth-building TRAJECTORY — your savings rate, retirement contributions, and investing — not your current net worth. So it can be high even while your net worth is still negative (common early on when paying down debt): a strong savings habit means you\'re on track to build wealth, even before the balance turns positive.',
   effScore:'Efficiency Score (0-10) measures how wisely you spend. It penalizes spending leaks (unnecessary recurring costs), high debt ratios, and excessive subscription spending.'
 };
 function showTip(key,event){
@@ -6824,6 +6979,9 @@ function _portalSpendStatus(viewCtx){
     severity='caution';
     reasons.push('On pace to overspend by $'+overspend.toLocaleString()+' this month.');
   }
+  // Capture month-level severity BEFORE per-category escalation, so the dashboard card can tell whether
+  // the alarm is the whole month vs only one category (avoids an "OVER BUDGET" header over healthy month totals).
+  var monthSeverity=severity;
   // Per-category check
   var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]=c.label;}); // §1.4 dynamic — custom categories get pace-checked
   var catSpend={};
@@ -6865,7 +7023,7 @@ function _portalSpendStatus(viewCtx){
     }
   });
   return{
-    severity:severity,paceRatio:Math.round(paceRatio*100)/100,
+    severity:severity,monthSeverity:monthSeverity,paceRatio:Math.round(paceRatio*100)/100,
     pctSpent:pctSpent,pctOfMonthGone:pctOfMonthGone,
     moneyIn:moneyIn,moneyOut:Math.round(moneyOut),
     projected:projected,overspend:Math.round(overspend),
@@ -7643,10 +7801,16 @@ function _portalRecsList(){
 function _portalRecsGetActive(){
   var now=Date.now();
   var maxAgeMs=_PFOS_RECS_CONFIG.expireAfterDays*24*60*60*1000;
+  var _seen={};
   return _portalRecsList().filter(function(r){
     if(!r||r.status!=='pending')return false;
     var created=r.createdAt?new Date(r.createdAt).getTime():0;
-    return (now-created)<maxAgeMs;
+    if((now-created)>=maxAgeMs)return false;
+    // Collapse duplicate active recs (same type + payload) so an identical card never shows twice or
+    // inflates the badge — covers pre-existing dupes the creation-time guard in _portalRecsCreate can't remove.
+    var _sig=r.type+'|';try{_sig+=JSON.stringify(r.payload);}catch(_s){_sig+=String(r.payload);}
+    if(_seen[_sig])return false; _seen[_sig]=true;
+    return true;
   });
 }
 
@@ -7704,6 +7868,13 @@ function _portalRecsUpdateBadge(){
 
 function _portalRecsCreate(rec){
   if(!rec||!rec.type||!rec.payload)return null;
+  // Dedup: never create a second ACTIVE rec identical to an existing one (same type + payload signature).
+  // Guards against a double detection run (or cloned data) surfacing the same recommendation card twice.
+  try{
+    var _sig=rec.type+'|'+JSON.stringify(rec.payload);
+    var _act=(typeof _portalRecsGetActive==='function')?_portalRecsGetActive():[];
+    if(_act&&_act.some&&_act.some(function(r){return r&&(r.type+'|'+JSON.stringify(r.payload))===_sig;}))return null;
+  }catch(_dup){}
   rec.id=rec.id||('rec_'+Date.now().toString(36)+'_'+Math.random().toString(36).slice(2,8));
   rec.status=rec.status||'pending';
   rec.createdAt=rec.createdAt||new Date().toISOString();
@@ -7720,16 +7891,28 @@ function _portalRecsUpdate(id,mutation){
   });
 }
 
+// Apply a terminal status change to the target rec AND any siblings sharing its type+payload signature, so
+// dismissing/accepting one collapses pre-existing duplicates instead of leaving a hidden dupe to resurface
+// (the read-level dedup in _portalRecsGetActive only hides dupes; this resolves them).
+function _portalRecsApplyToSiblings(id,mut){
+  _portalRecsWrite(function(list){
+    var tgt=null,i;
+    for(i=0;i<list.length;i++){if(list[i]&&list[i].id===id){tgt=list[i];break;}}
+    if(!tgt)return;
+    var _sig=tgt.type+'|';try{_sig+=JSON.stringify(tgt.payload);}catch(_s){_sig+=String(tgt.payload);}
+    list.forEach(function(r){if(!r)return;var rs=r.type+'|';try{rs+=JSON.stringify(r.payload);}catch(_s2){rs+=String(r.payload);}if(rs===_sig)mut(r);});
+  });
+}
 function _portalRecsDismiss(id){
-  _portalRecsUpdate(id,function(r){r.status='dismissed';r.appliedAt=new Date().toISOString();});
+  _portalRecsApplyToSiblings(id,function(r){r.status='dismissed';r.appliedAt=new Date().toISOString();});
 }
 
 function _portalRecsAccept(id){
-  _portalRecsUpdate(id,function(r){r.status='accepted';r.appliedAt=new Date().toISOString();});
+  _portalRecsApplyToSiblings(id,function(r){r.status='accepted';r.appliedAt=new Date().toISOString();});
 }
 
 function _portalRecsExpire(id){
-  _portalRecsUpdate(id,function(r){r.status='expired';});
+  _portalRecsApplyToSiblings(id,function(r){r.status='expired';});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -8909,13 +9092,22 @@ function _portalSvgDonut(data,size,label,opts){
   // pfos-main. Each path slice carries data-tip="<html>" with the tooltip
   // body; helpers compute position relative to the position:relative wrapper.
   var _donutId='donut_'+Math.random().toString(36).slice(2,9);
-  var svg='<style>.'+_donutId+' path{cursor:pointer;transition:opacity 0.15s, filter 0.15s}.'+_donutId+' path:hover{opacity:0.85;filter:brightness(1.15)}</style>';
+  var svg='<style>.'+_donutId+' path,.'+_donutId+' circle[data-tip]{cursor:pointer;transition:opacity 0.15s, filter 0.15s}.'+_donutId+' path:hover,.'+_donutId+' circle[data-tip]:hover{opacity:0.85;filter:brightness(1.15)}</style>';
   svg+='<div style="position:relative;display:inline-block;max-width:'+size+'px">';
   svg+='<svg class="'+_donutId+'" viewBox="0 0 '+size+' '+size+'" style="width:100%;height:auto;max-width:'+size+'px">';
   var angle=0;
   data.forEach(function(d){
     if(d.v<=0)return;
     var slice=d.v/total*360;var large=slice>180?1:0;
+    // A single ~360° slice is a degenerate arc (start point == end point → nothing renders). Draw the ring
+    // as concentric circles so single-holding / 100% donuts show a ring instead of an empty box.
+    if(slice>=359.9){
+      var _pct1=Math.round(d.v/total*100);
+      var _tip1='<div style="font-family:var(--fh);font-weight:700;color:#5B9BFF;margin-bottom:4px">'+(d.l||'Unlabeled').replace(/</g,'&lt;').replace(/"/g,'&quot;')+'</div><div style="font-family:var(--fd);font-size:18px;color:var(--wh);margin-bottom:2px">'+fmt(Math.round(d.v))+_amtSuf+'</div><div style="font-size:11px;color:var(--mu)">'+_pct1+'% of total</div>';
+      svg+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r+'" fill="'+d.c+'" stroke="var(--bg)" stroke-width="1" data-tip="'+_tip1.replace(/"/g,'&quot;')+'" onmouseenter="_donutTip(\''+_donutId+'\',event,this)" onmousemove="_donutTip(\''+_donutId+'\',event,this)" onmouseleave="_donutTipHide(\''+_donutId+'\')"></circle>';
+      svg+='<circle cx="'+cx+'" cy="'+cy+'" r="'+r2+'" fill="var(--bg)" pointer-events="none"></circle>';
+      angle+=slice;return;
+    }
     var x1=cx+r*Math.cos((angle-90)*Math.PI/180);var y1=cy+r*Math.sin((angle-90)*Math.PI/180);
     var x2=cx+r*Math.cos((angle+slice-90)*Math.PI/180);var y2=cy+r*Math.sin((angle+slice-90)*Math.PI/180);
     var ix1=cx+r2*Math.cos((angle-90)*Math.PI/180);var iy1=cy+r2*Math.sin((angle-90)*Math.PI/180);
@@ -9154,7 +9346,7 @@ function _portalWhereEveryDollarGoesBlock(){
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px" class="trk-grid-2">';
   // Left: Spending by category bars
   h+='<div style="padding:12px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">';
-  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;letter-spacing:.12em;text-transform:uppercase;margin-bottom:8px">SPENDING BY CATEGORY</div>';
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:#5B9BFF;letter-spacing:.12em;text-transform:uppercase;margin-bottom:8px">BUDGET BY CATEGORY</div>';
   var sortedExp=expData.slice().sort(function(a,b){return b.v-a.v;});
   var maxExp=sortedExp.length?sortedExp[0].v:1;
   sortedExp.forEach(function(d){
@@ -12560,6 +12752,10 @@ function _clientRenderSpendPulse(){
     over:{bg:'rgba(239,68,68,.06)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️',label:'Over budget'}
   };
   var t=theme[status.severity]||theme.ok;
+  // When the alarm is driven ONLY by a single category (the month itself is on-track), the header must say
+  // so — otherwise an "Over budget" header sits over healthy month totals ("18% spent · $5,310 left").
+  var _catDriven=(status.monthSeverity==='ok'&&status.severity!=='ok');
+  var _hdrLabel=_catDriven?(status.severity==='over'?'Category over budget':'Category watch'):t.label;
   var barCol=pctSpent>=100?'var(--rd)':pctSpent>90?'var(--rd)':pctSpent>70?'var(--or)':'var(--gr)';
   // Top line — "Day X of Y" + spent / income
   var monthShort=new Date().toLocaleDateString('en-US',{month:'short'});
@@ -12569,7 +12765,7 @@ function _clientRenderSpendPulse(){
   h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">';
   h+='<div style="display:flex;align-items:center;gap:6px">';
   h+='<span style="font-size:13px">'+t.icon+'</span>';
-  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+t.label+'</span>';
+  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+_hdrLabel+'</span>';
   h+='</div>';
   h+='<span style="font-family:var(--fh);font-size:12px;color:var(--mu)">'+monthShort+' · day '+status.dayOfMonth+' of '+status.daysInMonth+'</span>';
   h+='</div>';
@@ -12662,9 +12858,15 @@ function renderSpendingAnalysis(){
     var ed=expData[cat.key];
     var amt=0;
     if(ed){
-      if(ed.total!=null) amt=ed.total;
-      else if(ed.subs){
-        Object.keys(ed.subs).forEach(function(sk){amt+=(ed.subs[sk]||0);});
+      // Mirror the engine's canonical getMonthlyExp (pfos-main): total → amount(period-adjusted) → subs.
+      // (Previously read only ed.total/ed.subs and IGNORED ed.amount, so the canonical {amount,period}
+      //  expData shape computed 0 for every category and showed "No expense categories found".)
+      if(ed.total!=null&&!isNaN(parseFloat(ed.total))) amt=parseFloat(ed.total);
+      else {
+        var _base=parseFloat(ed.amount)||0; if(ed.period==='annual')_base=_base/12;
+        var _sub=0;
+        if(ed.subs)Object.keys(ed.subs).forEach(function(sk){var s=ed.subs[sk];var sv=parseFloat(s&&s.amount!=null?s.amount:s)||0;if(s&&s.period==='annual')sv=sv/12;_sub+=sv;});
+        amt=_sub>0?_sub:_base;
       }
     }
     if(amt>0) catData.push({key:cat.key,label:cat.label,icon:cat.icon,amount:amt,leaked:ed&&ed.leakTagged});
@@ -12697,7 +12899,7 @@ function renderSpendingAnalysis(){
   if(catData.length===0){
     h+='<div style="color:var(--mu);font-size:14px;padding:12px 0">No expense categories found. Enter expense data to see your breakdown.</div>';
   } else {
-    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Spending by Category</div>';
+    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Budget by Category</div>';
     catData.forEach(function(c){
       var pct=maxCat>0?(c.amount/maxCat*100):0;
       var pctOfInc=(c.amount/inc*100).toFixed(1);
@@ -12717,7 +12919,10 @@ function renderSpendingAnalysis(){
   if(leakCount>0){
     h+='<div style="margin-top:14px;padding:12px;background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.18);border-radius:2px">';
     h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--rd);margin-bottom:6px">💡 Spending Leak Tip</div>';
-    h+='<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">Your advisor flagged '+leakCount+' spending leak'+(leakCount>1?'s':'')+'. These are expenses that may be reduced or eliminated. Review the flagged categories above and discuss with your advisor for strategies to redirect this money toward your goals.</div>';
+    var _lkProd=(APP.currentClient&&APP.currentClient.client_type==='product');
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">'+(_lkProd
+      ? 'We flagged '+leakCount+' spending leak'+(leakCount>1?'s':'')+'. These are expenses that may be reduced or eliminated. Review the flagged categories above to redirect this money toward your goals.'
+      : 'Your advisor flagged '+leakCount+' spending leak'+(leakCount>1?'s':'')+'. These are expenses that may be reduced or eliminated. Review the flagged categories above and discuss with your advisor for strategies to redirect this money toward your goals.')+'</div>';
     h+='</div>';
   }
 
@@ -20875,7 +21080,7 @@ function renderCCPayoffCalc(){
   if(document.getElementById('ccp_extra')){calcCCPayoff();return;}
 
   var c=cpf('ccp');var rp=(S.riskProfile&&S.riskProfile.label)||'moderate';
-  var debts=isForMe('ccp')?(S.debts||[]).slice():[];
+  var debts=isForMe('ccp')?(S.debts||[]).map(function(_d){var _c=Object.assign({},_d);var _t=String(_c.type||'').toLowerCase(),_n=String(_c.name||'').toLowerCase();if(_t==='mortgage'||_t==='heloc'||/mortgage|heloc|home equity/.test(_n))_c._incl=false;return _c;}):[];   // mortgages/HELOCs default-EXCLUDED — you don't avalanche a low-rate secured loan (owner-decided); user can re-check
   if(!debts.length) debts=[{name:'',balance:'',rate:'',min:''}];
 
   var h=calcToggleHTML('ccp','calcCCPayoff');
@@ -20891,7 +21096,7 @@ function renderCCPayoffCalc(){
 
   // ── Editable Debt Rows ──
   h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--rd);margin-bottom:4px">YOUR DEBTS</div>';
-  h+='<div style="font-size:12px;color:var(--mu);margin-bottom:8px">Add all debts you want to pay off — credit cards, personal loans, medical, etc.</div>';
+  h+='<div style="font-size:12px;color:var(--mu);margin-bottom:8px"><strong style="color:var(--wh)">Mortgages are left out by default</strong> — you don\'t usually accelerate a low-rate home loan. Check or uncheck any debt to change the plan; add more below.</div>';
   h+='<div id="ccp_debtRows">';
   debts.forEach(function(d,i){
     h+=_ccpDebtRow(i,d);
@@ -20900,7 +21105,11 @@ function renderCCPayoffCalc(){
   h+='<div onclick="addCCPDebt()" style="display:flex;align-items:center;gap:6px;padding:8px;cursor:pointer;color:rgba(91,155,255,.7);font-size:13px;margin-bottom:12px"><span style="width:20px;height:20px;border-radius:50%;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;font-size:14px;line-height:18px;text-align:center">+</span> Add another debt</div>';
 
   // ── Extra Payment Input ──
-  h+='<div class="fi"><label class="lb">Extra Monthly Amount Available (above minimums)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ccp_extra" value="200" oninput="calcCCPayoff()" style="padding-left:22px;min-height:36px"></div></div>';
+  var _ncf=Math.max(0,(window.S&&S.calcs&&parseFloat(S.calcs.netCF))||0);
+  var _exMax=Math.max(1500,Math.ceil(_ncf/250)*250), _exVal=Math.min(200,_exMax);
+  h+='<div class="fi"><label class="lb">Extra Monthly Payment (above minimums) — drag to see the impact: <strong id="ccp_extraDisp" style="color:#5B9BFF;font-family:var(--fd);font-size:15px">$'+_exVal.toLocaleString()+'</strong>/mo</label>';
+  h+='<input type="range" id="ccp_extra" min="0" max="'+_exMax+'" step="25" value="'+_exVal+'" oninput="var v=parseInt(this.value)||0;var dd=document.getElementById(\'ccp_extraDisp\');if(dd)dd.textContent=\'$\'+v.toLocaleString();calcCCPayoff()" style="width:100%;accent-color:#5B9BFF;height:6px;cursor:pointer;margin:8px 0 4px">';
+  h+='<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--mu)"><span>$0</span><span>$'+_exMax.toLocaleString()+'/mo</span></div></div>';
 
   // ── Consolidation Offer Section ──
   h+='<div style="padding:12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.15);border-radius:6px;margin:12px 0">';
@@ -20925,7 +21134,8 @@ function renderCCPayoffCalc(){
 
 // ── Debt Row HTML ──
 function _ccpDebtRow(i,d){
-  return '<div style="display:grid;grid-template-columns:2fr 1.5fr 1fr 1.2fr 24px;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,68,191,.06)" id="ccp_row'+i+'">'
+  return '<div style="display:grid;grid-template-columns:26px 2fr 1.5fr 1fr 1.2fr 24px;gap:8px;align-items:center;padding:8px 0;border-bottom:1px solid rgba(0,68,191,.06)" id="ccp_row'+i+'">'
+    +'<input type="checkbox" '+(d._incl===false?'':'checked')+' onchange="_ccpUpdDebt()" title="Include this debt in the payoff plan" style="width:18px;height:18px;accent-color:#5B9BFF;cursor:pointer;justify-self:center">'
     +'<input type="text" value="'+escH(d.name||'')+'" placeholder="Debt name" onchange="_ccpUpdDebt()" style="background:var(--bg-in);border:1px solid var(--bd);color:#F0F6FF;font-size:13px;padding:8px 10px;border-radius:3px;min-height:38px;width:100%">'
     +'<div style="position:relative"><span style="position:absolute;left:10px;top:50%;transform:translateY(-50%);color:#5B9BFF;font-size:13px;font-weight:700;pointer-events:none;font-family:var(--fh)">$</span><input type="text" inputmode="decimal" value="'+(d.balance?Math.round(d.balance).toLocaleString():'')+'" placeholder="Balance" oninput="autoComma(this)" onchange="_ccpUpdDebt()" style="background:var(--bg-in);border:1px solid var(--bd);color:#F0F6FF;font-size:13px;padding:8px 10px 8px 22px;width:100%;border-radius:3px;min-height:38px"></div>'
     +'<div style="position:relative"><input type="number" value="'+(d.rate||'')+'" placeholder="APR" step="0.1" onchange="_ccpUpdDebt()" style="background:var(--bg-in);border:1px solid var(--bd);color:#F0F6FF;font-size:13px;padding:8px 24px 8px 10px;width:100%;border-radius:3px;min-height:38px;-moz-appearance:textfield"><span style="position:absolute;right:8px;top:50%;transform:translateY(-50%);color:var(--mu);font-size:12px;pointer-events:none;font-family:var(--fh)">%</span></div>'
@@ -20958,10 +21168,12 @@ function _ccpReadDebts(){
   var rows=document.getElementById('ccp_debtRows');if(!rows)return[];
   var debts=[];
   for(var i=0;i<rows.children.length;i++){
-    var inputs=rows.children[i].querySelectorAll('input');
+    var cb=rows.children[i].querySelector('input[type="checkbox"]');
+    var incl=cb?cb.checked:true;
+    var inputs=rows.children[i].querySelectorAll('input:not([type="checkbox"])');
     if(inputs.length>=4){
       var bal=pf(inputs[1].value)||0;
-      if(bal>0) debts.push({name:inputs[0].value||'Debt '+(i+1),balance:bal,rate:parseFloat(inputs[2].value)||0,min:pf(inputs[3].value)||25});
+      if(bal>0) debts.push({name:inputs[0].value||'Debt '+(i+1),balance:bal,rate:parseFloat(inputs[2].value)||0,min:pf(inputs[3].value)||25,_incl:incl});
     }
   }
   return debts;
@@ -20969,7 +21181,7 @@ function _ccpReadDebts(){
 
 function _ccpSyncDebts(debts){
   var el=document.getElementById('ccp_data');
-  if(el) el.value=JSON.stringify(debts.filter(function(d){return(d.balance||0)>0;}));
+  if(el) el.value=JSON.stringify(debts.filter(function(d){return(d.balance||0)>0&&d._incl!==false;}));   // only checked debts feed the plan
 }
 
 function calcCCPayoff(){ calcDebounce('calcCCPayoff', _runCCPayoff); }
@@ -26979,6 +27191,9 @@ async function checkPartnerStatus(){
   var couple=getCoupleForClient(APP.currentClientId);
   if(!couple){card.style.display='none';return;}
   card.style.display='';
+  // Reveal the Couple View nav here too: getCoupleForClient reads the in-memory couples (reliable),
+  // whereas checkCoupleLink's login-time couple_links query can race the session and leave the nav hidden.
+  var _cnavCouple=document.getElementById('cnav-couple');if(_cnavCouple)_cnavCouple.style.display='flex';
   var partnerId=couple.client_a_id===APP.currentClientId?couple.client_b_id:couple.client_a_id;
   var partnerName='Partner';
   var partnerClient=null;
@@ -29071,7 +29286,7 @@ function _renderAnnualReviewDetail(d){
   if(ir){
     h+=secHead(ir.applicable?'Income Rider':'Income Rider — Not Active');
     var irC='';
-    if(!ir.applicable){irC+='<div style="color:var(--yl)">No income rider attached. Discuss with advisor whether to add one or plan for systematic withdrawals.</div>';if(ir.incomeWithoutRider)irC+='<br>Systematic 4%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal4Pct)+'/yr. 5%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal5Pct)+'/yr (not guaranteed).<br>';}
+    if(!ir.applicable){irC+='<div style="color:var(--yl)">'+((APP.currentClient&&APP.currentClient.client_type==='product')?'No income rider attached. Consider adding one or planning for systematic withdrawals.':'No income rider attached. Discuss with advisor whether to add one or plan for systematic withdrawals.')+'</div>';if(ir.incomeWithoutRider)irC+='<br>Systematic 4%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal4Pct)+'/yr. 5%: '+fmt(ir.incomeWithoutRider.systematicWithdrawal5Pct)+'/yr (not guaranteed).<br>';}
     else{irC+='<strong style="color:var(--wh)">Income Base:</strong> '+fmt(ir.incomeBase)+' (contract: '+fmt(ir.contractValue)+', divergence: '+fmt(ir.divergence)+')<br>';if(ir.rollupRate)irC+='<strong style="color:var(--wh)">Rollup:</strong> '+pct(ir.rollupRate)+(ir.rollupActive?' (active)':' (expired)')+'<br>';irC+='<strong style="color:var(--wh)">Rider Fee:</strong> '+fmt(ir.riderFeeAmount)+'/yr ('+pct(ir.riderFeeAsPercentOfContractValue)+' of contract value)<br>';if(ir.projectedIncomeAtStartAge){var pi=ir.projectedIncomeAtStartAge;irC+='<br><strong style="color:var(--wh)">Projected at Age '+pi.startAge+':</strong> '+fmt(pi.guaranteedMonthly)+'/mo ('+fmt(pi.guaranteedAnnual)+'/yr)<br>';}}
     if(ir.explanation)irC+='<div style="margin-top:6px;font-size:13px;color:var(--mu)">'+escH(ir.explanation)+'</div>';
     h+=secBox(irC);
@@ -30308,6 +30523,53 @@ function _cpRenderAdvisorPending(){
 // unassigned column — READ-ONLY — plus an upgrade panel. The cards come from the same
 // _cpSyncFlagsToUnassigned + PFOSIssues.rankCards path the builder uses, so a Core user's preview is
 // exactly what becomes interactive after upgrading (cohesion by construction). Portal only.
+// ── Owner rebalance (2026-06): the canonical rank floats every protection/estate gap (engine level 2)
+// ABOVE debt/savings/retirement, so a user with insurance gaps saw an all-insurance teaser. Lead with the
+// money-moves and weave in at most 2 protection/estate within the top 5 — a balanced, substance-forward
+// "what to do next." Display-only (teaser); the canonical PFOSIssues rank is unchanged.
+function _cpRebalanceTop(cards){
+  if(!cards||cards.length<2) return cards||[];
+  var PROT={protection:1,protection_ext:1,estate:1};
+  function _act(c){ var a=(c&&(c.flagAction||c.type))||''; var k=a.indexOf('_spouse'); return k>0?a.slice(0,k):a; }
+  var money=[],prot=[];
+  cards.forEach(function(c){ (PROT[_act(c)]?prot:money).push(c); }); // each keeps canonical order
+  if(!prot.length||!money.length) return cards.slice();
+  var out=money.slice();
+  out.splice(Math.min(1,out.length),0,prot[0]);                   // 1st protection → position 2
+  if(prot.length>1) out.splice(Math.min(3,out.length),0,prot[1]); // 2nd protection → position 4
+  for(var i=2;i<prot.length;i++) out.push(prot[i]);               // remaining protection/estate trail
+  return out;
+}
+// Debt-priority substance: surface the avalanche payoff (target debt, months, interest saved vs minimums)
+// right on the card, via the local synchronous _cpDebtSimulate. Snowball is modeled too (the full optimizer).
+function _cpDebtSubstanceLine(a){
+  try{
+    if(typeof _cpDebtSort!=='function'||typeof _cpDebtSimulate!=='function') return '';
+    var all=((typeof CPLAN!=='undefined'&&CPLAN.debts)||[]).filter(function(d){return (parseFloat(d.balance)||0)>0;});
+    if(!all.length) return '';
+    // Scope to the HIGH-INTEREST debts this card is about (>15% APR, matching the flag) so the payoff math
+    // is consistent with "High-interest debt: $X" — NOT the user's entire (mortgage-included) balance.
+    var hi=all.filter(function(d){return (parseFloat(d.rate)||0)>15;});
+    var debts=hi.length?hi:all, multi=debts.length>1;
+    var sorted=_cpDebtSort(debts,'avalanche');
+    var d0=sorted[0]||{}, target=d0.name||d0.type||'your highest-rate debt', rate=parseFloat(d0.rate)||0;
+    var rateTxt=rate?(' ('+(Math.round(rate*10)/10)+'%)'):'';
+    function _yr(m){ return m>=24?(' (~'+(Math.round(m/12*10)/10)+' yrs)'):''; }
+    var extra=parseFloat(a&&a.amount)||Math.max(0,Math.round(((typeof CPLAN!=='undefined'&&CPLAN.surplus)||0)*0.5));
+    var base=_cpDebtSimulate(sorted,0);
+    var h='<div style="margin-top:12px;padding:10px 12px;background:rgba(239,68,68,.05);border:1px solid rgba(239,68,68,.14);border-radius:6px;font-size:13px;color:var(--mu);line-height:1.6">';
+    if(extra>0){
+      var av=_cpDebtSimulate(sorted,extra), saved=Math.max(0,(base.interest||0)-(av.interest||0));
+      h+='<span style="color:var(--wh);font-weight:600">💳 '+(multi?'Avalanche:':'Fast payoff:')+'</span> put <span style="color:var(--wh);font-weight:600">'+fmt(extra)+'/mo</span> extra toward <span style="color:var(--wh)">'+_cpEscHtml(target)+'</span>'+rateTxt+(multi?' (highest rate) first':'')+' → '+(multi?'high-interest debt gone':'paid off')+' in <span style="color:var(--wh);font-weight:600">'+av.months+' month'+(av.months===1?'':'s')+'</span>'+_yr(av.months);
+      if(saved>0) h+=', saving <span style="color:var(--gr);font-weight:600">'+fmt(saved)+'</span> in interest vs minimum payments';
+      h+='.';
+    } else {
+      h+='<span style="color:var(--wh);font-weight:600">💳 Pay off '+_cpEscHtml(target)+rateTxt+' first.</span> At minimum payments it costs <span style="color:var(--wh);font-weight:600">'+fmt(base.interest||0)+'</span> in interest over '+base.months+' months — extra payments shrink both.';
+    }
+    h+=' <span>The planner compares avalanche, snowball &amp; 3 more.</span></div>';
+    return h;
+  }catch(_e){ return ''; }
+}
 function _cpRenderPlanTeaser(){
   var root=document.getElementById('cplanRoot');if(!root)return;
   // Stage the flag-derived priority cards (same path as the builder's unassigned column). Read-only
@@ -30315,6 +30577,7 @@ function _cpRenderPlanTeaser(){
   try{ if(!CPLAN.hasAdvisor && typeof _cpSyncFlagsToUnassigned==='function') _cpSyncFlagsToUnassigned(); }catch(_e){}
   var unassigned=CPLAN.allocations.filter(function(a){return a&&a.phase===0&&!(a._completed&&typeof _cpIsActionOnly==='function'&&_cpIsActionOnly(a));});
   if(typeof PFOSIssues!=='undefined'&&PFOSIssues.rankCards) unassigned=PFOSIssues.rankCards(unassigned);
+  if(typeof _cpRebalanceTop==='function') unassigned=_cpRebalanceTop(unassigned);   // owner: balance domains, lead with money-moves
   var top=unassigned.slice(0,5);
   var h='';
   h+='<div style="text-align:center;padding:30px 16px 18px">';
@@ -30353,6 +30616,7 @@ function _cpTeaserCard(a){
     h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_rgba(color,0.08)+';border-radius:4px"><div style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(_tot)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
   }
   h+='</div>';
+  if(a.type==='debt'&&typeof _cpDebtSubstanceLine==='function'){ var _dsl=_cpDebtSubstanceLine(a); if(_dsl)h+=_dsl; }
   h+='</div>';
   return h;
 }
@@ -49283,6 +49547,6 @@ function cas_toggleBiometricEnrollment(checkbox){
 })();
 </script>
 <!-- PFOS canonical engine (single source of truth) — IBC cascade + calculators. -->
-<script src="/pfos-core.v55.js" defer></script>
+<script src="/pfos-core.v57.js" defer></script>
 </body>
 </html>
