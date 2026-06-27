@@ -3155,11 +3155,25 @@ function _nwSmooth(pts){
   }
   return d;
 }
+// Snapshots are captured only monthly (pfos-main captureSnapshot: daysSince>=28), so the stored series can lag the
+// user's CURRENT net worth by up to ~4 weeks. Append a live "Now" actual point so the Reports timeline reflects
+// TODAY's value between snapshots (owner: net worth lives on Reports, but must stay up to date). Pure + no-op when
+// the latest snapshot already equals today's value (avoids a duplicate flat segment). The forward sim already
+// starts from today, so this also closes any past→future discontinuity at the TODAY divider.
+function _nwLivePast(past, liveNW){
+  if(liveNW==null||!isFinite(liveNW))return past;
+  var last=past.length?past[past.length-1]:null;
+  if(last&&Math.round(last.v)===Math.round(liveNW))return past;
+  return past.concat([{label:'Now',v:liveNW}]);
+}
 function renderNetWorthTimeline(targetId){
   _nwTimelineTarget=targetId||'nwTimeline';
   var el=document.getElementById(_nwTimelineTarget); if(!el) return;
   var snaps=(APP._supabaseSnapshots||[]).filter(function(s){return s&&isFinite(parseFloat(s.netWorth));});
   var past=snaps.map(function(s){return {label:String(s.label||s.date||''),v:parseFloat(s.netWorth)};});
+  // keep TODAY current: prefer the live engine calcs net worth, else the sim's year-0 (both = today's value)
+  var _liveNW=(typeof APP!=='undefined'&&APP._portalCalcs&&isFinite(parseFloat(APP._portalCalcs.netWorth)))?parseFloat(APP._portalCalcs.netWorth):((typeof CPLAN!=='undefined'&&CPLAN&&CPLAN._sim&&Array.isArray(CPLAN._sim.netWorth)&&isFinite(parseFloat(CPLAN._sim.netWorth[0])))?parseFloat(CPLAN._sim.netWorth[0]):null);
+  past=_nwLivePast(past,_liveNW);
   var simNW=(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN._sim&&Array.isArray(CPLAN._sim.netWorth)&&CPLAN._sim.netWorth.length>1)?CPLAN._sim.netWorth:null;
   var future=null, fullYears=0;
   if(simNW){ fullYears=simNW.length-1; var hz=Math.min(_nwHorizon,fullYears); future=simNW.slice(0,hz+1).map(function(v,i){var n=parseFloat(v); return {year:i,v:(isFinite(n)?n:0)};}); } // slice to the chosen horizon: a full 30y compound curve crushes the near-term flat
@@ -10307,8 +10321,10 @@ function _bridgeHeadlineBlock(impacts){
 // Called only behind the flag → OFF byte-identical (the static priority string is untouched).
 function _cpSnapshotDeltas(prev,curr){
   // MoM delta truth table (mirrors pfos-main buildTrackingHTML): green when good; "up is good" flips for debt.
+  // Net worth is DELIBERATELY excluded here (owner: it's a slow, market-driven balance that belongs on Reports,
+  // not the daily/dashboard surface — see dashboard-immediate-check-only). The headline keeps the ACTION-driven,
+  // frequently-changing signals: debt (moves with payments), savings rate, and cash flow.
   var defs=[
-    { l:'Net worth', o:prev.netWorth, n:curr.netWorth, up:true },
     { l:'Debt', o:prev.totalDebt, n:curr.totalDebt, up:false },
     { l:'Savings rate', o:prev.savingsRate, n:curr.savingsRate, up:true, pct:true },
     { l:'Cash flow', o:prev.netCF, n:curr.netCF, up:true }
