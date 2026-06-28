@@ -870,11 +870,11 @@ function _issuesDetect(ctx){
       var rsugg=Math.max(0,_dcNum(c.requiredMonthlyIncrease));
       var ryrs=(c.yearsToRetire>0?c.yearsToRetire:0), rage=_dcNum(c.retAge);
       card.diagnosis={ metric:'Retirement savings', current:rcur, target:rtgt, gap:rgap, unit:'money',
-        text:'Projected '+fmt(rcur)+' vs a '+fmt(rtgt)+' FI target'+(rgap>0?(' — '+fmt(rgap)+' short.'):' — on track.') };
+        text:'Projected '+fmtK(rcur)+' vs a '+fmtK(rtgt)+' FI target'+(rgap>0?(' — '+fmtK(rgap)+' short.'):' — on track.') };
       card.nextAction={ suggestedMonthly:rsugg, timelineMonths:ryrs*12,
         timelineText:(rsugg>0?'add '+fmt(rsugg)+'/mo over '+ryrs+' year'+(ryrs===1?'':'s'):'on track'),
-        projectionText:(rsugg>0?'Add '+fmt(rsugg)+'/mo → closes the '+fmt(rgap)+' gap by age '+rage+'.':'On track to reach your FI number by age '+rage+'.') };
-      card.impact={ text:(rsugg>0?'Adding '+fmt(rsugg)+'/mo keeps you on track to be financially independent at age '+rage+' instead of falling '+fmt(rgap)+' short.':'You are on track for financial independence at age '+rage+'.') };
+        projectionText:(rsugg>0?'Add '+fmt(rsugg)+'/mo → closes the gap by age '+rage+'.':'On track to reach your FI number by age '+rage+'.') };
+      card.impact={ text:(rsugg>0?'Adding '+fmt(rsugg)+'/mo keeps you on track to be financially independent at age '+rage+'.':'You are on track for financial independence at age '+rage+'.') };
       card.priority.why='Growth lever — closing this gap is what makes work optional on time.';
     } else {
       // debt/protection/estate/other — shell only; B/D/E fill diagnosis/nextAction/impact ADDITIVELY.
