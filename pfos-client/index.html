@@ -4616,7 +4616,16 @@ function clientHasFeature(feature){
 // "Planning" prompt. Dark by default (litePlanner unset → _liteActive() false → every gate passes → builder
 // byte-identical). Each gate is `if(_liteActive())`-guarded.
 function _liteActive(){ return !!(window.PFOS_FLAGS&&PFOS_FLAGS.litePlanner&&typeof clientHasFeature==='function'&&!clientHasFeature('plan_builder_full')); }
+// SINGLE source of truth for "Core lite plan = one 'fund these now' allocation, NO phases / NO cascade" (cascading is
+// a Planning feature). Global (unlike the old _liteSingle local var inside _cpRenderPlanV2) so the per-card emitter
+// _cpBuildCard + the cascade-prompt modal can gate on the SAME predicate — that local-scope gap is exactly why phase
+// surfaces leaked into lite. Render/input-time only: NEVER mutate/filter CPLAN.allocations (upgrade must keep data).
+function _cpSinglePhasePlan(){ return (typeof _liteActive==='function' && _liteActive()); }
 function _cpLiteVehicleAllow(){ return { ef:1, debt:1, protection:1, roth:1, roth401k:1, '401k':1, trad_ira:1, solo401k:1, sep_ira:1, invest:1, edu:1, custom:1, rental:1 }; }   // traditional accounts + the basics; EXCLUDES iul/wl/ibc/hsa/annuities/rollover (advanced = Planning)
+// Lite blocks IUL/WL/annuities (Planning-tier vehicles, see _cpLiteVehicleAllow). Strip those names out of any
+// "(Roth, IRA, IUL, and more)"-style vehicle list in copy so lite NEVER names a vehicle the tier hides. Lite-only
+// (owner decision: IUL-strip is lite-only) — returns the string untouched outside lite, so all other tiers are byte-identical.
+function _cpLiteStripBlockedVehicles(s){ if(!_cpSinglePhasePlan()||!s)return s||''; return String(s).replace(/\b(?:IUL|WL|annuities)\b/gi,'').replace(/\(\s*,\s*/g,'(').replace(/,\s*,/g,',').replace(/\s+,/g,',').replace(/,\s*(and more)/gi,', $1').replace(/,\s*\)/g,')').replace(/\s{2,}/g,' '); }
 function _cpLiteGrowthLevers(){ return { invest:1, edu:1, custom:1, rental:1 }; }   // the "ONE additional growth lever" set (retirement accounts are unlimited; ef/debt/protection are always allowed)
 function _cpLiteCanAdd(type){
   if(!_liteActive()) return { ok:true };
@@ -4626,6 +4635,35 @@ function _cpLiteCanAdd(type){
     if(levers>=1) return { ok:false, msg:'Core plans include one growth lever — add more in Planning.' };
   }
   return { ok:true };
+}
+// Lite (Core) auto-SEED: lite stages cards at $0 (→ "Deploying $0/mo"). This funds the urgent money-moves out of
+// the box — debt → EF → a concrete retirement/invest card — by setting amounts on EXISTING $0 cards. It NEVER pushes
+// new cards, NEVER funds a chooser placeholder ("Choose a vehicle" stays a prompt — you can't fund an unchosen
+// vehicle), and NEVER sets cascade. Runs ONCE per plan (_liteSeeded, persisted) and only when the user hasn't
+// allocated yet → never overwrites real choices, fully upgrade-safe. Reuses _cpAutoSuggestV2's priority shares
+// WITHOUT calling it (that one wipes allocations + bakes in cascade).
+function _cpLiteAutoSeed(){
+  if(!_cpSinglePhasePlan())return;
+  if(typeof CPLAN==='undefined'||!CPLAN||!Array.isArray(CPLAN.allocations))return;
+  if(CPLAN._liteSeeded)return;
+  var _isAO=(typeof _cpIsActionOnly==='function')?_cpIsActionOnly:function(){return false;};
+  if(CPLAN.allocations.some(function(a){return a&&(parseFloat(a.amount)||0)>0&&!_isAO(a);}))return;   // user already allocated → never overwrite
+  CPLAN._liteSeeded=true;
+  var _brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15);
+  var pool=Math.round((parseFloat(CPLAN.surplus)||0)*(1-_brPct/100));
+  if(pool<=0)return;
+  var hiDebts=((CPLAN.debts)||[]).filter(function(x){return(parseFloat(x.rate)||0)>10&&(parseFloat(x.balance)||0)>0;});
+  var debtPct=hiDebts.length>0?0.30:0, efPct=(CPLAN.efBal<CPLAN.efTarget)?0.10:0, matchPct=CPLAN.employer?0.08:0;
+  var growthPct=1-debtPct-efPct-matchPct;
+  function _seed(pred,share){
+    if(share<=0)return; var amt=Math.round(pool*share); if(amt<=0)return;
+    var a=CPLAN.allocations.find(function(x){return x&&(parseFloat(x.amount)||0)===0&&(x.phase==null||x.phase<=1)&&!x._isPlaceholder&&!_isAO(x)&&pred(x);});
+    if(a){ var cap=(typeof _cpIRSMax==='function')?_cpIRSMax(a.type,a):amt; a.amount=Math.min(amt,cap); a.phase=1; }
+  }
+  _seed(function(x){return x.type==='debt';},debtPct);
+  _seed(function(x){return x.type==='ef';},efPct);
+  var _retGrowth={roth:1,'401k':1,roth401k:1,trad_ira:1,solo401k:1,sep_ira:1,invest:1};
+  _seed(function(x){return !!_retGrowth[x.type];},matchPct+growthPct);
 }
 // ── budget_v2 DARK-LAUNCH FLAG (Milestone 1) ── Gates ALL unified-budget + register M1 UI
 // while it's built behind the flag. OFF for everyone except the test/owner allowlist; flip to
@@ -5656,7 +5694,7 @@ function _syncPlanToMain(){
   var _allocsSource=_liveAllocs||_savedAllocs;
   if(!_allocsSource||!_allocsSource.length)return;// nothing to sync from either source
   var plan={
-    allocations:_allocsSource.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target};}),
+    allocations:_allocsSource.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target,_isPlaceholder:a._isPlaceholder,_chooserAction:a._chooserAction,owner:a.owner};}),// retain chooser identity (_isPlaceholder/_chooserAction/owner) — without these the sync orphaned unresolved "Choose a … vehicle" prompts into permanent $0 custom cards on reload
     sim:CPLAN._sim?{netWorth:CPLAN._sim.netWorth,baseline:CPLAN._sim.baseline,retirement:CPLAN._sim.retirement}:null,
     tracking:_cpTracking,
     calendar:_cpPlanCalendar,
@@ -30215,7 +30253,10 @@ function _cpHelpPanelHtml(audience){
       var _step1Hh='';
       if(_hh==='hybrid')_step1Hh=' If you want a card that belongs to a specific person, look for the owner badge when adding — you can pick "Your card" / "Spouse\'s card" / "Joint card" in the chooser.';
       else if(_hh==='joint')_step1Hh=' Every card you add becomes a household card — both of you can edit it.';
-      h+=_cpHelpStep(1,'Add items + assign each to a phase','Phase 1 is "now" — the things you start funding immediately. Phase 2 starts later, automatically, when something in Phase 1 frees up cash (debt paid off, emergency fund filled). Phase 3 is even later. Click "+ Add to Phase 1" to bring up the full menu of vehicles (Roth IRA, 401k, IUL, HSA, IBC, education, etc.) and pick what fits.'+_step1Hh,'#22C55E');
+      // Lite (Core) help must NOT describe phases/cascade or advanced vehicles (IUL/HSA/IBC) the tier blocks.
+      h+=_cpSinglePhasePlan()
+        ? _cpHelpStep(1,'Add items to your plan','Pick what to fund now — pay off high-interest debt, build your emergency fund, start a retirement account (Roth, 401(k), IRA), and add ONE growth goal. Click "+ Add to your plan" to choose. Advanced vehicles (IUL, HSA, IBC, annuities) and multi-stage cascading plans are part of PFOS Planning.'+_step1Hh,'#22C55E')
+        : _cpHelpStep(1,'Add items + assign each to a phase','Phase 1 is "now" — the things you start funding immediately. Phase 2 starts later, automatically, when something in Phase 1 frees up cash (debt paid off, emergency fund filled). Phase 3 is even later. Click "+ Add to Phase 1" to bring up the full menu of vehicles (Roth IRA, 401k, IUL, HSA, IBC, education, etc.) and pick what fits.'+_step1Hh,'#22C55E');
       var _step2Hh='';
       if(_hh==='hybrid')_step2Hh=' On JOINT cards (shared between both of you), you\'ll see TWO sliders on the same card — one is "your portion" and one is "your spouse\'s portion." Adjust your slider; your spouse adjusts theirs from their own login. The total is the sum.';
       h+=_cpHelpStep(2,'Set how much per month','Each item has a slider. The slider\'s maximum is the lower of the IRS contribution limit (where one applies) and the surplus you have left after other allocations and breathing room. As you allocate to one item, the others shrink. Move money around freely — nothing locks until you save.'+_step2Hh,'#22C55E');
@@ -30498,10 +30539,11 @@ function _cpUnassignedHelpHtml(){
     // ── HOW IT FITS TOGETHER ──
     h+='<div style="margin-bottom:18px;padding:12px 14px;background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.18);border-radius:4px">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--yl);margin-bottom:8px">The big picture in one paragraph</div>';
-    h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.75">Look at your monthly surplus and the breathing-room reserve at the top of the page. That tells you how much money you have left to deploy each month. You take items from this unassigned column, decide what amount of that surplus goes to each one, and assign each one to a phase. <strong style="color:var(--wh)">Phase 1 is what starts immediately.</strong> Then as Phase 1 items finish — debt gets paid off, emergency fund gets fully funded — the money that was going to those items <em>cascades</em> into the next phase automatically. The simulation runs all of this forward 30 years and shows you the chart and timeline at the bottom of the page.</div>';
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.75">Look at your monthly surplus and the breathing-room reserve at the top of the page. That tells you how much money you have left to deploy each month. You take items from this unassigned column'+(_cpSinglePhasePlan()?' and decide what amount of that surplus goes to each one. ':', decide what amount of that surplus goes to each one, and assign each one to a phase. <strong style="color:var(--wh)">Phase 1 is what starts immediately.</strong> Then as Phase 1 items finish — debt gets paid off, emergency fund gets fully funded — the money that was going to those items <em>cascades</em> into the next phase automatically. ')+'The simulation runs all of this forward 30 years and shows you the chart and timeline at the bottom of the page.</div>';
     h+='</div>';
 
-    // ── WHAT THE PHASES MEAN ──
+    // ── WHAT THE PHASES MEAN (Planning only — lite is a single "fund these now" plan, no phases/cascade) ──
+    if(!_cpSinglePhasePlan()){
     h+='<div style="margin-bottom:18px">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--yl);margin-bottom:8px">What the phases actually mean</div>';
     h+='<div style="display:grid;grid-template-columns:1fr;gap:8px">';
@@ -30518,6 +30560,7 @@ function _cpUnassignedHelpHtml(){
     h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.65">Same idea, one step further out. When a Phase 2 item completes, its money cascades to Phase 3. Use this for things that aren\'t time-sensitive (extra retirement, IBC growth, generational planning) and only make sense after the foundational work is done.</div>';
     h+='</div>';
     h+='</div></div>';
+    }   // end if(!_cpSinglePhasePlan()) — "What the phases mean" section is Planning-only
 
     // ── THE THREE CARD FLAVORS ──
     h+='<div style="margin-bottom:18px">';
@@ -30527,13 +30570,13 @@ function _cpUnassignedHelpHtml(){
     // Card type 1: direct-add (slider)
     h+='<div style="padding:12px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:3px;margin-bottom:10px">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--gr);margin-bottom:6px">1. Direct-add cards (slider + ✓ Done)</div>';
-    h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.7"><strong style="color:var(--wh)">When you\'ll see one:</strong> the card has a horizontal slider in the middle and a green <span style="display:inline-block;padding:2px 8px;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:2px">✓ Done</span> button at the bottom-right. Examples: emergency fund, debt extra payment, HSA, IBC, savings, an existing whole-life policy you already own.<br><br>';
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.7"><strong style="color:var(--wh)">When you\'ll see one:</strong> the card has a horizontal slider in the middle and a green <span style="display:inline-block;padding:2px 8px;background:rgba(34,197,94,.18);border:1px solid rgba(34,197,94,.4);color:var(--gr);font-family:var(--fh);font-size:12px;font-weight:700;border-radius:2px">✓ Done</span> button at the bottom-right. Examples: emergency fund, debt extra payment, '+(_cpSinglePhasePlan()?'savings.':'HSA, IBC, savings, an existing whole-life policy you already own.')+'<br><br>';
     h+='<strong style="color:var(--wh)">Step-by-step:</strong><ol style="margin:6px 0 0 18px;padding:0;line-height:1.85">';
     h+='<li><strong style="color:var(--wh)">Read the card title</strong> at the top-left to confirm what the recommendation is (e.g. "Emergency Fund — 3-month reserve"). Read the description below the title.</li>';
     h+='<li><strong style="color:var(--wh)">Find the slider</strong> in the middle of the card. To the left of the slider is the minimum (usually $0). To the right is the maximum — that number is the smaller of (a) the IRS contribution limit for that account type, or (b) what you have left after your breathing-room reserve and any other allocations you\'ve already funded.</li>';
     h+='<li><strong style="color:var(--wh)">Click and drag the slider thumb</strong> (the circle) left or right to choose how much per month you want to allocate. As you drag, watch the dollar amount in the box to the right of the slider update — that\'s what you\'re committing per month. Watch the deployment bar near the top of the page and the Net Worth Projection chart at the bottom — both update live with every move.</li>';
     h+='<li><strong style="color:var(--wh)">Type a specific amount instead of dragging</strong>: click into the dollar box to the right of the slider and type the number you want. The slider thumb jumps to match. Use this when you need an exact figure (e.g. exactly $250).</li>';
-    h+='<li><strong style="color:var(--wh)">Set the phase.</strong> Below the slider, find the dropdown that says "Phase: P1: Triage" (or P2/P3). Click it and pick the phase you want this allocation to belong to. Phase 1 is for things you\'re funding right now; Phase 2 is for things that start after a Phase 1 item finishes; Phase 3 is for long-game work that builds on top.</li>';
+    if(!_cpSinglePhasePlan())h+='<li><strong style="color:var(--wh)">Set the phase.</strong> Below the slider, find the dropdown that says "Phase: P1: Triage" (or P2/P3). Click it and pick the phase you want this allocation to belong to. Phase 1 is for things you\'re funding right now; Phase 2 is for things that start after a Phase 1 item finishes; Phase 3 is for long-game work that builds on top.</li>';
     h+='<li><strong style="color:var(--wh)">Stop here if you haven\'t opened the account yet.</strong> Your plan is saved automatically — leave the card sitting unfinished. The simulation will show "⏸ Not tracked yet" next to the card and won\'t count its contribution in the projection until you click Done. This is intentional: the chart shows what\'s actually happening, not what you\'ve planned.</li>';
     h+='<li><strong style="color:var(--wh)">Go open the account in the real world.</strong> Sign up with the bank, brokerage, or insurance carrier. Start the monthly contribution. Come back here.</li>';
     h+='<li><strong style="color:var(--wh)">Click the green ✓ Done button</strong> at the bottom-right of the card. A modal will pop up.</li>';
@@ -30561,7 +30604,7 @@ function _cpUnassignedHelpHtml(){
     // Card type 2: chooser
     h+='<div style="padding:12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-radius:3px;margin-bottom:10px">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#5B9BFF;margin-bottom:6px">2. Chooser cards (you pick the vehicle first)</div>';
-    h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.7"><strong style="color:var(--wh)">When you\'ll see one:</strong> the card title says something like "Choose your retirement vehicle" or "Choose your education savings vehicle". Instead of a slider, the card has a single button labeled <span style="display:inline-block;padding:2px 8px;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.4);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:2px">Choose…</span> in the middle. Examples: retirement (Roth IRA, 401(k), Roth 401(k), traditional IRA, IUL, WL, annuities), education (529, Coverdell, UTMA, WL, IUL), 401(k) rollover (target account).<br><br>';
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.7"><strong style="color:var(--wh)">When you\'ll see one:</strong> the card title says something like "Choose your retirement vehicle" or "Choose your education savings vehicle". Instead of a slider, the card has a single button labeled <span style="display:inline-block;padding:2px 8px;background:rgba(91,155,255,.18);border:1px solid rgba(91,155,255,.4);color:#5B9BFF;font-family:var(--fh);font-size:12px;font-weight:700;border-radius:2px">Choose…</span> in the middle. Examples: '+(_cpSinglePhasePlan()?'retirement (Roth IRA, 401(k), Roth 401(k), traditional IRA), education (529, Coverdell, UTMA).':'retirement (Roth IRA, 401(k), Roth 401(k), traditional IRA, IUL, WL, annuities), education (529, Coverdell, UTMA, WL, IUL), 401(k) rollover (target account).')+'<br><br>';
     h+='<strong style="color:var(--wh)">Step-by-step:</strong><ol style="margin:6px 0 0 18px;padding:0;line-height:1.85">';
     h+='<li><strong style="color:var(--wh)">Read the card title and description</strong> to understand what kind of vehicle you\'re picking (e.g. "Choose your retirement vehicle — we recommend X dollars/mo across the vehicles you select").</li>';
     h+='<li><strong style="color:var(--wh)">Click the blue Choose… button</strong> in the middle of the card. A modal slides in from the right with a scrollable list of available vehicles.</li>';
@@ -30575,18 +30618,19 @@ function _cpUnassignedHelpHtml(){
     // Card type 3: action-only
     h+='<div style="padding:12px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.18);border-radius:3px">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#A855F7;margin-bottom:6px">3. Action-only cards (no slider — just go do the thing)</div>';
-    h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.7"><strong style="color:var(--wh)">When you\'ll see one:</strong> the card has NO slider, NO dollar box — just a description and a green ✓ Done button at the bottom-right. There\'s nothing to set a monthly amount on because the action is one-time or the cost isn\'t known yet. Examples: life insurance review, disability insurance, umbrella policy, estate planning (will, POA, trusts), policy audit on a policy you already own, annuity research, income diversification.<br><br>';
+    h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.7"><strong style="color:var(--wh)">When you\'ll see one:</strong> the card has NO slider, NO dollar box — just a description and a green ✓ Done button at the bottom-right. There\'s nothing to set a monthly amount on because the action is one-time or the cost isn\'t known yet. Examples: '+(_cpSinglePhasePlan()?'life insurance review, disability insurance, umbrella policy, estate planning (will, POA, trusts), income diversification.':'life insurance review, disability insurance, umbrella policy, estate planning (will, POA, trusts), policy audit on a policy you already own, annuity research, income diversification.')+'<br><br>';
     h+='<strong style="color:var(--wh)">Step-by-step:</strong><ol style="margin:6px 0 0 18px;padding:0;line-height:1.85">';
     h+='<li><strong style="color:var(--wh)">Read the title and description</strong> on the card to understand what action is being recommended (e.g. "Establish disability insurance — protect your $X/yr income").</li>';
-    h+='<li><strong style="color:var(--wh)">Set the phase</strong> via the dropdown at the bottom of the card. If this is urgent (e.g. underinsured life with kids, no estate plan), pick Phase 1. If it can wait, pick Phase 2 or 3.</li>';
+    if(!_cpSinglePhasePlan())h+='<li><strong style="color:var(--wh)">Set the phase</strong> via the dropdown at the bottom of the card. If this is urgent (e.g. underinsured life with kids, no estate plan), pick Phase 1. If it can wait, pick Phase 2 or 3.</li>';
     h+='<li><strong style="color:var(--wh)">Leave the page and go execute</strong> in the real world. Depending on the action: call an insurance agent to get a quote, hire an estate attorney, schedule a policy audit with your existing carrier, research annuity products, etc.</li>';
     h+='<li><strong style="color:var(--wh)">Come back when the action is complete</strong> (policy in force, will signed, audit finished, etc.).</li>';
-    h+='<li><strong style="color:var(--wh)">Click the green ✓ Done button</strong> at the bottom-right of the card. A modal opens. The fields in the modal depend on the action type:<ul style="margin:4px 0 0 18px;padding:0;line-height:1.6"><li><strong style="color:var(--wh)">Insurance actions</strong> (life, disability, LTC, umbrella, IUL/WL purchases): the modal asks for carrier name, monthly premium, death benefit or coverage amount, and a few flags depending on type (IBC enabled? annuity? etc.). Fill in everything and click Save. The policy gets added to your Protection panel in My Financial Data, and the monthly premium becomes a recurring expense factored into your budget going forward.</li><li><strong style="color:var(--wh)">Estate, audit, research, or diversify actions</strong>: the modal asks how much it cost and how you paid (debit card, credit card, financed, savings withdrawal, etc.). Pick the payment method from the dropdown, enter the dollar amount, click Save. The right account or card balance in My Financial Data updates accordingly. These are usually one-time costs, not recurring.</li></ul></li>';
+    h+='<li><strong style="color:var(--wh)">Click the green ✓ Done button</strong> at the bottom-right of the card. A modal opens. The fields in the modal depend on the action type:<ul style="margin:4px 0 0 18px;padding:0;line-height:1.6"><li><strong style="color:var(--wh)">Insurance actions</strong>'+(_cpSinglePhasePlan()?' (life, disability, umbrella)':' (life, disability, LTC, umbrella, IUL/WL purchases)')+': the modal asks for carrier name, monthly premium, death benefit or coverage amount'+(_cpSinglePhasePlan()?'':', and a few flags depending on type (IBC enabled? annuity? etc.)')+'. Fill in everything and click Save. The policy gets added to your Protection panel in My Financial Data, and the monthly premium becomes a recurring expense factored into your budget going forward.</li><li><strong style="color:var(--wh)">Estate, audit, research, or diversify actions</strong>: the modal asks how much it cost and how you paid (debit card, credit card, financed, savings withdrawal, etc.). Pick the payment method from the dropdown, enter the dollar amount, click Save. The right account or card balance in My Financial Data updates accordingly. These are usually one-time costs, not recurring.</li></ul></li>';
     h+='<li><strong style="color:var(--wh)">The card flips to ✓ Completed</strong> (gray badge replaces the green button) and stays in your plan as a record of the completed action.</li>';
     h+='</ol></div></div>';
     h+='</div>';
 
-    // ── CASCADE EXPLAINED ──
+    // ── CASCADE EXPLAINED (Planning only — lite has no cascade) ──
+    if(!_cpSinglePhasePlan()){
     h+='<div style="margin-bottom:18px;padding:12px 14px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.18);border-radius:4px">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">How the cascade works (the big magic)</div>';
     h+='<div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.75"><strong style="color:var(--wh)">What it is:</strong> some allocations have a finish line — your emergency fund hits its target balance, your debt gets paid off. When that happens, the monthly dollars freed up don\'t just disappear; the cascade decides where they go next. You set the destination once, when you add the item, and the simulation handles the rest.<br><br>';
@@ -30600,6 +30644,7 @@ function _cpUnassignedHelpHtml(){
     h+='</ol><br>';
     h+='<strong style="color:var(--wh)">Changing a cascade later:</strong> on any time-bounded card (EF, debt extra-payment, custom goal), look for the small <strong style="color:var(--wh)">Edit</strong> button near the phase dropdown. Click it to re-open the cascade modal and pick a different option. The chart updates immediately to reflect the new destination.</div>';
     h+='</div>';
+    }   // end if(!_cpSinglePhasePlan()) — cascade section is Planning-only
 
     // ── WHAT DONE DOES ──
     h+='<div style="margin-bottom:18px;padding:12px 14px;background:rgba(34,197,94,.04);border:1px solid rgba(34,197,94,.18);border-radius:4px">';
@@ -30611,7 +30656,7 @@ function _cpUnassignedHelpHtml(){
     h+='</ol><br>';
     h+='<strong style="color:var(--gr)">The ✓ Done flow (NEW accounts only — click ONCE, after the account is open in the real world):</strong><ol style="margin:6px 0 0 18px;padding:0;line-height:1.85">';
     h+='<li><strong style="color:var(--wh)">Set the slider</strong> to the monthly contribution you plan to make in this new account.</li>';
-    h+='<li><strong style="color:var(--wh)">Pick the phase</strong> from the dropdown below the slider.</li>';
+    if(!_cpSinglePhasePlan())h+='<li><strong style="color:var(--wh)">Pick the phase</strong> from the dropdown below the slider.</li>';
     h+='<li><strong style="color:var(--wh)">Leave the card unfinished</strong> and go open the account in the real world (bank, brokerage, insurance carrier — whatever applies). Start the monthly contribution.</li>';
     h+='<li><strong style="color:var(--wh)">Come back here and click the green ✓ Done button.</strong> A modal opens.</li>';
     h+='<li><strong style="color:var(--wh)">Fill in the modal\'s fields</strong> — provider name, current balance (probably $0 for a brand-new account), confirm the monthly contribution amount, and any other type-specific fields it asks for.</li>';
@@ -30635,12 +30680,12 @@ function _cpUnassignedHelpHtml(){
     h+='<div style="margin-bottom:6px;padding:12px 14px;background:rgba(239,68,68,.03);border:1px solid rgba(239,68,68,.15);border-radius:4px">';
     h+='<div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--rd);margin-bottom:8px">Removing a card you don\'t want</div>';
     h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.7"><strong style="color:var(--wh)">Step-by-step:</strong><ol style="margin:6px 0 0 18px;padding:0;line-height:1.85">';
-    h+='<li><strong style="color:var(--wh)">Find the card you want to remove</strong> in any phase or in the Unassigned section.</li>';
+    h+='<li><strong style="color:var(--wh)">Find the card you want to remove</strong> '+(_cpSinglePhasePlan()?'in your plan or in the Unassigned section':'in any phase or in the Unassigned section')+'.</li>';
     h+='<li><strong style="color:var(--wh)">Look at the bottom-right of the card</strong> for a small red <strong style="color:var(--wh)">✕</strong> button (it sits next to the Done or Apply button).</li>';
     h+='<li><strong style="color:var(--wh)">Click the ✕.</strong> The card disappears immediately — no confirmation modal. The system stores a record of the dismissal so this same recommendation won\'t come back next time you regenerate.</li>';
     h+='<li><strong style="color:var(--wh)">Watch the deployment bar and chart update</strong> — any monthly contribution that was on the dismissed card is removed from the totals.</li>';
     h+='<li><strong style="color:var(--wh)">If the underlying flag still applies</strong> (e.g. you dismissed an "Emergency Fund" card but you still have no EF), the recommendation can re-appear if a NEW flag-triggering event happens (e.g. your spending pattern changes). Otherwise, once dismissed, the card stays gone.</li>';
-    h+='<li><strong style="color:var(--wh)">Changed your mind?</strong> Scroll to the phase where the card lived. At the bottom of that phase, find the <strong style="color:var(--wh)">+ Add to Phase [N]</strong> button. Click it — a chooser opens listing all available item types. Pick the one you dismissed earlier; it comes back as a fresh card.</li>';
+    h+='<li><strong style="color:var(--wh)">Changed your mind?</strong> '+(_cpSinglePhasePlan()?'Scroll to the bottom of your plan and find the <strong style="color:var(--wh)">+ Add to your plan</strong> button':'Scroll to the phase where the card lived. At the bottom of that phase, find the <strong style="color:var(--wh)">+ Add to Phase [N]</strong> button')+'. Click it — a chooser opens listing all available item types. Pick the one you dismissed earlier; it comes back as a fresh card.</li>';
     h+='</ol></div>';
     h+='</div>';
     h+='</div>';
@@ -31793,7 +31838,7 @@ function _cpStartSelfBuild(){
       }
       if(!_customNm&&f.title.indexOf('Disability coverage gap')===0)_customNm='Disability Coverage Gap Review';
     }
-    var pushObj={type:sol.type,amount:0,target:sol.type==='ef'?Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal)):0,phase:0,cascade:'',flagTitle:f.title,flagType:f.type,flagIcon:f.icon,reason:f.desc||''};
+    var pushObj={type:sol.type,amount:0,target:sol.type==='ef'?Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal)):0,phase:0,cascade:'',flagTitle:f.title,flagType:f.type,flagIcon:f.icon,reason:_cpLiteStripBlockedVehicles(f.desc||'')};
     if(_customNm)pushObj.customName=_customNm;
     CPLAN.allocations.push(pushObj);
   });
@@ -31862,6 +31907,19 @@ function _cpSyncFlagsToUnassigned(){
   // keep this aligned with the menu shown in _cpShowFlagMenu's 'growth' config.
   var growthDestTypes=['invest','iul','wl','fixed_annuity','fia','variable_annuity','spia'];
   var flags=_cpExtractRedFlags()||[];
+  // Clean up DUPLICATE / ORPHANED chooser prompts already in the plan. A chooser is "unresolved" when it's a $0 custom
+  // card still named the default prompt — either a live placeholder (_isPlaceholder+_chooserAction) OR an orphan whose
+  // chooser identity was stripped by the PFOS_PLAN_SYNC serializer (~5693) on a prior save, leaving a permanent dead
+  // "Choose a … vehicle" card. Collapse to ONE per action+owner, preferring a live placeholder (it's still resolvable).
+  // Safe + all-tier: these are system prompts the user never funded or resolved — junk cleanup, not data loss.
+  (function(){
+    var _titleAct={'Choose a retirement vehicle':'retirement','Choose an investment vehicle':'growth','Choose a growth vehicle':'growth','Choose an education vehicle':'edu','Choose a rollover destination':'rollover'};
+    function _ckey(a){ if(!a)return null; if(a._isPlaceholder&&a._chooserAction)return a._chooserAction+'|'+(a.owner||'self'); if(a.type==='custom'&&(parseFloat(a.amount)||0)===0&&_titleAct[a.customName])return _titleAct[a.customName]+'|'+(a.owner||'self'); return null; }
+    var _hasPh={}; CPLAN.allocations.forEach(function(a){ if(a&&a._isPlaceholder&&a._chooserAction)_hasPh[a._chooserAction+'|'+(a.owner||'self')]=true; });
+    var _seen={};
+    CPLAN.allocations=CPLAN.allocations.filter(function(a){ var k=_ckey(a); if(k===null)return true; var isPh=!!(a._isPlaceholder&&a._chooserAction); if(!isPh&&_hasPh[k])return false; if(_seen[k])return false; _seen[k]=true; return true; });
+  })();
+  var _seenChooser={};   // run-local dedup: one chooser placeholder per action+owner per detect() run (see chooser branch below)
   flags.forEach(function(f){
     var act=f.action;
     if(!act)return;
@@ -31906,6 +31964,11 @@ function _cpSyncFlagsToUnassigned(){
       // Also count an existing placeholder for this same chooser action+owner as "represented"
       // so the placeholder doesn't multiply on re-renders.
       if(!alreadyIn) alreadyIn=_ownerAllocSome(function(a){return a._chooserAction===act;});
+      // Run-local dedup (the duplicate "Choose a retirement vehicle" bug): sibling flags can share an action (e.g.
+      // several 'retirement' flags) within ONE detect() run, and the prior-placeholder check above misses them because
+      // this run's push hasn't landed yet. Track action+owner staged THIS run → one chooser per action+owner, any order.
+      var _chKey=act+'|'+(_isSpouseFlag?'spouse':'self');
+      if(!alreadyIn&&_seenChooser[_chKey])alreadyIn=true;
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t=actionOnlyMap[act];
       if(t==null) return; // 'expenses' has no allocation type — handled separately if we add a card later
@@ -31959,7 +32022,7 @@ function _cpSyncFlagsToUnassigned(){
     };
     // Stage a new card with flag context + appropriate type/markers. owner FOLLOWS the flag
     // (M5.2b-2: spouse flags → spouse-owned card; self flags → 'self' as before).
-    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:(_isSpouseFlag?'spouse':'self'),reason:f.desc||''};
+    var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:(_isSpouseFlag?'spouse':'self'),reason:_cpLiteStripBlockedVehicles(f.desc||'')};
     // M5.4 U2 — stamp the stable issue id this card addresses (dark: recStore; OFF → no field → byte-identical).
     if(window.PFOS_FLAGS&&PFOS_FLAGS.recStore&&typeof PFOSIssues!=='undefined'&&PFOSIssues.issueId)nowFlag.addressesIssueId=PFOSIssues.issueId({action:act,title:f.title,owner:nowFlag.owner});
     // Allow disability-gap title which is dynamic ('Disability coverage gap: $X/mo')
@@ -31976,6 +32039,7 @@ function _cpSyncFlagsToUnassigned(){
       // 'custom' so type-aware code paths gracefully ignore it (no IRS limits, no slider).
       var titleByAct={retirement:'Choose a retirement vehicle',edu:'Choose an education vehicle',rollover:'Choose a rollover destination',growth:'Choose a growth vehicle'};
       CPLAN.allocations.push(_extend(nowFlag,{type:'custom',amount:0,target:0,phase:0,cascade:'',customName:titleByAct[act]||'Choose a vehicle',_chooserAction:act,_isPlaceholder:true}));
+      _seenChooser[act+'|'+(_isSpouseFlag?'spouse':'self')]=true;   // mark this action+owner staged so sibling flags this run don't re-add it
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t2=actionOnlyMap[act]; if(t2==null)return;
       CPLAN.allocations.push(_extend(nowFlag,{type:t2,amount:0,target:0,phase:0,cascade:''}));
@@ -32056,7 +32120,7 @@ function _cpReAddDismissedFlag(flagAction, phase){
       var _lty = chooserActions[act] ? (act==='rollover'?'rollover':'custom') : (actionOnlyMap.hasOwnProperty(act)?actionOnlyMap[act] : (directMap[act]||act));
       if(_lty && _lty!=='custom' && !_cpLiteVehicleAllow()[_lty]) return;
     }
-    var nowFlag = {flagTitle:f.title, flagType:f.type, flagIcon:f.icon, flagAction:act, owner:'self', reason:f.desc||''};
+    var nowFlag = {flagTitle:f.title, flagType:f.type, flagIcon:f.icon, flagAction:act, owner:'self', reason:_cpLiteStripBlockedVehicles(f.desc||'')};
     // M5.4 U2 — stamp the stable issue id this card addresses (dark: recStore; OFF → no field → byte-identical).
     if(window.PFOS_FLAGS&&PFOS_FLAGS.recStore&&typeof PFOSIssues!=='undefined'&&PFOSIssues.issueId)nowFlag.addressesIssueId=PFOSIssues.issueId({action:act,title:f.title,owner:'self'});
     if(act === 'protection'){
@@ -36539,6 +36603,7 @@ function _cpRenderPlanV2(){
   // is actually building their own plan, regardless of historical AI artifacts.
   if(!CPLAN.hasAdvisor && CPLAN.planMode==='self'){
     if(typeof _cpSyncFlagsToUnassigned==='function')_cpSyncFlagsToUnassigned();
+    if(typeof _cpLiteAutoSeed==='function')_cpLiteAutoSeed();   // lite (Core): seed starting amounts so the plan funds debt/EF out of the box (once; never overwrites)
   }
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&!(a&&a._completed&&_cpIsActionOnly(a));});
   // M5.2b — canonical priority order for the unassigned list (dark-launched: PFOS_FLAGS.priorityEngine
@@ -36589,7 +36654,7 @@ function _cpRenderPlanV2(){
   // Section G (litePlanner) — the Core lite plan is a SINGLE "fund these now" allocation. CASCADING / multi-phase
   // is a Planning feature ("Core (lite): … this-month allocation"; "Planning (full): … cascading"). In lite, keep
   // _availablePhases = [1] only: no Phase 2/3 stages from cascade events, no AI phase-4 carryover.
-  var _liteSingle=(typeof _liteActive==='function'&&_liteActive());
+  var _liteSingle=_cpSinglePhasePlan();   // global predicate (see _cpSinglePhasePlan) — same value, shared with _cpBuildCard
   if(!_liteSingle){
     for(var _evi=0;_evi<_simEvents.length;_evi++){
       var _evPhase=_evi+2;// Event 0 → Phase 2, Event 1 → Phase 3, ...
@@ -36767,7 +36832,7 @@ function _cpRenderPlanV2(){
       s+='<div style="height:100%;width:'+w+'%;background:'+(CP_COL[item.colorType]||CP_COL[item.a.type]||'#94A3B8')+';opacity:'+opacity+(isGrayed?'':';transition:width .3s')+'"></div>';
     });
     s+='</div></div>';
-    s+='<div style="font-size:10px;color:'+labelColor+';margin-bottom:'+(isGrayed?'4px':'2px')+'">'+labelPrefix+': '+fmt(totalWithOverflow)+'/mo'+(targetPhase===1?' <span style="opacity:.7">growth deployment</span>':' <span style="opacity:.85">(same surplus — redistributed)</span>')+'</div>';
+    s+='<div style="font-size:10px;color:'+labelColor+';margin-bottom:'+(isGrayed?'4px':'2px')+'">'+(labelPrefix?labelPrefix+': ':'')+fmt(totalWithOverflow)+'/mo'+(targetPhase===1?' <span style="opacity:.7">growth deployment</span>':' <span style="opacity:.85">(same surplus — redistributed)</span>')+'</div>';
     // Legend only for the colored row (current phase).
     if(!isGrayed){
       s+='<div style="display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:4px;margin-bottom:4px">';
@@ -36810,12 +36875,12 @@ function _cpRenderPlanV2(){
   });
   if(_curBarTotal>0){
     h+='<div style="margin-bottom:14px">';
-    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">DEPLOYMENT COMPARISON</div>';
+    h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu);margin-bottom:6px">'+(_cpSinglePhasePlan()?'YOUR MONTHLY DEPLOYMENT':'DEPLOYMENT COMPARISON')+'</div>';
     if(_activeTab>1){
       // Previous phase grayed reference + current phase colored.
       h+=_cpRenderPhaseBar(_activeTab-1, 'grayed', 'Phase '+(_activeTab-1));
     }
-    h+=_cpRenderPhaseBar(_activeTab, 'colored', 'Phase '+_activeTab);
+    h+=_cpRenderPhaseBar(_activeTab, 'colored', _cpSinglePhasePlan()?'':'Phase '+_activeTab);
     h+='</div>';
   }
 
@@ -36835,14 +36900,14 @@ function _cpRenderPlanV2(){
       h+='<div style="text-align:center;padding:20px;border:1px dashed var(--bd);border-radius:4px;background:rgba(100,116,139,.03)">';
       h+='<div style="font-size:24px;margin-bottom:8px">'+p.icon+'</div>';
       h+='<div style="font-size:13px;color:var(--mu);line-height:1.6;max-width:360px;margin:0 auto 12px">'+p.desc+'</div>';
-      h+='<button onclick="_cpShowAddMenu(1)" style="padding:8px 20px;font-family:var(--fh);font-size:13px;font-weight:700;background:'+p.color+'12;border:1px solid '+p.color+'30;color:'+p.color+';cursor:pointer;border-radius:4px;min-height:36px">+ Add to Phase 1</button>';
+      h+='<button onclick="_cpShowAddMenu(1)" style="padding:8px 20px;font-family:var(--fh);font-size:13px;font-weight:700;background:'+p.color+'12;border:1px solid '+p.color+'30;color:'+p.color+';cursor:pointer;border-radius:4px;min-height:36px">'+(_cpSinglePhasePlan()?'+ Add to your plan':'+ Add to Phase 1')+'</button>';
       h+='</div>';
     }
     _p1Items.forEach(function(a){var idx=CPLAN.allocations.indexOf(a);
       if(_cpPlanView==='ours')h+='<div style="font-size:10px;font-family:var(--fh);font-weight:700;color:#5B9BFF;letter-spacing:.06em;margin-bottom:-4px;margin-top:4px">YOU</div>';
       h+=_cpBuildCard(a,idx,false);
     });
-    h+='<div style="text-align:center;margin-top:8px"><button onclick="_cpShowAddMenu(1)" style="padding:6px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px dashed '+p.border+';color:'+p.color+';cursor:pointer;border-radius:2px;min-height:32px">+ Add to Phase 1</button></div>';
+    h+='<div style="text-align:center;margin-top:8px"><button onclick="_cpShowAddMenu(1)" style="padding:6px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px dashed '+p.border+';color:'+p.color+';cursor:pointer;border-radius:2px;min-height:32px">'+(_cpSinglePhasePlan()?'+ Add to your plan':'+ Add to Phase 1')+'</button></div>';
     h+='</div>';
   } else {
     // Phase 2+: SAME sheet — full cards with grayed completing items + boost indicators
@@ -37216,7 +37281,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     ph+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">';
     ph+='<div style="width:40px;height:40px;border-radius:10px;background:'+_cpHex2Rgba(_chColor,0.15)+';display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+_chIcon+'</div>';
     ph+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh)">'+_chTitle+'</div>';
-    if(a.reason)ph+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+a.reason+'</div>';
+    if(a.reason)ph+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+_cpLiteStripBlockedVehicles(a.reason)+'</div>';// strip IUL/WL/annuities at RENDER (not just creation) so a persisted placeholder with stale un-stripped copy still hides tier-blocked vehicles in lite
     ph+='</div></div>';
     ph+='<div style="display:flex;gap:6px;align-items:center">';
     // Default phase by chooser action — retirement/growth go to phase 2,
@@ -37225,7 +37290,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     // picked a retirement/education vehicle from a flag prompt. Sensible
     // defaults make the cards land in a real phase the user can immediately
     // see funded; they can still drag to a different phase if needed.
-    var _defaultPhase=_chAct==='retirement'?2:_chAct==='growth'?3:_chAct==='edu'?3:_chAct==='rollover'?2:2;
+    var _defaultPhase=_cpSinglePhasePlan()?1:(_chAct==='retirement'?2:_chAct==='growth'?3:_chAct==='edu'?3:_chAct==='rollover'?2:2);   // lite stages into the single phase 1
     ph+='<button onclick="CPLAN._cpChooserSourceIdx='+idx+';_cpShowFlagMenu(\''+_chAct+'\','+_defaultPhase+')" style="padding:9px 18px;font-family:var(--fh);font-size:13px;font-weight:700;background:'+_cpHex2Rgba(_chColor,0.18)+';border:1px solid '+_cpHex2Rgba(_chColor,0.4)+';color:'+_chColor+';cursor:pointer;border-radius:4px;min-height:36px">Choose…</button>';
     ph+='<button onclick="_cpRemove('+idx+')" title="Dismiss" style="padding:6px 10px;font-family:var(--fh);font-size:13px;font-weight:700;background:transparent;border:1px solid rgba(239,68,68,.25);color:var(--rd);cursor:pointer;border-radius:4px;min-height:36px">×</button>';
     ph+='</div></div></div>';
@@ -37393,7 +37458,9 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_cpHex2Rgba(color,0.08)+';border-radius:4px"><div id="cpAmt'+idx+'" style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(_displayTotal)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
   }
   h+='</div>';
-  // ── Cascade progression: show when unfunded items will start receiving money ──
+  // ── Cascade progression banner — lite (Core) is a single fund-now plan with no cascade boosts, so gate the
+  // whole "$X/mo now → $Y/mo after [event]" block on _cpSinglePhasePlan(). ──
+  if(!_cpSinglePhasePlan()){
   var _nowDate=new Date();
   if(a.amount===0&&!_isActionOnly&&CPLAN._sim&&CPLAN._sim.allocFuture){
     var _af=CPLAN._sim.allocFuture[idx];
@@ -37443,6 +37510,7 @@ function _cpBuildCard(a,idx,isUnassigned){
       }
     }
   }
+  }   // end if(!_cpSinglePhasePlan()) — cascade progression banner
   // ── Date range indicator for funded items ──
   if(a.amount>0&&!_isActionOnly){
     var _startMo=new Date().toLocaleDateString('en-US',{month:'short',year:'numeric'});
@@ -37840,7 +37908,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _isInsType=a.type==='iul'||a.type==='wl'||a.type==='ibc';
   var irsNote=_isInsType?'':_cpIRSNote(a.type);if(irsNote)h+='<div style="font-size:11px;color:rgba(91,155,255,.5);margin-bottom:4px">'+irsNote+'</div>';
   // Effective cap note — live cap based on available budget + IRS limit
-  if(!_isActionOnly)h+='<div id="cpCapNote'+idx+'" style="font-size:11px;margin-bottom:4px">'+_cpEffectiveCapNote(a.type,idx)+'</div>';
+  if(!_isActionOnly&&!_cpSinglePhasePlan())h+='<div id="cpCapNote'+idx+'" style="font-size:11px;margin-bottom:4px">'+_cpEffectiveCapNote(a.type,idx)+'</div>';   // "Cap … governed by available budget" is a budget/cascade surface — hide in the lite plan (slider-update sites no-op when the div is absent)
   // EF → HYSA note
   if(a.type==='ef')h+='<div style="font-size:11px;color:rgba(91,155,255,.5);margin-bottom:4px">→ Direct to a High-Yield Savings Account (HYSA) for liquidity + interest</div>';
   // Guided mode: show growth rate + quick projections for growth cards
@@ -38840,6 +38908,10 @@ function _cpBuildCard(a,idx,isUnassigned){
   }
   // Controls row
   h+='<div style="display:flex;align-items:center;gap:6px;margin-top:8px;flex-wrap:wrap">';
+  // Lite (Core) = a single "fund these now" plan: NO per-card Phase selector and NO cascade controls (cascading is
+  // a Planning feature). Gate the whole cascade-label + Phase-<select> block here; the Done/Apply/Remove row below
+  // stays. This is the main leak the prior fix missed — _cpBuildCard couldn't see the old _liteSingle local var.
+  if(!_cpSinglePhasePlan()){
   // Cascade — shows the user's choice (proportional default, or single destination).
   // Inline "Edit" button re-opens the cascade prompt for refinement.
   if(a.target>0||a.type==='ef'||a.type==='debt'){
@@ -38895,6 +38967,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _newPhaseNum=_phaseRange[_phaseRange.length-1]+1;
   h+='<option value="'+_newPhaseNum+'">+ New phase '+_newPhaseNum+'</option>';
   h+='</select></div>';
+  }   // end if(!_cpSinglePhasePlan()) — per-card phase selector + cascade controls (hidden in the lite plan)
   // Mark complete — action-only items get the button at amount 0; funded items need an amount;
   // E6: $0 non-action allocations also get a Done button (with a different tooltip) so the
   // user can mark "acknowledged" instead of being stuck with only the X. The button is
@@ -39375,11 +39448,19 @@ function _cpBuildTimeline(){
       // You-are-here on wealth trajectory
       h+='<div style="position:absolute;left:'+nwYahPct+'%;top:50%;transform:translate(-50%,-50%) rotate(45deg);width:14px;height:14px;background:#5B9BFF;border:2px solid var(--bg-card);box-shadow:0 0 0 2px #5B9BFF,0 0 12px rgba(91,155,255,.6);z-index:3"></div>';
       h+='</div>';
-      // Bottom labels
-      h+='<div style="position:relative;height:30px;margin:0 6px;margin-top:4px">';
+      // Bottom labels — TWO stacked rows so a 3rd close-together milestone (_placeLabels uses ROW_COUNT=3) still gets
+      // a label instead of a bare dot (the prior code rendered only rows 0 and 1). Container is tall enough for both.
+      h+='<div style="position:relative;height:62px;margin:0 6px;margin-top:4px">';
       nwPlaced.forEach(function(it){
         if(it.row!==1)return;
         h+='<div style="position:absolute;left:'+it.pct+'%;top:0;transform:translateX(-50%);text-align:center;max-width:140px">';
+        h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
+        h+='<div style="font-size:10px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
+        h+='</div>';
+      });
+      nwPlaced.forEach(function(it){
+        if(it.row!==2)return;
+        h+='<div style="position:absolute;left:'+it.pct+'%;top:32px;transform:translateX(-50%);text-align:center;max-width:140px">';
         h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+it.color+';white-space:nowrap;line-height:1.2">'+it.icon+' '+it.label+'</div>';
         h+='<div style="font-size:10px;color:var(--mu);line-height:1.2">'+it.dateLabel+'</div>';
         h+='</div>';
@@ -39395,7 +39476,7 @@ function _cpBuildTimeline(){
 }
 
 // ── PHASE HANDLERS ──
-function _cpSetPhase(i,v){CPLAN.allocations[i].phase=parseInt(v)||0;_cpRenderPlanV2();}
+function _cpSetPhase(i,v){CPLAN.allocations[i].phase=_cpSinglePhasePlan()?1:(parseInt(v)||0);_cpRenderPlanV2();}   // lite = single phase 1 (the select is hidden anyway; defensive)
 function _cpSetBreathingRoom(v){
   // Clamp to [0,50] to match the server's accepted range (index.ts) — guards against a malformed
   // persisted value making the frontend pool diverge from the AI/server pool.
@@ -39722,6 +39803,7 @@ function _cpFormatCompletionLabel(months){
 //     it via slider, and the prompt fires on a future trigger if we want; for v1 we just skip)
 //   - There are no other growth allocations to redistribute to (nowhere to cascade)
 function _cpMaybeShowCascadePrompt(idx,force){
+  if(_cpSinglePhasePlan())return false;   // lite (Core) has no cascade — neutralize every fire path (Edit btn, +Add menu, bulk add) in one place
   var a=CPLAN.allocations[idx];
   if(!a)return false;
   if(!force&&CPLAN._cascadePromptOff)return false;
@@ -39951,6 +40033,7 @@ function _cpAddToPhase(type,phase){
 //   • _cpShowAddOwnerPicker after the user picks for Hybrid households
 function _cpAddToPhaseInternal(type,phase,owner){
   owner=owner||'self';
+  if(_cpSinglePhasePlan())phase=1;   // lite = single phase: every add lands in phase 1 regardless of the caller's phase arg
   if(typeof _liteActive==='function'&&_liteActive()){ var _lg=_cpLiteCanAdd(type); if(!_lg.ok){ if(typeof _cpToast==='function')_cpToast(_lg.msg); return; } }   // Section G — lite Core: block advanced types + cap growth levers at one (defense + the toast)
   var t=0;if(type==='ef')t=Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal));
   // Allocation amount starts at $0. The user's existing real-world contribution
@@ -41643,7 +41726,7 @@ function _cpGetPhase(){
     return{phase:2,name:'Stability',color:'var(--or)',desc:'Build your full emergency fund, capture employer match, and eliminate high-interest debt.',next:(efPct<1?'EF to '+fmt(Math.round(d.efTarget))+'. ':'')+(d.employer&&!has401k?'Start 401(k) to capture match. ':'')+(hiDebt.length>0?'Eliminate '+hiDebt.length+' high-rate debt'+(hiDebt.length>1?'s':'')+'.' :'')};
   // Phase 3: Growth — max tax-advantaged, invest surplus
   if(!hasRetAlloc||!hasInvest)
-    return{phase:3,name:'Growth',color:'#5B9BFF',desc:'You\'re stable. Now maximize tax-advantaged accounts and build your investment portfolio.',next:(!hasRetAlloc?'Add retirement accounts (Roth/401k/IUL). ':'')+(!hasInvest?'Start building an investment portfolio.':'')};
+    return{phase:3,name:'Growth',color:'#5B9BFF',desc:'You\'re stable. Now maximize tax-advantaged accounts and build your investment portfolio.',next:(!hasRetAlloc?'Add retirement accounts (Roth/401k'+(_cpSinglePhasePlan()?'':'/IUL')+'). ':'')+(!hasInvest?'Start building an investment portfolio.':'')};   // lite blocks IUL → don't name it in lite copy
   // Phase 4: Optimization — IBC, tax strategy, estate
   return{phase:4,name:'Optimization',color:'var(--gr)',desc:'Strong foundation in place. Focus on tax efficiency, IBC strategies, and legacy planning.',next:(!hasIBCActive?'Consider IBC for tax-free retirement income. ':'')+'Review estate plan and tax optimization.'};
 }
@@ -41719,12 +41802,14 @@ function _cpRenderIncomeReplacement(){
   // ── Inner helper: renders one labeled income-vs-target bar ──
   // Used for both single-bucket and per-bucket displays. Caller computes
   // retIncome and target; we draw the bar, label, gap/surplus line, etc.
-  function _renderBar(label,retIncome,target,smallTitle,extraNote){
+  function _renderBar(label,retIncome,target,smallTitle,extraNote,isFallback){
     if(target<=0&&retIncome<=0)return '';
     var replacePct=target>0?Math.round(retIncome/target*100):0;
     var displayPct=Math.min(100,replacePct);
-    var col=replacePct>=80?'var(--gr)':replacePct>=50?'var(--yl)':replacePct>=25?'var(--or)':'var(--rd)';
-    var statusLbl=replacePct>=100?'On track':replacePct>=80?'Close':replacePct>=50?'Behind':replacePct>=25?'Significant gap':'Critical gap';
+    // isFallback = the user never set a Desired Monthly Income (we used current expenses as the target). Don't raise
+    // a red "Critical gap" alarm against a number they never chose — show a calm neutral "set a target" state.
+    var col=isFallback?'var(--mu)':(replacePct>=80?'var(--gr)':replacePct>=50?'var(--yl)':replacePct>=25?'var(--or)':'var(--rd)');
+    var statusLbl=isFallback?'Set a Desired Monthly Income to measure this':(replacePct>=100?'On track':replacePct>=80?'Close':replacePct>=50?'Behind':replacePct>=25?'Significant gap':'Critical gap');
     var titleSize=smallTitle?'11px':'12px';
     var out='<div style="margin-bottom:'+(smallTitle?'8px':'0')+'">';
     out+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
@@ -41734,7 +41819,7 @@ function _cpRenderIncomeReplacement(){
     out+='<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--mu)">';
     out+='<span>'+statusLbl+' &mdash; '+fmt(retIncome)+'/mo projected</span>';
     out+='<span>of '+fmt(target)+'/mo target</span></div>';
-    if(replacePct<100&&target>0)out+='<div style="font-size:12px;color:var(--yl);margin-top:4px">Gap: '+fmt(Math.max(0,target-retIncome))+'/mo</div>';
+    if(!isFallback&&replacePct<100&&target>0)out+='<div style="font-size:12px;color:var(--yl);margin-top:4px">Gap: '+fmt(Math.max(0,target-retIncome))+'/mo</div>';
     else if(replacePct>100)out+='<div style="font-size:12px;color:var(--gr);margin-top:4px">Surplus: '+fmt(retIncome-target)+'/mo above target</div>';
     if(extraNote)out+='<div style="font-size:11px;color:var(--mu);margin-top:4px;font-style:italic">'+extraNote+'</div>';
     out+='</div>';
@@ -41751,9 +41836,9 @@ function _cpRenderIncomeReplacement(){
     var tSelf=Math.round(_cpRetIncomeTarget('self'));
     var tSpouse=Math.round(_cpRetIncomeTarget('spouse'));
     var tJoint=Math.round(_cpRetIncomeTarget('joint'));
-    h+=_renderBar('You',sim.projRetIncome_self||0,tSelf,true,'');
-    h+=_renderBar(spouseName,sim.projRetIncome_spouse||0,tSpouse,true,'');
-    h+=_renderBar('Joint',sim.projRetIncome_joint||0,tJoint,true,'');
+    h+=_renderBar('You',sim.projRetIncome_self||0,tSelf,true,'',!CPLAN.retIncome);
+    h+=_renderBar(spouseName,sim.projRetIncome_spouse||0,tSpouse,true,'',!CPLAN.spRetIncome);
+    h+=_renderBar('Joint',sim.projRetIncome_joint||0,tJoint,true,'',!CPLAN.retIncome&&!CPLAN.spRetIncome);
     if(!CPLAN.retIncome&&!CPLAN.spRetIncome)h+='<div style="font-size:11px;color:var(--mu);margin-top:4px;font-style:italic">No retirement income targets set in profile &mdash; using current monthly expenses as fallback. Set Desired Monthly Income for each partner for accurate planning.</div>';
     h+='</div>';
     el.innerHTML=h;
@@ -41793,7 +41878,7 @@ function _cpRenderIncomeReplacement(){
   // Why this can read low next to a large net-worth projection: it counts only money INVESTED for retirement.
   // Idle cash + home equity are in your net worth but don't produce retirement income — the clarifier closes the gap.
   h2+='<div style="font-size:11px;color:var(--mu);line-height:1.5;margin:-2px 0 8px">Projected from your retirement accounts.'+(retIncome<target?' Idle cash and home equity count toward your net worth but aren\'t invested for retirement income — direct more surplus into retirement vehicles to raise this.':'')+'</div>';
-  h2+=_renderBar('',retIncome,target,false,fallbackNote);
+  h2+=_renderBar('',retIncome,target,false,fallbackNote,!CPLAN.retIncome);
   h2+='</div>';
   el.innerHTML=h2;
 }
@@ -41877,7 +41962,12 @@ function _cpRenderRebalanceTriggers(){
 
 function _cpWhy(type){
   var d=CPLAN;
-  if(type==='ef')return'You need about '+fmt(Math.round(d.efTarget))+' to cover 3 months of expenses. Right now you have '+fmt(Math.round(d.efBal))+'. '+(d.efBal<d.efTarget?'Without this, any surprise expense forces you into debt.':'You\'re almost there — keep building.');
+  if(type==='ef'){
+    // Funded guard (mirrors the decision-card egap<=0 branch, pfos-shared.v6.js:847): an over-/fully-funded EF must
+    // NOT say "almost there — keep building" (the $65,589-vs-$15,120 bug). Show the funded state instead.
+    if(d.efBal>=d.efTarget) return'You already have '+fmt(Math.round(d.efBal))+' — your '+fmt(Math.round(d.efTarget))+' (3-month) safety net is fully funded. New surplus can go to higher-return goals.';
+    return'You need about '+fmt(Math.round(d.efTarget))+' to cover 3 months of expenses. Right now you have '+fmt(Math.round(d.efBal))+'. Without this, any surprise expense forces you into debt.';
+  }
   if(type==='debt'){var hi=d.debts.filter(function(x){return(parseFloat(x.rate)||0)>=15;});var intMo=hi.reduce(function(t,x){return t+((parseFloat(x.balance)||0)*(parseFloat(x.rate)||0)/100/12);},0);return'Your '+fmtK(d.totalDebt)+' in debt'+(intMo>0?' is costing you '+fmt(Math.round(intMo))+'/mo in interest — that\'s '+fmt(Math.round(intMo*12))+'/yr going to banks instead of you':'')+'.';}
   if(type==='iul')return'An Indexed Universal Life policy grows tax-free with a 0% floor — your money grows when markets are up but never goes backward. You can access cash value via policy loans without penalties or taxes.';
   if(type==='wl')return'Whole Life from a mutual company provides guaranteed growth every year plus dividends. Your cash value grows predictably and you can access it via policy loans for major purchases or opportunities.';
@@ -41933,6 +42023,10 @@ function _cpWhy(type){
     +'• <strong>Disability insurance:</strong> if your only income source is interrupted by illness/injury, this becomes the income substitute. See the protection card.<br>'
     +'• <strong>Secondary income stream:</strong> consulting, rental income, or side business income reduces the single-point-of-failure. Not always actionable immediately, but worth a 12–24 month plan.<br><br>'
     +'<strong style="color:var(--wh)">When you click Done:</strong> this card is marked complete (no monthly cost) and removed from your unassigned items. The underlying risk doesn\'t go away — but completing this signals you\'ve thought it through and have a mitigation strategy in place.';
+  // Retirement vehicles not handled above (trad IRA / Roth 401k / solo 401k / SEP) — give a real reason instead of
+  // the bare "personal savings goal" fallback. (roth/401k/iul/wl already have copy earlier.)
+  if(type==='trad_ira'||type==='solo401k'||type==='sep_ira')return'Pre-tax retirement savings — lowers your taxable income today while it compounds for retirement; withdrawals are taxed as ordinary income later.';
+  if(type==='roth401k')return'Roth 401(k) contributions are after-tax and grow completely tax-free'+(d.employer?' — and '+d.employer+' may match (free money)':'')+'. No income limit, unlike a Roth IRA.';
   return'Your personal savings goal.';
 }
 

@@ -3024,7 +3024,7 @@ function _syncPlanToMain(){
     // Phase D multi-partner: include owner per allocation so pfos-main can render
     // owner-aware projections (currently it falls back to user's retirement age, but
     // the owner field travels through for future per-partner projection rendering).
-    allocations:CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target,owner:a.owner||'self'};}),
+    allocations:CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target,owner:a.owner||'self',_isPlaceholder:a._isPlaceholder,_chooserAction:a._chooserAction};}),// retain chooser identity so unresolved "Choose a … vehicle" prompts don't orphan into permanent $0 custom cards on reload (mirror of pfos-client ~5693)
     sim:null,
     tracking:{},
     calendar:{},
@@ -18297,6 +18297,17 @@ function _cpSyncFlagsToUnassigned(){
   // keep this aligned with the menu shown in _cpShowFlagMenu's 'growth' config.
   var growthDestTypes=['invest','iul','wl','fixed_annuity','fia','variable_annuity','spia'];
   var flags=_cpExtractRedFlags()||[];
+  // §3 mirror of pfos-client: collapse DUPLICATE / ORPHANED chooser prompts to ONE per action+owner. An orphan is a $0
+  // custom card still named the default prompt whose chooser identity was stripped by the plan-sync serializer (~3027)
+  // on a prior save. Prefer a live placeholder (resolvable). Safe + all-tier: junk system prompts, not user data.
+  (function(){
+    var _titleAct={'Choose a retirement vehicle':'retirement','Choose an investment vehicle':'growth','Choose a growth vehicle':'growth','Choose an education vehicle':'edu','Choose a rollover destination':'rollover'};
+    function _ckey(a){ if(!a)return null; if(a._isPlaceholder&&a._chooserAction)return a._chooserAction+'|'+(a.owner||'self'); if(a.type==='custom'&&(parseFloat(a.amount)||0)===0&&_titleAct[a.customName])return _titleAct[a.customName]+'|'+(a.owner||'self'); return null; }
+    var _hasPh={}; CPLAN.allocations.forEach(function(a){ if(a&&a._isPlaceholder&&a._chooserAction)_hasPh[a._chooserAction+'|'+(a.owner||'self')]=true; });
+    var _seen={};
+    CPLAN.allocations=CPLAN.allocations.filter(function(a){ var k=_ckey(a); if(k===null)return true; var isPh=!!(a._isPlaceholder&&a._chooserAction); if(!isPh&&_hasPh[k])return false; if(_seen[k])return false; _seen[k]=true; return true; });
+  })();
+  var _seenChooser={};   // §3 mirror of pfos-client: run-local dedup so sibling same-action chooser flags don't duplicate
   flags.forEach(function(f){
     var act=f.action;
     if(!act)return;
@@ -18328,6 +18339,10 @@ function _cpSyncFlagsToUnassigned(){
       else if(act==='growth') alreadyIn=_ownerAllocSome(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
       // Also count an existing placeholder for this same chooser action+owner.
       if(!alreadyIn) alreadyIn=CPLAN.allocations.some(function(a){return a._chooserAction===act&&((a.owner||'self')==='spouse')===_isSpouseFlag;});
+      // Run-local dedup (§3 mirror): sibling flags can share an action within ONE detect() run; the check above
+      // misses them because this run's push hasn't landed yet. One chooser per action+owner per run, any order.
+      var _chKey=act+'|'+(_isSpouseFlag?'spouse':'self');
+      if(!alreadyIn&&_seenChooser[_chKey])alreadyIn=true;
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t=actionOnlyMap[act];
       if(t==null) return;
@@ -18431,6 +18446,7 @@ function _cpSyncFlagsToUnassigned(){
       // 'custom' so type-aware code paths gracefully ignore it (no IRS limits, no slider).
       var titleByAct={retirement:'Choose a retirement vehicle',edu:'Choose an education vehicle',rollover:'Choose a rollover destination',growth:'Choose a growth vehicle'};
       CPLAN.allocations.push(_extend(nowFlag,{type:'custom',amount:0,target:0,phase:0,cascade:'',customName:titleByAct[act]||'Choose a vehicle',_chooserAction:act,_isPlaceholder:true}));
+      _seenChooser[act+'|'+(_isSpouseFlag?'spouse':'self')]=true;   // §3 mirror
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t2=actionOnlyMap[act]; if(t2==null)return;
       CPLAN.allocations.push(_extend(nowFlag,{type:t2,amount:0,target:0,phase:0,cascade:''}));
