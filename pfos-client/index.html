@@ -10362,9 +10362,18 @@ function _cpHeadlineModel(calcs){
   var surplus=Math.max(0, Math.round(_lnum(c.netCF)));
   if(surplus>0 && typeof PFOSImpact!=='undefined' && PFOSImpact.allocate){
     var flags=[]; try{ if(typeof _cpExtractRedFlags==='function') flags=_cpExtractRedFlags()||[]; }catch(_e){ flags=[]; }
+    // Only FUNDABLE money-moves belong in a monthly $-allocation. Protection/estate items (life insurance, power of
+    // attorney, will, umbrella, beneficiary review) are one-time SETUP actions with NO monthly cash basis — splitting
+    // surplus dollars onto them produces nonsense like "$562/mo to power of attorney." They still surface as red-flag
+    // Decision cards ("go do this"); they are NOT a $/mo row in "this month's move." Strip them before the allocator.
+    var _NONFUND={protection:1,protection_ext:1,umbrella:1,estate:1,estate_tax:1,no_will:1,beneficiary_audit:1,ibc_audit:1,annuity_research:1,diversify:1,expenses:1,leaks:1};
+    flags=flags.filter(function(f){ if(!f||!f.action)return false; var b=String(f.action).split('_spouse')[0]; return !_NONFUND[b]; });
     try{
       var plan=PFOSImpact.allocate({ surplus:surplus, bufferPct:0, flags:flags, maxRows:3 });   // bufferPct:0 → the shown rows sum to the headline surplus (no hidden 15% cushion mismatch)
       var rows=((plan&&plan.rows)||[]).filter(function(r){ return r && r.flagId!=='_buffer' && _lnum(r.amt)>0; });
+      // The savings/idle flag's TITLE ("Idle cash: $55.5K") describes existing cash — odd as a monthly target row.
+      // Relabel the monthly move toward it to the ACTION ("Build savings & investments"), not the problem.
+      rows.forEach(function(r){ if(r&&r.flagId==='savings') r.label='Build savings & investments'; });
       move={ surplus:surplus, rows:rows, hasMove:rows.length>0 };
     }catch(_e){}
   }
@@ -30984,9 +30993,16 @@ function _cpCardToIssue(a){
 function _cpRenderDecisionCard(a,dc){
   if(!dc||!dc.diagnosis)return'';
   var _rgba=(typeof _cpHex2Rgba==='function')?_cpHex2Rgba:function(hx){return hx;};
-  var icon=(typeof CP_IC!=='undefined'&&CP_IC[a.type])||dc.icon||'⭐';
+  // A retirement/edu/growth/rollover priority is staged as a builder CHOOSER PLACEHOLDER (type:'custom',
+  // customName:'Choose a … vehicle') — fine in the builder, but in the read-only DECISION card it renders as a
+  // generic ⭐ "Choose a retirement vehicle" instead of a real priority. Give placeholders a family-appropriate
+  // icon + a concrete priority title; concrete cards (debt/protection/ef) keep their CP_IC/CP_NM derivation.
+  var _ca=a._chooserAction;
+  var _chooserIcon={retirement:'🎯',edu:'🎓',growth:'📊',rollover:'🔄'};
+  var _chooserName={retirement:'Boost your retirement savings',edu:'Fund education savings',growth:'Start investing for growth',rollover:'Roll over an old account'};
+  var icon=(a._isPlaceholder&&_ca&&_chooserIcon[_ca])||(typeof CP_IC!=='undefined'&&CP_IC[a.type])||dc.icon||'⭐';
   var color=(typeof CP_COL!=='undefined'&&CP_COL[a.type])||'#5B9BFF';
-  var name=a.customName||((typeof CP_NM!=='undefined'&&CP_NM[a.type])||dc.title||a.type);
+  var name=(a._isPlaceholder&&_ca&&_chooserName[_ca])||a.customName||((typeof CP_NM!=='undefined'&&CP_NM[a.type])||dc.title||a.type);
   var h='<div style="margin-bottom:10px;border-left:4px solid '+color+';background:'+_rgba(color,0.10)+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_rgba(color,0.18)+';border-right:1px solid '+_rgba(color,0.18)+';border-bottom:1px solid '+_rgba(color,0.18)+'">';
   if(a.flagTitle){h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;padding:7px 10px;border-radius:3px;background:'+(a.flagType==='crit'?'rgba(239,68,68,.08)':'rgba(234,179,8,.05)')+';border:1px solid '+(a.flagType==='crit'?'rgba(239,68,68,.15)':'rgba(234,179,8,.12)')+'"><span style="font-size:13px">'+(a.flagIcon||'⚠️')+'</span><span style="font-size:12px;font-weight:600;color:'+(a.flagType==='crit'?'var(--rd)':'var(--yl)')+'">'+a.flagTitle+'</span></div>';}
   h+='<div style="display:flex;align-items:center;gap:10px"><div style="width:40px;height:40px;border-radius:10px;background:'+_rgba(color,0.15)+';display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+icon+'</div><div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh)">'+name+'</div></div>';
@@ -31030,7 +31046,13 @@ function _cpTeaserCard(a){
   } else {
     var _cur=0; if(typeof _cpMatchExisting==='function'){ try{ var _m=_cpMatchExisting(a); _cur=parseInt((_m&&_m.currentContrib)||0)||0; }catch(_e){} }
     var _tot=_cur+(parseFloat(a.amount)||0);
-    h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_rgba(color,0.08)+';border-radius:4px"><div style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(_tot)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
+    if(_tot>0){
+      h+='<div style="text-align:right;flex-shrink:0;padding:6px 10px;background:'+_rgba(color,0.08)+';border-radius:4px"><div style="font-family:var(--fd);font-size:24px;color:'+color+'">'+fmt(_tot)+'</div><div style="font-size:11px;color:var(--mu)">/mo</div></div>';
+    } else if(a.flagType==='opp'){
+      // an OPPORTUNITY with no set monthly amount (e.g. idle cash — a lump-sum move) is NOT "$0/mo"; show EXPLORE
+      h+='<div style="flex-shrink:0;padding:6px 10px;font-family:var(--fh);font-size:11px;font-weight:700;color:var(--gr);background:rgba(34,197,94,.08);border:1px solid rgba(34,197,94,.18);border-radius:4px">EXPLORE</div>';
+    }
+    // else: a $0 non-opportunity card shows no amount badge at all (a bare "$0/mo" reads as "do nothing")
   }
   h+='</div>';
   if(a.type==='debt'&&typeof _cpDebtSubstanceLine==='function'){ var _dsl=_cpDebtSubstanceLine(a); if(_dsl)h+=_dsl; }
@@ -36542,18 +36564,24 @@ function _cpRenderPlanV2(){
   // _simEvents, plans whose AI-emitted recommendations all sit in Phase 1 (the typical
   // case for a balanced plan) only ever get a Phase 1 + Phase 2 view, even when two
   // or more goals complete on different timelines.
-  for(var _evi=0;_evi<_simEvents.length;_evi++){
-    var _evPhase=_evi+2;// Event 0 → Phase 2, Event 1 → Phase 3, ...
-    if(_availablePhases.indexOf(_evPhase)<0)_availablePhases.push(_evPhase);
+  // Section G (litePlanner) — the Core lite plan is a SINGLE "fund these now" allocation. CASCADING / multi-phase
+  // is a Planning feature ("Core (lite): … this-month allocation"; "Planning (full): … cascading"). In lite, keep
+  // _availablePhases = [1] only: no Phase 2/3 stages from cascade events, no AI phase-4 carryover.
+  var _liteSingle=(typeof _liteActive==='function'&&_liteActive());
+  if(!_liteSingle){
+    for(var _evi=0;_evi<_simEvents.length;_evi++){
+      var _evPhase=_evi+2;// Event 0 → Phase 2, Event 1 → Phase 3, ...
+      if(_availablePhases.indexOf(_evPhase)<0)_availablePhases.push(_evPhase);
+    }
+    // Plus any AI-assigned phase with content not already covered by a cascade stage —
+    // keeps action-only Phase 4 ("Optimization") items visible when the AI puts them there.
+    [2,3,4].forEach(function(pn){if(_availablePhases.indexOf(pn)<0&&_allocPhases[pn]&&_phaseHasContent(pn))_availablePhases.push(pn);});
+    // Support additional phases beyond 4 only if items exist with content
+    Object.keys(_allocPhases).forEach(function(k){var pn=parseInt(k);if(pn>4&&_availablePhases.indexOf(pn)<0&&_phaseHasContent(pn))_availablePhases.push(pn);});
+    _availablePhases.sort(function(a,b){return a-b;});
   }
-  // Plus any AI-assigned phase with content not already covered by a cascade stage —
-  // keeps action-only Phase 4 ("Optimization") items visible when the AI puts them there.
-  [2,3,4].forEach(function(pn){if(_availablePhases.indexOf(pn)<0&&_allocPhases[pn]&&_phaseHasContent(pn))_availablePhases.push(pn);});
-  // Support additional phases beyond 4 only if items exist with content
-  Object.keys(_allocPhases).forEach(function(k){var pn=parseInt(k);if(pn>4&&_availablePhases.indexOf(pn)<0&&_phaseHasContent(pn))_availablePhases.push(pn);});
-  _availablePhases.sort(function(a,b){return a-b;});
-  // Ensure active tab is valid
-  if(_availablePhases.indexOf(CPLAN._activePhaseTab)<0)CPLAN._activePhaseTab=1;
+  // Ensure active tab is valid (lite is always the single Phase 1)
+  if(_liteSingle||_availablePhases.indexOf(CPLAN._activePhaseTab)<0)CPLAN._activePhaseTab=1;
   var _activeTab=CPLAN._activePhaseTab;
 
   // Phase trigger info from simulation — map all events to phase triggers
@@ -36568,7 +36596,9 @@ function _cpRenderPlanV2(){
     _phaseTriggers[pn]={month:_trigMonth,date:_trigDate.toLocaleDateString('en-US',{month:'short',year:'numeric'}),label:ev.label||'Cascade event'};
   });
 
-  // ── Phase Tab Bar ──
+  // ── Phase Tab Bar ── (Section G — HIDDEN in lite: a single-phase "fund now" plan has no phases to tab between
+  // and no "+ Phase" — cascading is the Planning upgrade)
+  if(!_liteSingle){
   h+='<div style="display:flex;gap:4px;margin-bottom:14px;border-bottom:2px solid var(--bd);padding-bottom:0">';
   _availablePhases.forEach(function(pn){
     var p=CP_PHASE[pn]||{name:'Phase '+pn,color:'#94A3B8',icon:'📌'};
@@ -36589,6 +36619,7 @@ function _cpRenderPlanV2(){
   var _nextPhase=(_availablePhases[_availablePhases.length-1]||4)+1;
   h+='<button onclick="CPLAN._activePhaseTab='+_nextPhase+';_cpRenderPlanV2()" style="padding:8px 12px;font-family:var(--fh);font-size:12px;font-weight:700;border:1px dashed var(--bd);background:transparent;color:var(--mu);cursor:pointer;border-radius:2px;min-height:36px;margin-left:4px">+ Phase</button>';
   h+='</div>';
+  }   // end if(!_liteSingle) phase tab bar
 
   // ── Phase Header (for Phase 2+) ──
   if(_activeTab>1){

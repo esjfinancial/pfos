@@ -548,7 +548,12 @@ function _issuesDetect(ctx){
     // estate_tax, the Roth-strategy items — are deferred pending rank/owner decisions, see M5.2d notes.)
     var _calc=rawS2.calcs||{};
     var _idle=parseFloat(_calc.idleCash)||0;
-    if(_idle>2000) flags.push({type:'opp',icon:'💤',title:'Idle cash: '+fmtK(_idle),desc:fmtK(_idle)+' sits above your emergency-fund target, losing ~'+fmt(Math.round(_idle*0.035))+'/yr to inflation. Putting it to work (money market, index fund) captures the return you\'re currently giving up.',action:'savings'});
+    // Idle cash is only "put it to work" advice once high-interest debt is gone — investing at ~7% while paying 15%+
+    // on debt loses money. When hiDebts exist, the idle-cash card DEFERS to debt payoff (fixes the cross-card
+    // contradiction where one card said "attack 28% debt first" and this one said "invest at 7%"). Guarded:
+    // hiDebts is a function-scoped var that may be unassigned if the debt branch never ran.
+    var _idleHiDebt=(typeof hiDebts!=='undefined'&&hiDebts&&hiDebts.length>0);
+    if(_idle>2000) flags.push({type:'opp',icon:'💤',title:'Idle cash: '+fmtK(_idle),desc:(_idleHiDebt?fmtK(_idle)+' sits above your emergency-fund target — but clear your high-interest debt first (investing at ~7% while paying 15%+ on debt loses money), then put the rest to work.':fmtK(_idle)+' sits above your emergency-fund target, losing ~'+fmt(Math.round(_idle*0.035))+'/yr to inflation. Putting it to work (money market, index fund) captures the return you\'re currently giving up.'),action:'savings'});
     var _aCash=parseFloat(_calc.aCash)||0, _tAssets=parseFloat(_calc.totalAssets)||0, _cashRatio=_tAssets>0?_aCash/_tAssets:0;
     if(_cashRatio>0.6&&_aCash>10000&&(parseFloat(_calc.efMonths)||0)>6) flags.push({type:'opp',icon:'🏦',title:'High cash allocation: '+Math.round(_cashRatio*100)+'%',desc:fmtK(_aCash)+' is in cash while your emergency fund is already full — cash loses purchasing power to inflation (~'+fmt(Math.round(_aCash*0.035))+'/yr). Consider moving the excess into investments.',action:'savings'});
     var _dti=parseFloat(_calc.dti)||0;
@@ -839,6 +844,17 @@ function _issuesDetect(ctx){
     if(fam==='ef'){
       var ecur=_dcNum(c.efBal), etgt=_dcNum(c.efT3);
       var egap=(c.efS3!=null?_dcNum(c.efS3):Math.max(0,etgt-ecur));
+      if(egap<=0){
+        // Already at/over the target — there is NO "build" action. Show the FUNDED state instead of the nonsensical
+        // "Set aside $0/mo → fully funded in about 3 months" (a divide-by-recommended-amount that yields a garbage
+        // timeline when the recommended amount is 0). nextAction:null so the teaser drops the ▸ action line.
+        card.diagnosis={ metric:'Emergency fund', current:ecur, target:etgt, gap:0, unit:'money',
+          text:'You have '+fmt(ecur)+' — your '+fmt(etgt)+' (3-month) safety net is fully funded.' };
+        card.nextAction=null;
+        card.impact={ text:'Your cushion is set — new surplus can go to higher-return goals.' };
+        card.priority.why='Your safety net is fully funded.';
+        return card;
+      }
       var emo=(c.efBuildMonths3>0?c.efBuildMonths3:3);                 // EF framing LOCKED: one consistent pair
       var esugg=Math.max(0,Math.ceil(egap/Math.max(1,c.efBuildMonths3||3)));  // suggest = gap/efBuildMonths3, timeline = efBuildMonths3
       card.diagnosis={ metric:'Emergency fund', current:ecur, target:etgt, gap:egap, unit:'money',
