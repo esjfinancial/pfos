@@ -6323,7 +6323,7 @@ async function generateProgressReport(clientId){
       {label:'Net Worth',     curr:calcs.netWorth||0,     prev:firstSnap?firstSnap.net_worth:null,   fmt:fmtK},
       {label:'Monthly Income',curr:calcs.inc||0,          prev:firstSnap?firstSnap.income:null,      fmt:fmt},
       {label:'Total Debt',    curr:calcs.totalDebt||0,    prev:firstSnap?firstSnap.total_debt:null,  fmt:fmtK, invert:true},
-      {label:'Cash Flow Score',curr:scores.cfScore||0,   prev:firstSnap?firstSnap.cf_score:null,    fmt:function(v){return (Math.round(v*10)/10)+'';}},
+      {label:'Cash Flow Score',curr:(calcs.cfScore!=null?calcs.cfScore:scores.cfScore)||0,   prev:firstSnap?firstSnap.cf_score:null,    fmt:function(v){return (Math.round(v*10)/10)+'';}},
     ];
     metrics.forEach(function(m){
       var changeDir = m.invert ? (m.prev!==null&&m.curr<m.prev) : (m.prev!==null&&m.curr>m.prev);
@@ -6337,12 +6337,16 @@ async function generateProgressReport(clientId){
     html += '</div></div>';
 
     // ── Scores ──
-    var scoreKeys = Object.keys(scoreMap).filter(function(k){return scores[k]!==undefined;});
+    // Read the canonical engine calcs first; fall back to the stale `scores` column only if calcs lacks the key
+    // (CLAUDE.md §4 — mirrors pfos-client:6092). A product/just-saved client with an empty scores column otherwise
+    // rendered a 0 / blank panel even though financial_data.calcs carries the scores.
+    var _getScore=function(k){return (calcs&&calcs[k]!=null)?calcs[k]:scores[k];};
+    var scoreKeys = Object.keys(scoreMap).filter(function(k){return _getScore(k)!==undefined&&_getScore(k)!==null;});
     if(scoreKeys.length){
       html += '<div style="margin-bottom:22px"><div class="slbl" style="margin-bottom:10px">Financial Scores</div>';
       html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">';
       scoreKeys.forEach(function(k){
-        var v = scores[k]||0;
+        var v = _getScore(k)||0;
         var col = v>=7?'var(--gr)':v>=5?'var(--yl)':'var(--rd)';
         html+='<div style="background:rgba(0,0,0,.15);border:1px solid var(--bd);border-radius:2px;padding:12px;text-align:center">'
           +'<div style="font-size:11px;color:var(--mu);margin-bottom:6px">'+scoreMap[k]+'</div>'
@@ -12193,6 +12197,10 @@ function _portalSpendStatus(viewCtx){
     severity='caution';
     reasons.push('On pace to overspend by $'+overspend.toLocaleString()+' this month.');
   }
+  // Capture month-level severity BEFORE per-category escalation so the card can tell whether the alarm is the
+  // whole month vs only one category (mirrors the client at pfos-client:7027 — avoids an "Over budget" header
+  // over healthy month totals).
+  var monthSeverity=severity;
   // Per-category check
   var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]=c.label;}); // §1.4 dynamic categories
   var catSpend={};
@@ -12232,7 +12240,7 @@ function _portalSpendStatus(viewCtx){
     }
   });
   return{
-    severity:severity,paceRatio:Math.round(paceRatio*100)/100,
+    severity:severity,monthSeverity:monthSeverity,paceRatio:Math.round(paceRatio*100)/100,
     pctSpent:pctSpent,pctOfMonthGone:pctOfMonthGone,
     moneyIn:moneyIn,moneyOut:Math.round(moneyOut),
     projected:projected,overspend:Math.round(overspend),
@@ -15134,6 +15142,26 @@ function _clientRenderSpendPulse(){
     over:{bg:'rgba(239,68,68,.06)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️',label:'Over budget'}
   };
   var t=theme[status.severity]||theme.ok;
+  // When the alarm is driven by a single category (the month itself is on-track), the header + body + bar must
+  // reflect THAT category — not month totals — else a red "Category over budget" header sits over a green
+  // "18% spent · $5,310 left" body. Mirrors pfos-client _clientRenderSpendPulse (029b7ab) so the two stay in lockstep.
+  var _catDriven=(status.monthSeverity==='ok'&&status.severity!=='ok');
+  var _hdrLabel=_catDriven?(status.severity==='over'?'Category over budget':'Category watch'):t.label;
+  var _barPct=Math.min(100,pctSpent);
+  if(_catDriven&&status.categories&&status.categories.length){
+    var _worst=status.categories.slice().sort(function(a,b){
+      var ao=(a.severity==='over')?1:0,bo=(b.severity==='over')?1:0;
+      if(ao!==bo)return bo-ao;
+      return (b.pct||0)-(a.pct||0);
+    })[0];
+    if(_worst){
+      moneyOut=_worst.spent;moneyIn=_worst.budget;
+      pctSpent=_worst.pct;
+      _barPct=Math.min(100,_worst.pct);
+      leftToSpend=Math.max(0,_worst.budget-_worst.spent);
+      dailyBudget=status.daysLeft>0?Math.round(leftToSpend/status.daysLeft):0;
+    }
+  }
   var barCol=pctSpent>=100?'var(--rd)':pctSpent>90?'var(--rd)':pctSpent>70?'var(--or)':'var(--gr)';
   // Top line — "Day X of Y" + spent / income
   var monthShort=new Date().toLocaleDateString('en-US',{month:'short'});
@@ -15143,20 +15171,20 @@ function _clientRenderSpendPulse(){
   h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">';
   h+='<div style="display:flex;align-items:center;gap:6px">';
   h+='<span style="font-size:13px">'+t.icon+'</span>';
-  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+t.label+'</span>';
+  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+_hdrLabel+'</span>';
   h+='</div>';
   h+='<span style="font-family:var(--fh);font-size:12px;color:var(--mu)">'+monthShort+' · day '+status.dayOfMonth+' of '+status.daysInMonth+'</span>';
   h+='</div>';
   // Numbers row
   h+='<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:8px;gap:10px">';
   h+='<div><div style="font-family:var(--fd);font-size:22px;color:var(--wh);line-height:1">'+fmt(moneyOut)+' <span style="font-size:13px;color:var(--mu);font-family:var(--fh)">of '+fmt(moneyIn)+'</span></div>';
-  h+='<div style="font-size:12px;color:var(--mu);margin-top:3px">'+pctSpent+'% spent · '+fmt(leftToSpend)+' left ('+fmt(dailyBudget)+'/day)</div></div>';
+  h+='<div style="font-size:12px;color:var(--mu);margin-top:3px">'+pctSpent+'% spent · '+fmt(leftToSpend)+' left'+(status.daysLeft>=3?(' ('+fmt(dailyBudget)+'/day)'):'')+'</div></div>';
   // CTA on the right
   h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+t.fg+';white-space:nowrap">Open →</div>';
   h+='</div>';
   // Progress bar
   h+='<div style="height:5px;background:rgba(0,68,191,.1);border-radius:3px;overflow:hidden">';
-  h+='<div style="height:100%;width:'+pctSpent+'%;background:'+barCol+';border-radius:3px;transition:width .5s ease"></div>';
+  h+='<div style="height:100%;width:'+_barPct+'%;background:'+barCol+';border-radius:3px;transition:width .5s ease"></div>';
   h+='</div>';
   // Status line — mirrors the banner reason if there's an issue
   if(status.severity!=='ok'&&status.reasons&&status.reasons.length>0){
