@@ -293,7 +293,7 @@ function _issuesDetect(ctx){
       if(!hasRet&&!hasExistingRet&&d.age>=25&&d.income>0)
         flags.push({type:'warn',icon:'🕒',title:'No retirement savings active',desc:'Time is the most powerful factor in retirement planning. Starting now, even small amounts compound significantly.',action:'retirement'});
       else if(!hasRet&&hasExistingRet&&d.age>=25&&d.income>0)
-        flags.push({type:'opp',icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle (Roth, IRA, IUL, and more).',action:'retirement'});
+        flags.push({type:'opp',icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle (Roth IRA, Traditional IRA, IUL, and more).',action:'retirement'});
     } else {
       // ===== CLIENT branch =====
       if(!hasRet&&d.age>=25&&d.income>0)
