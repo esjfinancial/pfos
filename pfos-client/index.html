@@ -42107,7 +42107,7 @@ function _cpRenderIncomeReplacement(){
     out+='<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">';
     out+='<div style="font-family:var(--fh);font-size:'+titleSize+';font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">'+label+'</div>';
     out+='<div style="font-family:var(--fd);font-size:'+(smallTitle?'16px':'20px')+';color:'+col+'">'+(isFallback?'&mdash;':displayPct+'%')+'</div></div>';   // fallback (no Desired Monthly Income set): show a dash, not a concrete % — a number contradicts the "Set a target to score this" caption (matches the advisor-profile pattern)
-    out+='<div style="height:8px;background:rgba(0,68,191,.06);border-radius:4px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+(isFallback?0:displayPct)+'%;background:'+col+';border-radius:4px;transition:width .3s"></div></div>';   // fallback: empty bar (no score against an unset target)
+    out+='<div style="height:8px;background:rgba(0,68,191,.06);border-radius:4px;overflow:hidden;margin-bottom:6px"><div style="height:100%;width:'+displayPct+'%;background:'+col+';border-radius:4px;transition:width .3s"></div></div>';   // bug #6: ALWAYS fill proportionally — in fallback the color is already muted (var(--mu)) so the bar is informational, not alarming. An empty track next to "$2,670/mo projected of $5,040/mo" looked broken; the dash (above) still signals "not scored against a target you set."
     out+='<div style="display:flex;justify-content:space-between;font-size:12px;color:var(--mu)">';
     out+='<span>'+statusLbl+' &mdash; '+fmt(retIncome)+'/mo projected</span>';
     out+='<span>of '+fmt(target)+'/mo '+(isFallback?'current expenses':'target')+'</span></div>';
@@ -46753,6 +46753,22 @@ function _cpRenderChart(targetId,bucket){
 //   - One chart (current behavior, bucket='all'), or
 //   - A toggle row + three child charts (#cplanChart_self, _spouse, _joint).
 // The shared toggle invokes _cpRenderCharts to re-render all three at once.
+// bug #7: a bucket (self/spouse/joint) "has data" iff it owns a funded allocation OR its baseline seed is non-zero.
+// Same predicate _cpRenderChart uses internally to decide between a real chart and the "No data in this bucket"
+// placeholder — factored out so _cpRenderCharts can DROP empty columns instead of rendering big empty placeholder boxes.
+function _cpBucketHasData(bucket){
+  var _isRet=(CPLAN._chartView==='retirement');
+  var hasAllocs=CPLAN.allocations.some(function(a){
+    var o=(a.owner==='spouse')?'spouse':(a.owner==='joint')?'joint':'self';
+    return o===bucket&&(parseFloat(a.amount)||0)>0;
+  });
+  if(hasAllocs)return true;
+  if(CPLAN._sim){
+    var arr=_isRet?CPLAN._sim['baselineRet_'+bucket]:CPLAN._sim['baseline_'+bucket];
+    if(Array.isArray(arr)&&arr.length>0&&(arr[0]>0||arr[arr.length-1]>0))return true;
+  }
+  return false;
+}
 function _cpRenderCharts(){
   var el=document.getElementById('cplanChart');if(!el)return;
   var isHybrid=(CPLAN._householdType==='hybrid')&&!!CPLAN._partner;
@@ -46764,6 +46780,11 @@ function _cpRenderCharts(){
   }
   if(!CPLAN._chartView)CPLAN._chartView='nw';
   var _isRetView=CPLAN._chartView==='retirement';
+  // bug #7: only render bucket columns that actually have data. In Core the seeder owns everything as 'self', so the
+  // spouse/joint buckets are structurally empty and would otherwise each render a full-size "No data in this bucket"
+  // dashed box. If 0 or 1 buckets survive, fall back to the single combined chart (a lone column == the 'all' view).
+  var _buckets=['self','spouse','joint'].filter(_cpBucketHasData);
+  if(_buckets.length<=1){ _cpRenderChart('cplanChart'); return; }
   // Shared toggle row at the top — drives all three child charts in lockstep.
   // We re-call _cpRenderCharts on toggle so the bucket parameter is preserved
   // for each child chart.
@@ -46773,12 +46794,10 @@ function _cpRenderCharts(){
   h+='<button onclick="CPLAN._chartView=\'nw\';_cpRenderCharts()" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(!_isRetView?'rgba(91,155,255,.15)':'transparent')+';color:'+(!_isRetView?'#5B9BFF':'var(--mu)')+'">Net Worth</button>';
   h+='<button onclick="CPLAN._chartView=\'retirement\';_cpRenderCharts()" style="padding:4px 12px;font-family:var(--fh);font-size:11px;font-weight:700;border:none;cursor:pointer;min-height:26px;background:'+(_isRetView?'rgba(34,197,94,.15)':'transparent')+';color:'+(_isRetView?'var(--gr)':'var(--mu)')+'">Retirement</button>';
   h+='</div></div>';
-  // Three side-by-side chart containers. On narrow viewports they stack via
-  // CSS media query (handled elsewhere) — the inline grid keeps desktop layout.
-  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px">';
-  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_self"></div></div>';
-  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_spouse"></div></div>';
-  h+='<div class="info-card" style="padding:12px"><div id="cplanChart_joint"></div></div>';
+  // Side-by-side chart containers — ONLY for buckets with data (bug #7). On narrow viewports they stack via CSS
+  // media query (handled elsewhere) — the inline grid keeps desktop layout.
+  h+='<div style="display:grid;grid-template-columns:repeat('+_buckets.length+',1fr);gap:10px">';
+  _buckets.forEach(function(bk){ h+='<div class="info-card" style="padding:12px"><div id="cplanChart_'+bk+'"></div></div>'; });
   h+='</div>';
   el.innerHTML=h;
   // Defer child-chart rendering one tick so the DOM exists before _cpRenderChart
@@ -46786,9 +46805,7 @@ function _cpRenderCharts(){
   // through its own toggle clicks (its own toggle is suppressed for non-'all'
   // bucket renders — handled inside _cpRenderChart).
   setTimeout(function(){
-    try{_cpRenderChart('cplanChart_self','self');}catch(e){}
-    try{_cpRenderChart('cplanChart_spouse','spouse');}catch(e){}
-    try{_cpRenderChart('cplanChart_joint','joint');}catch(e){}
+    _buckets.forEach(function(bk){ try{_cpRenderChart('cplanChart_'+bk,bk);}catch(e){} });
   },10);
 }
 
