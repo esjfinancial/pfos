@@ -4694,6 +4694,22 @@ function _cpLiteCanAdd(type){
   }
   return { ok:true };
 }
+// Is this EF card fully funded? Owner- + household-aware (mirrors the _efFunded predicate in _cpBuildCard so the hide
+// and the "✓ Funded" chip can never disagree). Never funded off a spouse card.
+function _cpEfCardFunded(a){
+  if(!a||a.type!=='ef'||a.owner==='spouse')return false;
+  var _h=(a.owner==='joint'&&typeof _cpHouseholdEF==='function')?_cpHouseholdEF():{bal:(parseFloat(CPLAN.efBal)||0),target:(parseFloat(CPLAN.efTarget)||0)};
+  return _h.target>0&&_h.bal>=_h.target;
+}
+// CORE: a SOLVED issue is a pointless card — hide it. A fully-funded emergency fund, or a savings goal that has reached
+// its target, is removed from the Core plan view. RENDER-ONLY (the allocation stays in CPLAN.allocations, so upgrading to
+// Planning still shows everything + nothing is lost). Lite-only; a card with no target (target===0) is never "solved".
+function _cpLiteHideSolved(a){
+  if(!a||typeof _cpSinglePhasePlan!=='function'||!_cpSinglePhasePlan())return false;
+  if(a.type==='ef')return _cpEfCardFunded(a);
+  if((a.type==='custom'||a.type==='savings_goal'||a.type==='edu')&&(parseFloat(a.target)||0)>0&&(parseFloat(a.goalCurrent)||0)>=(parseFloat(a.target)||0))return true;
+  return false;
+}
 // The default retirement vehicle for the Core prescriptive plan: 401(k) if employed (capture the employer match), Roth
 // IRA otherwise, Traditional IRA if the user is over the Roth income (MAGI) limit (so the Roth phase-out, which makes
 // _cpIRSMax('roth') return 0, can't leave an unfundable $0 card). Used to auto-resolve the "Choose a retirement vehicle"
@@ -36764,7 +36780,7 @@ function _cpRenderPlanV2(){
   // Education re-type — UNCONDITIONAL (every plan mode incl. advisory/AI; the stager above is !hasAdvisor-gated and
   // would miss them). Idempotent. Ownership (joint vs personal) is the user's PROMPTED choice on the card, not a default.
   if(typeof _cpEduNormalizeType==='function')_cpEduNormalizeType();
-  var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&!(a&&a._completed&&_cpIsActionOnly(a));});
+  var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&!(a&&a._completed&&_cpIsActionOnly(a))&&!_cpLiteHideSolved(a);});   // Core hides SOLVED issues (funded EF / met goal)
   // M5.2b — canonical priority order for the unassigned list (dark-launched: PFOS_FLAGS.priorityEngine
   // OFF = today's detector push-order, byte-identical). Ranks flag-sourced cards by engine-exact priority;
   // non-flag cards trail. Sorts a filtered COPY only — _cpBuildCard re-derives idx via indexOf, array untouched.
@@ -37047,7 +37063,7 @@ function _cpRenderPlanV2(){
   // Completed action/to-do cards (umbrella/estate/diversify/protection/etc.) leave the
   // plan once Done + tracked. Term life & disability are intentionally KEPT here (grayed)
   // so the agent can track the client's coverage — they aren't in _cpIsActionOnly.
-  var _hideDoneAction=function(a){return !(a&&a._completed&&_cpIsActionOnly(a));};
+  var _hideDoneAction=function(a){return !(a&&a._completed&&_cpIsActionOnly(a))&&!_cpLiteHideSolved(a);};   // Core also hides SOLVED issues (funded EF / met goal) — render-only
   var _p1Items=CPLAN.allocations.filter(function(a){return a.phase===1&&_hideDoneAction(a);});
   var _activeItems=CPLAN.allocations.filter(function(a){return a.phase===_activeTab&&_hideDoneAction(a);});
 
@@ -37549,7 +37565,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   var h='<div id="cpCardWrap'+idx+'" data-alloc-idx="'+idx+'" style="margin-bottom:10px;border-left:4px solid '+color+';background:'+_cpHex2Rgba(color,0.10)+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_cpHex2Rgba(color,0.18)+';border-right:1px solid '+_cpHex2Rgba(color,0.18)+';border-bottom:1px solid '+_cpHex2Rgba(color,0.18)+';position:relative;overflow:hidden;transition:border-color .2s,box-shadow .2s'+_completedStyle+'">';
   // Self/household EF fully funded (owner-aware — never off a spouse card). Calms the card everywhere: green header,
   // a "✓ Funded" amount chip instead of "$0/mo", and no "direct to HYSA" tip. Non-funded / spouse EF unaffected.
-  var _efFunded=(function(){ if(a.type!=='ef'||a.owner==='spouse')return false; var _h=(a.owner==='joint'&&typeof _cpHouseholdEF==='function')?_cpHouseholdEF():{bal:(parseFloat(CPLAN.efBal)||0),target:(parseFloat(CPLAN.efTarget)||0)}; return _h.target>0&&_h.bal>=_h.target; })();   // owner-aware + HOUSEHOLD-aware: a joint EF card is funded vs the COMBINED household balance/target, not self-only
+  var _efFunded=(typeof _cpEfCardFunded==='function')?_cpEfCardFunded(a):false;   // owner- + HOUSEHOLD-aware (single source: same predicate the Core hide-solved uses, so the chip + the hide never disagree)
   // Red flag source — when the EF is funded, flip the persisted red "Emergency fund low" header to calm green "funded".
   if(a.flagTitle){
     var _efDone=_efFunded;
