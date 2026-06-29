@@ -18309,6 +18309,20 @@ function _cpSyncFlagsToUnassigned(){
     var _seen={};
     CPLAN.allocations=CPLAN.allocations.filter(function(a){ var k=_ckey(a); if(k===null)return true; var isPh=!!(a._isPlaceholder&&a._chooserAction); if(!isPh&&_hasPh[k])return false; if(_seen[k])return false; _seen[k]=true; return true; });
   })();
+  // Household EF model (§3 mirror): collapse every EF card to ONE owner='joint' household card for a joint/hybrid couple
+  // (prefer an already-shared card so partners converge; seed a 50/50 split). Skip cards the user made personal
+  // (_userMadePersonal) so a split EF isn't re-collapsed. Separate/single left individual.
+  if(typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint()){
+    var _efCards=(CPLAN.allocations||[]).filter(function(a){return a&&a.type==='ef'&&!a._userMadePersonal;});
+    if(_efCards.length){
+      var _efKeep=null;
+      _efCards.forEach(function(a){ if(!_efKeep||(a._sharedId&&!_efKeep._sharedId))_efKeep=a; });
+      CPLAN.allocations=CPLAN.allocations.filter(function(a){ return !(a&&a.type==='ef'&&!a._userMadePersonal&&a!==_efKeep); });
+      _efKeep.owner='joint';
+      if(!_efKeep._sharedId&&_efKeep._sharedOwnerClientId==null)_efKeep._sharedOwnerClientId=null;
+      if(_efKeep.amountSelf==null||_efKeep.amountSpouse==null){ var _am=parseFloat(_efKeep.amount)||0; _efKeep.amountSelf=Math.round(_am/2); _efKeep.amountSpouse=Math.round((_am-_efKeep.amountSelf)*100)/100; }
+    }
+  }
   var _seenChooser={};   // §3 mirror of pfos-client: run-local dedup so sibling same-action chooser flags don't duplicate
   flags.forEach(function(f){
     var act=f.action;
@@ -18356,7 +18370,7 @@ function _cpSyncFlagsToUnassigned(){
         alreadyIn=_ownerAllocSome(function(a){return a.type===t;});
       }
     } else if(directMap[act]){
-      alreadyIn=_ownerAllocSome(function(a){return a.type===directMap[act];});
+      alreadyIn=(act==='ef'&&typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint())?CPLAN.allocations.some(function(a){return a&&a.type==='ef';}):_ownerAllocSome(function(a){return a.type===directMap[act];});   // §3: household EF self+spouse collapse → any ef card counts as represented
     } else if(act==='401k'){
       alreadyIn=_ownerAllocSome(function(a){return a.type==='401k';});
     }
@@ -18387,6 +18401,7 @@ function _cpSyncFlagsToUnassigned(){
     // Stage a new card with flag context + appropriate type/markers.
     // owner follows the flag (spouse flags → spouse-owned card).
     var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:_flagOwner,reason:f.desc||''};
+    if(act==='ef'&&typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint())nowFlag.owner='joint';   // §3: EF is a household goal in joint/hybrid → owner 'joint'
     // Allow disability-gap title which is dynamic ('Disability coverage gap: $X/mo')
     if(act==='protection'){
       var _customNm=_protectionTitleMap[f.title];
@@ -18454,7 +18469,16 @@ function _cpSyncFlagsToUnassigned(){
       CPLAN.allocations.push(_extend(nowFlag,{type:t2,amount:0,target:0,phase:0,cascade:''}));
     } else if(directMap[act]){
       var t3=directMap[act];
-      var tgt=t3==='ef'?Math.round(Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0))):0;
+      // §3 mirror: a joint household EF card targets the gap to the COMBINED 3-month reserve + carries a household-framed
+      // reason + a 50/50 split (_sharedOwnerClientId:null so the client-side syncJointCards adopts it).
+      var _efIsJoint=(t3==='ef'&&nowFlag.owner==='joint');
+      var _hef=_efIsJoint?_cpHouseholdEF():null;
+      var tgt=t3!=='ef'?0:Math.round(Math.max(0,((_hef?_hef.target:(CPLAN.efTarget||0))-(_hef?_hef.bal:(CPLAN.efBal||0)))));
+      var _efExtra={};
+      if(_efIsJoint){
+        _efExtra={amountSelf:0,amountSpouse:0,_sharedOwnerClientId:null};
+        nowFlag.reason='Your household emergency fund — a shared safety net you both contribute to. '+(_hef.bal>=_hef.target?('You already have '+fmt(_hef.bal)+' of your '+fmt(_hef.target)+' (3-month) target — fully funded.'):('Target '+fmt(_hef.target)+' (3 months of combined expenses); '+fmt(_hef.bal)+' saved so far.'));
+      }
       // A funded HSA (existing payroll contribution) isn't a suggestion to be
       // placed — it's money already flowing — so drop it into Phase 1 rather than
       // the Unassigned column. Check the owner's existing HSA contribution.
@@ -18466,7 +18490,7 @@ function _cpSyncFlagsToUnassigned(){
           if(_hsaCur>0)_autoPhase=1;
         }catch(e){}
       }
-      CPLAN.allocations.push(_extend(nowFlag,{type:t3,amount:0,target:tgt,phase:_autoPhase,cascade:''}));
+      CPLAN.allocations.push(_extend(nowFlag,_extend({type:t3,amount:0,target:tgt,phase:_autoPhase,cascade:''},_efExtra)));
     } else if(act==='401k'){
       CPLAN.allocations.push(_extend(nowFlag,{type:'401k',amount:0,target:0,phase:0,cascade:''}));
     }
@@ -19549,7 +19573,7 @@ function _cpBuildCard(a,idx,isUnassigned){
   // Red flag source. §3 mirror of pfos-client: a staged card keeps its original flagTitle/flagType — if the EF is now
   // fully funded, flip the persisted red "Emergency fund low" header to a calm green "funded" state (no contradiction).
   if(a.flagTitle){
-    var _efDone=(a.type==='ef'&&a.owner!=='spouse'&&(parseFloat(CPLAN.efTarget)||0)>0&&(parseFloat(CPLAN.efBal)||0)>=(parseFloat(CPLAN.efTarget)||0));   // §3 mirror: owner-aware — never flip a SPOUSE EF card to "funded" off the self/household balance
+    var _efDone=(function(){ if(a.type!=='ef'||a.owner==='spouse')return false; var _h=(a.owner==='joint'&&typeof _cpHouseholdEF==='function')?_cpHouseholdEF():{bal:(parseFloat(CPLAN.efBal)||0),target:(parseFloat(CPLAN.efTarget)||0)}; return _h.target>0&&_h.bal>=_h.target; })();   // §3 mirror: owner- + HOUSEHOLD-aware — a joint EF card is funded vs the COMBINED household balance/target, never off a spouse card
     var _fBg=_efDone?'rgba(34,197,94,.08)':(a.flagType==='crit'?'rgba(239,68,68,.08)':'rgba(234,179,8,.05)');
     var _fBd=_efDone?'rgba(34,197,94,.18)':(a.flagType==='crit'?'rgba(239,68,68,.15)':'rgba(234,179,8,.12)');
     var _fCol=_efDone?'var(--gr)':(a.flagType==='crit'?'var(--rd)':'var(--yl)');
@@ -23393,6 +23417,22 @@ function _cpDismissStateCBanner(){
 }
 
 
+// Household EF model (§3 mirror of pfos-client) — LIVE: a joint/hybrid couple's emergency fund is ONE shared household
+// fund (collapsed to a single owner='joint' card). Either spouse can later split it via "↩ Make personal" (which pins
+// _userMadePersonal so the collapse skips it). Separate/single stay individual. Advisor has no couple-sync — render/
+// persist parity only; cross-partner delivery happens on the client side.
+function _cpEfHouseholdJoint(){ var h=CPLAN._householdType; return h==='joint'||h==='hybrid'; }
+// Combined household EF balance + 3-month target. JOINT = one merged row → CPLAN values already combined. HYBRID = add
+// the partner's balance + their 3-month target. Else the self values.
+function _cpHouseholdEF(){
+  var bal=parseFloat(CPLAN.efBal)||0, tgt=parseFloat(CPLAN.efTarget)||0;
+  if(CPLAN._householdType==='hybrid'&&CPLAN._partner){
+    var _mo=parseInt(CPLAN._efMonthsTarget||3)||3;
+    bal+=parseFloat(CPLAN._partner.efBal)||0;
+    tgt+=Math.round((parseFloat(CPLAN._partner.expenses)||0)*_mo);
+  }
+  return {bal:Math.round(bal),target:Math.round(tgt)};
+}
 // Household EDUCATION model (§3 mirror of pfos-client): a child's education is a shared-OR-personal choice, so for a
 // couple WITH children the education card PROMPTS joint vs personal (not a silent default), switchable both ways. LIVE
 // (not flag-gated). Advisor twin has NO couple-sync — render/persist parity only. See pfos-client for canonical comments.
