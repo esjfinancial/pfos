@@ -19904,7 +19904,8 @@ function _cpBuildCard(a,idx,isUnassigned){
   // its owner isn't "Shared". This makes the Combined tab behave "like a joint" per
   // spec. Match cards are excluded (they use the match-dual slider instead).
   var _inCombinedTab=(_hh==='hybrid' && typeof _cpTabOfAlloc==='function' && _cpTabOfAlloc(a)==='combined');
-  var _renderDual=((_hh==='hybrid'||_hh==='joint')&&_isJointCard) || (_inCombinedTab && !(a._hasMatch && a._retAccountId));
+  // Separate households get the dual-slider for EDUCATION joint cards only (the one type that can be a shared household goal there) — §3 mirror of pfos-client.
+  var _renderDual=((_hh==='hybrid'||_hh==='joint'||(_hh==='separate'&&a.type==='edu'))&&_isJointCard) || (_inCombinedTab && !(a._hasMatch && a._retAccountId));
   var _renderRequest=(_hh==='hybrid'&&_isPartnerOwnedShared);
   // Match-dual-slider: existing-account cards with employer match get TWO
   // sliders (match-capture + additional contribution) on the same card.
@@ -20078,15 +20079,18 @@ function _cpBuildCard(a,idx,isUnassigned){
   // to other paths.
   var _aOwnForBtns=a.owner||'self';
   var _aOwnIsSelf=(_aOwnForBtns==='self'||_aOwnForBtns==='personal');
-  if(_hh==='hybrid'&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
+  // §3 mirror: joint/separate surface ONLY the "Make joint" button, and ONLY for education. Share-with-spouse (grant) stays hybrid-only.
+  if((( _hh==='hybrid')||((_hh==='joint'||_hh==='separate')&&a.type==='edu'))&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
     h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">';
     if(_jointEligible_isType){
       h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Make joint</button>';
     }
-    if(!a._sharedId){
-      h+='<button onclick="_cpShareCardWithPartner('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:transparent;border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Share with spouse</button>';
-    } else {
-      h+='<span style="font-size:11px;color:rgba(168,85,247,.7);align-self:center">💑 Shared with your spouse</span>';
+    if(_hh==='hybrid'){
+      if(!a._sharedId){
+        h+='<button onclick="_cpShareCardWithPartner('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:transparent;border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Share with spouse</button>';
+      } else {
+        h+='<span style="font-size:11px;color:rgba(168,85,247,.7);align-self:center">💑 Shared with your spouse</span>';
+      }
     }
     h+='</div>';
   }
@@ -23378,15 +23382,57 @@ function _cpDismissStateCBanner(){
 }
 
 
+// Household EDUCATION model (§3 mirror of pfos-client): a child's education is a SHARED goal, so an education card
+// defaults to a JOINT household card for any couple WITH children, in every household type, switchable via "Make
+// personal". LIVE (not flag-gated). Advisor twin has NO couple-sync (syncJointCards) — this is render/persist parity
+// only; cross-partner delivery happens on the client side. See pfos-client for the canonical comments.
+function _cpEduHouseholdJoint(){
+  if(typeof CPLAN==='undefined'||!CPLAN)return false;
+  var h=CPLAN._householdType||'individual';
+  if(h!=='joint'&&h!=='hybrid'&&h!=='separate')return false;
+  if(!CPLAN._coupleLink&&!(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name)))return false;
+  return !!(CPLAN.children&&CPLAN.children.length>0);
+}
+function _cpEduDefaultJoint(){
+  if(typeof CPLAN==='undefined'||!CPLAN||!Array.isArray(CPLAN.allocations))return;
+  // (1) Universal education re-type (the client's "Fix PP7" runs only on the AI path; mirror it here for all paths).
+  CPLAN.allocations.forEach(function(a){
+    if(!a||!a.customName||a.type==='edu')return;
+    var nm=String(a.customName).toLowerCase();
+    if(nm.indexOf('education')>=0||nm.indexOf('college')>=0||nm.indexOf('529')>=0){
+      var ot=a.type; a.type='edu';
+      if(ot==='wl')a.eduVehicle='wl'; else if(ot==='iul')a.eduVehicle='iul';
+      else if(nm.indexOf('coverdell')>=0)a.eduVehicle='coverdell';
+      else if(nm.indexOf('utma')>=0||nm.indexOf('ugma')>=0)a.eduVehicle='utma';
+      else if(!a.eduVehicle)a.eduVehicle='529';
+    }
+  });
+  // (2) Couples-with-children: default education to a shared joint card. Idempotent; respects sticky-personal.
+  if(!(typeof _cpEduHouseholdJoint==='function'&&_cpEduHouseholdJoint()))return;
+  var _meId=(typeof APP!=='undefined'&&APP)?APP.currentClientId:null;
+  CPLAN.allocations.forEach(function(a){
+    if(!a||a.type!=='edu')return;
+    if(a._userMadePersonal)return;
+    if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==_meId)return;
+    if(a.owner!=='self'&&a.owner!=='personal'&&a.owner)return;
+    a.owner='joint';
+    if(!a._sharedId&&a._sharedOwnerClientId==null)a._sharedOwnerClientId=null;
+    if(a.amountSelf==null||a.amountSpouse==null){ var _ae=parseFloat(a.amount)||0; a.amountSelf=Math.round(_ae/2); a.amountSpouse=Math.round((_ae-a.amountSelf)*100)/100; }
+  });
+}
 function _cpConvertToJoint(i){
   var a=CPLAN.allocations[i];if(!a)return;
-  if(CPLAN._householdType!=='hybrid'){_cpToast('Joint cards require a Hybrid couple');return;}
+  // Education can be a shared household goal in ANY couple (joint|hybrid|separate); all other types stay hybrid-only.
+  if(a.type==='edu'){ if(CPLAN._householdType!=='hybrid'&&CPLAN._householdType!=='joint'&&CPLAN._householdType!=='separate'){_cpToast('Joint cards require a linked partner');return;} }
+  else if(CPLAN._householdType!=='hybrid'){_cpToast('Joint cards require a Hybrid couple');return;}
   // Accept 'self' or 'personal' (both mean user-owned — seeders default to
   // 'personal'). Anything else (joint/spouse) is already not eligible.
   if(a.owner!=='self'&&a.owner!=='personal'&&a.owner){_cpToast('This card is already joint or spouse-owned');return;}
   // Type allowlist mirrors the UI gating so this is hard to misuse even if
   // the button is somehow rendered on an excluded type.
   if(!_cpJointEligible(a.type)){_cpToast('This card type can\'t be made joint');return;}
+  // Defensive: in joint/separate only education may go joint (parity with pfos-client). Other types stay hybrid-only.
+  if((CPLAN._householdType==='joint'||CPLAN._householdType==='separate')&&a.type!=='edu'){_cpToast('Only education can be a shared household goal in this household');return;}
   var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
   var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
   var prevAmt=parseFloat(a.amount)||0;
@@ -23461,6 +23507,7 @@ async function _cpDoConvertToJoint(i, partnerName){
   // ── Mutate the local allocation to joint ──
   var prevAmt=parseFloat(a.amount)||0;
   a.owner='joint';
+  if(a._userMadePersonal)delete a._userMadePersonal;   // explicit Make-joint clears the sticky-personal pin (§3 mirror)
   a.amountSelf=Math.round(prevAmt/2);
   a.amountSpouse=prevAmt-a.amountSelf;// keeps total exactly == prevAmt
   // If the card had been self-shared previously, clean up old grants on
@@ -23516,6 +23563,7 @@ async function _cpRevertFromJoint(i){
   if(!ok)return;
   // ── Mutate the local allocation back to self ──
   a.owner='self';
+  if(a.type==='edu')a._userMadePersonal=true;   // sticky-personal: don't let _cpEduDefaultJoint re-jointify it (§3 mirror)
   a.amount=selfPart;// drop the spouse's portion; keep ONLY this user's
   a.amountSelf=0;
   a.amountSpouse=0;
@@ -24190,8 +24238,8 @@ function cplanSave(){
   // the partner via shared_card_grants are filtered.
   var cleanAllocs=CPLAN.allocations.filter(function(a){
     return !(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint');
-  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,
-  // Loan tracking fields — persisted so the IBC continuation card state
+  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,
+  // _userMadePersonal: sticky-personal pin (§3 mirror) so a privatized education card isn't re-jointified on reload. Loan tracking fields — persisted so the IBC continuation card state
   // survives logout/login. loanBalance is the canonical outstanding balance;
   // monthlyLoanRepay is the user's repayment slider value; loans[] is the
   // per-loan audit trail; loanRate is the simple-interest annual rate.
@@ -25036,6 +25084,9 @@ function _cpRenderPlanFull(){
       }catch(_sgErr){console.warn('Shared-goal seed in render:',_sgErr);}
     }
   }
+  // Education default-to-joint — UNCONDITIONAL (every plan mode incl. AI), §3 mirror of pfos-client. Idempotent;
+  // respects sticky-personal. Advisor has no couple-sync, so this is render/persist parity only.
+  if(typeof _cpEduDefaultJoint==='function')_cpEduDefaultJoint();
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&_cpAllocInTab(a);});
   // M5.2b — canonical priority order for the unassigned list (dark-launched: PFOS_FLAGS.priorityEngine
   // OFF = today's detector push-order, byte-identical). Ranks the flag-sourced cards by engine-exact
