@@ -4724,6 +4724,15 @@ function _cpLiteHideSolved(a){
 function _cpIsOrphanSpouseCard(a){
   return !!(a&&a.owner==='spouse'&&['joint','hybrid','separate'].indexOf((typeof CPLAN!=='undefined'&&CPLAN&&CPLAN._householdType)||'individual')<0);
 }
+// CORE: a college/education card in a household with NO children is irrelevant — hide it (owner decision). The seeder
+// zeroes its amount (no college weight without kids) so it never deploys; this just removes the now-$0 card from view.
+// RENDER-ONLY (the allocation stays in CPLAN.allocations — re-adding a child in Core brings it back; a Pro user managing
+// goals in Planning still sees their saved goal). Lite/Core only.
+function _cpHideChildlessEdu(a){
+  if(!a||a.type!=='edu')return false;
+  if(typeof _cpSinglePhasePlan!=='function'||!_cpSinglePhasePlan())return false;
+  return !(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN.children&&CPLAN.children.length>0);
+}
 // The default retirement vehicle for the Core prescriptive plan: 401(k) if employed (capture the employer match), Roth
 // IRA otherwise, Traditional IRA if the user is over the Roth income (MAGI) limit (so the Roth phase-out, which makes
 // _cpIRSMax('roth') return 0, can't leave an unfundable $0 card). Used to auto-resolve the "Choose a retirement vehicle"
@@ -4775,16 +4784,25 @@ function _cpLiteAutoSeed(){
   var _hasRet=CPLAN.allocations.some(function(x){return _ok(x)&&_retOnly[x.type];});
   var _hasInv=CPLAN.allocations.some(function(x){return _ok(x)&&x.type==='invest';});
   var _g=matchPct+growthPct;
-  _seed(function(x){return !!_retOnly[x.type];}, _hasRet?(_hasInv?_g*0.6:_g):0);
-  _seed(function(x){return x.type==='invest';}, _hasInv?(_hasRet?_g*0.4:_g):0);
-  // EDUCATION (college) — owner rule: auto-fund ONLY from the RESIDUAL cash flow left after the prescribed essentials
-  // (debt → EF → retirement → invest). College is the lowest-priority lever and obeys the SAME pool invariant as the
-  // sliders (sum of all amounts ≤ surplus−breathing): it may take only the headroom the essentials didn't consume, so
-  // it can never push the plan past 100% (the old "Deploying 105% of surplus" over-deploy) and its slider value always
-  // fits its max (no $300 shown with the handle pinned at 0). When headroom is ~0 it funds $0 and the card explains
-  // college still needs funding + why (the _eduFundGap note in _cpBuildCard). DISCRIMINATOR: a real user drag is always
-  // snapped to ≤ headroom by _cpSlide, so an edu amount ABOVE its headroom can only be a stale auto-staged value →
-  // safe to recompute; an amount that already fits is left alone (not causing the bug, and may be a deliberate edit).
+  // GROWTH BUDGET — distribute _g across the available growth vehicles by weight. Retirement is prioritized (weight 6);
+  // taxable investing (4) preserves the prior 60/40 retirement:invest ratio when there is no college lane; and when the
+  // household HAS CHILDREN, the college card joins as a REAL funded lane (weight 3) so a parent's Core plan prescribes a
+  // monthly college amount (owner decision) instead of college always falling to $0 "can't fund yet". A childless
+  // household contributes NO college weight — its (saved) college card is zeroed below and hidden (_cpHideChildlessEdu).
+  var _hasEduKids=(CPLAN.children&&CPLAN.children.length>0)&&CPLAN.allocations.some(function(x){return _ok(x)&&x.type==='edu';});
+  var _wRet=_hasRet?6:0, _wInv=_hasInv?4:0, _wEdu=_hasEduKids?3:0, _wTot=_wRet+_wInv+_wEdu;
+  if(_wTot>0){
+    _seed(function(x){return !!_retOnly[x.type];}, _g*(_wRet/_wTot));
+    _seed(function(x){return x.type==='invest';}, _g*(_wInv/_wTot));
+  }
+  // EDUCATION lane — college gets its weighted share of the growth budget when children exist; a childless household's
+  // (saved) college card is zeroed (and hidden). Custom seed (not _seed) so a STALE auto-staged amount is recomputed: a
+  // card we've never seeded (_liteSeededAmt==null, e.g. a $300 PP8/persisted leftover) is safe to take over, while a
+  // genuine post-seed user drag (cur ≠ _liteSeededAmt, always ≤ headroom via _cpSlide) is preserved. Capped at the live
+  // headroom so the total never exceeds the pool. _eduFundGap (kids but $0) still drives the "still needs funding" note
+  // for the rare case where debt/EF consume everything and no growth budget is left.
+  var _EDU_MIN=10;
+  var _eduTarget=(_wEdu>0)?Math.round(pool*_g*(_wEdu/_wTot)):0;   // 0 when no kids → zero-out the stale card
   CPLAN.allocations.forEach(function(a){
     if(!_ok(a)||a.type!=='edu'||!(a.phase==null||a.phase<=1))return;
     var cur=parseFloat(a.amount)||0;
@@ -4792,14 +4810,11 @@ function _cpLiteAutoSeed(){
       if(!_ok(x)||x===a||!(x.phase==null||x.phase<=1))return t;
       return t+(parseFloat(x.amount)||0);
     },0);
-    // Floor: a few leftover dollars (rounding crumbs from the lane splits) is not "enough residual to fund college" —
-    // a $1/mo 529 is noise. Below a meaningful minimum, fund $0 so the card shows the "still needs funding" message
-    // rather than a degenerate trickle + a near-flat projection chart.
-    var _EDU_MIN=10;
-    var _head=Math.max(0,pool-_other); if(_head<_EDU_MIN)_head=0;
-    var _reseed=(cur===0)||(a._liteSeededAmt!=null&&Math.abs(cur-(parseFloat(a._liteSeededAmt)||0))<1)||(cur>_head);
-    if(_reseed){ a.amount=Math.round(_head); a.phase=1; a._liteSeededAmt=a.amount; }
-    a._eduFundGap=((parseFloat(a.amount)||0)<=0&&!!(CPLAN.children&&CPLAN.children.length>0));   // render-only: couldn't fund from residual
+    var _head=Math.max(0,pool-_other);
+    var _give=Math.min(_eduTarget,_head); if(_give<_EDU_MIN)_give=0;
+    var _reseed=(a._liteSeededAmt==null)||(Math.abs(cur-(parseFloat(a._liteSeededAmt)||0))<1)||(cur>_head);
+    if(_reseed){ a.amount=Math.round(_give); a.phase=1; a._liteSeededAmt=a.amount; }
+    a._eduFundGap=((parseFloat(a.amount)||0)<=0&&!!(CPLAN.children&&CPLAN.children.length>0));   // render-only: kids but no growth budget left
   });
 }
 // ── budget_v2 DARK-LAUNCH FLAG (Milestone 1) ── Gates ALL unified-budget + register M1 UI
@@ -36845,7 +36860,7 @@ function _cpRenderPlanV2(){
   // Education re-type — UNCONDITIONAL (every plan mode incl. advisory/AI; the stager above is !hasAdvisor-gated and
   // would miss them). Idempotent. Ownership (joint vs personal) is the user's PROMPTED choice on the card, not a default.
   if(typeof _cpEduNormalizeType==='function')_cpEduNormalizeType();
-  var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&!(a&&a._completed&&_cpIsActionOnly(a))&&!_cpLiteHideSolved(a)&&!_cpIsOrphanSpouseCard(a);});   // Core hides SOLVED issues (funded EF / met goal); all tiers hide ORPHAN spouse cards (no partner)
+  var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&!(a&&a._completed&&_cpIsActionOnly(a))&&!_cpLiteHideSolved(a)&&!_cpIsOrphanSpouseCard(a)&&!_cpHideChildlessEdu(a);});   // Core hides SOLVED issues (funded EF / met goal) + a childless household's college card; all tiers hide ORPHAN spouse cards (no partner)
   // M5.2b — canonical priority order for the unassigned list (dark-launched: PFOS_FLAGS.priorityEngine
   // OFF = today's detector push-order, byte-identical). Ranks flag-sourced cards by engine-exact priority;
   // non-flag cards trail. Sorts a filtered COPY only — _cpBuildCard re-derives idx via indexOf, array untouched.
@@ -37128,7 +37143,7 @@ function _cpRenderPlanV2(){
   // Completed action/to-do cards (umbrella/estate/diversify/protection/etc.) leave the
   // plan once Done + tracked. Term life & disability are intentionally KEPT here (grayed)
   // so the agent can track the client's coverage — they aren't in _cpIsActionOnly.
-  var _hideDoneAction=function(a){return !(a&&a._completed&&_cpIsActionOnly(a))&&!_cpLiteHideSolved(a)&&!_cpIsOrphanSpouseCard(a);};   // Core hides SOLVED issues; all tiers hide ORPHAN spouse cards (spouse-owned card but no partner) — render-only
+  var _hideDoneAction=function(a){return !(a&&a._completed&&_cpIsActionOnly(a))&&!_cpLiteHideSolved(a)&&!_cpIsOrphanSpouseCard(a)&&!_cpHideChildlessEdu(a);};   // Core hides SOLVED issues + a childless household's college card; all tiers hide ORPHAN spouse cards (spouse-owned card but no partner) — render-only
   var _p1Items=CPLAN.allocations.filter(function(a){return a.phase===1&&_hideDoneAction(a);});
   var _activeItems=CPLAN.allocations.filter(function(a){return a.phase===_activeTab&&_hideDoneAction(a);});
 
