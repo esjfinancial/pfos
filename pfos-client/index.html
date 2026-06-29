@@ -31936,18 +31936,22 @@ function _cpSyncFlagsToUnassigned(){
     var _seen={};
     CPLAN.allocations=CPLAN.allocations.filter(function(a){ var k=_ckey(a); if(k===null)return true; var isPh=!!(a._isPlaceholder&&a._chooserAction); if(!isPh&&_hasPh[k])return false; if(_seen[k])return false; _seen[k]=true; return true; });
   })();
-  // Household EF model: in a joint/hybrid household the emergency fund is ONE shared card. Re-tag any existing EF card
-  // to owner='joint' (an EF staged before the household was set, or a leftover self/spouse pair) and collapse to one,
-  // preserving amount + seeding a 50/50 amountSelf/amountSpouse split. Separate/single is left individual + private.
+  // Household EF model: in a joint/hybrid household the emergency fund is ONE shared card. Collapse every EF card to a
+  // single owner='joint' household card. When more than one exists (e.g. each partner auto-staged their own, or a
+  // self+spouse pair), PREFER the one already carrying a _sharedId — that's the card the couple-sync store knows, so
+  // both partners converge on the SAME shared object instead of accumulating duplicates (hydration dedups by _sharedId
+  // only, not type). The survivor is promoted to joint with a 50/50 amountSelf/amountSpouse split; a fresh self card
+  // gets _sharedOwnerClientId:null so syncJointCards adopts it. Separate/single is left individual + private.
   if(typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint()){
-    var _efSeen=false;
-    CPLAN.allocations=CPLAN.allocations.filter(function(a){
-      if(!a||a.type!=='ef')return true;
-      if(_efSeen)return false;   // drop duplicate EF cards (keep the first as the shared household card)
-      _efSeen=true; a.owner='joint';
-      if(a.amountSelf==null||a.amountSpouse==null){ var _am=parseFloat(a.amount)||0; a.amountSelf=Math.round(_am/2); a.amountSpouse=Math.round((_am-a.amountSelf)*100)/100; }
-      return true;
-    });
+    var _efCards=(CPLAN.allocations||[]).filter(function(a){return a&&a.type==='ef';});
+    if(_efCards.length){
+      var _efKeep=null;
+      _efCards.forEach(function(a){ if(!_efKeep||(a._sharedId&&!_efKeep._sharedId))_efKeep=a; });   // prefer an already-shared card
+      CPLAN.allocations=CPLAN.allocations.filter(function(a){ return !(a&&a.type==='ef'&&a!==_efKeep); });
+      _efKeep.owner='joint';
+      if(!_efKeep._sharedId&&_efKeep._sharedOwnerClientId==null)_efKeep._sharedOwnerClientId=null;   // fresh self→joint: claimable by syncJointCards (don't clobber a partner-owned hydrated card)
+      if(_efKeep.amountSelf==null||_efKeep.amountSpouse==null){ var _am=parseFloat(_efKeep.amount)||0; _efKeep.amountSelf=Math.round(_am/2); _efKeep.amountSpouse=Math.round((_am-_efKeep.amountSelf)*100)/100; }
+    }
   }
   var _seenChooser={};   // run-local dedup: one chooser placeholder per action+owner per detect() run (see chooser branch below)
   flags.forEach(function(f){
@@ -32083,7 +32087,9 @@ function _cpSyncFlagsToUnassigned(){
       var tgt=t3!=='ef'?0:Math.round(Math.max(0,((_hef?_hef.target:(CPLAN.efTarget||0))-(_hef?_hef.bal:(CPLAN.efBal||0)))));
       var _efExtra={};
       if(_efIsJoint){
-        _efExtra={amountSelf:0,amountSpouse:0};
+        // _sharedOwnerClientId:null marks this fresh joint card as unclaimed so syncJointCards adopts it (generates a
+        // _sharedId) on first save and the couple-sync/dual-slider infra takes over from there.
+        _efExtra={amountSelf:0,amountSpouse:0,_sharedOwnerClientId:null};
         nowFlag.reason='Your household emergency fund — a shared safety net you both contribute to. '+(_hef.bal>=_hef.target?('You already have '+fmt(_hef.bal)+' of your '+fmt(_hef.target)+' (3-month) target — fully funded.'):('Target '+fmt(_hef.target)+' (3 months of combined expenses); '+fmt(_hef.bal)+' saved so far.'));
       }
       CPLAN.allocations.push(_extend(nowFlag,_extend({type:t3,amount:0,target:tgt,phase:0,cascade:''},_efExtra)));
@@ -38555,18 +38561,8 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<div style="margin-top:6px;font-size:11px;color:var(--mu);line-height:1.45">'+_rationale+'</div>';
     h+='</div>';
   }
-  // Household EF (joint/hybrid) — show each person's monthly contribution toward the shared fund (50/50 default;
-  // the slider chain keeps amountSelf/amountSpouse consistent as the user edits the total). Skipped when funded.
-  if(a.type==='ef'&&a.owner==='joint'&&!_efFunded){
-    var _efAmt=parseFloat(a.amount)||0;
-    // 50/50 split of the current contribution. (amountSelf/amountSpouse persist the split when the user edits via the
-    // slider chain; we derive from a.amount for the display so it stays correct even when the auto-seed set a.amount.)
-    var _efAS=Math.round(_efAmt/2);
-    var _efAP=_efAmt-_efAS;
-    var _efMe=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('self'):'You';
-    var _efSp=(typeof _cpOwnerFirstName==='function')?_cpOwnerFirstName('spouse'):'Spouse';
-    h+='<div style="margin-top:8px;padding:8px 12px;background:rgba(34,197,94,.05);border:1px solid rgba(34,197,94,.15);border-radius:4px;font-size:12px;color:var(--mu)">Shared fund &mdash; <strong style="color:var(--wh)">'+_efMe+':</strong> '+fmt(_efAS)+'/mo · <strong style="color:var(--wh)">'+_efSp+':</strong> '+fmt(_efAP)+'/mo</div>';
-  }
+  // (The joint EF card's per-person split renders via the canonical dual-slider — the _renderDual branch above —
+  // which shows an editable "You / [Spouse]" contribution split and syncs through syncJointCards. No separate display.)
   // Completion estimate
   if(a.target>0&&a.amount>0){
     var moLeft;
