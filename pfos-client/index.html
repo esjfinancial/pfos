@@ -4624,9 +4624,10 @@ function _cpSinglePhasePlan(){ return (typeof _liteActive==='function' && _liteA
 function _cpLiteVehicleAllow(){ return { ef:1, debt:1, protection:1, roth:1, roth401k:1, '401k':1, trad_ira:1, solo401k:1, sep_ira:1, invest:1, edu:1, custom:1, rental:1 }; }   // traditional accounts + the basics; EXCLUDES iul/wl/ibc/hsa/annuities/rollover (advanced = Planning)
 // Household EF model (owner decision): a joint OR hybrid couple shares ONE household emergency fund (a joint savings
 // goal), shown as a single joint card with each person's contribution. Separate/single = an individual private EF.
-// Gated behind spouseVisibility — the joint EF card is part of the household/couples experience and must flip together
-// with spouse-flag visibility (OFF in production today). OFF → false → EF stays self-owned (byte-identical to pre-model).
-function _cpEfHouseholdJoint(){ if(!(window.PFOS_FLAGS&&PFOS_FLAGS.spouseVisibility))return false; var h=CPLAN._householdType; return h==='joint'||h==='hybrid'; }
+// LIVE (owner flipped it on 2026-06-29) — a joint/hybrid couple's emergency fund is one shared household fund. Either
+// spouse can later split it into individual EF cards via "↩ Make personal" (which pins _userMadePersonal so this
+// collapse skips it). Separate/single households are left individual + private (h not joint/hybrid → false).
+function _cpEfHouseholdJoint(){ var h=CPLAN._householdType; return h==='joint'||h==='hybrid'; }
 // Combined household EF balance + 3-month target. JOINT shares one row → CPLAN values are already combined. HYBRID =
 // each spouse has their own row → add the partner's balance + their 3-month target. Else the self values.
 function _cpHouseholdEF(){
@@ -31984,7 +31985,9 @@ function _cpSyncFlagsToUnassigned(){
   // only, not type). The survivor is promoted to joint with a 50/50 amountSelf/amountSpouse split; a fresh self card
   // gets _sharedOwnerClientId:null so syncJointCards adopts it. Separate/single is left individual + private.
   if(typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint()){
-    var _efCards=(CPLAN.allocations||[]).filter(function(a){return a&&a.type==='ef';});
+    // Skip cards the user explicitly made personal (_userMadePersonal, e.g. after splitting the joint EF) so a privatized
+    // EF is NOT re-collapsed back to joint on the next render — respects the either-spouse "make personal" choice.
+    var _efCards=(CPLAN.allocations||[]).filter(function(a){return a&&a.type==='ef'&&!a._userMadePersonal;});
     if(_efCards.length){
       var _efKeep=null;
       _efCards.forEach(function(a){ if(!_efKeep||(a._sharedId&&!_efKeep._sharedId))_efKeep=a; });   // prefer an already-shared card
@@ -35311,23 +35314,32 @@ function _cpSubscribeToShared(){
     jointCards.forEach(function(c){if(c&&c.sharedId)validSharedIds[c.sharedId]=true;});
     partnerSharedCards.forEach(function(c){if(c&&c.sharedId)validSharedIds[c.sharedId]=true;});
     var beforeLen=CPLAN.allocations?CPLAN.allocations.length:0;
+    var _dissolvedJoint=false;
     if(CPLAN.allocations){
       CPLAN.allocations=CPLAN.allocations.filter(function(a){
-        // Only remove cards we know are partner-managed AND no longer in the shared set
-        if(!a._sharedId)return true;
-        if(!a._sharedOwnerClientId||a._sharedOwnerClientId===APP.currentClientId)return true;
-        if(validSharedIds[a._sharedId])return true;
-        // Phase 3.2 exemption: spouse-account view cards (locally seeded from
-        // CPLAN._partner.retAccounts / .investments) carry _retAccountId or
-        // _investmentId. They're NOT joint cards and NOT partner-shared cards —
-        // they're local views of accounts the partner owns in their own
-        // pfos-main. The mirror entries we write on approve have owner='spouse'
-        // and no grants, so they're filtered out of jointCards/partnerSharedCards,
-        // which would otherwise cause this filter to delete the local cards.
+        if(!a._sharedId)return true;                  // not a shared card, keep
+        if(validSharedIds[a._sharedId])return true;   // still in the shared set, keep
+        // ── This card is gone from the shared set ──
+        if(a.owner==='joint'){
+          // A joint card is CO-OWNED by both spouses, and EITHER can dissolve it (see _cpRevertFromJoint, no creator
+          // restriction). When the partner dissolves it, the share vanishes from couple_links → this fires on MY side.
+          // SPLIT, don't delete: convert my copy into a PERSONAL card holding MY portion (amountSelf) so each spouse
+          // keeps their own individual card. _userMadePersonal pins it (don't re-collapse a household EF / re-prompt edu).
+          a.owner='self';
+          a.amount=parseFloat(a.amountSelf)||parseFloat(a.amount)||0;
+          a.amountSelf=0; a.amountSpouse=0;
+          a._sharedId=null; a._sharedOwnerClientId=null;
+          a._userMadePersonal=true;
+          _dissolvedJoint=true;
+          return true;                                // keep (now personal)
+        }
+        if(!a._sharedOwnerClientId||a._sharedOwnerClientId===APP.currentClientId)return true;  // my own non-joint shared card, keep
+        // Phase 3.2 exemption: spouse-account view cards (locally seeded from CPLAN._partner.retAccounts/.investments)
+        // carry _retAccountId/_investmentId — local views of accounts the partner owns, not partner-shared cards.
         if(a._retAccountId||a._investmentId)return true;
-        return false;
+        return false;   // partner-shared self card that was un-shared → drop my view
       });
-      if(CPLAN.allocations.length<beforeLen)inserted=true;
+      if(CPLAN.allocations.length<beforeLen||_dissolvedJoint)inserted=true;
     }
     CPLAN.partnerSharedCards=partnerSharedCards;
     CPLAN._jointSharedCards=jointCards;
@@ -47881,40 +47893,36 @@ async function _cpDoConvertToJoint(i, partnerName){
 //   • _sharedId dropped + shared_plan_cards entry removed so the partner's
 //     realtime fires and they no longer see the card on their plan
 //
-// Authority: only the user who originally created the joint card (or who has
-// no _sharedOwnerClientId tag because they created it directly) can unjoint.
-// Joint cards received via hydration (where _sharedOwnerClientId === partnerId)
-// are blocked — let the originator make that call.
+// Authority: a joint card is CO-OWNED — EITHER spouse can dissolve it (owner decision). When one does, the card SPLITS:
+// the actor keeps their portion as a personal card, and the partner's realtime (the joint-card branch in
+// _cpSubscribeToShared) converts THEIR copy into a personal card holding their own portion. So each spouse ends up with
+// their own individual card. (No creator-only restriction — that old model couldn't make the partner's change stick.)
 async function _cpRevertFromJoint(i){
   var a=CPLAN.allocations[i];if(!a)return;
   if(a.owner!=='joint'){_cpToast('This card isn\'t joint');return;}
-  if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId){
-    _cpToast('Only your spouse can unjoint this — they created it');
-    return;
-  }
   var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
   var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
   var selfPart=parseFloat(a.amountSelf)||0;
   var spousePart=parseFloat(a.amountSpouse)||0;
   var ok = await _cpConfirmModal({
-    title: 'Convert "'+cardName+'" back to a personal card?',
-    message: 'You\'ll be the sole owner. '+partnerName+' will no longer see this card on their plan.',
+    title: 'Make "'+cardName+'" a personal card?',
+    message: 'This stops sharing it. You and '+partnerName+' each keep your own contribution as a separate personal card.',
     detail:
       '• You keep your portion: <strong style="color:var(--wh)">$'+fmt(selfPart)+'/mo</strong><br>'
-      +'• '+_cpEscapeHtmlForModal(partnerName)+'\'s portion released: <strong style="color:var(--wh)">$'+fmt(spousePart)+'/mo</strong><br>'
-      +'• '+_cpEscapeHtmlForModal(partnerName)+' can add their own version later if they still want to contribute separately',
-    confirmLabel: '↩ Revert to personal',
+      +'• '+_cpEscapeHtmlForModal(partnerName)+' keeps their portion as their own card: <strong style="color:var(--wh)">$'+fmt(spousePart)+'/mo</strong><br>'
+      +'• Either of you can make it joint again later',
+    confirmLabel: '↩ Make personal',
     confirmStyle: 'warning',
     icon: '↩'
   });
   if(!ok)return;
   // ── Mutate the local allocation back to self ──
   a.owner='self';
-  // Sticky-personal: an education card the user explicitly privatized must NOT be re-jointified by _cpEduDefaultJoint
-  // on the next render/reload/regen. Persisted via the cleanAllocs serializer (and bridge map); cleared by an explicit
-  // Make-joint. Scoped to edu (the only type with an auto-joint default).
-  if(a.type==='edu')a._userMadePersonal=true;
-  a.amount=selfPart;// drop the spouse's portion; keep ONLY this user's
+  // Sticky-personal: a joint card the user explicitly made personal must NOT be re-jointified by an auto-default
+  // (household EF collapse / — education uses a prompt, not a default). Persisted via the cleanAllocs serializer + the
+  // bridge map; cleared by an explicit Make-joint. General (any type) so a privatized EF/edu/etc. stays personal.
+  a._userMadePersonal=true;
+  a.amount=selfPart;// keep ONLY this user's portion (the partner keeps theirs on their side via the dissolve-split)
   a.amountSelf=0;
   a.amountSpouse=0;
   var _oldSharedId=a._sharedId;
