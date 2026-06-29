@@ -4694,34 +4694,59 @@ function _cpLiteCanAdd(type){
   }
   return { ok:true };
 }
-// Lite (Core) auto-SEED: lite stages cards at $0 (→ "Deploying $0/mo"). This funds the urgent money-moves out of
-// the box — debt → EF → a concrete retirement/invest card — by setting amounts on EXISTING $0 cards. It NEVER pushes
-// new cards, NEVER funds a chooser placeholder ("Choose a vehicle" stays a prompt — you can't fund an unchosen
-// vehicle), and NEVER sets cascade. Runs ONCE per plan (_liteSeeded, persisted) and only when the user hasn't
-// allocated yet → never overwrites real choices, fully upgrade-safe. Reuses _cpAutoSuggestV2's priority shares
-// WITHOUT calling it (that one wipes allocations + bakes in cascade).
+// The default retirement vehicle for the Core prescriptive plan: 401(k) if employed (capture the employer match), Roth
+// IRA otherwise, Traditional IRA if the user is over the Roth income (MAGI) limit (so the Roth phase-out, which makes
+// _cpIRSMax('roth') return 0, can't leave an unfundable $0 card). Used to auto-resolve the "Choose a retirement vehicle"
+// chooser/orphan in Core. Still switchable by the user via the (locked-option) menu.
+function _cpLiteRetType(){
+  var t=(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN.employer)?'401k':'roth';
+  if(t==='roth'&&typeof _cpIRSMax==='function'&&(_cpIRSMax('roth',{type:'roth'})||0)<=0)t='trad_ira';
+  return t;
+}
+// Lite (Core) PRESCRIPTIVE auto-SEED: lite stages cards at $0 (→ "Deploying $0/mo"). This funds the urgent money-moves
+// out of the box — debt → EF → a concrete retirement/invest card — by setting amounts on EXISTING fundable cards (the
+// retirement chooser is auto-resolved to a real vehicle upstream so it IS fundable). It NEVER pushes new cards and NEVER
+// sets cascade. Runs EVERY render but is per-card idempotent + edit-preserving: it only (re)fills a card still at $0 or
+// still equal to its own seeded value (_liteSeededAmt); a user-nudged amount is never overwritten → upgrade-safe.
+// Reuses _cpAutoSuggestV2's priority shares WITHOUT calling it (that one wipes allocations + bakes in cascade).
 function _cpLiteAutoSeed(){
   if(!_cpSinglePhasePlan())return;
   if(typeof CPLAN==='undefined'||!CPLAN||!Array.isArray(CPLAN.allocations))return;
-  if(CPLAN._liteSeeded)return;
   var _isAO=(typeof _cpIsActionOnly==='function')?_cpIsActionOnly:function(){return false;};
-  if(CPLAN.allocations.some(function(a){return a&&(parseFloat(a.amount)||0)>0&&!_isAO(a);}))return;   // user already allocated → never overwrite
-  CPLAN._liteSeeded=true;
+  // PRESCRIPTIVE pre-fund: distribute the monthly surplus across the urgent money-moves so the Core plan is always laid
+  // out. NO global "skip if any funded" bail (an unrelated funded goal like "College fund" must NOT block seeding debt/
+  // EF/retirement — the bug that left a $1460/mo plan all $0) and NO once-guard (the old _liteSeeded was never persisted).
+  // A per-CARD guard preserves user nudges: only (re)fill a card still at $0 OR still equal to its own seeded value
+  // (_liteSeededAmt, float-tolerant); a user-edited amount is left alone. Re-running is idempotent (same pool → same amt).
   var _brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15);
   var pool=Math.round((parseFloat(CPLAN.surplus)||0)*(1-_brPct/100));
   if(pool<=0)return;
+  var _hef=(typeof _cpHouseholdEF==='function')?_cpHouseholdEF():{bal:(parseFloat(CPLAN.efBal)||0),target:(parseFloat(CPLAN.efTarget)||0)};   // household-aware EF (joint/hybrid combined) — a funded HOUSEHOLD EF seeds 0% so the freed budget rolls into growth
   var hiDebts=((CPLAN.debts)||[]).filter(function(x){return(parseFloat(x.rate)||0)>10&&(parseFloat(x.balance)||0)>0;});
-  var debtPct=hiDebts.length>0?0.30:0, efPct=(CPLAN.efBal<CPLAN.efTarget)?0.10:0, matchPct=CPLAN.employer?0.08:0;
+  var debtPct=hiDebts.length>0?0.30:0, efPct=(_hef.bal<_hef.target)?0.10:0, matchPct=CPLAN.employer?0.08:0;
   var growthPct=1-debtPct-efPct-matchPct;
   function _seed(pred,share){
     if(share<=0)return; var amt=Math.round(pool*share); if(amt<=0)return;
-    var a=CPLAN.allocations.find(function(x){return x&&(parseFloat(x.amount)||0)===0&&(x.phase==null||x.phase<=1)&&!x._isPlaceholder&&!_isAO(x)&&pred(x);});
-    if(a){ var cap=(typeof _cpIRSMax==='function')?_cpIRSMax(a.type,a):amt; a.amount=Math.min(amt,cap); a.phase=1; }
+    var a=CPLAN.allocations.find(function(x){
+      if(!x||x._isPlaceholder||_isAO(x)||!(x.phase==null||x.phase<=1)||!pred(x))return false;
+      var cur=parseFloat(x.amount)||0;
+      if(cur===0)return true;                                                                  // unfunded → seed
+      return x._liteSeededAmt!=null&&Math.abs(cur-(parseFloat(x._liteSeededAmt)||0))<1;          // still our seed → re-fillable; user-edited → skip the lane
+    });
+    if(a){ var cap=(typeof _cpIRSMax==='function')?_cpIRSMax(a.type,a):amt; a.amount=Math.min(amt,cap); a.phase=1; a._liteSeededAmt=a.amount; }
   }
   _seed(function(x){return x.type==='debt';},debtPct);
   _seed(function(x){return x.type==='ef';},efPct);
-  var _retGrowth={roth:1,'401k':1,roth401k:1,trad_ira:1,solo401k:1,sep_ira:1,invest:1};
-  _seed(function(x){return !!_retGrowth[x.type];},matchPct+growthPct);
+  // The growth share splits between RETIREMENT (roth/401k/etc., the auto-resolved vehicle) and taxable INVESTING so BOTH
+  // get funded — retirement prioritized 60/40 when both a retirement card and an invest card exist; if only one exists it
+  // takes the whole share. (The old single combined lane funded whichever matched first, leaving the other at $0.)
+  var _retOnly={roth:1,'401k':1,roth401k:1,trad_ira:1,solo401k:1,sep_ira:1};
+  var _ok=function(x){return x&&!x._isPlaceholder&&!_isAO(x);};
+  var _hasRet=CPLAN.allocations.some(function(x){return _ok(x)&&_retOnly[x.type];});
+  var _hasInv=CPLAN.allocations.some(function(x){return _ok(x)&&x.type==='invest';});
+  var _g=matchPct+growthPct;
+  _seed(function(x){return !!_retOnly[x.type];}, _hasRet?(_hasInv?_g*0.6:_g):0);
+  _seed(function(x){return x.type==='invest';}, _hasInv?(_hasRet?_g*0.4:_g):0);
 }
 // ── budget_v2 DARK-LAUNCH FLAG (Milestone 1) ── Gates ALL unified-budget + register M1 UI
 // while it's built behind the flag. OFF for everyone except the test/owner allowlist; flip to
@@ -31997,6 +32022,17 @@ function _cpSyncFlagsToUnassigned(){
       if(_efKeep.amountSelf==null||_efKeep.amountSpouse==null){ var _am=parseFloat(_efKeep.amount)||0; _efKeep.amountSelf=Math.round(_am/2); _efKeep.amountSpouse=Math.round((_am-_efKeep.amountSelf)*100)/100; }
     }
   }
+  // CORE: resolve any RELOADED retirement-chooser ORPHAN — a persisted 'Choose a retirement vehicle' custom card that
+  // lost its _chooserAction/_isPlaceholder identity on save (those fields aren't in the serializer) — to the default real
+  // vehicle. Doing it BEFORE the flag loop means the dedup below sees a real (auto-resolved) retirement card and won't
+  // re-stage a duplicate placeholder; the seeder can then fund it. Lite-only; fresh flags are resolved at the chooser branch.
+  if(typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()){
+    (CPLAN.allocations||[]).forEach(function(a){
+      if(a&&a.type==='custom'&&((a._chooserAction==='retirement')||(a.customName==='Choose a retirement vehicle'))){
+        a.type=_cpLiteRetType(); a._autoResolvedFromPlaceholder=true; a.customName=''; delete a._isPlaceholder; delete a._chooserAction;
+      }
+    });
+  }
   var _seenChooser={};   // run-local dedup: one chooser placeholder per action+owner per detect() run (see chooser branch below)
   flags.forEach(function(f){
     var act=f.action;
@@ -32035,7 +32071,7 @@ function _cpSyncFlagsToUnassigned(){
     // Already represented?
     var alreadyIn=false;
     if(chooserActions[act]){
-      if(act==='retirement') alreadyIn=_ownerAllocSome(function(a){return retTypes.indexOf(a.type)>=0&&a.amount>0;});
+      if(act==='retirement') alreadyIn=_ownerAllocSome(function(a){return retTypes.indexOf(a.type)>=0&&(a.amount>0||a._autoResolvedFromPlaceholder);});   // Core auto-resolves the chooser to a real vehicle (amount 0 until seeded) — count it so the placeholder doesn't re-stage alongside it
       else if(act==='edu') alreadyIn=_ownerAllocSome(function(a){return a.type==='edu'&&a.amount>0;});
       else if(act==='rollover') alreadyIn=_ownerAllocSome(function(a){return rolloverDestTypes.indexOf(a.type)>=0;});
       else if(act==='growth') alreadyIn=_ownerAllocSome(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
@@ -32113,6 +32149,16 @@ function _cpSyncFlagsToUnassigned(){
       if(_customNm)nowFlag.customName=_customNm;
     }
     if(chooserActions[act]){
+      // CORE (lite) PRESCRIPTIVE: resolve the RETIREMENT chooser to a real default vehicle so it can be pre-funded and
+      // shows a concrete instruction ("Put $X into your Roth IRA") instead of an unfundable "Choose a vehicle" placeholder
+      // the seeder skips. 401(k) if employed (capture the match) · Roth IRA otherwise · Traditional if over the Roth income
+      // limit (so the Roth MAGI phase-out can't leave a $0 card). Still switchable via the (locked-option) menu. The seeder
+      // (_cpLiteAutoSeed) funds it via the _retGrowth lane. Non-lite (Planning/advisor) keeps the chooser placeholder.
+      if(act==='retirement'&&typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()){
+        CPLAN.allocations.push(_extend(nowFlag,{type:_cpLiteRetType(),amount:0,target:0,phase:0,cascade:'',_autoResolvedFromPlaceholder:true}));
+        _seenChooser[act+'|'+(_isSpouseFlag?'spouse':'self')]=true;
+        return;
+      }
       // Placeholder card. Type is irrelevant for the placeholder render path; we use
       // 'custom' so type-aware code paths gracefully ignore it (no IRS limits, no slider).
       var titleByAct={retirement:'Choose a retirement vehicle',edu:'Choose an education vehicle',rollover:'Choose a rollover destination',growth:'Choose a growth vehicle'};
@@ -49781,7 +49827,8 @@ function cplanSave(){
   // the partner via shared_card_grants are filtered.
   var cleanAllocs=CPLAN.allocations.filter(function(a){
     return !(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint');
-  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',addressesIssueId:a.addressesIssueId||undefined,goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,
+  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',addressesIssueId:a.addressesIssueId||undefined,goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,_liteSeededAmt:(a._liteSeededAmt!=null?a._liteSeededAmt:undefined),_autoResolvedFromPlaceholder:a._autoResolvedFromPlaceholder===true,
+  // _liteSeededAmt: the Core auto-seed's stamped amount (distinguishes a seeded default from a user-nudged slider so re-seeding never clobbers an edit). _autoResolvedFromPlaceholder: the retirement chooser was auto-resolved to a real vehicle in Core.
   // _userMadePersonal: sticky pin so an education card the user explicitly made personal is NOT re-jointified by the
   // _cpEduDefaultJoint auto-default on the next render/reload/regen. MUST be in this allowlist serializer or the pin is
   // dropped on every save and privatization silently reverts. Loan tracking fields — persisted so the IBC continuation card state
