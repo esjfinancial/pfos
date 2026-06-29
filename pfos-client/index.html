@@ -4638,12 +4638,12 @@ function _cpHouseholdEF(){
   }
   return {bal:Math.round(bal),target:Math.round(tgt)};
 }
-// Household EDUCATION model (owner decision): a child's education (529/college) is a SHARED goal, so an education card
-// defaults to a JOINT household card for any couple WITH children — in EVERY household type (joint|hybrid|separate) and
-// EVERY tier — switchable to personal via "↶ Make personal". UNLIKE the EF model this is LIVE (NOT gated behind
-// spouseVisibility): the owner directed it on regardless of tier/household, and the Make-joint mechanism it reuses is
-// already live. Keys off _householdType + _coupleLink (set SYNCHRONOUSLY in _cpEnsurePlanLoaded) — NOT _partner (async)
-// — plus children, so it's correct at the synchronous render chokepoint. Childless couples + individuals stay self.
+// Household EDUCATION model (owner decision): a child's education (529/college) is a shared-OR-personal choice. For a
+// couple WITH children the education card PROMPTS the user to pick joint (a shared household goal w/ a per-spouse
+// dual-slider) or personal — in EVERY household type (joint|hybrid|separate) and EVERY tier — rather than silently
+// defaulting either way. Once chosen it's switchable both ways. LIVE (not flag-gated). _cpEduHouseholdJoint() = "this is
+// a couple with kids" → decides WHEN to show the prompt. Keys off _householdType + _coupleLink (set SYNCHRONOUSLY in
+// _cpEnsurePlanLoaded) — NOT _partner (async) — plus children, so it's correct at the synchronous render chokepoint.
 function _cpEduHouseholdJoint(){
   if(typeof CPLAN==='undefined'||!CPLAN)return false;
   var h=CPLAN._householdType||'individual';
@@ -4651,15 +4651,12 @@ function _cpEduHouseholdJoint(){
   if(!CPLAN._coupleLink&&!(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name)))return false;
   return !!(CPLAN.children&&CPLAN.children.length>0);
 }
-// Universal education default-to-joint pass. Runs on EVERY render for EVERY plan mode (DIY/AI/advisory) — called from
-// _cpRenderPlanV2 UNCONDITIONALLY (the flag-stager _cpSyncFlagsToUnassigned is !hasAdvisor-gated, so advisory/AI plans
-// would be missed). Idempotent. Two steps: (1) re-type education-named 'custom' cards to 'edu' (mirror of the AI-path
-// "Fix PP7" so DIY goal-staged education is typed consistently on all paths); (2) for a couple-with-children, promote
-// edu cards to owner='joint' + seed a 50/50 split, leaving them claimable by syncJointCards. Skips cards the user
-// explicitly privatized (sticky _userMadePersonal) and partner-owned cards (_sharedOwnerClientId != me).
-function _cpEduDefaultJoint(){
+// Universal education re-type: education-named 'custom' cards → type='edu' (mirror of the AI-path "Fix PP7", which only
+// runs inside _cpConvertAIRecs) so DIY goal-staged education is typed consistently on every path. Called UNCONDITIONALLY
+// from _cpRenderPlanV2 (covers DIY/AI/advisory). Idempotent. Does NOT set ownership — the user is PROMPTED to choose
+// joint vs personal on the card itself (see the ownership prompt in _cpBuildCard); there is no silent default.
+function _cpEduNormalizeType(){
   if(typeof CPLAN==='undefined'||!CPLAN||!Array.isArray(CPLAN.allocations))return;
-  // (1) Universal education re-type (mirror of "Fix PP7" which only runs on the AI path inside _cpConvertAIRecs).
   CPLAN.allocations.forEach(function(a){
     if(!a||!a.customName||a.type==='edu')return;
     var nm=String(a.customName).toLowerCase();
@@ -4671,18 +4668,16 @@ function _cpEduDefaultJoint(){
       else if(!a.eduVehicle)a.eduVehicle='529';
     }
   });
-  // (2) Couples-with-children: default education to a shared joint card (in-memory; persists/syncs on the next save).
-  if(!(typeof _cpEduHouseholdJoint==='function'&&_cpEduHouseholdJoint()))return;
-  var _meId=(typeof APP!=='undefined'&&APP)?APP.currentClientId:null;
-  CPLAN.allocations.forEach(function(a){
-    if(!a||a.type!=='edu')return;
-    if(a._userMadePersonal)return;                                   // sticky: user privatized it → never re-jointify
-    if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==_meId)return; // partner owns this shared card
-    if(a.owner!=='self'&&a.owner!=='personal'&&a.owner)return;        // already joint/spouse
-    a.owner='joint';
-    if(!a._sharedId&&a._sharedOwnerClientId==null)a._sharedOwnerClientId=null;   // claimable by syncJointCards
-    if(a.amountSelf==null||a.amountSpouse==null){ var _ae=parseFloat(a.amount)||0; a.amountSelf=Math.round(_ae/2); a.amountSpouse=Math.round((_ae-a.amountSelf)*100)/100; }
-  });
+}
+// "Just mine" choice on the education ownership prompt — record that the user chose PERSONAL (so the prompt doesn't keep
+// asking) and persist it. Reuses the _userMadePersonal pin (same field the "↶ Make personal" revert sets). Switchable
+// back via "💑 Make it joint". Edu-only.
+function _cpEduKeepPersonal(i){
+  var a=CPLAN.allocations[i];if(!a||a.type!=='edu')return;
+  a._userMadePersonal=true;
+  if(typeof _cpMarkModified==='function')_cpMarkModified();
+  if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  if(typeof cplanSave==='function')cplanSave();
 }
 // Lite blocks IUL/WL/annuities (Planning-tier vehicles, see _cpLiteVehicleAllow). Strip those names out of any
 // "(Roth, IRA, IUL, and more)"-style vehicle list in copy so lite NEVER names a vehicle the tier hides. Lite-only
@@ -32858,10 +32853,10 @@ function _cpConvertAIRecs(aiData){
   var _preservedShared=(CPLAN.allocations||[]).filter(function(a){
     return a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId;
   });
-  // Sticky-personal across AI regeneration: if the user had explicitly made their education card PERSONAL, that intent
-  // must survive a regenerate (which clears + rebuilds from the fresh AI payload). We can't map old→new cards (the AI
-  // emits fresh ones), so carry the intent forward — re-pin the new education cards as personal below — instead of
-  // re-jointifying them. Without this, _cpEduDefaultJoint would silently re-join the user's privatized education.
+  // Sticky-personal across AI regeneration: if the user had explicitly chosen PERSONAL for their education card, that
+  // choice must survive a regenerate (which clears + rebuilds from the fresh AI payload). We can't map old→new cards
+  // (the AI emits fresh ones), so carry the choice forward — re-pin the new education cards as personal below — so they
+  // render as a personal card rather than re-showing the joint-vs-personal ownership prompt.
   var _hadPersonalEdu=(CPLAN.allocations||[]).some(function(a){ return a&&a.type==='edu'&&a._userMadePersonal===true; });
   CPLAN.allocations=[];
   var brPct3=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15);var pool=Math.round(CPLAN.surplus*(1-brPct3/100));
@@ -36708,9 +36703,9 @@ function _cpRenderPlanV2(){
     if(typeof _cpSyncFlagsToUnassigned==='function')_cpSyncFlagsToUnassigned();
     if(typeof _cpLiteAutoSeed==='function')_cpLiteAutoSeed();   // lite (Core): seed starting amounts so the plan funds debt/EF out of the box (once; never overwrites)
   }
-  // Education default-to-joint — UNCONDITIONAL (every plan mode incl. advisory/AI; the stager above is !hasAdvisor-gated
-  // and would miss them). Idempotent + display-only here (persists/syncs on the next save). Sticky-personal respected.
-  if(typeof _cpEduDefaultJoint==='function')_cpEduDefaultJoint();
+  // Education re-type — UNCONDITIONAL (every plan mode incl. advisory/AI; the stager above is !hasAdvisor-gated and
+  // would miss them). Idempotent. Ownership (joint vs personal) is the user's PROMPTED choice on the card, not a default.
+  if(typeof _cpEduNormalizeType==='function')_cpEduNormalizeType();
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&!(a&&a._completed&&_cpIsActionOnly(a));});
   // M5.2b — canonical priority order for the unassigned list (dark-launched: PFOS_FLAGS.priorityEngine
   // OFF = today's detector push-order, byte-identical). Ranks flag-sourced cards by engine-exact priority;
@@ -38015,10 +38010,21 @@ function _cpBuildCard(a,idx,isUnassigned){
   // to other paths.
   var _aOwnForBtns=a.owner||'self';
   var _aOwnIsSelf=(_aOwnForBtns==='self'||_aOwnForBtns==='personal');
-  // Ownership controls. Hybrid: full set (Make joint for any eligible type + Share-with-spouse) — unchanged. Joint +
-  // separate: surface ONLY the "Make joint" button, and ONLY for education (the one type that can be a shared household
-  // goal there) so the joint↔personal switch works in every household type without exposing other types or the grant.
-  if((( _hh==='hybrid')||((_hh==='joint'||_hh==='separate')&&a.type==='edu'))&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
+  // Ownership controls (self-owned cards). For EDUCATION in a couple-with-children that hasn't chosen yet, this is an
+  // explicit PROMPT — joint (shared household goal) vs personal — instead of a silent default (owner decision). Once
+  // chosen (joint, or _userMadePersonal), it falls through to the normal control set. Non-edu hybrid cards are unchanged.
+  var _eduPrompt=(a.type==='edu'&&_aOwnIsSelf&&!a._userMadePersonal&&typeof _cpEduHouseholdJoint==='function'&&_cpEduHouseholdJoint());
+  if(_eduPrompt){
+    var _epn=(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name))||'your partner';
+    h+='<div style="margin-top:8px;padding:10px 12px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.22);border-radius:5px">';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.92);margin-bottom:8px;line-height:1.5">🎓 Is this a <strong>shared</strong> education goal with '+esc(_epn)+', or just yours? You can change this anytime.</div>';
+    h+='<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:6px 13px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.45);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em">💑 Shared with '+esc(_epn)+'</button>';
+    h+='<button onclick="_cpEduKeepPersonal('+idx+')" style="padding:6px 13px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em">Just mine</button>';
+    h+='</div></div>';
+  } else if((( _hh==='hybrid')||((_hh==='joint'||_hh==='separate')&&a.type==='edu'))&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
+    // Education the user already chose to keep personal still offers a quiet "Make joint" (re-share); other eligible
+    // hybrid types keep the full set. Joint/separate only surface the Make-joint button for education (no grant leak).
     h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">';
     if(_jointEligible_isType){
       h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Make joint</button>';

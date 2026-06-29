@@ -20080,7 +20080,18 @@ function _cpBuildCard(a,idx,isUnassigned){
   var _aOwnForBtns=a.owner||'self';
   var _aOwnIsSelf=(_aOwnForBtns==='self'||_aOwnForBtns==='personal');
   // §3 mirror: joint/separate surface ONLY the "Make joint" button, and ONLY for education. Share-with-spouse (grant) stays hybrid-only.
-  if((( _hh==='hybrid')||((_hh==='joint'||_hh==='separate')&&a.type==='edu'))&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
+  // §3 mirror: education ownership PROMPT (joint vs personal) for a couple-with-children that hasn't chosen; else the
+  // normal control set. (Advisor has no couple-sync — this is render parity.)
+  var _eduPrompt=(a.type==='edu'&&_aOwnIsSelf&&!a._userMadePersonal&&typeof _cpEduHouseholdJoint==='function'&&_cpEduHouseholdJoint());
+  if(_eduPrompt){
+    var _epn=(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name))||'your partner';
+    h+='<div style="margin-top:8px;padding:10px 12px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.22);border-radius:5px">';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.92);margin-bottom:8px;line-height:1.5">🎓 Is this a <strong>shared</strong> education goal with '+esc(_epn)+', or just yours? You can change this anytime.</div>';
+    h+='<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:6px 13px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.45);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em">💑 Shared with '+esc(_epn)+'</button>';
+    h+='<button onclick="_cpEduKeepPersonal('+idx+')" style="padding:6px 13px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em">Just mine</button>';
+    h+='</div></div>';
+  } else if((( _hh==='hybrid')||((_hh==='joint'||_hh==='separate')&&a.type==='edu'))&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
     h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">';
     if(_jointEligible_isType){
       h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Make joint</button>';
@@ -23382,10 +23393,9 @@ function _cpDismissStateCBanner(){
 }
 
 
-// Household EDUCATION model (§3 mirror of pfos-client): a child's education is a SHARED goal, so an education card
-// defaults to a JOINT household card for any couple WITH children, in every household type, switchable via "Make
-// personal". LIVE (not flag-gated). Advisor twin has NO couple-sync (syncJointCards) — this is render/persist parity
-// only; cross-partner delivery happens on the client side. See pfos-client for the canonical comments.
+// Household EDUCATION model (§3 mirror of pfos-client): a child's education is a shared-OR-personal choice, so for a
+// couple WITH children the education card PROMPTS joint vs personal (not a silent default), switchable both ways. LIVE
+// (not flag-gated). Advisor twin has NO couple-sync — render/persist parity only. See pfos-client for canonical comments.
 function _cpEduHouseholdJoint(){
   if(typeof CPLAN==='undefined'||!CPLAN)return false;
   var h=CPLAN._householdType||'individual';
@@ -23393,9 +23403,8 @@ function _cpEduHouseholdJoint(){
   if(!CPLAN._coupleLink&&!(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name)))return false;
   return !!(CPLAN.children&&CPLAN.children.length>0);
 }
-function _cpEduDefaultJoint(){
+function _cpEduNormalizeType(){
   if(typeof CPLAN==='undefined'||!CPLAN||!Array.isArray(CPLAN.allocations))return;
-  // (1) Universal education re-type (the client's "Fix PP7" runs only on the AI path; mirror it here for all paths).
   CPLAN.allocations.forEach(function(a){
     if(!a||!a.customName||a.type==='edu')return;
     var nm=String(a.customName).toLowerCase();
@@ -23407,18 +23416,13 @@ function _cpEduDefaultJoint(){
       else if(!a.eduVehicle)a.eduVehicle='529';
     }
   });
-  // (2) Couples-with-children: default education to a shared joint card. Idempotent; respects sticky-personal.
-  if(!(typeof _cpEduHouseholdJoint==='function'&&_cpEduHouseholdJoint()))return;
-  var _meId=(typeof APP!=='undefined'&&APP)?APP.currentClientId:null;
-  CPLAN.allocations.forEach(function(a){
-    if(!a||a.type!=='edu')return;
-    if(a._userMadePersonal)return;
-    if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==_meId)return;
-    if(a.owner!=='self'&&a.owner!=='personal'&&a.owner)return;
-    a.owner='joint';
-    if(!a._sharedId&&a._sharedOwnerClientId==null)a._sharedOwnerClientId=null;
-    if(a.amountSelf==null||a.amountSpouse==null){ var _ae=parseFloat(a.amount)||0; a.amountSelf=Math.round(_ae/2); a.amountSpouse=Math.round((_ae-a.amountSelf)*100)/100; }
-  });
+}
+function _cpEduKeepPersonal(i){
+  var a=CPLAN.allocations[i];if(!a||a.type!=='edu')return;
+  a._userMadePersonal=true;
+  if(typeof _cpMarkModified==='function')_cpMarkModified();
+  if(typeof _cpRenderPlanFull==='function')_cpRenderPlanFull(); else if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  if(typeof cplanSave==='function')cplanSave();
 }
 function _cpConvertToJoint(i){
   var a=CPLAN.allocations[i];if(!a)return;
@@ -25086,7 +25090,7 @@ function _cpRenderPlanFull(){
   }
   // Education default-to-joint — UNCONDITIONAL (every plan mode incl. AI), §3 mirror of pfos-client. Idempotent;
   // respects sticky-personal. Advisor has no couple-sync, so this is render/persist parity only.
-  if(typeof _cpEduDefaultJoint==='function')_cpEduDefaultJoint();
+  if(typeof _cpEduNormalizeType==='function')_cpEduNormalizeType();
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&_cpAllocInTab(a);});
   // M5.2b — canonical priority order for the unassigned list (dark-launched: PFOS_FLAGS.priorityEngine
   // OFF = today's detector push-order, byte-identical). Ranks the flag-sourced cards by engine-exact
