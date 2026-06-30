@@ -5484,6 +5484,7 @@ async function saveRecommendation(){
     }
     if(error){ showModalErr('recModalErr', error.message); setBtnLoading('saveRecBtn',false,'Save Recommendation'); return; }
     closeModal('recommendationModal');
+    _advShowToast('✓ Recommendation '+(editId?'updated':'saved'));   // success feedback — the error path shows showModalErr, but success was silent (modal just closed)
     await loadRecommendations(APP.currentClientId);
     if(APP._clientFD)renderProfileRedFlags(APP._clientFD);
   } catch(e){ showModalErr('recModalErr', e.message); }
@@ -6129,7 +6130,7 @@ function openPFOSToSection(section,stepOrTab){
   },800);
 }
 async function saveClientData(){
-  if(!pfosClientContext){ _advShowToast('No client selected.','warning'); return; }
+  if(!pfosClientContext){ _advShowToast('No client selected.','warning'); return false; }
   showSaveIndicator('saving');
   try{
     var stateData = _lastPfosState.state || {};
@@ -6151,7 +6152,8 @@ async function saveClientData(){
     autoSaveSnapshot(_scClientId, calcs);
     showSaveIndicator('saved');
     var idx=APP.myClients.findIndex(c=>c.id===_scClientId); if(idx>=0) APP.myClients[idx].last_review_date=new Date().toISOString().split('T')[0];
-  }catch(e){ console.error(e); showSaveIndicator(null); _advShowToast('Save failed: '+e.message,'error'); }
+    return true;
+  }catch(e){ console.error(e); showSaveIndicator(null); _advShowToast('Save failed: '+e.message,'error'); return false; }
 }
 async function generateAndSaveReport(){
   if(!pfosClientContext) return;
@@ -13988,13 +13990,13 @@ function _portalShowSnapshotSetup(){
   h+='<div style="font-size:12px;color:var(--mu);margin-top:3px">'+(billsPaid.length>0?'Auto-estimated from your bills: '+billsPaid.map(function(b){return esc(b.name);}).join(', '):'Enter bills you\'ve already paid this month')+'</div></div>';
   h+='</div>';
   h+='<div style="display:flex;gap:10px;margin-top:14px"><button onclick="closeModal(\'portalSnapshotModal\')" style="flex:1;padding:10px;background:transparent;border:1px solid var(--bd);color:var(--mu);font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:42px">Cancel</button>';
-  h+='<button onclick="_portalSaveSnapshot()" style="flex:2;padding:10px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:42px">Save Starting Point</button></div>';
+  h+='<button id="portalSnapSaveBtn" onclick="_portalSaveSnapshot()" style="flex:2;padding:10px;background:linear-gradient(135deg,#0044BF,#5B9BFF);border:none;color:#fff;font-family:var(--fh);font-size:13px;font-weight:700;border-radius:4px;cursor:pointer;min-height:42px">Save Starting Point</button></div>';
   h+='</div>';
   el.innerHTML=h;
   openModal('portalSnapshotModal');
 }
 
-function _portalSaveSnapshot(){
+async function _portalSaveSnapshot(){
   var pf=function(v){return parseFloat((v||'').toString().replace(/[^0-9.\-]/g,''))||0;};
   var snap={
     setupDate:new Date().toISOString(),
@@ -14017,16 +14019,30 @@ function _portalSaveSnapshot(){
     if(!APP._currentClientFd.S._touched)APP._currentClientFd.S._touched={};
     APP._currentClientFd.S._touched.snapshot=true;
   }
-  // Post canonical write to pfos-main
+  // Push to the engine (pfos-main) so its live S.snapshot + pulse view recompute this session.
   try{
     var frame=getPFOSFrame();
     if(frame&&frame.contentWindow){
       frame.contentWindow.postMessage({type:'PFOS_SNAPSHOT_SET',snapshot:snap},'https://pfos.esjfinancial.com');
     }
   }catch(e){console.warn('Portal snapshot postMessage:',e);}
-  closeModal('portalSnapshotModal');
-  if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
-  if(typeof _clientRenderSpendPulse==='function'){try{_clientRenderSpendPulse();}catch(e){}}
+  // Durable save WITH feedback — close only on a confirmed Supabase write; on failure keep the modal
+  // open so the advisor's calibration isn't silently lost (was: closed regardless, no feedback).
+  // saveClientData persists _lastPfosState (which now carries the snapshot) and is household-safe
+  // (V2-joint de-merge). §3 mirror of the pfos-client #4 fix.
+  var _btn=document.getElementById('portalSnapSaveBtn'), _btnLabel=_btn?_btn.textContent:'';
+  if(_btn){_btn.disabled=true;_btn.textContent='Saving…';_btn.style.opacity='0.7';_btn.style.cursor='wait';}
+  var ok=false;
+  try{ ok=await saveClientData(); }catch(e){ ok=false; }
+  if(ok){
+    if(typeof _advShowToast==='function')_advShowToast('✓ Starting point saved');
+    closeModal('portalSnapshotModal');
+    if(typeof renderSpendingAnalysis==='function')renderSpendingAnalysis();
+    if(typeof _clientRenderSpendPulse==='function'){try{_clientRenderSpendPulse();}catch(e){}}
+  } else {
+    // saveClientData already surfaced an error toast; keep the modal open + restore the button for retry.
+    if(_btn){_btn.disabled=false;_btn.textContent=_btnLabel||'Save Starting Point';_btn.style.opacity='';_btn.style.cursor='';}
+  }
 }
 
 function _portalEditEntry(entryId){
