@@ -17,7 +17,7 @@
 <noscript><link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700;800&display=swap" rel="stylesheet"></noscript>
 </head>
 <body>
-<script src="/pfos-shared.v5.js"></script>
+<script src="/pfos-shared.v6.js"></script>
 <script>
 (function(){
   var d = document.documentElement;
@@ -3024,7 +3024,7 @@ function _syncPlanToMain(){
     // Phase D multi-partner: include owner per allocation so pfos-main can render
     // owner-aware projections (currently it falls back to user's retirement age, but
     // the owner field travels through for future per-partner projection rendering).
-    allocations:CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target,owner:a.owner||'self'};}),
+    allocations:CPLAN.allocations.map(function(a){return{type:a.type,amount:a.amount,customName:a.customName,_completed:a._completed,_linkedId:a._linkedId,phase:a.phase,target:a.target,owner:a.owner||'self',_isPlaceholder:a._isPlaceholder,_chooserAction:a._chooserAction};}),// retain chooser identity so unresolved "Choose a … vehicle" prompts don't orphan into permanent $0 custom cards on reload (mirror of pfos-client ~5693)
     sim:null,
     tracking:{},
     calendar:{},
@@ -3816,6 +3816,12 @@ function healthScoreBadge(score){
   return '<span style="font-family:var(--fh);font-size:11px;font-weight:700;color:'+col+';background:'+col+'14;border:1px solid '+col+'40;padding:2px 7px;border-radius:10px">'+score+'/10</span>';
 }
 function computeHealthScore(scores){
+  // M5.7b — single-source collapse (dark: healthV2). ON → the canonical PFOSHealth.score ('mean' averager =
+  // this exact >0-mean rollup); this advisor-roster surface has no rec/goal data → newCats empty → byte-identical.
+  // OFF → the original inline averager (verbatim).
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.healthV2&&typeof PFOSHealth!=='undefined'&&PFOSHealth.score){
+    return scores?PFOSHealth.score({cfScore:scores.cfScore,protScore:scores.protScore,growScore:scores.growScore,effScore:scores.effScore,averager:'mean',newCats:{}}):null;
+  }
   if(!scores) return null;
   var keys = ['cfScore','protScore','growScore','effScore'];
   var vals = keys.map(function(k){ return parseFloat(scores[k])||0; }).filter(function(v){ return v>0; });
@@ -3845,7 +3851,7 @@ function computeEngagementScore(client, recs){
   score+=statusPts; factors.push({label:'Status ('+st+')',pts:statusPts,max:2});
   // 4. Recommendation compliance (0-2)
   var allRecs=(recs||[]).filter(function(r){return r.status!=='dismissed';});
-  var implRecs=allRecs.filter(function(r){return r.status==='implemented';});
+  var implRecs=allRecs.filter(function(r){return r.status==='implemented'||r.status==='active'||r.status==='completed';});
   var compliancePts=0;
   if(allRecs.length>0){
     compliancePts=Math.round(implRecs.length/allRecs.length*2*10)/10;
@@ -4065,7 +4071,7 @@ CREATE TABLE IF NOT EXISTS advisor_recommendations (
   section        TEXT,
   recommendation TEXT,
   priority       TEXT DEFAULT 'medium' CHECK (priority IN ('high','medium','low')),
-  status         TEXT DEFAULT 'drafted' CHECK (status IN ('pending','in_progress','completed','dismissed','drafted','proposed','agreed','submitted','implemented','active')),
+  status         TEXT DEFAULT 'pending' CHECK (status IN ('pending','in_progress','completed','dismissed')),
   is_locked      BOOLEAN DEFAULT FALSE,
   created_by     UUID REFERENCES users(id),
   created_at     TIMESTAMPTZ DEFAULT NOW(),
@@ -4400,15 +4406,17 @@ async function _saveImplLog(recId, action, changedBy, calcsBefore){
 async function advisorMarkImplemented(recId){
   try{
     var calcsBefore = (_lastPfosState&&_lastPfosState.calcs)?_lastPfosState.calcs:null;
+    // 'completed' is the live advisor_recommendations.status CHECK value ('implemented' is rejected); the
+    // implementation_log keeps its own action vocab ('implemented'/'reverted'), unchanged.
     await db.from('advisor_recommendations')
-      .update({status:'implemented', updated_at:new Date().toISOString()})
+      .update({status:'completed', updated_at:new Date().toISOString()})
       .eq('id', recId);
     await _saveImplLog(recId,'implemented','advisor',calcsBefore);
     // Create 30-day follow-up reminder (Phase 6)
     createFollowUpReminder(recId, APP.currentClientId, 30);
     // Update local APP_RECS cache
     var idx = APP_RECS.findIndex(function(r){ return r.id===recId; });
-    if(idx>=0) APP_RECS[idx].status='implemented';
+    if(idx>=0) APP_RECS[idx].status='completed';
     renderRecommendations();
     renderEngagementScore(APP.currentClient, APP_RECS);
     // Smart scheduling: suggest review date after implementation
@@ -5205,8 +5213,8 @@ function generateMeetingAgenda(){
   var name=client.name||((client.first_name||'')+' '+(client.last_name||'')).trim()||'Client';
   var today=new Date().toLocaleDateString('en-US',{weekday:'long',month:'long',day:'numeric',year:'numeric'});
   var fd=(_lastPfosState&&_lastPfosState.calcs)?_lastPfosState.calcs:{};
-  var openRecs=(APP_RECS||[]).filter(function(r){return r.status!=='implemented'&&r.status!=='dismissed';});
-  var implRecs=(APP_RECS||[]).filter(function(r){return r.status==='implemented';});
+  var openRecs=(APP_RECS||[]).filter(function(r){return r.status!=='implemented'&&r.status!=='dismissed'&&r.status!=='completed'&&r.status!=='active';});
+  var implRecs=(APP_RECS||[]).filter(function(r){return r.status==='implemented'||r.status==='active'||r.status==='completed';});
 
   var h='';
   // Section 1: Header
@@ -5457,7 +5465,8 @@ async function saveRecommendation(){
     updated_at: new Date().toISOString()
   };
   // Link to red flag if created from flag template
-  if(APP._pendingFlagId){data.flag_id=APP._pendingFlagId;APP._pendingFlagId=null;APP._pendingFlagLabel=null;}
+  // The issue link (the proper addresses_issue_id column) lands in M5.5 U3; flag_id is not a live column.
+  if(APP._pendingFlagId){APP._pendingFlagId=null;APP._pendingFlagLabel=null;}
   try {
     var error;
     if(editId){
@@ -5539,7 +5548,7 @@ function renderRecommendations(){
     // Stale: created >60 days ago and still drafted/proposed/pending
     var staleCutoff = new Date(); staleCutoff.setDate(staleCutoff.getDate()-60);
     var isStale = new Date(r.created_at)<staleCutoff
-      && ['drafted','proposed','pending','agreed'].indexOf(r.status)>=0;
+      && r.status==='pending';
     var staleBadge = isStale
       ? '<span style="font-family:var(--fh);font-size:11px;font-weight:700;padding:2px 6px;border-radius:2px;color:var(--or);background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.25)">⚠ STALE</span>'
       : '';
@@ -6314,7 +6323,7 @@ async function generateProgressReport(clientId){
       {label:'Net Worth',     curr:calcs.netWorth||0,     prev:firstSnap?firstSnap.net_worth:null,   fmt:fmtK},
       {label:'Monthly Income',curr:calcs.inc||0,          prev:firstSnap?firstSnap.income:null,      fmt:fmt},
       {label:'Total Debt',    curr:calcs.totalDebt||0,    prev:firstSnap?firstSnap.total_debt:null,  fmt:fmtK, invert:true},
-      {label:'Cash Flow Score',curr:scores.cfScore||0,   prev:firstSnap?firstSnap.cf_score:null,    fmt:function(v){return (Math.round(v*10)/10)+'';}},
+      {label:'Cash Flow Score',curr:(calcs.cfScore!=null?calcs.cfScore:scores.cfScore)||0,   prev:firstSnap?firstSnap.cf_score:null,    fmt:function(v){return (Math.round(v*10)/10)+'';}},
     ];
     metrics.forEach(function(m){
       var changeDir = m.invert ? (m.prev!==null&&m.curr<m.prev) : (m.prev!==null&&m.curr>m.prev);
@@ -6328,12 +6337,16 @@ async function generateProgressReport(clientId){
     html += '</div></div>';
 
     // ── Scores ──
-    var scoreKeys = Object.keys(scoreMap).filter(function(k){return scores[k]!==undefined;});
+    // Read the canonical engine calcs first; fall back to the stale `scores` column only if calcs lacks the key
+    // (CLAUDE.md §4 — mirrors pfos-client:6092). A product/just-saved client with an empty scores column otherwise
+    // rendered a 0 / blank panel even though financial_data.calcs carries the scores.
+    var _getScore=function(k){return (calcs&&calcs[k]!=null)?calcs[k]:scores[k];};
+    var scoreKeys = Object.keys(scoreMap).filter(function(k){return _getScore(k)!==undefined&&_getScore(k)!==null;});
     if(scoreKeys.length){
       html += '<div style="margin-bottom:22px"><div class="slbl" style="margin-bottom:10px">Financial Scores</div>';
       html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px">';
       scoreKeys.forEach(function(k){
-        var v = scores[k]||0;
+        var v = _getScore(k)||0;
         var col = v>=7?'var(--gr)':v>=5?'var(--yl)':'var(--rd)';
         html+='<div style="background:rgba(0,0,0,.15);border:1px solid var(--bd);border-radius:2px;padding:12px;text-align:center">'
           +'<div style="font-size:11px;color:var(--mu);margin-bottom:6px">'+scoreMap[k]+'</div>'
@@ -7198,7 +7211,7 @@ window.addEventListener('message', async function(e){
             section:        r.section       || 'general',
             priority:       r.priority      || 'medium',
             recommendation: r.recommendation|| '',
-            status:         (['pending','in_progress','completed','dismissed','drafted','proposed','agreed','submitted','implemented','active'].indexOf(r.status)>=0 ? r.status : 'drafted'),
+            status:         (window.PFOSRecs ? PFOSRecs.normalizeStatus(r.status) : 'pending'),  // fold the DE pipeline labels onto the live 4-value CHECK
             created_at:     r.createdAt     || new Date().toISOString(),
             updated_at:     new Date().toISOString()
           };
@@ -7921,8 +7934,8 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
   if(!exp&&rawS.expData)Object.keys(rawS.expData).forEach(function(k){exp+=(parseFloat((rawS.expData[k]||{}).amount)||0);});
   CPLAN.income=inc;CPLAN.expenses=exp;CPLAN.surplus=Math.max(0,inc-exp);
   CPLAN.efTarget=Math.max(exp*3,1);CPLAN.efBal=0;
-  // Prefer the engine's c.efBal (= aCash incl. Plaid linkedCash); fall back to the manual scalar.
-  CPLAN.efBal=(c&&c.efBal!=null)?c.efBal:(rawS.assets?((parseFloat(rawS.assets.checking)||0)+(parseFloat(rawS.assets.savings)||0)):0);
+  // Prefer the engine's c.efBal (= savings + checking over the $5k floor; owner rule). Fallback mirrors it.
+  CPLAN.efBal=(c&&c.efBal!=null)?c.efBal:(rawS.assets?((parseFloat(rawS.assets.savings)||0)+Math.max(0,(parseFloat(rawS.assets.checking)||0)-5000)):0);
   CPLAN.debts=rawS.debts||[];CPLAN.totalDebt=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.balance)||0);},0);
   CPLAN.debtMin=CPLAN.debts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
   CPLAN.age=parseInt(rawS.currentAge)||parseInt(c.age)||35;
@@ -8095,7 +8108,16 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
   _cpEnforce();
   _cpRenderPlan();
 }
+// ── M5.1c — dark-launched (PFOS_FLAGS.issuesDetect OFF -> _cpExtractFlags_LEGACY = byte-identical;
+// ON -> the unified richer detector via _cpExtractRedFlags = PFOSIssues.detect). The only LIVE consumer
+// is the advisor empty-plan "N issues detected" fork-screen (display-only, :11435), which thus adopts the
+// richer card set when the flag flips ON (owner-approved). The dormant bulk-add handlers below are pinned
+// to _cpExtractFlags_LEGACY so their action/index maps stay internally consistent until the M5.9 sweep.
 function _cpExtractFlags(){
+  if(!(window.PFOS_FLAGS&&PFOS_FLAGS.issuesDetect)) return _cpExtractFlags_LEGACY();
+  return _cpExtractRedFlags();
+}
+function _cpExtractFlags_LEGACY(){
   var flags=[];
   var d=CPLAN;
   // Wave 5: pull rawS from saved fd reference for flags that need richer client data
@@ -8152,7 +8174,7 @@ function _cpExtractFlags(){
   else if(!hasRet&&hasExistingRet&&d.age>=25&&d.income>0)
     flags.push({icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle.',type:'opp',action:'retirement'});
   // ── Education funding for kids ──
-  if(d.children.length>0&&!CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;}))
+  if(d.children.length>0&&!CPLAN.allocations.some(function(a){return a.type==='edu';}))   // ANY edu card represents education (§3 mirror) — don't fire "add education" when a College fund exists
     flags.push({icon:'🎓',title:'No education funding for '+d.children.length+' child'+(d.children.length>1?'ren':''),desc:'Tax-advantaged education savings grow significantly with time. Multiple vehicle options available.',type:'opp',action:'edu'});
   // ── Old/orphaned retirement accounts (rollover candidates) + annuity opportunity for eligible profiles ──
   var retAccounts=rawS2.retAccounts||[];
@@ -9016,11 +9038,12 @@ function _cpRenderEFRunway(){
   h+='<div style="font-family:var(--fh);font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">Emergency Fund Runway</div>';
   h+='<div style="font-family:var(--fd);font-size:20px;color:'+col+'">'+months.toFixed(1)+'<span style="font-size:11px;color:var(--mu)"> months</span></div></div>';
   // Bar with 3-mo and 6-mo markers
-  h+='<div style="position:relative;height:10px;background:rgba(0,68,191,.06);border-radius:5px;overflow:visible;margin-bottom:6px">';
+  h+='<div style="position:relative;height:10px;background:rgba(0,68,191,.06);border-radius:5px;overflow:visible;margin-bottom:24px">';   // bug #10 (mirror, §3): clear the 3mo/6mo tick labels so the caption row below doesn't collide
   h+='<div style="height:100%;width:'+Math.min(100,Math.round(efBal/Math.max(target6,1)*100))+'%;background:'+col+';border-radius:5px;transition:width .3s"></div>';
   var mark3=Math.round(target3/Math.max(target6,1)*100);
   h+='<div style="position:absolute;top:-2px;left:'+mark3+'%;width:1px;height:14px;background:rgba(91,155,255,.4)"></div>';
   h+='<div style="position:absolute;top:14px;left:'+mark3+'%;transform:translateX(-50%);font-size:11px;color:#5B9BFF;font-family:var(--fh);white-space:nowrap">3 mo</div>';
+  h+='<div style="position:absolute;top:14px;right:0;font-size:11px;color:var(--mu);font-family:var(--fh);white-space:nowrap">6 mo</div>';   // §3 mirror: label the 6-mo right-edge target
   h+='</div>';
   h+='<div style="display:flex;justify-content:space-between;font-size:11px;color:var(--mu);margin-top:10px">';
   h+='<span>Current: '+fmt(Math.round(efBal))+'</span>';
@@ -10532,12 +10555,17 @@ function _cpRunSimulation(){
     } catch(_pErr){_ibcAllocFallback[idx]=true;}
   });
 
+  // bug #4 (mirror of pfos-client, CLAUDE.md §3): seed the "do nothing" baseline with existing assets + home equity
+  // (STATIC) so its year-0 point equals the plan's net worth — otherwise -debt-only sinks below the plan start, becomes
+  // the chart's bottom axis label, and "current net worth" shows two different numbers (Wealth Trajectory vs chart).
+  var _baseAssetSeed=0; CPLAN.allocations.forEach(function(a,idx){ if(a.type!=='debt'||a._ibcDebtStrategy)_baseAssetSeed+=(_curBalanceByIdx[idx]||0); });
+  var _baseHomeEqSeed=Math.max(0,_homeValue-_mortgageBal);
   for(var yr=0;yr<=years;yr++){
-    // Baseline: idle cash at 0%, ALL debt with min payments only
+    // Baseline: existing assets + home equity held STATIC (do-nothing), idle cash at 0%, ALL debt with min payments only
     var baseCash=CPLAN.surplus*12*yr;
     var baseDebt=CPLAN.totalDebt;
     for(var bdm=0;bdm<yr*12;bdm++){baseDebt=Math.max(0,baseDebt*(1+avgAllRate)-totalDebtMin);if(baseDebt<1)baseDebt=0;}
-    baselineData.push(Math.round(baseCash-baseDebt));
+    baselineData.push(Math.round(_baseAssetSeed+_baseHomeEqSeed+baseCash-baseDebt));
 
     // Plan: each allocation grows with cascade-adjusted amounts.
     // We walk month-by-month so that when an allocation caps (EF/house/custom hits target),
@@ -12175,6 +12203,10 @@ function _portalSpendStatus(viewCtx){
     severity='caution';
     reasons.push('On pace to overspend by $'+overspend.toLocaleString()+' this month.');
   }
+  // Capture month-level severity BEFORE per-category escalation so the card can tell whether the alarm is the
+  // whole month vs only one category (mirrors the client at pfos-client:7027 — avoids an "Over budget" header
+  // over healthy month totals).
+  var monthSeverity=severity;
   // Per-category check
   var bucketMap={}; getL1Cats().forEach(function(c){bucketMap[c.key]=c.label;}); // §1.4 dynamic categories
   var catSpend={};
@@ -12214,7 +12246,7 @@ function _portalSpendStatus(viewCtx){
     }
   });
   return{
-    severity:severity,paceRatio:Math.round(paceRatio*100)/100,
+    severity:severity,monthSeverity:monthSeverity,paceRatio:Math.round(paceRatio*100)/100,
     pctSpent:pctSpent,pctOfMonthGone:pctOfMonthGone,
     moneyIn:moneyIn,moneyOut:Math.round(moneyOut),
     projected:projected,overspend:Math.round(overspend),
@@ -15116,6 +15148,26 @@ function _clientRenderSpendPulse(){
     over:{bg:'rgba(239,68,68,.06)',bd:'rgba(239,68,68,.28)',fg:'var(--rd)',icon:'⚖️',label:'Over budget'}
   };
   var t=theme[status.severity]||theme.ok;
+  // When the alarm is driven by a single category (the month itself is on-track), the header + body + bar must
+  // reflect THAT category — not month totals — else a red "Category over budget" header sits over a green
+  // "18% spent · $5,310 left" body. Mirrors pfos-client _clientRenderSpendPulse (029b7ab) so the two stay in lockstep.
+  var _catDriven=(status.monthSeverity==='ok'&&status.severity!=='ok');
+  var _hdrLabel=_catDriven?(status.severity==='over'?'Category over budget':'Category watch'):t.label;
+  var _barPct=Math.min(100,pctSpent);
+  if(_catDriven&&status.categories&&status.categories.length){
+    var _worst=status.categories.slice().sort(function(a,b){
+      var ao=(a.severity==='over')?1:0,bo=(b.severity==='over')?1:0;
+      if(ao!==bo)return bo-ao;
+      return (b.pct||0)-(a.pct||0);
+    })[0];
+    if(_worst){
+      moneyOut=_worst.spent;moneyIn=_worst.budget;
+      pctSpent=_worst.pct;
+      _barPct=Math.min(100,_worst.pct);
+      leftToSpend=Math.max(0,_worst.budget-_worst.spent);
+      dailyBudget=status.daysLeft>0?Math.round(leftToSpend/status.daysLeft):0;
+    }
+  }
   var barCol=pctSpent>=100?'var(--rd)':pctSpent>90?'var(--rd)':pctSpent>70?'var(--or)':'var(--gr)';
   // Top line — "Day X of Y" + spent / income
   var monthShort=new Date().toLocaleDateString('en-US',{month:'short'});
@@ -15125,20 +15177,20 @@ function _clientRenderSpendPulse(){
   h+='<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">';
   h+='<div style="display:flex;align-items:center;gap:6px">';
   h+='<span style="font-size:13px">'+t.icon+'</span>';
-  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+t.label+'</span>';
+  h+='<span style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+t.fg+'">'+_hdrLabel+'</span>';
   h+='</div>';
   h+='<span style="font-family:var(--fh);font-size:12px;color:var(--mu)">'+monthShort+' · day '+status.dayOfMonth+' of '+status.daysInMonth+'</span>';
   h+='</div>';
   // Numbers row
   h+='<div style="display:flex;justify-content:space-between;align-items:flex-end;margin-bottom:8px;gap:10px">';
   h+='<div><div style="font-family:var(--fd);font-size:22px;color:var(--wh);line-height:1">'+fmt(moneyOut)+' <span style="font-size:13px;color:var(--mu);font-family:var(--fh)">of '+fmt(moneyIn)+'</span></div>';
-  h+='<div style="font-size:12px;color:var(--mu);margin-top:3px">'+pctSpent+'% spent · '+fmt(leftToSpend)+' left ('+fmt(dailyBudget)+'/day)</div></div>';
+  h+='<div style="font-size:12px;color:var(--mu);margin-top:3px">'+pctSpent+'% spent · '+fmt(leftToSpend)+' left'+(status.daysLeft>=3?(' ('+fmt(dailyBudget)+'/day)'):'')+'</div></div>';
   // CTA on the right
   h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;color:'+t.fg+';white-space:nowrap">Open →</div>';
   h+='</div>';
   // Progress bar
   h+='<div style="height:5px;background:rgba(0,68,191,.1);border-radius:3px;overflow:hidden">';
-  h+='<div style="height:100%;width:'+pctSpent+'%;background:'+barCol+';border-radius:3px;transition:width .5s ease"></div>';
+  h+='<div style="height:100%;width:'+_barPct+'%;background:'+barCol+';border-radius:3px;transition:width .5s ease"></div>';
   h+='</div>';
   // Status line — mirrors the banner reason if there's an issue
   if(status.severity!=='ok'&&status.reasons&&status.reasons.length>0){
@@ -18238,7 +18290,10 @@ function _cpSyncFlagsToUnassigned(){
     ibc_audit:'ibc_audit',
     annuity_research:'annuity_research',
     diversify:'diversify',
-    expenses:null // no allocation type; surface as a "review expenses" placeholder via diversify-style action
+    expenses:null, // no allocation type; surface as a "review expenses" placeholder via diversify-style action
+    leaks:null, // M5.2d-1b: list-only (no plan card, like expenses); ranks L3 via _ACTION_LEVEL
+    estate_tax:'estate', // M5.2d-1b: routes to the estate card; ranks L4 (engine-exact) via _ACTION_LEVEL
+    cashflow:null // §3 mirror — informational only (cash-flow deficit isn't a fundable card, like expenses/leaks); arrives via cashflow_spouse strip
   };
   var chooserActions={retirement:1, edu:1, rollover:1, growth:1};
   // Retirement flag is "addressed" by any retirement vehicle in the plan; same idea for edu/rollover.
@@ -18249,6 +18304,31 @@ function _cpSyncFlagsToUnassigned(){
   // keep this aligned with the menu shown in _cpShowFlagMenu's 'growth' config.
   var growthDestTypes=['invest','iul','wl','fixed_annuity','fia','variable_annuity','spia'];
   var flags=_cpExtractRedFlags()||[];
+  // §3 mirror of pfos-client: collapse DUPLICATE / ORPHANED chooser prompts to ONE per action+owner. An orphan is a $0
+  // custom card still named the default prompt whose chooser identity was stripped by the plan-sync serializer (~3027)
+  // on a prior save. Prefer a live placeholder (resolvable). Safe + all-tier: junk system prompts, not user data.
+  (function(){
+    var _titleAct={'Choose a retirement vehicle':'retirement','Choose an investment vehicle':'growth','Choose a growth vehicle':'growth','Choose an education vehicle':'edu','Choose a rollover destination':'rollover'};
+    function _ckey(a){ if(!a)return null; if(a._isPlaceholder&&a._chooserAction)return a._chooserAction+'|'+(a.owner||'self'); if(a.type==='custom'&&(parseFloat(a.amount)||0)===0&&_titleAct[a.customName])return _titleAct[a.customName]+'|'+(a.owner||'self'); return null; }
+    var _hasPh={}; CPLAN.allocations.forEach(function(a){ if(a&&a._isPlaceholder&&a._chooserAction)_hasPh[a._chooserAction+'|'+(a.owner||'self')]=true; });
+    var _seen={};
+    CPLAN.allocations=CPLAN.allocations.filter(function(a){ var k=_ckey(a); if(k===null)return true; var isPh=!!(a._isPlaceholder&&a._chooserAction); if(!isPh&&_hasPh[k])return false; if(_seen[k])return false; _seen[k]=true; return true; });
+  })();
+  // Household EF model (§3 mirror): collapse every EF card to ONE owner='joint' household card for a joint/hybrid couple
+  // (prefer an already-shared card so partners converge; seed a 50/50 split). Skip cards the user made personal
+  // (_userMadePersonal) so a split EF isn't re-collapsed. Separate/single left individual.
+  if(typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint()){
+    var _efCards=(CPLAN.allocations||[]).filter(function(a){return a&&a.type==='ef'&&!a._userMadePersonal;});
+    if(_efCards.length){
+      var _efKeep=null;
+      _efCards.forEach(function(a){ if(!_efKeep||(a._sharedId&&!_efKeep._sharedId))_efKeep=a; });
+      CPLAN.allocations=CPLAN.allocations.filter(function(a){ return !(a&&a.type==='ef'&&!a._userMadePersonal&&a!==_efKeep); });
+      _efKeep.owner='joint';
+      if(!_efKeep._sharedId&&_efKeep._sharedOwnerClientId==null)_efKeep._sharedOwnerClientId=null;
+      if(_efKeep.amountSelf==null||_efKeep.amountSpouse==null){ var _am=parseFloat(_efKeep.amount)||0; _efKeep.amountSelf=Math.round(_am/2); _efKeep.amountSpouse=Math.round((_am-_efKeep.amountSelf)*100)/100; }
+    }
+  }
+  var _seenChooser={};   // §3 mirror of pfos-client: run-local dedup so sibling same-action chooser flags don't duplicate
   flags.forEach(function(f){
     var act=f.action;
     if(!act)return;
@@ -18275,11 +18355,15 @@ function _cpSyncFlagsToUnassigned(){
     var alreadyIn=false;
     if(chooserActions[act]){
       if(act==='retirement') alreadyIn=_ownerAllocSome(function(a){return retTypes.indexOf(a.type)>=0&&a.amount>0;});
-      else if(act==='edu') alreadyIn=_ownerAllocSome(function(a){return a.type==='edu'&&a.amount>0;});
+      else if(act==='edu') alreadyIn=_ownerAllocSome(function(a){return a.type==='edu';});   // ANY edu card represents education → no duplicate chooser (§3 mirror)
       else if(act==='rollover') alreadyIn=_ownerAllocSome(function(a){return rolloverDestTypes.indexOf(a.type)>=0;});
       else if(act==='growth') alreadyIn=_ownerAllocSome(function(a){return growthDestTypes.indexOf(a.type)>=0&&a.amount>0;});
       // Also count an existing placeholder for this same chooser action+owner.
       if(!alreadyIn) alreadyIn=CPLAN.allocations.some(function(a){return a._chooserAction===act&&((a.owner||'self')==='spouse')===_isSpouseFlag;});
+      // Run-local dedup (§3 mirror): sibling flags can share an action within ONE detect() run; the check above
+      // misses them because this run's push hasn't landed yet. One chooser per action+owner per run, any order.
+      var _chKey=act+'|'+(_isSpouseFlag?'spouse':'self');
+      if(!alreadyIn&&_seenChooser[_chKey])alreadyIn=true;
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t=actionOnlyMap[act];
       if(t==null) return;
@@ -18291,7 +18375,7 @@ function _cpSyncFlagsToUnassigned(){
         alreadyIn=_ownerAllocSome(function(a){return a.type===t;});
       }
     } else if(directMap[act]){
-      alreadyIn=_ownerAllocSome(function(a){return a.type===directMap[act];});
+      alreadyIn=(act==='ef'&&typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint())?CPLAN.allocations.some(function(a){return a&&a.type==='ef';}):_ownerAllocSome(function(a){return a.type===directMap[act];});   // §3: household EF self+spouse collapse → any ef card counts as represented
     } else if(act==='401k'){
       alreadyIn=_ownerAllocSome(function(a){return a.type==='401k';});
     }
@@ -18308,7 +18392,24 @@ function _cpSyncFlagsToUnassigned(){
         alreadyIn=CPLAN.partnerSharedCards.some(function(c){return c&&c.type===checkType;});
       }
     }
-    if(alreadyIn)return;
+    if(alreadyIn){
+      // §3 mirror of the client REASON-REFRESH: refresh an already-staged flag-card's reason from the LIVE flag desc
+      // (advisor uses f.desc directly — no lite strip). SAFE: match by THIS flag's title (+ owner scope) and SKIP any
+      // reason carrying an augmentation/template/special marker so those are never wiped or re-accumulated.
+      var _freshReason=f.desc||'';
+      if(_freshReason){
+        CPLAN.allocations.forEach(function(a){
+          if(!a||a.flagTitle!==f.title)return;
+          var _ao=a.owner||'self';
+          if(_isSpouseFlag){if(_ao!=='spouse')return;}else{if(_ao==='spouse')return;}
+          var _r=a.reason||'';
+          if(_r===_freshReason)return;
+          if(_r.indexOf('⚠️')>=0||_r.indexOf('⚙️')>=0||_r.indexOf('{{')>=0||_r.indexOf('household emergency fund')>=0||_r.indexOf('employer match on')>=0)return;
+          a.reason=_freshReason;
+        });
+      }
+      return;
+    }
     // Map flag title to a meaningful card header for protection sub-types.
     // Generic "Protection Review" was misleading since multiple distinct
     // gaps can land here. Specific names mirror the AI version.
@@ -18322,6 +18423,7 @@ function _cpSyncFlagsToUnassigned(){
     // Stage a new card with flag context + appropriate type/markers.
     // owner follows the flag (spouse flags → spouse-owned card).
     var nowFlag={flagTitle:f.title,flagType:f.type,flagIcon:f.icon,flagAction:act,owner:_flagOwner,reason:f.desc||''};
+    if(act==='ef'&&typeof _cpEfHouseholdJoint==='function'&&_cpEfHouseholdJoint())nowFlag.owner='joint';   // §3: EF is a household goal in joint/hybrid → owner 'joint'
     // Allow disability-gap title which is dynamic ('Disability coverage gap: $X/mo')
     if(act==='protection'){
       var _customNm=_protectionTitleMap[f.title];
@@ -18383,12 +18485,22 @@ function _cpSyncFlagsToUnassigned(){
       // 'custom' so type-aware code paths gracefully ignore it (no IRS limits, no slider).
       var titleByAct={retirement:'Choose a retirement vehicle',edu:'Choose an education vehicle',rollover:'Choose a rollover destination',growth:'Choose a growth vehicle'};
       CPLAN.allocations.push(_extend(nowFlag,{type:'custom',amount:0,target:0,phase:0,cascade:'',customName:titleByAct[act]||'Choose a vehicle',_chooserAction:act,_isPlaceholder:true}));
+      _seenChooser[act+'|'+(_isSpouseFlag?'spouse':'self')]=true;   // §3 mirror
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t2=actionOnlyMap[act]; if(t2==null)return;
       CPLAN.allocations.push(_extend(nowFlag,{type:t2,amount:0,target:0,phase:0,cascade:''}));
     } else if(directMap[act]){
       var t3=directMap[act];
-      var tgt=t3==='ef'?Math.round(Math.max(0,(CPLAN.efTarget||0)-(CPLAN.efBal||0))):0;
+      // §3 mirror: a joint household EF card targets the gap to the COMBINED 3-month reserve + carries a household-framed
+      // reason + a 50/50 split (_sharedOwnerClientId:null so the client-side syncJointCards adopts it).
+      var _efIsJoint=(t3==='ef'&&nowFlag.owner==='joint');
+      var _hef=_efIsJoint?_cpHouseholdEF():null;
+      var tgt=t3!=='ef'?0:Math.round(Math.max(0,((_hef?_hef.target:(CPLAN.efTarget||0))-(_hef?_hef.bal:(CPLAN.efBal||0)))));
+      var _efExtra={};
+      if(_efIsJoint){
+        _efExtra={amountSelf:0,amountSpouse:0,_sharedOwnerClientId:null};
+        nowFlag.reason='Your household emergency fund — a shared safety net you both contribute to. '+(_hef.bal>=_hef.target?('You already have '+fmt(_hef.bal)+' of your '+fmt(_hef.target)+' (3-month) target — fully funded.'):('Target '+fmt(_hef.target)+' (3 months of combined expenses); '+fmt(_hef.bal)+' saved so far.'));
+      }
       // A funded HSA (existing payroll contribution) isn't a suggestion to be
       // placed — it's money already flowing — so drop it into Phase 1 rather than
       // the Unassigned column. Check the owner's existing HSA contribution.
@@ -18400,7 +18512,7 @@ function _cpSyncFlagsToUnassigned(){
           if(_hsaCur>0)_autoPhase=1;
         }catch(e){}
       }
-      CPLAN.allocations.push(_extend(nowFlag,{type:t3,amount:0,target:tgt,phase:_autoPhase,cascade:''}));
+      CPLAN.allocations.push(_extend(nowFlag,_extend({type:t3,amount:0,target:tgt,phase:_autoPhase,cascade:''},_efExtra)));
     } else if(act==='401k'){
       CPLAN.allocations.push(_extend(nowFlag,{type:'401k',amount:0,target:0,phase:0,cascade:''}));
     }
@@ -19373,7 +19485,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     ph+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0">';
     ph+='<div style="width:40px;height:40px;border-radius:10px;background:'+_cpHex2Rgba(_chColor,0.15)+';display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+_chIcon+'</div>';
     ph+='<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:15px;font-weight:700;color:var(--wh)">'+_chTitle+'</div>';
-    if(a.reason)ph+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+a.reason+'</div>';
+    if(a.reason)ph+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.5;margin-top:3px">'+a.reason+'</div>';
     ph+='</div></div>';
     ph+='<div style="display:flex;gap:6px;align-items:center">';
     // Default phase by chooser action — retirement/growth go to phase 2,
@@ -19480,8 +19592,17 @@ function _cpBuildCard(a,idx,isUnassigned){
   // Card is still interactive (Remove still works) but the wrapper communicates "this is checked off".
   var _completedStyle=a._completed?';opacity:0.55;filter:saturate(0.7)':'';
   var h='<div id="cpCardWrap'+idx+'" data-alloc-idx="'+idx+'" style="margin-bottom:10px;border-left:4px solid '+color+';background:'+_cpHex2Rgba(color,0.10)+';border-radius:0 6px 6px 0;padding:16px 18px;border-top:1px solid '+_cpHex2Rgba(color,0.18)+';border-right:1px solid '+_cpHex2Rgba(color,0.18)+';border-bottom:1px solid '+_cpHex2Rgba(color,0.18)+';position:relative;overflow:hidden;transition:border-color .2s,box-shadow .2s'+_completedStyle+'">';
-  // Red flag source
-  if(a.flagTitle){h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;padding:7px 10px;border-radius:3px;background:'+(a.flagType==='crit'?'rgba(239,68,68,.08)':'rgba(234,179,8,.05)')+';border:1px solid '+(a.flagType==='crit'?'rgba(239,68,68,.15)':'rgba(234,179,8,.12)')+'"><span style="font-size:13px">'+(a.flagIcon||'⚠️')+'</span><span style="font-size:12px;font-weight:600;color:'+(a.flagType==='crit'?'var(--rd)':'var(--yl)')+'">'+a.flagTitle+'</span></div>';}
+  // Red flag source. §3 mirror of pfos-client: a staged card keeps its original flagTitle/flagType — if the EF is now
+  // fully funded, flip the persisted red "Emergency fund low" header to a calm green "funded" state (no contradiction).
+  if(a.flagTitle){
+    var _efDone=(function(){ if(a.type!=='ef'||a.owner==='spouse')return false; var _h=(a.owner==='joint'&&typeof _cpHouseholdEF==='function')?_cpHouseholdEF():{bal:(parseFloat(CPLAN.efBal)||0),target:(parseFloat(CPLAN.efTarget)||0)}; return _h.target>0&&_h.bal>=_h.target; })();   // §3 mirror: owner- + HOUSEHOLD-aware — a joint EF card is funded vs the COMBINED household balance/target, never off a spouse card
+    var _fBg=_efDone?'rgba(34,197,94,.08)':(a.flagType==='crit'?'rgba(239,68,68,.08)':'rgba(234,179,8,.05)');
+    var _fBd=_efDone?'rgba(34,197,94,.18)':(a.flagType==='crit'?'rgba(239,68,68,.15)':'rgba(234,179,8,.12)');
+    var _fCol=_efDone?'var(--gr)':(a.flagType==='crit'?'var(--rd)':'var(--yl)');
+    var _fIcon=_efDone?'✅':(a.flagIcon||'⚠️');
+    var _fTtl=_efDone?'Emergency fund funded':a.flagTitle;
+    h+='<div style="display:flex;align-items:center;gap:6px;margin-bottom:10px;padding:7px 10px;border-radius:3px;background:'+_fBg+';border:1px solid '+_fBd+'"><span style="font-size:13px">'+_fIcon+'</span><span style="font-size:12px;font-weight:600;color:'+_fCol+'">'+_fTtl+'</span></div>';
+  }
   // Header
   h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:6px">';
   h+='<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:0"><div style="width:40px;height:40px;border-radius:10px;background:'+_cpHex2Rgba(color,0.15)+';display:flex;align-items:center;justify-content:center;font-size:18px;flex-shrink:0">'+icon+'</div><div style="flex:1;min-width:0">';
@@ -19538,9 +19659,9 @@ function _cpBuildCard(a,idx,isUnassigned){
         _liveReason='Capture your full employer 401(k) match first — it\u2019s an immediate guaranteed return. Use the top slider for the match, the bottom slider for additional contributions.';
       }
     }
-    h+='<div id="cpReason'+idx+'" style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+_liveReason+'</div>';
+    h+='<div id="cpReason'+idx+'" style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.5;margin-top:3px">'+_liveReason+'</div>';
   }
-  else{var why=_cpWhy(a.type);if(why)h+='<div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+why+'</div>';}
+  else{var why=_cpWhy(a.type);if(why)h+='<div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.5;margin-top:3px">'+why+'</div>';}
   h+='</div></div>';
   // Amount display + Slider — skip for action-only items (protection, estate)
   var _isActionOnly=_cpIsActionOnly(a);
@@ -19554,7 +19675,8 @@ function _cpBuildCard(a,idx,isUnassigned){
     else if(a.type==='annuity_research')_aoMsg='Action required — research annuity options.';
     else if(a.type==='diversify')_aoMsg='Action required — explore mitigations. No expense to log.';
     else if(a.type==='hsa'&&a._hdhpGated)_aoMsg='Action required — confirm HDHP enrollment, then return to set a contribution amount.';
-    h+='<div style="padding:10px 12px;background:rgba(234,179,8,.06);border:1px solid rgba(234,179,8,.15);border-radius:4px;margin-top:8px;font-size:13px;color:var(--yl);line-height:1.5;display:flex;align-items:center;gap:8px"><span style="font-size:16px">📋</span><span>'+_aoMsg+'</span></div>';
+    // §3 mirror of pfos-client: calm neutral to-do (flag header already conveys severity), readable text color.
+    h+='<div style="padding:10px 12px;background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2);border-radius:4px;margin-top:8px;font-size:13px;color:rgba(226,232,240,.82);line-height:1.5;display:flex;align-items:center;gap:8px"><span style="font-size:16px">📋</span><span>'+_aoMsg+'</span></div>';
   } else {
     // Big-number display = TOTAL (currentContrib + a.amount). a.amount stays as
     // EXTRA in storage. Matches the slider's TOTAL display under extras semantics
@@ -19828,7 +19950,8 @@ function _cpBuildCard(a,idx,isUnassigned){
   // its owner isn't "Shared". This makes the Combined tab behave "like a joint" per
   // spec. Match cards are excluded (they use the match-dual slider instead).
   var _inCombinedTab=(_hh==='hybrid' && typeof _cpTabOfAlloc==='function' && _cpTabOfAlloc(a)==='combined');
-  var _renderDual=((_hh==='hybrid'||_hh==='joint')&&_isJointCard) || (_inCombinedTab && !(a._hasMatch && a._retAccountId));
+  // Separate households get the dual-slider for EDUCATION joint cards only (the one type that can be a shared household goal there) — §3 mirror of pfos-client.
+  var _renderDual=((_hh==='hybrid'||_hh==='joint'||(_hh==='separate'&&a.type==='edu'))&&_isJointCard) || (_inCombinedTab && !(a._hasMatch && a._retAccountId));
   var _renderRequest=(_hh==='hybrid'&&_isPartnerOwnedShared);
   // Match-dual-slider: existing-account cards with employer match get TWO
   // sliders (match-capture + additional contribution) on the same card.
@@ -19954,7 +20077,7 @@ function _cpBuildCard(a,idx,isUnassigned){
     h+='<input type="range" data-cpjointidx="'+idx+'" data-cpjointside="spouse" min="0" max="'+_jointMax+'" step="5" value="'+Math.round(_curSpousePart)+'" oninput="_cpSlideJoint('+idx+',\'spouse\',this.value)" onchange="_cpSlideEnd()" style="flex:1;accent-color:#A855F7;height:6px">';
     h+='<div class="inp-prefix" style="width:90px;flex-shrink:0"><span class="pfx">$</span><input class="inp" type="number" id="cpJointSpouse'+idx+'" value="'+Math.round(_curSpousePart)+'" min="0" max="'+_jointMax+'" step="5" oninput="_cpSlideJoint('+idx+',\'spouse\',this.value)" onchange="_cpSlideEnd()" style="padding-left:22px;min-height:30px;font-size:13px;width:100%"></div>';
     h+='</div>';
-    h+='<div style="font-size:11px;color:var(--mu);text-align:right">Combined: <strong style="color:var(--gr)" id="cpJointTotal'+idx+'">$'+fmt(Math.round(_curSelfPart+_curSpousePart))+'</strong>/mo</div>';
+    h+='<div style="font-size:11px;color:var(--mu);text-align:right">Combined: <strong style="color:var(--gr)" id="cpJointTotal'+idx+'">'+fmt(Math.round(_curSelfPart+_curSpousePart))+'</strong>/mo</div>';   // fmt() already prefixes $ (avoid $$)
     h+='</div>';
   } else if(_renderRequest){
     // Shared non-owned card: slider stages a request rather than applying directly
@@ -20002,15 +20125,29 @@ function _cpBuildCard(a,idx,isUnassigned){
   // to other paths.
   var _aOwnForBtns=a.owner||'self';
   var _aOwnIsSelf=(_aOwnForBtns==='self'||_aOwnForBtns==='personal');
-  if(_hh==='hybrid'&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
+  // §3 mirror: joint/separate surface ONLY the "Make joint" button, and ONLY for education. Share-with-spouse (grant) stays hybrid-only.
+  // §3 mirror: education ownership PROMPT (joint vs personal) for a couple-with-children that hasn't chosen; else the
+  // normal control set. (Advisor has no couple-sync — this is render parity.)
+  var _eduPrompt=(a.type==='edu'&&_aOwnIsSelf&&!a._userMadePersonal&&typeof _cpEduHouseholdJoint==='function'&&_cpEduHouseholdJoint());
+  if(_eduPrompt){
+    var _epn=(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name))||'your partner';
+    h+='<div style="margin-top:8px;padding:10px 12px;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.22);border-radius:5px">';
+    h+='<div style="font-size:12px;color:rgba(226,232,240,.92);margin-bottom:8px;line-height:1.5">🎓 Is this a <strong>shared</strong> education goal with '+esc(_epn)+', or just yours? You can change this anytime.</div>';
+    h+='<div style="display:flex;flex-wrap:wrap;gap:6px">';
+    h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:6px 13px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.14);border:1px solid rgba(34,197,94,.45);color:var(--gr);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em">💑 Shared with '+esc(_epn)+'</button>';
+    h+='<button onclick="_cpEduKeepPersonal('+idx+')" style="padding:6px 13px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:3px;min-height:30px;letter-spacing:.04em">Just mine</button>';
+    h+='</div></div>';
+  } else if((( _hh==='hybrid')||((_hh==='joint'||_hh==='separate')&&a.type==='edu'))&&_aOwnIsSelf&&!_renderDual&&!_renderRequest){
     h+='<div style="margin-top:6px;display:flex;flex-wrap:wrap;gap:6px">';
     if(_jointEligible_isType){
       h+='<button onclick="_cpConvertToJoint('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:rgba(34,197,94,.06);border:1px solid rgba(34,197,94,.3);color:var(--gr);cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Make joint</button>';
     }
-    if(!a._sharedId){
-      h+='<button onclick="_cpShareCardWithPartner('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:transparent;border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Share with spouse</button>';
-    } else {
-      h+='<span style="font-size:11px;color:rgba(168,85,247,.7);align-self:center">💑 Shared with your spouse</span>';
+    if(_hh==='hybrid'){
+      if(!a._sharedId){
+        h+='<button onclick="_cpShareCardWithPartner('+idx+')" style="padding:5px 11px;font-family:var(--fh);font-size:11px;font-weight:700;background:transparent;border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:3px;min-height:28px;letter-spacing:.04em">💑 Share with spouse</button>';
+      } else {
+        h+='<span style="font-size:11px;color:rgba(168,85,247,.7);align-self:center">💑 Shared with your spouse</span>';
+      }
     }
     h+='</div>';
   }
@@ -20374,8 +20511,8 @@ function _cpBuildCard(a,idx,isUnassigned){
     }
     // ── end IBC-specific UI ──
   }
-  // Education vehicle selector
-  if(a.type==='edu'){
+  // Education vehicle selector — only for a household WITH children (bug #3; mirror of pfos-client, CLAUDE.md §3).
+  if(a.type==='edu'&&CPLAN.children&&CPLAN.children.length>0){
     h+='<div style="display:flex;gap:4px;flex-wrap:wrap;margin:6px 0">';
     ['529','coverdell','utma','wl','iul'].forEach(function(v){var sel2=a.eduVehicle===v;h+='<button onclick="CPLAN.allocations['+idx+'].eduVehicle=\''+v+'\';_cpRenderPlanFull()" style="padding:4px 8px;font-family:var(--fh);font-size:11px;font-weight:700;border-radius:2px;cursor:pointer;min-height:28px;border:1px solid '+(sel2?'rgba(6,182,212,.4)':'var(--bd)')+';background:'+(sel2?'rgba(6,182,212,.12)':'transparent')+';color:'+(sel2?'#06B6D4':'var(--mu)')+'">'+CP_EDU_VEH_NM[v]+'</button>';});
     h+='</div>';
@@ -20392,7 +20529,7 @@ function _cpBuildCard(a,idx,isUnassigned){
         _eduPts.push(Math.round(_eBal));
         _costPts.push(Math.round(_baseCost*4*Math.pow(1+_eduInflation,_ey)));
       }
-      var _eMax=Math.max(_projCost,_eduPts[_eduPts.length-1],1);
+      var _eMax=Math.max(_projCost,_eduPts[_eduPts.length-1],1)*1.15;   // bug #9 (mirror, §3): 15% headroom so the top label isn't clipped above the SVG viewBox
       var _eW=340,_eH=100,_ePL=6,_ePR=6,_ePT=6,_ePB=18;
       var _ecW=_eW-_ePL-_ePR,_ecH=_eH-_ePT-_ePB;
       function _ex(i){return _ePL+i/_yrsToCollege*_ecW;}
@@ -20578,7 +20715,8 @@ function _cpBuildCard(a,idx,isUnassigned){
   // irregular income, high-job-risk industries. Persists on CPLAN._efMonthsTarget
   // which feeds CPLAN.efTarget (computed in _cpLoadPlanFromDashboard at line ~31345
   // and in the life-change handler at line ~25284).
-  if(a.type==='ef'){
+  // §3 mirror: EF target picker for SELF/household non-funded EF only (skip spouse cards + funded self EF — see pfos-client).
+  if(a.type==='ef' && a.owner!=='spouse' && !((parseFloat(CPLAN.efTarget)||0)>0&&(parseFloat(CPLAN.efBal)||0)>=(parseFloat(CPLAN.efTarget)||0))){
     var _efMoCurrent=parseInt(CPLAN._efMonthsTarget||3)||3;
     h+='<div style="margin-top:8px;padding:10px 12px;background:rgba(91,155,255,.04);border:1px solid rgba(91,155,255,.12);border-radius:4px">';
     h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px;flex-wrap:wrap">';
@@ -21523,7 +21661,45 @@ function _cpFlagMenuSubmit(){
   }
 }
 
+// ── M5.1 wrapper: dark-launched (PFOS_FLAGS.issuesDetect OFF -> _LEGACY = byte-identical; ON -> the unified PFOSIssues.detect).
 function _cpExtractRedFlags(){
+  if(!(window.PFOS_FLAGS&&PFOS_FLAGS.issuesDetect)) return _cpExtractRedFlags_LEGACY();
+  var d=CPLAN;
+  var rawS2=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+  d.savingsRate=(APP._currentClientFd&&APP._currentClientFd.calcs&&APP._currentClientFd.calcs.savingsRate)||0;
+  var selfMonthlyIncome=(function(){
+    try{
+      var _rs=(APP._currentClientFd&&APP._currentClientFd.S)||{};
+      var _srcs=_rs.incomeSources||[];
+      if(!_srcs.length)return d.income||0;
+      var _self=_srcs.filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';})
+                     .reduce(function(t,s){return t+(typeof _incSrcMonthlyTakeHome==='function'?_incSrcMonthlyTakeHome(s):(parseFloat(s.amount)||0));},0);
+      return _self>0?_self:(d.income||0);
+    }catch(e){return d.income||0;}
+  })();
+  var retExisting=(rawS2.retAccounts||[]).some(function(ra){return(parseFloat(ra.balance)||0)>0||(parseFloat(ra.contrib)||0)>0;});
+  var hsaEligibleOwnerAware=(function(){
+    var hasHDHP=false;
+    var _selfSrcsRF=(rawS2.incomeSources||[]).filter(function(s){var o=(s&&s.owner)||'personal';return o!=='spouse'&&o!=='joint';});
+    if(_selfSrcsRF.some(function(s){return (parseFloat(s.deduction_hsa)||0)>0;}))hasHDHP=true;
+    var _hasSpouseDataRF=!!(rawS2&&rawS2.incomeSources&&rawS2.incomeSources.some(function(s){return (s&&s.owner)==='spouse';}));
+    if(rawS2.profile&&rawS2.profile.hasHDHP&&!_hasSpouseDataRF)hasHDHP=true;
+    if(rawS2.profile&&rawS2.profile.selfHasHDHP)hasHDHP=true;
+    return hasHDHP;
+  })();
+  var ctx={
+    d:d, rawS2:rawS2,
+    matchInfo:(typeof _cpMatchExisting==='function')?_cpMatchExisting({type:'401k',owner:'self'},{inspect:true}):null,
+    hsaIRSMax:(typeof _cpIRSMax==='function')?_cpIRSMax('hsa'):367,
+    _mortgageUsesInclDebts:false,
+    selfMonthlyIncome:selfMonthlyIncome,
+    retExisting:retExisting,
+    hsaEligibleOwnerAware:hsaEligibleOwnerAware,
+    spouse:{ householdType:CPLAN._householdType, partner:CPLAN._partner, allocations:CPLAN.allocations }  // M5.1b: scanner now lives in v6 (_spouseFlags); pass the data bag instead of a global-closure callback (5b firewall)
+  };
+  return PFOSIssues.detect(ctx).map(PFOSIssues.toCp);
+}
+function _cpExtractRedFlags_LEGACY(){
   var flags=[];
   var d=CPLAN;
   // Cash flow deficit
@@ -21706,9 +21882,9 @@ function _cpExtractRedFlags(){
     // Has existing retirement (e.g. a 401k) but no ADDITIONAL contribution planned.
     // A single account often won't reach the retirement goal, so offer adding more
     // vehicles — framed accurately as an opportunity, not "no savings."
-    flags.push({type:'opp',icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle (Roth, IRA, IUL, and more).',action:'retirement'});
+    flags.push({type:'opp',icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle (Roth IRA, Traditional IRA, IUL, and more).',action:'retirement'});
   // Children but no education savings
-  if(d.children.length>0&&!CPLAN.allocations.some(function(a){return a.type==='edu'&&a.amount>0;}))
+  if(d.children.length>0&&!CPLAN.allocations.some(function(a){return a.type==='edu';}))   // ANY edu card represents education (§3 mirror) — don't fire "add education" when a College fund exists
     flags.push({type:'opp',icon:'🎓',title:'No education funding for '+d.children.length+' child'+(d.children.length>1?'ren':''),desc:'Tax-advantaged education savings grow significantly with time. Multiple vehicle options available.',action:'edu'});
   // Old/orphaned retirement accounts (rollover candidates)
   var rawS2=(APP._currentClientFd&&APP._currentClientFd.S)||{};
@@ -23263,15 +23439,69 @@ function _cpDismissStateCBanner(){
 }
 
 
+// Household EF model (§3 mirror of pfos-client) — LIVE: a joint/hybrid couple's emergency fund is ONE shared household
+// fund (collapsed to a single owner='joint' card). Either spouse can later split it via "↩ Make personal" (which pins
+// _userMadePersonal so the collapse skips it). Separate/single stay individual. Advisor has no couple-sync — render/
+// persist parity only; cross-partner delivery happens on the client side.
+function _cpEfHouseholdJoint(){ var h=CPLAN._householdType; return h==='joint'||h==='hybrid'; }
+// Combined household EF balance + 3-month target. JOINT = one merged row → CPLAN values already combined. HYBRID = add
+// the partner's balance + their 3-month target. Else the self values.
+function _cpHouseholdEF(){
+  var bal=parseFloat(CPLAN.efBal)||0, tgt=parseFloat(CPLAN.efTarget)||0;
+  if(CPLAN._householdType==='hybrid'&&CPLAN._partner){
+    var _mo=parseInt(CPLAN._efMonthsTarget||3)||3;
+    bal+=parseFloat(CPLAN._partner.efBal)||0;
+    tgt+=Math.round((parseFloat(CPLAN._partner.expenses)||0)*_mo);
+  }
+  return {bal:Math.round(bal),target:Math.round(tgt)};
+}
+// Household EDUCATION model (§3 mirror of pfos-client): a child's education is a shared-OR-personal choice, so for a
+// couple WITH children the education card PROMPTS joint vs personal (not a silent default), switchable both ways. LIVE
+// (not flag-gated). Advisor twin has NO couple-sync — render/persist parity only. See pfos-client for canonical comments.
+function _cpEduHouseholdJoint(){
+  if(typeof CPLAN==='undefined'||!CPLAN)return false;
+  var h=CPLAN._householdType||'individual';
+  if(h!=='joint'&&h!=='hybrid'&&h!=='separate')return false;
+  if(!CPLAN._coupleLink&&!(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name)))return false;
+  return !!(CPLAN.children&&CPLAN.children.length>0);
+}
+function _cpEduNormalizeType(){
+  if(typeof CPLAN==='undefined'||!CPLAN||!Array.isArray(CPLAN.allocations))return;
+  // No children in the household → do NOT fabricate an education/529 card from a goal merely NAMED "College fund"
+  // (bug #3). Mirror of the same guard in pfos-client, per CLAUDE.md §3.
+  if(!(CPLAN.children&&CPLAN.children.length))return;
+  CPLAN.allocations.forEach(function(a){
+    if(!a||!a.customName||a.type==='edu'||a._isPlaceholder)return;   // skip chooser placeholders ("Choose an education vehicle" contains "education" but must stay a placeholder, not become an edu card)
+    var nm=String(a.customName).toLowerCase();
+    if(nm.indexOf('education')>=0||nm.indexOf('college')>=0||nm.indexOf('529')>=0){
+      var ot=a.type; a.type='edu';
+      if(ot==='wl')a.eduVehicle='wl'; else if(ot==='iul')a.eduVehicle='iul';
+      else if(nm.indexOf('coverdell')>=0)a.eduVehicle='coverdell';
+      else if(nm.indexOf('utma')>=0||nm.indexOf('ugma')>=0)a.eduVehicle='utma';
+      else if(!a.eduVehicle)a.eduVehicle='529';
+    }
+  });
+}
+function _cpEduKeepPersonal(i){
+  var a=CPLAN.allocations[i];if(!a||a.type!=='edu')return;
+  a._userMadePersonal=true;
+  if(typeof _cpMarkModified==='function')_cpMarkModified();
+  if(typeof _cpRenderPlanFull==='function')_cpRenderPlanFull(); else if(typeof _cpRenderPlanV2==='function')_cpRenderPlanV2();
+  if(typeof cplanSave==='function')cplanSave();
+}
 function _cpConvertToJoint(i){
   var a=CPLAN.allocations[i];if(!a)return;
-  if(CPLAN._householdType!=='hybrid'){_cpToast('Joint cards require a Hybrid couple');return;}
+  // Education can be a shared household goal in ANY couple (joint|hybrid|separate); all other types stay hybrid-only.
+  if(a.type==='edu'){ if(CPLAN._householdType!=='hybrid'&&CPLAN._householdType!=='joint'&&CPLAN._householdType!=='separate'){_cpToast('Joint cards require a linked partner');return;} }
+  else if(CPLAN._householdType!=='hybrid'){_cpToast('Joint cards require a Hybrid couple');return;}
   // Accept 'self' or 'personal' (both mean user-owned — seeders default to
   // 'personal'). Anything else (joint/spouse) is already not eligible.
   if(a.owner!=='self'&&a.owner!=='personal'&&a.owner){_cpToast('This card is already joint or spouse-owned');return;}
   // Type allowlist mirrors the UI gating so this is hard to misuse even if
   // the button is somehow rendered on an excluded type.
   if(!_cpJointEligible(a.type)){_cpToast('This card type can\'t be made joint');return;}
+  // Defensive: in joint/separate only education may go joint (parity with pfos-client). Other types stay hybrid-only.
+  if((CPLAN._householdType==='joint'||CPLAN._householdType==='separate')&&a.type!=='edu'){_cpToast('Only education can be a shared household goal in this household');return;}
   var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
   var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
   var prevAmt=parseFloat(a.amount)||0;
@@ -23346,6 +23576,7 @@ async function _cpDoConvertToJoint(i, partnerName){
   // ── Mutate the local allocation to joint ──
   var prevAmt=parseFloat(a.amount)||0;
   a.owner='joint';
+  if(a._userMadePersonal)delete a._userMadePersonal;   // explicit Make-joint clears the sticky-personal pin (§3 mirror)
   a.amountSelf=Math.round(prevAmt/2);
   a.amountSpouse=prevAmt-a.amountSelf;// keeps total exactly == prevAmt
   // If the card had been self-shared previously, clean up old grants on
@@ -23379,29 +23610,28 @@ async function _cpDoConvertToJoint(i, partnerName){
 async function _cpRevertFromJoint(i){
   var a=CPLAN.allocations[i];if(!a)return;
   if(a.owner!=='joint'){_cpToast('This card isn\'t joint');return;}
-  if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId){
-    _cpToast('Only your spouse can unjoint this — they created it');
-    return;
-  }
+  // §3 mirror: a joint card is CO-OWNED — either spouse can dissolve it (no creator-only restriction). Splits into two
+  // personal cards (each keeps their portion; the partner's side converts via the client realtime handler).
   var partnerName=(CPLAN._partner&&CPLAN._partner.firstName)||'your spouse';
   var cardName=a.customName||(CP_NM&&CP_NM[a.type])||a.type;
   var selfPart=parseFloat(a.amountSelf)||0;
   var spousePart=parseFloat(a.amountSpouse)||0;
   var ok = await _cpConfirmModal({
-    title: 'Convert "'+cardName+'" back to a personal card?',
-    message: 'You\'ll be the sole owner. '+partnerName+' will no longer see this card on their plan.',
+    title: 'Make "'+cardName+'" a personal card?',
+    message: 'This stops sharing it. You and '+partnerName+' each keep your own contribution as a separate personal card.',
     detail:
       '• You keep your portion: <strong style="color:var(--wh)">$'+fmt(selfPart)+'/mo</strong><br>'
-      +'• '+_cpEscapeHtmlForModal(partnerName)+'\'s portion released: <strong style="color:var(--wh)">$'+fmt(spousePart)+'/mo</strong><br>'
-      +'• '+_cpEscapeHtmlForModal(partnerName)+' can add their own version later if they still want to contribute separately',
-    confirmLabel: '↩ Revert to personal',
+      +'• '+_cpEscapeHtmlForModal(partnerName)+' keeps their portion as their own card: <strong style="color:var(--wh)">$'+fmt(spousePart)+'/mo</strong><br>'
+      +'• Either of you can make it joint again later',
+    confirmLabel: '↩ Make personal',
     confirmStyle: 'warning',
     icon: '↩'
   });
   if(!ok)return;
   // ── Mutate the local allocation back to self ──
   a.owner='self';
-  a.amount=selfPart;// drop the spouse's portion; keep ONLY this user's
+  a._userMadePersonal=true;   // sticky-personal (any type) — don't let an auto-default re-jointify it (§3 mirror)
+  a.amount=selfPart;// keep ONLY this user's portion (the partner keeps theirs on their side)
   a.amountSelf=0;
   a.amountSpouse=0;
   var _oldSharedId=a._sharedId;
@@ -24075,8 +24305,8 @@ function cplanSave(){
   // the partner via shared_card_grants are filtered.
   var cleanAllocs=CPLAN.allocations.filter(function(a){
     return !(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint');
-  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,
-  // Loan tracking fields — persisted so the IBC continuation card state
+  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,
+  // _userMadePersonal: sticky-personal pin (§3 mirror) so a privatized education card isn't re-jointified on reload. Loan tracking fields — persisted so the IBC continuation card state
   // survives logout/login. loanBalance is the canonical outstanding balance;
   // monthlyLoanRepay is the user's repayment slider value; loans[] is the
   // per-loan audit trail; loanRate is the simple-interest annual rate.
@@ -24687,7 +24917,7 @@ function _cpRenderPlanFull(){
     var _gpName=CPLAN._stateCGeneratedByPartnerName||'Your partner';
     var _gpAt=CPLAN._stateCGeneratedByPartnerAt?(new Date(CPLAN._stateCGeneratedByPartnerAt)).toLocaleDateString():'';
     h+='<div style="display:flex;align-items:flex-start;justify-content:space-between;padding:14px 16px;margin-bottom:12px;background:linear-gradient(135deg,rgba(168,85,247,.08),rgba(91,155,255,.06));border:1px solid rgba(168,85,247,.3);border-left:4px solid #A855F7;border-radius:4px;flex-wrap:wrap;gap:10px">';
-    h+='<div style="display:flex;align-items:flex-start;gap:10px;flex:1;min-width:0"><span style="font-size:22px">💑</span><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#A855F7">Your plan was generated by '+esc(_gpName)+(_gpAt?' on '+esc(_gpAt):'')+'</div><div style="font-size:13px;color:var(--mu);line-height:1.5;margin-top:3px">'+esc(_gpName)+' ran AI for both of you. This plan was coordinated with theirs — joint cards are shared, personal cards are yours alone. Review and adjust as needed.</div></div></div>';
+    h+='<div style="display:flex;align-items:flex-start;gap:10px;flex:1;min-width:0"><span style="font-size:22px">💑</span><div><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:#A855F7">Your plan was generated by '+esc(_gpName)+(_gpAt?' on '+esc(_gpAt):'')+'</div><div style="font-size:13px;color:rgba(226,232,240,.82);line-height:1.5;margin-top:3px">'+esc(_gpName)+' ran AI for both of you. This plan was coordinated with theirs — joint cards are shared, personal cards are yours alone. Review and adjust as needed.</div></div></div>';
     h+='<button onclick="_cpDismissStateCBanner()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:transparent;border:1px solid var(--bd);color:var(--mu);cursor:pointer;border-radius:2px;min-height:32px;align-self:center">Got it</button>';
     h+='</div>';
   }
@@ -24921,7 +25151,15 @@ function _cpRenderPlanFull(){
       }catch(_sgErr){console.warn('Shared-goal seed in render:',_sgErr);}
     }
   }
+  // Education default-to-joint — UNCONDITIONAL (every plan mode incl. AI), §3 mirror of pfos-client. Idempotent;
+  // respects sticky-personal. Advisor has no couple-sync, so this is render/persist parity only.
+  if(typeof _cpEduNormalizeType==='function')_cpEduNormalizeType();
   var unassigned=CPLAN.allocations.filter(function(a){return a.phase===0&&_cpAllocInTab(a);});
+  // M5.2b — canonical priority order for the unassigned list (dark-launched: PFOS_FLAGS.priorityEngine
+  // OFF = today's detector push-order, byte-identical). Ranks the flag-sourced cards by engine-exact
+  // priority; savings-goal cards (no flagAction) trail. Sorts a filtered COPY only — _cpBuildCard
+  // re-derives idx via CPLAN.allocations.indexOf(a), so the underlying array/order is untouched.
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.priorityEngine&&typeof PFOSIssues!=='undefined'&&PFOSIssues.rankCards) unassigned=PFOSIssues.rankCards(unassigned);
   if(unassigned.length){
     // Detailed instructional panel — default collapsed. Sits just above the unassigned
     // items so the user can read about how everything works right next to the thing
@@ -27888,7 +28126,9 @@ function _cpCascadeGuardPublishAnyway(){
 function _cpWhy(type){
   var d=CPLAN;
   var children=d.children||[];
-  if(type==='ef')return 'About '+fmt(Math.round(d.efTarget||0))+' covers 3 months of expenses. Currently '+fmt(Math.round(d.efBal||0))+' on hand. '+((d.efBal||0)<(d.efTarget||0)?'Without this, any surprise expense forces new debt.':'Almost there — keep building.');
+  if(type==='ef')return (d.efBal||0)>=(d.efTarget||0)
+    ? 'You already have '+fmt(Math.round(d.efBal||0))+' — your '+fmt(Math.round(d.efTarget||0))+' (3-month) safety net is fully funded. New surplus can go to higher-return goals.'   // §3 mirror of pfos-client _cpWhy: funded EF must NOT say "keep building" (contradicts the green "Emergency fund funded" header from 6f6ac49)
+    : 'About '+fmt(Math.round(d.efTarget||0))+' covers 3 months of expenses. Currently '+fmt(Math.round(d.efBal||0))+' on hand. Without this, any surprise expense forces new debt.';
   if(type==='debt'){
     var hi=(d.debts||[]).filter(function(x){return(parseFloat(x.rate)||0)>=15;});
     var intMo=hi.reduce(function(t,x){return t+((parseFloat(x.balance)||0)*(parseFloat(x.rate)||0)/100/12);},0);
@@ -27904,7 +28144,9 @@ function _cpWhy(type){
   if(type==='trad_ira')return 'Tax-deductible contributions, taxed at withdrawal. Useful when current bracket is higher than expected retirement bracket.';
   if(type==='term_life')return 'Pure death benefit, no cash value. Cheaper than permanent. Right for income replacement during working years (mortgage, kids, dependent spouse).';
   if(type==='edu'){
-    var yrs=children.length?Math.max(1,18-(children[0].age||0)):18;
+    // No children → generic savings-goal copy; don't fabricate a child's college timeline / aid framing (bug #3; mirror of pfos-client, §3).
+    if(!children.length)return 'A dedicated pot toward future education costs. Contributions compound over time; pick a tax-advantaged vehicle when ready.';
+    var yrs=Math.max(1,18-(children[0].age||0));
     return 'With '+yrs+' years of compounding, modest monthly contributions grow significantly. 529 offers tax-free growth for qualified ed expenses; WL/IUL CV doesn\'t count against financial aid + includes death benefit. Vehicle picker on the card.';
   }
   if(type==='invest'){
@@ -28129,7 +28371,7 @@ function _cpToggleFlagSelect(fi,checked){
 function _cpSelectAllFlags(checkAll){
   if(!CPLAN._flagBulkSelect)CPLAN._flagBulkSelect={};
   if(!checkAll){CPLAN._flagBulkSelect={};_cpRenderPlanFull();return;}
-  var flags=_cpExtractFlags();
+  var flags=_cpExtractFlags_LEGACY();  // M5.1c: dormant handler — keep the OLD action-keyed detector (its maps below match it)
   var directAddActions={ef:1,debt:1,'401k':1,savings:1,hsa:1,ibc:1,existing_policy:1};
   var typeMap={ef:'ef',debt:'debt','401k':'401k',savings:'invest',hsa:'hsa',ibc:'ibc',existing_policy:'wl'};
   flags.forEach(function(f,fi){
@@ -28144,7 +28386,7 @@ function _cpSelectAllFlags(checkAll){
 // Action-only flag → $0 placeholder allocation tagged with flag context.
 // Used for: protection (life/disability), umbrella, estate, ibc_audit, annuity_research, diversify.
 function _cpAddActionFlag(fi,phase){
-  var flags=_cpExtractFlags();
+  var flags=_cpExtractFlags_LEGACY();  // M5.1c: dormant handler — keep the OLD action-keyed detector (actionToType below matches it)
   var f=flags[fi];if(!f)return;
   var actionToType={protection:'protection',protection_ext:'umbrella',estate:'estate',ibc_audit:'ibc_audit',annuity_research:'annuity_research',diversify:'diversify'};
   var t=actionToType[f.action];if(!t)return;
@@ -28175,7 +28417,7 @@ function _cpBulkAddFlags(){
   if(!CPLAN._flagBulkSelect)return;
   var selectedIds=Object.keys(CPLAN._flagBulkSelect).filter(function(k){return CPLAN._flagBulkSelect[k];});
   if(!selectedIds.length)return;
-  var flags=_cpExtractFlags();
+  var flags=_cpExtractFlags_LEGACY();  // M5.1c: dormant handler — keep the OLD action-keyed detector (typeMap below matches it)
   var typeMap={ef:'ef',debt:'debt','401k':'401k',savings:'invest',rollover:'rollover',hsa:'hsa',ibc:'ibc',existing_policy:'wl'};
   var phase=CPLAN._flagBulkPhase||(typeof CPLAN._activePhaseTab==='number'?CPLAN._activePhaseTab:1)||1;
   if(phase<1)phase=1;
@@ -30677,6 +30919,6 @@ async function _checkUnreadMessages(){
 </div>
 
 <!-- PFOS canonical engine (single source of truth) — advisor metrics compute on-read. -->
-<script src="/pfos-core.v55.js" defer></script>
+<script src="/pfos-core.v57.js" defer></script>
 </body>
 </html>

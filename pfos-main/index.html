@@ -1022,7 +1022,7 @@ html[data-theme="light"] .pwa-bar{background:linear-gradient(0deg,#FFFFFF,#F8FAF
 </style>
 </head>
 <body style="background:#09092E;margin:0;padding:0">
-<script src="/pfos-shared.v5.js"></script>
+<script src="/pfos-shared.v6.js"></script>
 <script>(function(){var d=document.documentElement;var _t='dark';try{_t=localStorage.getItem('pfos_theme')||'dark';}catch(e){}if(_t==='light')d.setAttribute('data-theme','light');d.style.margin='0';d.style.padding='0';})()</script>
 
 <!-- PWA INSTALL BANNER -->
@@ -4207,6 +4207,19 @@ function _hybridShareField(){
   return _hybridIsClientA() ? 'share_pct_a' : 'share_pct_b';
 }
 
+// Joint goals to PERSIST to couple_links — owner==='joint', deduped by id. The parent replaces
+// joint_financial_data.goals wholesale with this array, so deduping here is the write-side half of the
+// triplication fix: a duplicated joint goal in S.goals can never be written back into jfd (the read-side
+// half is _applyJointGoals). Never drops a distinct goal — only collapses exact-id duplicates.
+function _jointGoalsForWrite(){
+  var _seen={}, _out=[];
+  (S.goals||[]).forEach(function(g){
+    if(!g || g.owner!=='joint') return;
+    if(g.id){ if(_seen[g.id]) return; _seen[g.id]=true; }
+    _out.push(g);
+  });
+  return _out;
+}
 function _postJointItemsWrite(){
   // Posts the current S._jointItems to pfos-client for couple_links write.
   // No-op if not Hybrid or no couple link.
@@ -4221,7 +4234,7 @@ function _postJointItemsWrite(){
   // couple_links.joint_financial_data.goals, wiping the partner's joint goals.
   // (Goal-mutation paths also call _syncJointGoalsToCoupleLinks which performs
   // the same refresh; this guard catches every OTHER path.)
-  S._jointItems.goals = (S.goals||[]).filter(function(g){return g && g.owner==='joint';});
+  S._jointItems.goals = _jointGoalsForWrite();
   try{
     window.parent.postMessage({
       type:'PFOS_WRITE_JOINT_ITEMS',
@@ -4240,10 +4253,32 @@ function _postJointItemsWrite(){
 // unlinked users — they have no couple_links row to write to. Goals remain
 // in S.goals (with owner='joint') for the existing renderSavingsGoals path;
 // the _jointItems.goals copy is the canonical cross-spouse store.
+// Merge joint goals from couple_links.joint_financial_data (jfd) into S.goals — the single source for both
+// the PFOS_LOAD and the realtime joint-sync handlers (previously copy-pasted, which let them drift).
+// Dedups jfd by goal id (joint_financial_data can carry duplicate copies) and treats jfd as authoritative:
+// drops any local goal — including a stale PERSONAL copy sharing the id — before re-adding, so a shared goal
+// never renders 2-3× (the hybrid goals-triplication bug). id-less jfd goals are preserved (can't dedup).
+function _applyJointGoals(jfd){
+  if(!Array.isArray(S.goals)) S.goals=[];
+  if(!jfd || !Array.isArray(jfd.goals) || !jfd.goals.length) return;
+  // Drop existing joint goals (re-added authoritatively from jfd below); KEEP every non-joint goal — never
+  // drop a personal goal, so unsynced local edits can't be lost. (The PFOS_LOAD path also restores local-only
+  // joint goals via __preDropLocalJoint around this call.)
+  S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
+  // Dedup the re-add by id against goals already present (a personal copy of a now-shared goal) AND against
+  // earlier jfd entries (joint_financial_data can carry duplicate ids) — so a shared goal never renders 2-3×.
+  var _seen={};
+  S.goals.forEach(function(g){ if(g && g.id) _seen[g.id]=true; });
+  jfd.goals.forEach(function(jg){
+    if(!jg) return;
+    if(jg.id){ if(_seen[jg.id]) return; _seen[jg.id]=true; }
+    var c=Object.assign({}, jg); c.owner='joint'; S.goals.push(c);
+  });
+}
 function _syncJointGoalsToCoupleLinks(){
   if(S.householdType !== 'hybrid' || !S.coupleLinkId) return;
   if(!S._jointItems) S._jointItems = {incomeSources:[],retAccounts:[],investments:[],debts:[],expenses:[],goals:[],linkedCash:[]};
-  S._jointItems.goals = (S.goals||[]).filter(function(g){return g && g.owner==='joint';});
+  S._jointItems.goals = _jointGoalsForWrite();
   _postJointItemsWrite();
 }
 
@@ -6187,7 +6222,77 @@ function _leakFinder(opts){
 // "One Action This Month" card) — so the two surfaces can never disagree. The §3.2 leak-led P2P branch and the
 // $50-floored EF steps live here ONCE (previously duplicated + drifted: renderOneAction lacked the leak branch and
 // emitted an unfloored "$0/mo" EF step for a paycheck-to-paycheck user).
+// ── M5.2c — dark-launched (PFOS_FLAGS.priorityEngine OFF -> _pickOneAction_LEGACY = the curated 8-gate
+// ladder verbatim, byte-identical; ON -> _pickOneActionRanked). When ON the one-action card FOLLOWS the
+// engine ranking (DE.systemFlags[0]) — closing the coverage gap (the legacy ladder had no gate for
+// insurance/estate/HSA/tax) — rendered with TAILORED copy (legacy copy ported for the overlapping issues;
+// action titles + the DE flag's own desc for the new categories), and KEEPING the §3.2 leak-led override
+// for paycheck-to-paycheck users + the cash-flow-deficit-first priority. (Owner: "expand the ladder, keep good parts".)
 function _pickOneAction(c){
+  if(!c||!c.inc) return null;
+  if(!(window.PFOS_FLAGS&&PFOS_FLAGS.priorityEngine)) return _pickOneAction_LEGACY(c);
+  return _pickOneActionRanked(c);
+}
+// Render one DE flag (the engine's #1 priority) as a one-action card. Overlapping issues port the legacy
+// tailored copy (incl. dynamic $ amounts + the original icon) so those picks stay identical; new categories
+// get an action-oriented title + the DE flag's own (already-tailored) desc, with urgency/colour by level.
+function _oneActionForFlag(f,c){
+  var lvlUrg={1:'This week',2:'This month',3:'This quarter',4:'Ongoing'};
+  var lvlCol={1:'var(--or)',2:'var(--or)',3:'var(--yl)',4:'#5B9BFF'};
+  var M={
+    cashflow_neg:{icon:'🚨',title:'Fix Negative Cash Flow',d:function(c){return 'You are spending '+fmt(Math.abs(c.netCF))+'/mo more than you earn. Cut expenses or increase income before any other financial action.';},u:'Do this today',col:'var(--rd)'},
+    cashflow_thin:{title:'Build a Cash-Flow Buffer',u:'This week',col:'var(--or)'},
+    ef_none:{icon:'🛡️',title:'Start Your Emergency Fund',d:function(c){return 'Open a high-yield savings account and automate '+fmt(Math.max(50,Math.min(c.netCF*0.5,500)))+'/mo transfers. Target: '+fmt(c.efT3)+' (3 months of expenses).';},u:'This week',col:'var(--or)'},
+    ef_low:{icon:'📈',title:'Build to 3-Month Emergency Fund',d:function(c){return 'Continue saving '+fmt(Math.max(50,Math.min(c.netCF*0.3,400)))+'/mo until reserves reach '+fmt(c.efT3)+'. Currently '+c.efMonths.toFixed(1)+' months covered.';},u:'Ongoing',col:'var(--yl)'},
+    employer_match:{icon:'🆓',title:'Get Your Full Employer Match',d:function(){return 'Increase 401(k) contributions to capture the full employer match. This is a guaranteed 100% return — no other investment comes close.';},u:'Next paycheck',col:'var(--gr)'},
+    high_debt:{title:'Attack High-Interest Debt',u:'This month',col:'var(--rd)'},
+    dti_high:{icon:'💳',title:'Attack High-Interest Debt',d:function(c){return 'Your DTI at '+c.dti.toFixed(0)+'% is critical. Put every extra dollar toward your highest-rate debt using the avalanche method.';},u:'This month',col:'var(--rd)'},
+    low_savings:{icon:'💰',title:'Boost Savings Rate to 15%',d:function(c){return 'Current rate: '+c.savingsRate.toFixed(1)+'%. Increase by '+fmt(Math.round(c.inc*((15-c.savingsRate)/100)))+'/mo to hit the wealth-building threshold.';},u:'This month',col:'var(--yl)'},
+    retirement_gap:{icon:'🎯',title:'Close Retirement Gap',d:function(c){return 'Increase retirement contributions by '+fmt(c.requiredMonthlyIncrease||0)+'/mo. Gap: '+fmtK(c.retGap)+'.';},u:'This quarter',col:'#5B9BFF'},
+    no_retirement:{title:'Open a Retirement Account',u:'This quarter',col:'#5B9BFF'},
+    protection_gap:{title:'Close Your Protection Gap',u:'This month',col:'var(--or)'},
+    no_disability:{title:'Get Disability Insurance',u:'This month',col:'var(--or)'},
+    no_ltc:{title:'Plan for Long-Term Care',u:'This quarter',col:'var(--yl)'},
+    no_umbrella:{title:'Add Umbrella Liability Coverage',u:'This quarter',col:'var(--yl)'},
+    nw_declining:{title:'Reverse Your Net-Worth Decline',u:'This month',col:'var(--or)'},
+    idle_cash:{title:'Put Your Idle Cash to Work',u:'This quarter',col:'var(--yl)'},
+    high_cash:{title:'Reallocate Your Excess Cash',u:'This quarter',col:'var(--yl)'},
+    leaks:{title:'Plug Your Spending Leaks',u:'This month',col:'var(--yl)'},
+    hsa_not_maxed:{title:'Max Out Your HSA',u:'This year',col:'var(--yl)'},
+    roth_opportunity:{title:'Do a Roth Conversion',u:'This year',col:'var(--yl)'},
+    backdoor_roth:{title:'Use a Backdoor Roth',u:'This year',col:'var(--yl)'},
+    overwithholding:{title:'Adjust Your Tax Withholding',u:'This quarter',col:'var(--yl)'},
+    edu_gap:{title:'Fund Your Education Goal',u:'This year',col:'#5B9BFF'},
+    beneficiary_audit:{title:'Review Your Beneficiaries',u:'This month',col:'var(--or)'},
+    no_will:{title:'Create Your Will',u:'This month',col:'var(--or)'},
+    estate_tax:{title:'Plan for Estate Taxes',u:'This year',col:'#5B9BFF'},
+    // M5.2d-2a — shared-only self flags (only reachable when BOTH sharedSelfFlags + priorityEngine are ON)
+    single_income:{title:'Diversify Your Income',u:'This quarter',col:'var(--or)'},
+    rollover:{title:'Consolidate Old Accounts',u:'This quarter',col:'var(--yl)'},
+    mortgage_in_retirement:{title:'Plan Your Mortgage Payoff',u:'This quarter',col:'var(--yl)'},
+    liquidity_locked:{title:'Build Liquid Savings',u:'This quarter',col:'var(--yl)'}
+  };
+  var cfg=M[f.id]||{};
+  var desc=cfg.d?cfg.d(c):(f.desc||'');
+  return {icon:cfg.icon||f.icon||'•', title:cfg.title||f.title||'Take action', desc:desc, urgency:cfg.u||lvlUrg[f.level]||'Soon', col:cfg.col||lvlCol[f.level]||'var(--yl)'};
+}
+function _pickOneActionRanked(c){
+  if(typeof deDetectFlags==='function'){try{deDetectFlags(c);}catch(e){}}
+  var top=(DE&&DE.systemFlags&&DE.systemFlags[0])||null;
+  // §3.2 leak-led override (KEPT): a paycheck-to-paycheck user (saving <5%) leads with WHERE to find money,
+  // above the emergency fund. But a cash-flow DEFICIT still wins — when netCF<0, DE's cashflow_neg is the
+  // top flag and renders first, so we only take the leak path when cash flow is non-negative.
+  if(c.savingsRate<5 && c.netCF>=0){
+    var _lk=_leakFinder({expData:S.expData,spendingEntries:S.spendingEntries,monthlyExpOf:(typeof getMonthlyExp==='function'?getMonthlyExp:null)});
+    if(_lk.leaks.length){ var _t=_lk.leaks[0];
+      return {icon:'🔍',title:'Free Up Cash: '+_t.label,desc:_t.why+' Cutting it frees ~'+fmt(_t.monthlyAmt)+'/mo to start breaking the paycheck-to-paycheck cycle.',urgency:'This week',col:'var(--or)'};
+    }
+    return {icon:'🔍',title:'Find Your Spending Leaks',desc:'You\'re saving under 5% — the fastest win is cutting waste, not squeezing savings from nothing. Review your recent spending and flag 1-2 expenses to cut.',urgency:'This week',col:'var(--or)'};
+  }
+  if(top) return _oneActionForFlag(top,c);
+  return {icon:'✅',title:'Stay the Course',desc:'Your financial fundamentals are solid. Focus on maintaining habits and reviewing quarterly.',urgency:'Keep going',col:'var(--gr)'};
+}
+function _pickOneAction_LEGACY(c){
   if(!c||!c.inc) return null;
   var action=null;
   if(c.netCF<0) action={icon:'🚨',title:'Fix Negative Cash Flow',desc:'You are spending '+fmt(Math.abs(c.netCF))+'/mo more than you earn. Cut expenses or increase income before any other financial action.',urgency:'Do this today',col:'var(--rd)'};
@@ -13270,8 +13375,15 @@ function deDetectFlags(c){
   if(S.currentAge>=50&&!S.hasLTCInsurance&&c.netWorth>100000){
     DE.systemFlags.push({id:'no_ltc',level:3,levelName:'Efficiency',icon:'🏠',severity:'medium',urgency:'medium_term',title:'No Long-Term Care Coverage',desc:'Average nursing home: $8,800/mo. Average stay: 2.5 years = $264,000 exposure.',impact:fmtK(264000)+' potential out-of-pocket',costOfNothing:'LTC costs can consume retirement savings and leave spouse financially vulnerable.',strategies:['ltc_insurance'],service:'Long-Term Care Insurance',confidence:'medium',status:'detected'});
   }
-  // Umbrella insurance (high net worth)
-  if(c.netWorth>500000&&!S.hasUmbrellaInsurance){
+  // Umbrella insurance — for those with ASSETS a lawsuit could reach, not everyone. M5.2d-2b broadens the gate
+  // behind PFOS_FLAGS.sharedSelfFlags: ON → scan actual policies (not just the boolean) + ALSO catch high
+  // earners with real assets (income>200k/yr AND net worth>250k); OFF → the original net-worth>500k + boolean,
+  // byte-identical. The bare income>3k trigger from the source was deliberately NOT adopted (too broad — umbrella
+  // protects assets, not income; per owner, limit to those who genuinely need it).
+  var _umbBroad=window.PFOS_FLAGS&&PFOS_FLAGS.sharedSelfFlags;
+  var _hasUmb=_umbBroad?((S.policies||[]).some(function(p){return (p&&p.type||'').toLowerCase().indexOf('umbrella')>=0;})||!!S.hasUmbrellaInsurance):S.hasUmbrellaInsurance;
+  var _umbNeeds=_umbBroad?(c.netWorth>500000||(((c.incGross||c.inc||0)*12)>200000&&c.netWorth>250000)):(c.netWorth>500000);
+  if(_umbNeeds&&!_hasUmb){
     DE.systemFlags.push({id:'no_umbrella',level:3,levelName:'Efficiency',icon:'☂️',severity:'low',urgency:'medium_term',title:'No Umbrella Liability Policy',desc:'Net worth of '+fmtK(c.netWorth)+' exceeds standard liability limits. $200-400/yr for $1M+ gap coverage.',impact:'Lawsuit or liability event could reach personal assets',costOfNothing:'One liability event above auto/home limits exposes personal assets.',strategies:['umbrella_policy'],service:'Umbrella Insurance',confidence:'medium',status:'detected'});
   }
   // ── TAX STRATEGY FLAGS ──
@@ -13324,6 +13436,42 @@ function deDetectFlags(c){
     var exposure=Math.max(0,estateValue-estateExemption);
     var estTax=Math.round(exposure*0.40);
     DE.systemFlags.push({id:'estate_tax',level:4,levelName:'Growth',icon:'🏛️',severity:exposure>0?'high':'medium',urgency:'long_term',title:'Estate Tax Exposure: '+fmtK(estTax),desc:'Projected estate of '+fmtK(estateValue)+' approaches federal exemption of '+fmtK(estateExemption)+'.',impact:fmtK(estTax)+' potential estate tax',costOfNothing:'Estate tax at 40% on amounts above exemption.',strategies:['estate_trust','estate_gifting','estate_beneficiary'],service:'Estate Planning',confidence:'medium',status:'detected'});
+  }
+  // ── M5.2d-2a — shared-only SELF flags (engine parity). The engine detector now ALSO surfaces issues the
+  // shared PFOSIssues detector has but DE lacked (rollover, single-income, mortgage-past-retirement,
+  // low-liquidity), so the one-action card + Drift-Engine view cover them for an individual too. Dark-launched
+  // behind PFOS_FLAGS.sharedSelfFlags via ONE guarded block: when OFF the block is skipped entirely, so
+  // DE.systemFlags — and the badge count (:5519), deCalcAllocation weights, the sort, and the one-action pick —
+  // are byte-identical to today. Reads S + c only (no plan dependency, no over-fire). Tax-strategy items
+  // (tax-diversification → 5.2e Planning) and owner-decision items (underinsured-life suppression, umbrella
+  // broadening) are deferred; annuity/ibc-audit/rmd are follow-ups.
+  if(window.PFOS_FLAGS&&PFOS_FLAGS.sharedSelfFlags){
+    var _oldRet=(S.retAccounts||[]).filter(function(a){return a.type&&a.type.indexOf('_old')>=0&&(parseFloat(a.balance)||0)>0;});
+    if(_oldRet.length){var _ob=_oldRet.reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+      DE.systemFlags.push({id:'rollover',level:3,levelName:'Efficiency',icon:'🔄',severity:'medium',urgency:'medium_term',title:'Old Retirement Account'+(_oldRet.length>1?'s':'')+': '+fmtK(_ob),desc:_oldRet.length+' orphaned account'+(_oldRet.length>1?'s':'')+' from a previous employer. Consolidating or rolling into a current 401(k)/IRA simplifies management and may cut fees.',impact:fmtK(_ob)+' in stranded balances',costOfNothing:'Orphaned 401(k)s often sit in high-fee default funds, quietly eroding returns.',strategies:['roth_conversion','tax_advantaged'],service:'Account Consolidation / Rollover',confidence:'high',status:'detected'});
+      var _rp=((S.riskProfile&&S.riskProfile.label)||'moderate').toLowerCase();var _anAge=parseInt(S.currentAge)||0;
+      if(_anAge>=45&&_ob>=25000&&(_rp==='conservative'||_rp==='moderate')&&_anAge<66)
+        DE.systemFlags.push({id:'annuity_research',level:3,levelName:'Efficiency',icon:'🛡️',severity:'low',urgency:'medium_term',title:'Consider a Guaranteed Vehicle for '+fmtK(_ob),desc:(_rp==='conservative'?'A Fixed Annuity or MYGA offers guaranteed rates (4-5%) with no market risk.':'A Fixed Indexed Annuity links growth to an index with a 0% floor — gains without principal loss.')+' Trade-offs: surrender charges lock funds 7-12 years; fees can reach 2-4%; inside a 401(k)/IRA it adds no extra tax benefit. Use the Policy Audit tool before committing.',impact:'Optional principal-protected reallocation of '+fmtK(_ob),costOfNothing:'For conservative savers near retirement, market exposure on these balances carries sequence risk.',strategies:['fixed_annuity','fixed_indexed_annuity','tax_advantaged'],service:'Annuity / Guaranteed Income Research',confidence:'low',status:'detected'});}
+    if((S.incomeSources||[]).length===1&&c.inc>0)
+      DE.systemFlags.push({id:'single_income',level:2,levelName:'Risk Protection',icon:'📌',severity:'low',urgency:'medium_term',title:'Single Income Source',desc:'All household income comes from one source — a job loss eliminates 100% of income at once. Deepen the emergency fund (6-9mo), confirm disability coverage, and develop a secondary income stream over 12-24 months.',impact:'100% income concentration risk',costOfNothing:'One layoff or illness = total income loss with no second salary to absorb it.',strategies:['increase_income','disability_insurance','emergency_fund_build'],service:'Income Diversification',confidence:'medium',status:'detected'});
+    var _mAge=parseInt(S.currentAge)||0;
+    if(_mAge>=50){var _mInc=(S.debts||[]).filter(function(x){return !(x&&x.include===false);});var _morts=_mInc.filter(function(x){var t=(x.type||x.name||'').toLowerCase();return t.indexOf('mortgage')>=0||t.indexOf('home loan')>=0;});
+      if(_morts.length){var _mBal=_morts.reduce(function(t,m){return t+(parseFloat(m.balance)||0);},0);var _mAnn=c.inc*12;
+        if(_mBal>0&&_mAnn>0&&_mBal>_mAnn*5)
+          DE.systemFlags.push({id:'mortgage_in_retirement',level:3,levelName:'Efficiency',icon:'🏠',severity:'medium',urgency:'near_term',title:'Mortgage May Extend Past Retirement',desc:fmtK(_mBal)+' mortgage at age '+_mAge+'. At standard amortization this likely runs into retirement, layering fixed housing costs on reduced income. Consider accelerated payoff or a shorter-term refinance.',impact:'Fixed housing cost on retirement income',costOfNothing:'Carrying a large mortgage into retirement raises the income you must replace.',strategies:['debt_avalanche','debt_hybrid'],service:'Debt / Mortgage Planning',confidence:'medium',status:'detected'});}}
+    var _lAge=parseInt(S.currentAge)||0;var _lRet=(S.retAccounts||[]).reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+    if(_lRet>50000&&_lAge<55){
+      var _lLiq=parseFloat((S.assets&&S.assets.checking)||0)+parseFloat((S.assets&&S.assets.savings)||0);
+      if((S.investments||[]).length){_lLiq+=(S.investments||[]).reduce(function(t,iv){var ty=(iv&&iv.type||'').toLowerCase();return (ty==='brokerage'||ty==='mutual_fund'||ty==='robo_advisor')?t+(parseFloat(iv.balance)||0):t;},0);}else{_lLiq+=parseFloat((S.assets&&S.assets.invest)||0);}
+      var _lExp=(c.totalExp!=null?c.totalExp:(c.inc-(c.netCF||0)));var _lr=_lRet>0?_lLiq/_lRet:0;
+      if(_lr<0.15&&_lLiq<_lExp*6)
+        DE.systemFlags.push({id:'liquidity_locked',level:3,levelName:'Efficiency',icon:'🔒',severity:'medium',urgency:'medium_term',title:'Most Savings Locked Until Retirement',desc:fmtK(_lRet)+' in retirement accounts vs '+fmtK(_lLiq)+' liquid. Pre-59½ withdrawals trigger a 10% penalty plus tax. A taxable brokerage or HYSA buffer adds flexibility for pre-retirement goals.',impact:'Limited access to capital before 59½',costOfNothing:'A mid-life need (home, opportunity, emergency) could force a penalized early withdrawal.',strategies:['reallocate_cash','index_fund','money_market'],service:'Liquidity / Investment Allocation',confidence:'medium',status:'detected'});}
+    var _unsureIBC=(S.policies||[]).filter(function(p){return p&&p.ibcFlag==='not_sure';});
+    if(_unsureIBC.length>0)
+      DE.systemFlags.push({id:'ibc_audit',level:4,levelName:'Growth',icon:'🔍',severity:'low',urgency:'medium_term',title:'Policy Needs IBC Assessment',desc:_unsureIBC.length+' policy'+(_unsureIBC.length>1?'ies need':' needs')+' evaluation. Upload to the Policy Audit tool to determine IBC suitability and get a structural rating.',impact:'Unclassified policy — opportunity unknown',costOfNothing:'You may be holding (or paying for) a policy whose banking potential is unrealized.',strategies:['ibc_whole_life'],service:'Policy Audit',confidence:'medium',status:'detected'});
+    var _rmdAge=parseInt(S.currentAge)||0;
+    if(_rmdAge>=68&&_rmdAge<=74){var _ptB=(S.retAccounts||[]).filter(function(a){var t=(a.type||'').toLowerCase();return t.indexOf('trad')>=0||t.indexOf('401k')>=0||t.indexOf('sep')>=0;}).reduce(function(t,a){return t+(parseFloat(a.balance)||0);},0);
+      if(_ptB>=500000)DE.systemFlags.push({id:'rmd_risk',level:4,levelName:'Growth',icon:'📅',severity:'medium',urgency:'near_term',title:'Approaching RMD Age: '+fmtK(_ptB)+' Pre-Tax',desc:'RMDs begin at 73 and force taxable income that can lift Medicare (IRMAA) premium tiers. Roth conversions in low-income years before 73 reduce future forced distributions.',impact:'Forced taxable withdrawals + potential IRMAA surcharges',costOfNothing:'Every year of delay shrinks the low-bracket window for proactive Roth conversions.',strategies:['roth_conversion','roth_ladder','tax_advantaged'],service:'Tax Strategy / RMD Planning',confidence:'medium',status:'detected'});}
   }
   var sevOrd={critical:0,high:1,medium:2,low:3};
   DE.systemFlags.sort(function(a,b){return a.level-b.level||(sevOrd[a.severity]||3)-(sevOrd[b.severity]||3);});
@@ -13604,13 +13752,13 @@ function deGenSystemPlan(c){
     if(riskFiltered.length&&riskFiltered.indexOf(ds)<0) ds=riskFiltered[0];
     var so=DE_STRATEGIES[ds]||{label:ds};
     var alloc=DE.allocation.find(function(a){return a.flagId===f.id;});
-    return{flagId:f.id,section:deFlagToSection(f.id),priority:f.level<=2?'high':f.level===3?'medium':'low',title:f.title,strategy:ds,strategyLabel:so.label,service:f.service+(so.desc?' — '+so.desc:''),recommendation:deGenRecText(f,c),allocAmt:alloc?alloc.amt:0,outcome:deGenOutcome(f,c),assumptionLevel:deGetAssumptions(f.id,c),costOfDelay:deCalcCostOfDelay(f.id,c),confidence:f.confidence,status:'drafted',isSystemGen:true,advisorModified:false,availableStrategies:riskFiltered.length?riskFiltered:f.strategies,riskProfile:riskLabel,checklist:[],consentStatus:'pending',dependsOn:null,auditLog:[],nextAction:'',tradeoffMsg:'',createdAt:new Date().toISOString()};
+    return{flagId:f.id,section:deFlagToSection(f.id),priority:f.level<=2?'high':f.level===3?'medium':'low',title:f.title,strategy:ds,strategyLabel:so.label,service:f.service+(so.desc?' — '+so.desc:''),recommendation:deGenRecText(f,c),allocAmt:alloc?alloc.amt:0,outcome:deGenOutcome(f,c),assumptionLevel:deGetAssumptions(f.id,c),costOfDelay:deCalcCostOfDelay(f.id,c),confidence:f.confidence,status:'pending',isSystemGen:true,advisorModified:false,availableStrategies:riskFiltered.length?riskFiltered:f.strategies,riskProfile:riskLabel,checklist:[],consentStatus:'pending',dependsOn:null,auditLog:[],nextAction:'',tradeoffMsg:'',createdAt:new Date().toISOString()};
   });
 }
 function deCalcTradeoff(changedIdx,newAmt){var c=S.calcs;if(!c)return'';var surplus=Math.max(0,c.netCF);var totalAlloc=DE.advisorPlan.reduce(function(s,r,i){return s+(i===changedIdx?newAmt:(r.allocAmt||0));},0)+DE.bufferAmt;var remaining=surplus-totalAlloc;if(remaining<0)return'⚠️ Over-allocated by '+fmt(Math.abs(remaining))+'/mo — reduce other allocations to compensate.';if(remaining>200)return'💡 '+fmt(remaining)+'/mo unallocated — consider adding to retirement or emergency fund.';return'✅ Allocation balanced. '+fmt(Math.max(0,remaining))+'/mo remaining.';}
 function deGenMinimumViablePlan(){var c=S.calcs;if(!c||!c.inc)return null;var surplus=Math.max(0,c.netCF)-DE.bufferAmt;if(!DE.systemFlags.length)return{title:'On Track',action:'No critical issues. Continue current plan and increase retirement contributions.',amt:surplus,service:''};var top=DE.systemFlags[0];var alloc=DE.allocation.find(function(a){return a.flagId===top.id;});return{title:top.title,action:deGenRecText(top,c),amt:alloc?alloc.amt:Math.min(surplus,200),service:top.service};}
-var DE_NEXT_ACTIONS={detected:'Review details and discuss with client.',drafted:'Present at next meeting.',proposed:'Confirm client agreement and set timeline.',agreed:'Submit application or initiate service.',submitted:'Follow up on application status.',implemented:'Update client profile. Schedule 90-day check-in.',active:'Review progress at next meeting.'};
-function deGetNextAction(recStatus,service){if(recStatus==='agreed'&&service)return'Submit application / initiate '+service+'.';if(recStatus==='implemented')return'Add premiums to expenses, update contributions, schedule check-in.';return DE_NEXT_ACTIONS[recStatus]||'Continue to next step.';}
+var DE_NEXT_ACTIONS={pending:'Review details and discuss with client.',in_progress:'In progress — follow up on the next step.',completed:'Update client profile. Schedule 90-day check-in.',dismissed:'Dismissed — no further action.',detected:'Review details and discuss with client.',drafted:'Present at next meeting.',proposed:'Confirm client agreement and set timeline.',agreed:'Submit application or initiate service.',submitted:'Follow up on application status.',implemented:'Update client profile. Schedule 90-day check-in.',active:'Review progress at next meeting.'};
+function deGetNextAction(recStatus,service){if(recStatus==='in_progress'&&service)return'Submit application / initiate '+service+'.';if(recStatus==='completed')return'Add premiums to expenses, update contributions, schedule check-in.';return DE_NEXT_ACTIONS[recStatus]||'Continue to next step.';}
 function deLogAudit(recIdx,field,oldVal,newVal){if(!DE.advisorPlan[recIdx])return;if(!DE.advisorPlan[recIdx].auditLog)DE.advisorPlan[recIdx].auditLog=[];DE.advisorPlan[recIdx].auditLog.push({field:field,before:oldVal,after:newVal,changedBy:'advisor',timestamp:new Date().toISOString()});}
 // ── LINKED INCOME UPDATE FOR PRE-TAX 401(k) APPLY ─────────────────────────
 // When a 401(k) increase recommendation is applied, the contribution gets
@@ -13803,10 +13951,10 @@ function deApplyImplementationEffect(recIdx){
   // Re-detect flags to update severity/status after implementation
   var c2=S.calcs;if(c2&&c2.inc) deDetectFlags(c2);
 }
-function deUpdateRec(i,field,val){if(!DE.advisorPlan[i])return;var oldVal=DE.advisorPlan[i][field];DE.advisorPlan[i][field]=val;DE.advisorPlan[i].advisorModified=true;if(oldVal!==val)deLogAudit(i,field,oldVal,val);if(field==='status'){DE.advisorPlan[i].nextAction=deGetNextAction(val,DE.advisorPlan[i].service);if(val==='implemented'||val==='active')deApplyImplementationEffect(i);}if(field==='allocAmt')DE.advisorPlan[i].tradeoffMsg=deCalcTradeoff(i,pf(val));DE.advisorPlan[i].assumptionLevel=deGetAssumptions(DE.advisorPlan[i].flagId||'',S.calcs||{});if(field!=='recommendation')deRenderPlan();deSyncRecsToState();}
+function deUpdateRec(i,field,val){if(!DE.advisorPlan[i])return;var oldVal=DE.advisorPlan[i][field];DE.advisorPlan[i][field]=val;DE.advisorPlan[i].advisorModified=true;if(oldVal!==val)deLogAudit(i,field,oldVal,val);if(field==='status'){DE.advisorPlan[i].nextAction=deGetNextAction(val,DE.advisorPlan[i].service);if(val==='completed')deApplyImplementationEffect(i);}if(field==='allocAmt')DE.advisorPlan[i].tradeoffMsg=deCalcTradeoff(i,pf(val));DE.advisorPlan[i].assumptionLevel=deGetAssumptions(DE.advisorPlan[i].flagId||'',S.calcs||{});if(field!=='recommendation')deRenderPlan();deSyncRecsToState();}
 function deRemoveRec(i){DE.advisorPlan.splice(i,1);deSyncRecsToState();deRenderPlan();}
-function deAddManualRec(){DE.advisorPlan.push({flagId:'manual',section:'general',priority:'medium',title:'Custom Recommendation',strategy:'cut_expenses',strategyLabel:'Custom',service:'General',recommendation:'',outcome:'',assumptionLevel:'Based on advisor judgment.',confidence:'medium',allocAmt:0,status:'drafted',advisorModified:true,availableStrategies:Object.keys(DE_STRATEGIES),isSystemGen:false,auditLog:[],nextAction:'',tradeoffMsg:'',createdAt:new Date().toISOString()});deRenderPlan();}
-function deSyncRecsToState(){var mapped=DE.advisorPlan.map(function(r){return{section:r.section,priority:r.priority,recommendation:r.recommendation,status:r.status,service:r.service,title:r.title,strategy:r.strategy,allocAmt:r.allocAmt,outcome:r.outcome,advisorModified:r.advisorModified,assumptionLevel:r.assumptionLevel||'',nextAction:r.nextAction||'',tradeoffMsg:r.tradeoffMsg||'',auditLog:r.auditLog||[],createdAt:r.createdAt};});if(!S.coupleData)S.coupleData={};S.coupleData.recommendations=mapped;S.advisorRecs=mapped;}
+function deAddManualRec(){DE.advisorPlan.push({flagId:'manual',section:'general',priority:'medium',title:'Custom Recommendation',strategy:'cut_expenses',strategyLabel:'Custom',service:'General',recommendation:'',outcome:'',assumptionLevel:'Based on advisor judgment.',confidence:'medium',allocAmt:0,status:'pending',advisorModified:true,availableStrategies:Object.keys(DE_STRATEGIES),isSystemGen:false,auditLog:[],nextAction:'',tradeoffMsg:'',createdAt:new Date().toISOString()});deRenderPlan();}
+function deSyncRecsToState(){var mapped=DE.advisorPlan.map(function(r){return{id:r.id,section:r.section,priority:r.priority,recommendation:r.recommendation,status:r.status,service:r.service,title:r.title,strategy:r.strategy,allocAmt:r.allocAmt,outcome:r.outcome,advisorModified:r.advisorModified,assumptionLevel:r.assumptionLevel||'',nextAction:r.nextAction||'',tradeoffMsg:r.tradeoffMsg||'',auditLog:r.auditLog||[],createdAt:r.createdAt};});if(!S.coupleData)S.coupleData={};S.coupleData.recommendations=mapped;S.advisorRecs=mapped;}
 
 function deRenderFlags(){
   var c=S.calcs;if(!c||!c.inc)return;
@@ -13851,7 +13999,7 @@ function deRenderPlan(){
     var sp=DE.systemPlan[i]||{},isDev=r.advisorModified||r.strategy!==sp.strategy,sc=r.priority==='high'?'var(--rd)':r.priority==='medium'?'var(--yl)':'#5B9BFF';
     var allStratKeys=Object.keys(DE_STRATEGIES);
     var stratOpts=(r.availableStrategies||allStratKeys).concat(allStratKeys).filter(function(v,i,a){return a.indexOf(v)===i;}).map(function(s){var sl=(DE_STRATEGIES[s]||{label:s}).label;return'<option value="'+s+'"'+(r.strategy===s?' selected':'')+'>'+escH(sl)+'</option>';}).join('');
-    var statOpts=['drafted','proposed','agreed','submitted','implemented','active'].map(function(s){return'<option value="'+s+'"'+(r.status===s?' selected':'')+'>'+s.charAt(0).toUpperCase()+s.slice(1)+'</option>';}).join('');
+    var statOpts=[['pending','Pending Review'],['in_progress','In Progress'],['completed','Completed'],['dismissed','Dismissed']].map(function(o){return'<option value="'+o[0]+'"'+(r.status===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
     var nextAct=r.nextAction||deGetNextAction(r.status,r.service);
     return'<div style="background:var(--bg-card);border:1px solid '+(isDev?'rgba(249,115,22,.3)':'var(--bd)')+';border-left:3px solid '+sc+';border-radius:2px;padding:13px;margin-bottom:10px"><div style="display:flex;align-items:center;gap:6px;margin-bottom:8px;flex-wrap:wrap"><span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:#5B9BFF;background:rgba(0,68,191,.1);border:1px solid rgba(0,68,191,.2)">'+(secL[r.section]||'General')+'</span>'+(isDev?'<span style="font-family:var(--fh);font-size:9px;font-weight:700;color:var(--or)">MODIFIED</span>':'')+'<div style="margin-left:auto;display:flex;gap:6px"><select class="sel" style="font-size:10px;min-height:28px;padding:2px 6px" onchange="deUpdateRec('+i+',\'status\',this.value)">'+statOpts+'</select><button onclick="deRemoveRec('+i+')" style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.2);color:var(--rd);padding:3px 8px;cursor:pointer;border-radius:2px;font-size:10px">✕</button></div></div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh);margin-bottom:8px">'+escH(r.title)+'</div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center"><div style="font-size:11px;color:var(--mu)">Strategy:</div><select class="sel" style="font-size:11px;min-height:30px;flex:1;min-width:180px" onchange="deUpdateRec('+i+',\'strategy\',this.value)">'+stratOpts+'</select></div><div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;align-items:center"><div style="font-size:11px;color:var(--mu)">Monthly Allocation: $</div><input class="inp" type="number" value="'+r.allocAmt+'" style="width:100px;min-height:28px;font-size:12px" oninput="deUpdateRec('+i+',\'allocAmt\',pf(this.value))">'+(sp.allocAmt&&r.allocAmt!==sp.allocAmt?'<span style="font-size:10px;color:var(--or)">System: '+fmt(sp.allocAmt)+'</span>':'')+'</div>'+(r.tradeoffMsg?'<div style="font-size:11px;color:var(--yl);margin-bottom:6px;padding:4px 8px;background:rgba(234,179,8,.05);border-radius:2px">'+r.tradeoffMsg+'</div>':'')+'<textarea class="inp" rows="3" style="width:100%;resize:vertical;font-size:12px;line-height:1.6;box-sizing:border-box;margin-bottom:6px" oninput="deUpdateRec('+i+',\'recommendation\',this.value)">'+escH(r.recommendation||'')+'</textarea><div style="display:flex;gap:12px;flex-wrap:wrap;font-size:11px;margin-bottom:4px"><div><span style="color:var(--mu)">Expected: </span><span style="color:var(--gr)">'+escH(r.outcome||'')+'</span></div><div><span style="color:var(--mu)">Confidence: </span><span style="color:var(--wh)">'+r.confidence+'</span></div><div><span style="color:var(--mu)">Fee Score: </span><span style="color:'+(getFeeTransparencyScore(r.strategy)>=7?'var(--gr)':getFeeTransparencyScore(r.strategy)>=5?'var(--yl)':'var(--rd)')+'">'+getFeeTransparencyScore(r.strategy)+'/10</span></div></div>'+(r.costOfDelay&&r.costOfDelay.yr1>0?'<div style="font-size:10px;margin-bottom:4px;padding:4px 8px;background:rgba(239,68,68,.05);border-radius:2px;color:var(--or)">⏱ Cost of delay: <strong>'+fmtK(r.costOfDelay.yr1)+'</strong>/yr · '+fmtK(r.costOfDelay.yr3)+' over 3yr · '+fmtK(r.costOfDelay.yr5)+' over 5yr</div>':'')+(r.assumptionLevel?'<div style="font-size:10px;color:var(--mu);font-style:italic;margin-bottom:4px">Assumes: '+escH(r.assumptionLevel)+'</div>':'')+(nextAct?'<div style="font-size:11px;color:#5B9BFF;margin-top:6px;padding:6px 8px;background:rgba(0,68,191,.06);border-radius:2px;border-left:2px solid #5B9BFF">▶ Next: '+escH(nextAct)+'</div>':'')+(isDev&&sp.recommendation?'<div style="margin-top:8px;padding:8px;background:rgba(249,115,22,.05);border-radius:2px;border:1px solid rgba(249,115,22,.15)"><div style="font-size:10px;color:var(--or);font-family:var(--fh);font-weight:700;margin-bottom:3px">SYSTEM BASELINE</div><div style="font-size:11px;color:rgba(226,232,240,.55)">'+escH(sp.recommendation)+'</div></div>':'')+'</div>';
   }).join('');
@@ -13869,7 +14017,7 @@ function deRenderCompare(){
 }
 
 function renderActionPlanRecsSimplified(recs,el){
-  var statL={pending:'Pending Review',drafted:'Your Advisor Is Working On This',proposed:'Ready for Your Review',agreed:'Approved — In Progress',submitted:'Submitted',implemented:'Implemented ✓',active:'Active ✓'};
+  var statL={pending:'Pending Review',in_progress:'In Progress',completed:'Completed ✓',dismissed:'Dismissed',drafted:'Your Advisor Is Working On This',proposed:'Ready for Your Review',agreed:'Approved — In Progress',submitted:'Submitted',implemented:'Implemented ✓',active:'Active ✓'};
   var html='<div style="border-top:1px solid var(--bd);padding-top:16px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#5B9BFF;margin-bottom:12px">Your Advisor\'s Recommendations</div>';
   if(!recs.length){html+='<div style="color:var(--mu);font-size:13px;padding:14px;border:1px solid var(--bd);border-radius:2px">Your advisor has not yet added recommendations. Check back after your consultation.</div>';}
   else{recs.forEach(function(r){var pc=r.priority==='high'?'var(--rd)':r.priority==='medium'?'var(--yl)':'#5B9BFF';html+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+pc+';border-radius:2px;padding:14px;margin-bottom:10px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;flex-wrap:wrap;gap:6px"><span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF">'+escH(statL[r.status]||r.status)+'</span>'+(r.service?'<span style="font-size:11px;color:#5B9BFF">'+escH(r.service)+'</span>':'')+'</div><div style="margin-bottom:8px"><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:3px">The Problem</div><div style="font-size:13px;font-weight:700;color:var(--wh)">'+escH(r.title||'')+'</div></div><div style="margin-bottom:8px"><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:3px">The Solution</div><div style="font-size:13px;color:rgba(226,232,240,.85);line-height:1.6">'+escH(r.recommendation||'')+'</div></div>'+(r.outcome?'<div><div style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:3px">Expected Outcome</div><div style="font-size:12px;color:var(--gr)">'+escH(r.outcome)+'</div></div>':'')+'</div>';});}
@@ -13885,7 +14033,7 @@ function renderActionPlanRecs(){
   if(isClient&&hasAdvisor){renderActionPlanRecsSimplified(recs,el);return;}
   var html='<div style="border-top:1px solid var(--bd);padding-top:16px"><div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#5B9BFF">Advisor Recommendations</div><button onclick="goStep(15)" style="background:rgba(0,68,191,.1);border:1px solid rgba(0,68,191,.3);color:#5B9BFF;font-family:var(--fh);font-size:10px;font-weight:700;padding:4px 10px;cursor:pointer;border-radius:2px">Edit in Decision Engine →</button></div>';
   if(!recs.length)html+='<div style="color:var(--mu);font-size:13px;padding:10px">No recommendations yet. Add them in the Advisor Rec tab.</div>';
-  else recs.forEach(function(r,i){html+='<div style="border:1px solid var(--bd);border-radius:2px;padding:10px;margin-bottom:6px"><div style="font-size:12px;font-weight:700;color:var(--wh);margin-bottom:4px">'+escH(r.title||r.recommendation||'Recommendation '+(i+1))+'</div><div style="font-size:11px;color:var(--mu)">'+escH(r.status||'drafted')+'</div></div>';});
+  else recs.forEach(function(r,i){html+='<div style="border:1px solid var(--bd);border-radius:2px;padding:10px;margin-bottom:6px"><div style="font-size:12px;font-weight:700;color:var(--wh);margin-bottom:4px">'+escH(r.title||r.recommendation||'Recommendation '+(i+1))+'</div><div style="font-size:11px;color:var(--mu)">'+escH(r.status||'pending')+'</div></div>';});
   el.innerHTML=html+'</div>';
 }
 
@@ -13938,17 +14086,29 @@ function renderActionPlanButtons(){
   var recs=(S.coupleData&&S.coupleData.recommendations)||S.advisorRecs||[];
   var recEl=document.getElementById('actionPlanRecs');if(!recEl)return;
   if(isClient&&hasAdvisor&&recs.length){
-    recEl.innerHTML='<div style="border-top:1px solid var(--bd);padding-top:16px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Advisor Recommendations</div>'+recs.map(function(r,i){return'<div style="border:1px solid var(--bd);border-radius:2px;padding:10px;margin-bottom:6px"><div style="font-size:12px;font-weight:700;color:var(--wh);margin-bottom:4px">'+escH(r.title||r.recommendation||'Recommendation '+(i+1))+'</div><div style="font-size:11px;color:var(--mu)">'+escH(r.status||'drafted')+'</div></div>';}).join('')+'</div>';
+    recEl.innerHTML='<div style="border-top:1px solid var(--bd);padding-top:16px"><div style="font-family:var(--fh);font-size:10px;font-weight:700;letter-spacing:.15em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Advisor Recommendations</div>'+recs.map(function(r,i){return'<div style="border:1px solid var(--bd);border-radius:2px;padding:10px;margin-bottom:6px"><div style="font-size:12px;font-weight:700;color:var(--wh);margin-bottom:4px">'+escH(r.title||r.recommendation||'Recommendation '+(i+1))+'</div><div style="font-size:11px;color:var(--mu)">'+escH(r.status||'pending')+'</div></div>';}).join('')+'</div>';
   }else{recEl.innerHTML='';}
+}
+// M5.5 U1 — reflect a shell-side advisor-rec status change in the engine's read-only advisor-rec list
+// (renderActionPlan / renderActionPlanButtons show S.coupleData.recommendations || S.advisorRecs for an
+// advisory client). Display-only: updates the rec's status field and re-renders, NEVER calls calc()/
+// computeCalcs (metric-inert, 5b). Matches by DB id; returns whether a rec was found+updated.
+function _applyRecStatus(recId,status){
+  if(!recId)return false;
+  var _id=String(recId),_hit=false;
+  function _u(arr){ if(!arr||!arr.length)return; for(var i=0;i<arr.length;i++){ if(arr[i]&&String(arr[i].id)===_id){ arr[i].status=status; _hit=true; } } }
+  try{ if(S.coupleData)_u(S.coupleData.recommendations); _u(S.advisorRecs); }catch(_e){}
+  if(_hit){ try{ if(typeof renderActionPlan==='function')renderActionPlan(); if(typeof renderActionPlanButtons==='function')renderActionPlanButtons(); }catch(_e2){} }
+  return _hit;
 }
 function p15RenderRecs(){
   var el=document.getElementById('p15PlanCards');if(!el)return;
   if(!DE.advisorPlan.length){el.innerHTML='<div style="color:var(--mu);font-size:13px;padding:12px">Click ⚡ Refresh Analysis to generate recommendations.</div>';return;}
   var secL={income:'Income',expenses:'Expenses',debt:'Debt Strategy',emergency_fund:'Emergency Fund',retirement:'Retirement',protection:'Protection',education:'Education',investment:'Investment',tax:'Tax Strategy',estate:'Estate Planning',general:'General'};
-  var statC={detected:'var(--mu)',drafted:'#5B9BFF',proposed:'var(--yl)',agreed:'var(--gr)',submitted:'var(--gr)',implemented:'var(--gr)',active:'var(--gr)'};
+  var statC={detected:'var(--mu)',pending:'var(--mu)',in_progress:'var(--yl)',completed:'var(--gr)',dismissed:'var(--mu)',drafted:'#5B9BFF',proposed:'var(--yl)',agreed:'var(--gr)',submitted:'var(--gr)',implemented:'var(--gr)',active:'var(--gr)'};
   el.innerHTML=DE.advisorPlan.map(function(r,i){
     var strats=Object.keys(DE_STRATEGIES||{}).map(function(k){return'<option value="'+k+'"'+(r.strategy===k?' selected':'')+'>'+k.replace(/_/g,' ')+'</option>';}).join('');
-    var statusOpts=['drafted','proposed','agreed','submitted','implemented','active'].map(function(s){return'<option value="'+s+'"'+(r.status===s?' selected':'')+'>'+s+'</option>';}).join('');
+    var statusOpts=[['pending','Pending Review'],['in_progress','In Progress'],['completed','Completed'],['dismissed','Dismissed']].map(function(o){return'<option value="'+o[0]+'"'+(r.status===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('');
     return'<div style="background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+(statC[r.status]||'var(--mu)')+';border-radius:2px;padding:14px;margin-bottom:10px">'
       +'<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;margin-bottom:10px;flex-wrap:wrap">'
       +'<div><div style="font-family:var(--fh);font-size:12px;font-weight:700;color:var(--wh)">'+escH(r.title||'Recommendation')+'</div>'
@@ -13966,7 +14126,7 @@ function deRenderClientReadOnly(){
   // Shows the same Problem / Solution / Expected Outcome cards the advisor built,
   // but with all edit controls stripped out.
   var recs=(S.coupleData&&S.coupleData.recommendations)||S.advisorRecs||[];
-  var statL={pending:'Pending Review',drafted:'Your Advisor Is Working On This',proposed:'Ready for Your Review',agreed:'Approved — In Progress',submitted:'Submitted',implemented:'Implemented ✓',active:'Active ✓'};
+  var statL={pending:'Pending Review',in_progress:'In Progress',completed:'Completed ✓',dismissed:'Dismissed',drafted:'Your Advisor Is Working On This',proposed:'Ready for Your Review',agreed:'Approved — In Progress',submitted:'Submitted',implemented:'Implemented ✓',active:'Active ✓'};
   var secL={income:'Income',expenses:'Expenses',debt:'Debt Strategy',emergency_fund:'Emergency Fund',retirement:'Retirement',protection:'Protection',education:'Education',investment:'Investment',tax:'Tax Strategy',estate:'Estate Planning',general:'General'};
   var priorityColors={high:'var(--rd)',medium:'var(--yl)',low:'#5B9BFF'};
 
@@ -13994,7 +14154,7 @@ function deRenderClientReadOnly(){
     var pc=priorityColors[r.priority]||'var(--mu)';
     var sec=secL[r.section]||r.section||'General';
     var statusLabel=statL[r.status]||r.status||'Pending';
-    var statusColor=r.status==='implemented'||r.status==='active'?'var(--gr)':r.status==='agreed'?'var(--gr)':r.status==='proposed'?'var(--yl)':'var(--mu)';
+    var statusColor=r.status==='implemented'||r.status==='active'||r.status==='completed'?'var(--gr)':r.status==='in_progress'?'var(--yl)':r.status==='agreed'?'var(--gr)':r.status==='proposed'?'var(--yl)':'var(--mu)';
     return '<div style="background:var(--bg-card);border:1px solid var(--bd);border-left:3px solid '+pc+';border-radius:2px;padding:14px;margin-bottom:10px">'
       +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;flex-wrap:wrap;gap:6px">'
         +'<span style="font-family:var(--fh);font-size:9px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:#5B9BFF;background:rgba(0,68,191,.1);border:1px solid rgba(0,68,191,.2)">'+escH(sec)+'</span>'
@@ -14773,6 +14933,7 @@ function submitAdvisorRequestFromModal(){
     if(msg.type==='PFOS_CALC_ACCESS'){_calcAccess=msg.calcAccess||{};if(_currentSection==='tools')renderToolsGrid();return;}
     if(msg.type==='PFOS_FLUSH'){_flushSync();return;}
     if(msg.type==='PFOS_CONFIRMED_POLICY'){S.confirmedLifePolicy=msg.policy||null;try{if(document.getElementById('gw_results'))calcGenWealth();}catch(e){}return;}
+    if(msg.type==='PFOS_REC_STATUS'){_applyRecStatus(msg.recId,msg.status);return;}
     if(msg.type==='PFOS_LOGOUT_WIPE'){
       // Parent is logging out — wipe iframe's storage and in-memory state too
       try{
@@ -14938,16 +15099,7 @@ function submitAdvisorRequestFromModal(){
           // see it on next refresh (PFOS_LOAD has the same guard, so actually
           // they keep their local copy; an explicit refresh after both spouses
           // have synced is the cleanest way to reconcile delete-to-zero).
-          if(!Array.isArray(S.goals)) S.goals=[];
-          if(Array.isArray(jfd.goals) && jfd.goals.length){
-            S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
-            jfd.goals.forEach(function(jg){
-              if(!jg) return;
-              var copy = Object.assign({}, jg);
-              copy.owner = 'joint';
-              S.goals.push(copy);
-            });
-          }
+          _applyJointGoals(jfd);
           // Re-render all panels that read from _jointItems
           try{ if(typeof renderIncomeRow === 'function') renderIncomeRow(); }catch(e){}
           try{ if(typeof renderRetAccounts === 'function') renderRetAccounts(); }catch(e){}
@@ -16166,16 +16318,7 @@ function submitAdvisorRequestFromModal(){
             var __jfdGoalIds = (Array.isArray(jfd.goals)?jfd.goals:[]).map(function(g){return g && g.id;}).filter(Boolean);
             __preDropLocalJoint = S.goals.filter(function(g){return g && g.owner==='joint' && g.id && __jfdGoalIds.indexOf(g.id) === -1;});
           }
-          if(Array.isArray(jfd.goals) && jfd.goals.length){
-            if(!Array.isArray(S.goals)) S.goals=[];
-            S.goals = S.goals.filter(function(g){return g && g.owner !== 'joint';});
-            jfd.goals.forEach(function(jg){
-              if(!jg) return;
-              var copy = Object.assign({}, jg);
-              copy.owner = 'joint';
-              S.goals.push(copy);
-            });
-          }
+          _applyJointGoals(jfd);
           // Restore the captured local-only joint goals
           if(__preDropLocalJoint.length){
             if(!Array.isArray(S.goals)) S.goals=[];
@@ -27417,7 +27560,7 @@ function populateFromState(){
 </script>
 <!-- PFOS canonical engine (single source of truth). Loaded for SHADOW MODE:
      computes calcs alongside calc() and logs parity diffs; changes nothing rendered. -->
-<script src="/pfos-core.v55.js" defer></script>
+<script src="/pfos-core.v57.js" defer></script>
 <script src="/pfos-walkthrough/pfos-walkthrough.js" defer></script>
 <script>
 // Listen for theme changes from parent page
