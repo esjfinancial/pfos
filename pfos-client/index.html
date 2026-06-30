@@ -4733,6 +4733,25 @@ function _cpHideChildlessEdu(a){
   if(typeof _cpSinglePhasePlan!=='function'||!_cpSinglePhasePlan())return false;
   return !(typeof CPLAN!=='undefined'&&CPLAN&&CPLAN.children&&CPLAN.children.length>0);
 }
+// Owner decision: in an AUTO-generated plan (Core seeder / AI), a couple's college card defaults to JOINT from the start
+// — education is a shared household goal. Idempotent: only converts an UNDECIDED self/personal edu card; SKIPS a manually
+// +Added card (_userAdded) and an explicit "Just mine" pin (_userMadePersonal), and leaves an already-joint card alone so
+// a user's dual-slider split is preserved. Called from _cpLiteAutoSeed (Core) and the AI converter — NOT from Planning,
+// where the user builds manually and the per-card "shared or just yours?" prompt asks instead.
+function _cpEduAutoJoint(){
+  if(typeof CPLAN==='undefined'||!CPLAN||!Array.isArray(CPLAN.allocations))return;
+  var h=CPLAN._householdType||'individual';
+  if(h!=='joint'&&h!=='hybrid'&&h!=='separate')return;
+  if(!CPLAN._coupleLink&&!(CPLAN._partner&&(CPLAN._partner.firstName||CPLAN._partner.name)))return;   // need a real partner
+  if(!(CPLAN.children&&CPLAN.children.length>0))return;
+  CPLAN.allocations.forEach(function(a){
+    if(!a||a.type!=='edu'||a._isPlaceholder)return;
+    if(a._userAdded||a._userMadePersonal)return;                              // manual +Add / explicit personal → never auto-join
+    if(a.owner&&a.owner!=='self'&&a.owner!=='personal')return;               // already joint/spouse → leave the split alone
+    var amt=parseFloat(a.amount)||0;
+    a.owner='joint'; a.amountSelf=Math.round(amt/2); a.amountSpouse=amt-a.amountSelf;
+  });
+}
 // The default retirement vehicle for the Core prescriptive plan: 401(k) if employed (capture the employer match), Roth
 // IRA otherwise, Traditional IRA if the user is over the Roth income (MAGI) limit (so the Roth phase-out, which makes
 // _cpIRSMax('roth') return 0, can't leave an unfundable $0 card). Used to auto-resolve the "Choose a retirement vehicle"
@@ -4816,6 +4835,9 @@ function _cpLiteAutoSeed(){
     if(_reseed){ a.amount=Math.round(_give); a.phase=1; a._liteSeededAmt=a.amount; }
     a._eduFundGap=((parseFloat(a.amount)||0)<=0&&!!(CPLAN.children&&CPLAN.children.length>0));   // render-only: kids but no growth budget left
   });
+  // Core auto-generates the plan → a couple's college card defaults to JOINT (owner). Runs AFTER funding so the 50/50
+  // self/spouse split is taken from the seeded amount; idempotent + skips manual-add / explicit-personal cards.
+  if(typeof _cpEduAutoJoint==='function')_cpEduAutoJoint();
 }
 // ── budget_v2 DARK-LAUNCH FLAG (Milestone 1) ── Gates ALL unified-budget + register M1 UI
 // while it's built behind the flag. OFF for everyone except the test/owner allowlist; flip to
@@ -36581,6 +36603,9 @@ function _cpRenderPlanV2(){
     if(typeof _cpLiteAutoSeed==='function')_cpLiteAutoSeed();
   }
   if(typeof _cpEduNormalizeType==='function')_cpEduNormalizeType();
+  // AI-generated plan → same as Core: a couple's college card auto-defaults to JOINT (owner). The AI staging already
+  // funded the edu card, so this just sets the 50/50 split. Idempotent; Core handles its own inside _cpLiteAutoSeed.
+  if(CPLAN.planMode==='ai' && typeof _cpEduAutoJoint==='function')_cpEduAutoJoint();
   // Sum of allocations representing THIS user's deployment. Three buckets:
   //   • Partner-shared self cards (visible only for review/request) — don't
   //     count. They're the partner's commitments.
@@ -40369,7 +40394,9 @@ function _cpAddToPhaseInternal(type,phase,owner){
   // so pre-filling it with the current contribution would double-count.
   // Existing balance is displayed in the card too — also via _cpMatchExisting.
   var startAmount=0;
-  CPLAN.allocations.push({type:type,amount:startAmount,target:t,phase:phase,cascade:'',customName:type==='custom'?'My goal':'',owner:owner});
+  var _newCard={type:type,amount:startAmount,target:t,phase:phase,cascade:'',customName:type==='custom'?'My goal':'',owner:owner};
+  if(type==='edu')_newCard._userAdded=true;   // a manually +Added college card = "the user adds it on their own" → keep the personal/joint PROMPT (don't auto-default to joint like the prescriptive/auto card)
+  CPLAN.allocations.push(_newCard);
   var newIdx=CPLAN.allocations.length-1;
   // ── Cascade prompt resolution path ──
   // If the user just picked "Add a new allocation" in the cascade prompt, the original
@@ -49992,7 +50019,7 @@ function cplanSave(){
   // the partner via shared_card_grants are filtered.
   var cleanAllocs=CPLAN.allocations.filter(function(a){
     return !(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint');
-  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',addressesIssueId:a.addressesIssueId||undefined,goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,_liteSeededAmt:(a._liteSeededAmt!=null?a._liteSeededAmt:undefined),_autoResolvedFromPlaceholder:a._autoResolvedFromPlaceholder===true,
+  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',addressesIssueId:a.addressesIssueId||undefined,goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,_userAdded:a._userAdded===true,_liteSeededAmt:(a._liteSeededAmt!=null?a._liteSeededAmt:undefined),_autoResolvedFromPlaceholder:a._autoResolvedFromPlaceholder===true,
   // _liteSeededAmt: the Core auto-seed's stamped amount (distinguishes a seeded default from a user-nudged slider so re-seeding never clobbers an edit). _autoResolvedFromPlaceholder: the retirement chooser was auto-resolved to a real vehicle in Core.
   // _userMadePersonal: sticky pin so an education card the user explicitly made personal is NOT re-jointified by the
   // _cpEduDefaultJoint auto-default on the next render/reload/regen. MUST be in this allowlist serializer or the pin is
