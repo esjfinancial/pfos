@@ -1146,7 +1146,12 @@ function _issuesDetect(ctx){
   g.PFOSRecs.find = _recsFind;                      // find by id (pure)
   g.PFOSRecs.upsert = _recsUpsert;                  // replace-by-id or append; returns a NEW array (pure)
   g.PFOSRecs.setStatus = _recsSetStatus;            // normalized status change; returns a NEW array (pure)
-  g.PFOS_FLAGS = g.PFOS_FLAGS || {};   // dark-launch bag — each M5 sub-section gates here; default OFF = byte-identical
+  g.PFOS_FLAGS = g.PFOS_FLAGS || {};   // dark-launch bag — each M5 sub-section gates here
+  // ── M5 SHIP ── Flip the FOS-moat + Core-decision engines ON for production. They were dark-launched (default OFF =
+  // byte-identical to the legacy paths); each ON path was verified conforming (10-agent re-audit, 0 must-fix) and is
+  // exercised flags-ON by the _sLITE / _core-regression harnesses. To roll back, delete this forEach (reverts to OFF).
+  // NOTE: budgetV2 is NOT here — it stays separately email-gated via budgetV2Enabled() (M1, not shipping globally yet).
+  ['litePlanner','issuesDetect','sharedSelfFlags','priorityEngine','spouseVisibility','planTeaser','recStore','recLifecycle','coreAids','impactForecast','healthV2','decisionCards','decisionCardsHeadline','decisionCardsCommit'].forEach(function(_f){ if(g.PFOS_FLAGS[_f]===undefined)g.PFOS_FLAGS[_f]=true; });
   g.PFOSShared.PFOSIssues = g.PFOSIssues;
   g.PFOSShared.PFOSHealth = g.PFOSHealth;
   g.PFOSShared.PFOSImpact = g.PFOSImpact;
