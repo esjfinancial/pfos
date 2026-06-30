@@ -3146,7 +3146,11 @@ async function loadClientDataIntoPFOS(clientId){
     coupleData = { recommendations: recommendations };
   }
 
-  const { data:profile } = await db.from('client_profiles').select('*').eq('client_id',clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+  // Piece B: route the advisor's load through the server-side filter RPC — financial_data comes back stripped
+  // of the sections the client hid (client_profiles.data_visibility), with stale calcs dropped so the engine
+  // recomputes the cascade from the filtered S. A client viewing their OWN profile gets full data (RPC handles it).
+  const { data:_profRows } = await db.rpc('get_advisor_client_profile', { p_client_id: clientId });
+  const profile = (_profRows && _profRows.length) ? _profRows[0] : null;
 
   var mode = APP.role === 'client' ? 'client' : 'advisor';
   var stateData = (profile && profile.financial_data && profile.financial_data.S) ? profile.financial_data.S : null;
@@ -3158,7 +3162,8 @@ async function loadClientDataIntoPFOS(clientId){
   if(couple && couple.household_type==='joint' && _isJointModelV2(couple) && stateData){
     try{
       var _bId2 = couple.client_b_id; // primary is client_a (loadFrom); partner is client_b
-      var _bProfRes = await db.from('client_profiles').select('financial_data').eq('client_id',_bId2).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      var _bRpc = await db.rpc('get_advisor_client_profile', { p_client_id: _bId2 });   // Piece B: filter partner B's data too
+      var _bProfRes = { data: (_bRpc && _bRpc.data && _bRpc.data.length) ? _bRpc.data[0] : null };
       var _bS = (_bProfRes && _bProfRes.data && _bProfRes.data.financial_data && _bProfRes.data.financial_data.S) ? _bProfRes.data.financial_data.S : null;
       stateData = _mergeJointState(stateData, _bS);
     }catch(e){ console.warn('[jm] merge-on-read failed, using primary row only:', e&&e.message); }
