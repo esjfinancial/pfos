@@ -3146,9 +3146,11 @@ async function loadClientDataIntoPFOS(clientId){
     coupleData = { recommendations: recommendations };
   }
 
-  // The advisor reads the full profile (the advisory relationship is admin-controlled, not client-revocable).
-  // The only client-controlled hide is SPEND DATA, enforced separately via the spending_visibility tier.
-  const { data:profile } = await db.from('client_profiles').select('*').eq('client_id',clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+  // The advisor reads the full profile (the advisory relationship is admin-controlled, not client-revocable),
+  // EXCEPT the client's logged spending: get_advisor_profile strips financial_data.S.spendingEntries unless
+  // the client has shared it (spending_visibility effective tier >= 2). Self/admin always get the full row.
+  const { data:_apRows } = await db.rpc('get_advisor_profile', { p_client_id: clientId });
+  const profile = (_apRows && _apRows.length) ? _apRows[0] : null;
 
   var mode = APP.role === 'client' ? 'client' : 'advisor';
   var stateData = (profile && profile.financial_data && profile.financial_data.S) ? profile.financial_data.S : null;
@@ -3160,7 +3162,8 @@ async function loadClientDataIntoPFOS(clientId){
   if(couple && couple.household_type==='joint' && _isJointModelV2(couple) && stateData){
     try{
       var _bId2 = couple.client_b_id; // primary is client_a (loadFrom); partner is client_b
-      var _bProfRes = await db.from('client_profiles').select('financial_data').eq('client_id',_bId2).order('updated_at',{ascending:false}).limit(1).maybeSingle();   // binary access: RLS gates partner B too
+      var _bRpc2 = await db.rpc('get_advisor_profile', { p_client_id: _bId2 });   // strip partner B's spending too, per B's own sharing tier
+      var _bProfRes = { data: (_bRpc2 && _bRpc2.data && _bRpc2.data.length) ? _bRpc2.data[0] : null };
       var _bS = (_bProfRes && _bProfRes.data && _bProfRes.data.financial_data && _bProfRes.data.financial_data.S) ? _bProfRes.data.financial_data.S : null;
       stateData = _mergeJointState(stateData, _bS);
     }catch(e){ console.warn('[jm] merge-on-read failed, using primary row only:', e&&e.message); }
