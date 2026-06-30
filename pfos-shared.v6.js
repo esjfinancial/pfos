@@ -301,7 +301,7 @@ function _issuesDetect(ctx){
     }
 
     // Children but no education savings
-    if(d.children.length>0&&!d.allocations.some(function(a){return a.type==='edu'&&a.amount>0;}))
+    if(d.children.length>0&&!d.allocations.some(function(a){return a.type==='edu';}))   // ANY edu card (funded or not) means education IS represented — don't fire "add education" when a College fund already exists (it may be momentarily $0 pre-seed)
       flags.push({type:'opp',icon:'🎓',title:'No education funding for '+d.children.length+' child'+(d.children.length>1?'ren':''),desc:'Tax-advantaged education savings grow significantly with time. Multiple vehicle options available.',action:'edu'});
 
     // Old/orphaned retirement accounts (rollover candidates) — identical
