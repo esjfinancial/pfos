@@ -1598,7 +1598,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
         <div id="spendingSharingPanel" style="margin-bottom:14px"></div>
         <div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px;margin-bottom:12px">
           <div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:10px">Data Visibility Settings</div>
-          <div style="font-size:13px;color:var(--mu);margin-bottom:12px;line-height:1.7">Choose which sections your advisor can view. Hiding a section does not delete your data — it simply limits advisor visibility during reviews.</div>
+          <div style="font-size:13px;color:var(--mu);margin-bottom:12px;line-height:1.7">Turn this off to hide <strong>all</strong> of your financial data from your advisor. Your data is never deleted — your advisor simply won't see anything until you turn it back on.</div>
           <div id="sharingToggles"></div>
         </div>
         <div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px">
@@ -15003,47 +15003,41 @@ function printNWSClient(){
 }
 
 // ── PRIVACY & SHARING CONTROLS ──────────────────────────
-function initSharingControls(){
+// Binary advisor access (owner): the client either grants their advisor access to their financial data,
+// or not — one switch, no per-section partials. Enforcement is server-side: client_profiles RLS gates the
+// agent's SELECT on advisor_can_view, so "off" means the advisor's reads return ZERO rows (they see nothing,
+// not a hidden-section view). The graduated spending-detail tier below (_pvRenderSpendingSharing) is a
+// separate, finer control that only matters while access is ON.
+async function initSharingControls(){
   var el=document.getElementById('sharingToggles');if(!el) return;
-  var sections=[
-    {key:'income',label:'Income Sources',icon:'💰'},
-    {key:'expenses',label:'Monthly Expenses',icon:'💸'},
-    {key:'assets',label:'Assets & Savings',icon:'🏦'},
-    {key:'debts',label:'Debts & Liabilities',icon:'💳'},
-    {key:'retirement',label:'Retirement Accounts',icon:'🎯'},
-    {key:'protection',label:'Insurance & Protection',icon:'🛡️'},
-    {key:'goals',label:'Financial Goals',icon:'⭐'},
-    {key:'education',label:'Education Planning',icon:'🎓'}
-  ];
-  var prefs=getSharingPrefs();
-  el.innerHTML=sections.map(function(s){
-    var enabled=prefs[s.key]!==false;
-    return '<div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(0,68,191,.06)">'
-      +'<div style="display:flex;align-items:center;gap:8px"><span style="font-size:14px">'+s.icon+'</span><span style="font-size:14px;color:var(--wh)">'+s.label+'</span></div>'
-      +'<label style="position:relative;display:inline-block;width:36px;height:20px;cursor:pointer">'
-      +'<input type="checkbox" '+(enabled?'checked':'')+' onchange="toggleSharingPref(\''+s.key+'\',this.checked)" style="opacity:0;width:0;height:0">'
-      +'<span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:'+(enabled?'var(--gr)':'rgba(100,116,139,.3)')+';border-radius:10px;transition:.3s"></span>'
-      +'<span style="position:absolute;height:16px;width:16px;left:'+(enabled?'18px':'2px')+';bottom:2px;background:white;border-radius:50%;transition:.3s"></span>'
-      +'</label></div>';
-  }).join('');
-}
-function getSharingPrefs(){
-  try{var s=localStorage.getItem('pfos_sharing_prefs');return s?JSON.parse(s):{};}catch(e){return{};}
-}
-async function toggleSharingPref(key,enabled){
-  var prefs=getSharingPrefs();
-  prefs[key]=enabled;
-  try{localStorage.setItem('pfos_sharing_prefs',JSON.stringify(prefs));}catch(e){}  // fast cache; the DB column is the source of truth the advisor filter reads
-  initSharingControls();
-  // Piece B: persist to client_profiles.data_visibility so the server-side advisor filter
-  // (get_advisor_client_profile RPC) actually WITHHOLDS the section from the advisor — not just hides it in JS.
+  el.innerHTML='<div style="color:var(--mu);font-size:13px">Loading…</div>';
+  var allowed=true;
   try{
-    var _cid = APP && APP.currentClientId;
-    if(db && _cid){
-      await db.from('client_profiles').update({ data_visibility: prefs }).eq('client_id', _cid);
-      try{ await db.from('audit_log').insert({ performed_by:(APP.user&&APP.user.id)||null, action:'data_visibility_change', entity_type:'client_profile', entity_id:_cid, details:{ client_id:_cid, section:key, visible:enabled } }); }catch(_a){}
+    var _cid=APP&&APP.currentClientId;
+    if(db&&_cid){
+      var _r=await db.from('client_profiles').select('advisor_can_view').eq('client_id',_cid).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(_r&&_r.data&&_r.data.advisor_can_view===false) allowed=false;
     }
-  }catch(e){ console.warn('[privacy] persist data_visibility failed:', e&&e.message); }
+  }catch(e){ console.warn('[privacy] read advisor_can_view:',e&&e.message); }
+  el.innerHTML='<div style="display:flex;align-items:center;justify-content:space-between;gap:14px;padding:6px 0">'
+    +'<div style="display:flex;align-items:center;gap:11px"><span style="font-size:20px">👁️</span><div><div style="font-size:14px;font-weight:600;color:var(--wh)">Allow my advisor to view my financial data</div>'
+    +'<div style="font-size:12px;color:var(--mu);margin-top:3px;line-height:1.5">'+(allowed?'Your advisor can see your full profile during reviews.':'Your advisor cannot see any of your financial data right now.')+'</div></div></div>'
+    +'<label style="position:relative;display:inline-block;width:46px;height:26px;cursor:pointer;flex-shrink:0">'
+    +'<input type="checkbox" '+(allowed?'checked':'')+' onchange="toggleAdvisorAccess(this.checked)" style="opacity:0;width:0;height:0">'
+    +'<span style="position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:'+(allowed?'var(--gr)':'rgba(100,116,139,.35)')+';border-radius:13px;transition:.3s"></span>'
+    +'<span style="position:absolute;height:20px;width:20px;left:'+(allowed?'23px':'3px')+';bottom:3px;background:white;border-radius:50%;transition:.3s"></span>'
+    +'</label></div>';
+}
+async function toggleAdvisorAccess(enabled){
+  // optimistic: re-render reflects the change immediately; the RPC is the source of truth the RLS gate reads.
+  try{
+    var r=await db.rpc('set_advisor_access',{ p_enabled:enabled });
+    if(r&&r.error) throw r.error;
+    var _cid=APP&&APP.currentClientId;
+    try{ await db.from('audit_log').insert({ performed_by:(APP.user&&APP.user.id)||null, action:'advisor_access_change', entity_type:'client_profile', entity_id:_cid, details:{ client_id:_cid, advisor_can_view:enabled } }); }catch(_a){}
+    if(typeof _cpToast==='function') _cpToast(enabled?'Advisor access enabled':'Advisor access turned off');
+  }catch(e){ console.warn('[privacy] set_advisor_access failed:',e&&e.message); if(typeof _cpToast==='function') _cpToast('Could not update — please try again'); }
+  initSharingControls();
 }
 
 // ── ADVISOR ACTIVITY / AUDIT TRAIL ──────────────────────

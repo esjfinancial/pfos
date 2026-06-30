@@ -3146,13 +3146,33 @@ async function loadClientDataIntoPFOS(clientId){
     coupleData = { recommendations: recommendations };
   }
 
-  // Piece B: route the advisor's load through the server-side filter RPC — financial_data comes back stripped
-  // of the sections the client hid (client_profiles.data_visibility), with stale calcs dropped so the engine
-  // recomputes the cascade from the filtered S. A client viewing their OWN profile gets full data (RPC handles it).
-  const { data:_profRows } = await db.rpc('get_advisor_client_profile', { p_client_id: clientId });
-  const profile = (_profRows && _profRows.length) ? _profRows[0] : null;
+  // Binary advisor access (owner): the client either grants their advisor access or not. Enforcement is in
+  // the DB (client_profiles RLS gates the agent's SELECT on advisor_can_view) — a direct read here returns
+  // ZERO rows when the client has revoked access, so `profile` is null and we show the restricted state below.
+  // (A client viewing their OWN profile, and admins, are unaffected by that gate.)
+  const { data:profile } = await db.from('client_profiles').select('*').eq('client_id',clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
 
   var mode = APP.role === 'client' ? 'client' : 'advisor';
+  // Binary advisor access (owner): if the client revoked access, RLS returns no row (profile is null).
+  // Distinguish that from a brand-new client (also null, but the advisor SHOULD still get the empty setup
+  // form) via advisor_access_revoked() — a boolean-only SECURITY DEFINER check. When revoked, show a clear
+  // restricted state over the engine and load nothing; otherwise hide any prior notice and continue.
+  var _advRestrict=document.getElementById('advRestrictedOverlay');
+  if(mode==='advisor' && !profile){
+    var _revoked=false;
+    try{ var _rr=await db.rpc('advisor_access_revoked',{p_client_id:clientId}); _revoked=!!(_rr&&_rr.data); }catch(e){}
+    if(_revoked){
+      var _acR=document.getElementById('pfosAppContainer');
+      if(_acR){
+        _acR.style.position='relative';
+        if(!_advRestrict){ _advRestrict=document.createElement('div'); _advRestrict.id='advRestrictedOverlay'; _acR.appendChild(_advRestrict); }
+        _advRestrict.style.cssText='position:absolute;inset:0;z-index:60;display:flex;align-items:center;justify-content:center;background:#09092E;padding:24px;text-align:center';
+        _advRestrict.innerHTML='<div style="max-width:440px"><div style="font-size:42px;margin-bottom:14px">🔒</div><div style="font-size:18px;font-weight:700;color:#e2e8f0;margin-bottom:10px">Access restricted</div><div style="font-size:14px;color:#94a3b8;line-height:1.55">'+(((APP.currentClient&&APP.currentClient.name)||'This client').replace(/</g,'&lt;'))+' has not shared their financial data with you. They control this from their privacy settings and can grant access at any time.</div></div>';
+      }
+      return; // nothing to load — do not post PFOS_LOAD
+    }
+  }
+  if(_advRestrict) _advRestrict.style.display='none';
   var stateData = (profile && profile.financial_data && profile.financial_data.S) ? profile.financial_data.S : null;
   // ── Joint two-row model (V2): merge B's row into the primary's state on read ──
   // Only for couples migrated to V2 (flag on couple_links.joint_financial_data).
@@ -3162,8 +3182,7 @@ async function loadClientDataIntoPFOS(clientId){
   if(couple && couple.household_type==='joint' && _isJointModelV2(couple) && stateData){
     try{
       var _bId2 = couple.client_b_id; // primary is client_a (loadFrom); partner is client_b
-      var _bRpc = await db.rpc('get_advisor_client_profile', { p_client_id: _bId2 });   // Piece B: filter partner B's data too
-      var _bProfRes = { data: (_bRpc && _bRpc.data && _bRpc.data.length) ? _bRpc.data[0] : null };
+      var _bProfRes = await db.from('client_profiles').select('financial_data').eq('client_id',_bId2).order('updated_at',{ascending:false}).limit(1).maybeSingle();   // binary access: RLS gates partner B too
       var _bS = (_bProfRes && _bProfRes.data && _bProfRes.data.financial_data && _bProfRes.data.financial_data.S) ? _bProfRes.data.financial_data.S : null;
       stateData = _mergeJointState(stateData, _bS);
     }catch(e){ console.warn('[jm] merge-on-read failed, using primary row only:', e&&e.message); }
