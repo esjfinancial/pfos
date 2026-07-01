@@ -1469,6 +1469,8 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
         <div class="info-card"><div class="info-card-title">Scores</div><div id="clientScoresData"></div></div>
         <div class="info-card"><div class="info-card-title">Action Priority</div><div id="clientPriorityData"></div></div>
       </div>
+      <!-- #101: engagement strip — surfaces the savings streak on the dashboard (badges/achievements one click away) -->
+      <div id="engageStrip" style="display:none;margin-bottom:16px"></div>
       <!-- Partner Status Card (couples only) -->
       <div id="partnerStatusCard" style="display:none;margin-bottom:16px;padding:16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">
         <div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin-bottom:8px">💑 Partner Account</div>
@@ -2745,6 +2747,7 @@ function updateMobileTools(){
   // Net Worth Ticker
   renderClientTracking();
   if(typeof renderOnboardingChecklist==='function')renderOnboardingChecklist(); // #98: auto-show the guided checklist on the dashboard for incomplete-setup clients (self-gates — hides when done)
+  if(typeof renderEngageStrip==='function')renderEngageStrip(); // #101: streak on the dashboard overview
   loadSupabaseSnapshots();
   _cpLoadHoldings(); // §2.1 (M2): fire-and-forget RLS-scoped holdings read → APP._holdings[]; metric-inert
   if(typeof _writeAlertStateSoon==='function') _writeAlertStateSoon(); // §4.2a (M4): debounced alert snapshot; coalesces with the data-change trigger (one write per settle); metric-inert
@@ -4157,6 +4160,18 @@ function renderClientSavingsGoals(){
     h+='</div>';return h;
   }).join('');
 }
+// #101: surface the savings streak on the dashboard overview (it otherwise only lives on the Engagement page).
+function renderEngageStrip(){
+  var el=document.getElementById('engageStrip'); if(!el) return;
+  var fd=_lastPfosState||{}; var c=fd.calcs||{};
+  if(!c.inc){ el.style.display='none'; return; }   // needs data to be meaningful
+  var streak=0; try{streak=parseInt(localStorage.getItem('pfos_savings_streak_'+APP.currentClientId))||0;}catch(_){}
+  el.style.display='block';
+  el.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">'
+    +'<div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="font-size:18px">🔥</span><span style="color:var(--wh);font-weight:700;font-family:var(--fh);font-size:15px">'+streak+'</span><span style="color:var(--mu)">month'+(streak===1?'':'s')+' of positive cash flow</span></div>'
+    +'<a onclick="showClientPage(\'engage\')" style="margin-left:auto;font-size:12px;color:#5B9BFF;cursor:pointer;text-decoration:underline;font-family:var(--fh);font-weight:700">View achievements &amp; badges →</a>'
+    +'</div>';
+}
 function renderSavingsStreak(){
   var countEl=document.getElementById('streakCount');
   var msgEl=document.getElementById('streakMsg');
@@ -4175,6 +4190,12 @@ function renderSavingsStreak(){
   var milestones=[3,7,14,30,60,90,180,365];
   var nextMilestone=milestones.find(function(m){return m>streak;})||365;
   msgEl.textContent=!c.inc?'Set your income to start your streak!':streak===0?'Start saving to begin your streak!':streak+' month'+(streak>1?'s':'')+' of positive cash flow! Next milestone: '+nextMilestone; // #108: zero-income streak guidance
+  // #102: celebrate a streak milestone once each (seed silently on first-ever render so a pre-existing streak doesn't fire).
+  try{
+    var _mkey='pfos_streak_celebrated_'+APP.currentClientId, _rawM=null; try{_rawM=localStorage.getItem(_mkey);}catch(_){}
+    if(_rawM==null){ var _passed=milestones.filter(function(m){return streak>=m;}).pop()||0; try{localStorage.setItem(_mkey,_passed);}catch(_){} }
+    else { var _lastC=parseInt(_rawM)||0; var _hit=milestones.filter(function(m){return streak>=m&&m>_lastC;}).pop(); if(_hit&&typeof showCelebration==='function'){ try{localStorage.setItem(_mkey,_hit);}catch(_){} showCelebration('🔥 '+_hit+'-month streak!','Keep the positive cash flow going!'); } }
+  }catch(_){}
   if(barEl){
     var pct=Math.min(100,Math.round(streak/nextMilestone*100));
     barEl.innerHTML='<div style="height:6px;background:rgba(249,115,22,.1);border-radius:3px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:var(--or);border-radius:3px"></div></div>';
@@ -4193,6 +4214,15 @@ function renderBadges(){
     {id:'nw_100k',icon:'💎',name:'Six Figures',desc:'Net worth over $100K',earned:(c.netWorth||0)>=100000},
     {id:'balanced',icon:'⚖️',name:'Balanced',desc:'All scores 5+',earned:c.inc>0&&Object.keys({cfScore:1,protScore:1,growScore:1,effScore:1}).every(function(k){var sc=(fd.scores||{})[k];return sc!=null&&sc>=5;})}
   ];
+  // #102: celebrate a NEWLY-earned badge (seed silently on the first-ever render so pre-existing badges don't spam).
+  try{
+    var _bkey='pfos_badges_seen_'+APP.currentClientId, _rawB=null; try{_rawB=localStorage.getItem(_bkey);}catch(_){}
+    var _seenB={}; try{_seenB=JSON.parse(_rawB||'{}')||{};}catch(_){}
+    var _newB=(_rawB==null)?[]:badges.filter(function(bd){return bd.earned&&!_seenB[bd.id];});
+    badges.forEach(function(bd){ if(bd.earned)_seenB[bd.id]=1; });
+    try{localStorage.setItem(_bkey,JSON.stringify(_seenB));}catch(_){}
+    if(_newB.length&&typeof showCelebration==='function'){ var _b0=_newB[0]; showCelebration('🏅 Badge earned: '+_b0.name,_b0.desc); }
+  }catch(_){}
   el.innerHTML=badges.map(function(b){
     var col=b.earned?'rgba(34,197,94,.12)':'rgba(100,116,139,.06)';
     var borderCol=b.earned?'rgba(34,197,94,.25)':'rgba(100,116,139,.15)';
