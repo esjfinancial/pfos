@@ -1455,6 +1455,9 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
         <button onclick="dismissClientNotif()" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:16px;padding:0 4px">✕</button>
       </div>
 
+      <!-- #103: welcome-back banner — on return after 7+ days, a concise "what changed since your last visit" delta (dismissible) -->
+      <div id="welcomeBackBanner" style="display:none;margin-bottom:16px"></div>
+
       <!-- Couple link status (shown when client is linked) -->
       <div id="clientCoupleCard" style="display:none;margin-bottom:20px">
         <div class="info-card" style="border-color:rgba(91,155,255,.25);background:rgba(0,68,191,.04)">
@@ -2750,6 +2753,7 @@ function updateMobileTools(){
   renderClientTracking();
   if(typeof renderOnboardingChecklist==='function')renderOnboardingChecklist(); // #98: auto-show the guided checklist on the dashboard for incomplete-setup clients (self-gates — hides when done)
   if(typeof renderEngageStrip==='function')renderEngageStrip(); // #101: streak on the dashboard overview
+  if(typeof renderWelcomeBack==='function')renderWelcomeBack(); // #103: "what changed since your last visit" banner on 7+ day return
   if(typeof renderAdvisorTouchpoints==='function')renderAdvisorTouchpoints(); // #109: advisor touchpoints card (async, advisory-only)
   loadSupabaseSnapshots();
   _cpLoadHoldings(); // §2.1 (M2): fire-and-forget RLS-scoped holdings read → APP._holdings[]; metric-inert
@@ -4195,6 +4199,35 @@ function renderEngageStrip(){
     +'<a onclick="showClientPage(\'engage\')" style="margin-left:auto;font-size:12px;color:#5B9BFF;cursor:pointer;text-decoration:underline;font-family:var(--fh);font-weight:700">View achievements &amp; badges →</a>'
     +'</div>';
 }
+// #103: on return after 7+ days away, a concise "what changed since your last visit" delta banner (dismissible).
+// Compares current engine metrics (net worth, savings rate) against a per-client localStorage snapshot taken at the
+// last overview visit; re-stamps the snapshot every render so it fires once per genuine return, not on refresh.
+function renderWelcomeBack(){
+  var el=document.getElementById('welcomeBackBanner'); if(!el) return;
+  var fd=_lastPfosState||{}; var c=fd.calcs||{};
+  if(!c.inc){ el.style.display='none'; return; }   // no data → nothing meaningful to compare
+  var id=APP.currentClientId||'anon';
+  var key='pfos_lastvisit_'+id;
+  var cur={t:Date.now(), nw:(c.netWorth||0), sr:(c.savingsRate||0), cf:(c.netCF||0)};
+  var prev=null; try{ var raw=localStorage.getItem(key); if(raw) prev=JSON.parse(raw); }catch(_){}
+  try{ localStorage.setItem(key, JSON.stringify(cur)); }catch(_){}   // record THIS visit for next time, banner or not
+  if(!prev||!prev.t){ el.style.display='none'; return; }             // first visit → baseline only, no banner
+  var days=Math.floor((cur.t-prev.t)/86400000);
+  if(days<7){ el.style.display='none'; return; }
+  var parts=[];
+  if(prev.nw!=null){ var dNW=cur.nw-prev.nw; if(Math.abs(dNW)>=1){ var up=dNW>=0; parts.push('<span style="color:var(--wh)">Net worth</span> <span style="color:'+(up?'var(--gr)':'var(--rd)')+';font-weight:700">'+(up?'↑':'↓')+' '+fmt(Math.abs(Math.round(dNW)))+'</span>'); } }
+  if(prev.sr!=null){ var dSR=cur.sr-prev.sr; if(Math.abs(dSR)>=0.5){ var upS=dSR>=0; parts.push('<span style="color:var(--wh)">Savings rate</span> <span style="color:'+(upS?'var(--gr)':'var(--rd)')+';font-weight:700">'+(upS?'↑':'↓')+' '+Math.abs(dSR).toFixed(1)+' pts</span> <span style="color:var(--mu)">(now '+cur.sr.toFixed(0)+'%)</span>'); } }
+  if(!parts.length){ el.style.display='none'; return; }              // away 7+ days but nothing moved → don't nag
+  el.style.display='block';
+  el.innerHTML='<div style="display:flex;align-items:flex-start;gap:12px;padding:14px 16px;background:linear-gradient(135deg,rgba(91,155,255,.10),rgba(91,155,255,.03));border:1px solid rgba(91,155,255,.28);border-radius:6px">'
+    +'<div style="font-size:22px;line-height:1">👋</div>'
+    +'<div style="flex:1;min-width:0">'
+      +'<div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh);margin-bottom:4px">Welcome back — it\'s been '+days+' days</div>'
+      +'<div style="font-size:13px;color:var(--mu);line-height:1.7">Since your last visit: '+parts.join(' &nbsp;·&nbsp; ')+'</div>'
+    +'</div>'
+    +'<button aria-label="Dismiss" onclick="var e=document.getElementById(\'welcomeBackBanner\');if(e){e.style.display=\'none\';}" style="background:none;border:none;color:var(--mu);cursor:pointer;font-size:16px;padding:0 2px;line-height:1">✕</button>'
+    +'</div>';
+}
 function renderSavingsStreak(){
   var countEl=document.getElementById('streakCount');
   var msgEl=document.getElementById('streakMsg');
@@ -4980,7 +5013,14 @@ function renderClientPaySchedule(){
   var el=document.getElementById('clientPayScheduleContent');if(!el)return;
   if(!clientHasFeature('payschedule')){renderTierGate(el,'payschedule','💰 Pay Schedule','See when your paychecks arrive and how your income breaks down into each check.');return;}
   var fd=_lastPfosState||{};var st=fd.state||fd||{};var schedules=st.paySchedules||[];
-  if(!schedules.length){el.innerHTML=_renderEmptyState('empty',{icon:'💰',title:'No pay schedule yet',message:'No pay schedule set up yet.'+((APP.currentClient&&APP.currentClient.client_type==='product')?'':' Your advisor can configure this for you.')});return;}
+  if(!schedules.length){
+    // #99: product (self-serve) clients can set this up themselves in the engine → give them a deep-link CTA;
+    // advisory clients keep the informational "your advisor configures this" copy (no CTA).
+    var _isProdPS=(APP.currentClient&&APP.currentClient.client_type==='product');
+    var _psOpts={icon:'💰',title:'No pay schedule yet',message:'No pay schedule set up yet.'+(_isProdPS?'':' Your advisor can configure this for you.')};
+    if(_isProdPS){_psOpts.ctaLabel='Add in My Financial Data';_psOpts.ctaOnclick="showClientPage('pfos')";_psOpts.ctaAriaLabel='Go to My Financial Data to set up your pay schedule';}
+    el.innerHTML=_renderEmptyState('empty',_psOpts);return;
+  }
   var h='<div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:12px">💰 My Pay Schedule</div>';
   schedules.forEach(function(ps){
     var freqLabels={weekly:'Weekly',biweekly:'Every 2 Weeks',semimonthly:'Twice Monthly',monthly:'Monthly'};
@@ -5006,7 +5046,14 @@ function renderClientPolicies(){
   var el=document.getElementById('clientPoliciesContent');if(!el)return;
   if(!clientHasFeature('policies')){renderTierGate(el,'policies','🛡️ Insurance Policies','View all your insurance policies, coverage amounts, and premiums in one place.');return;}
   var fd=_lastPfosState||{};var st=fd.state||fd||{};var policies=st.insurancePolicies||[];
-  if(!policies.length){el.innerHTML=_renderEmptyState('empty',{icon:'🛡️',title:'No policies on file',message:'No insurance policies on file.'+((APP.currentClient&&APP.currentClient.client_type==='product')?'':' Your advisor can add them during your review.')});return;}
+  if(!policies.length){
+    // #99: product (self-serve) clients enter policies themselves in the engine's protection panel → deep-link CTA;
+    // advisory clients keep the informational "your advisor adds them" copy (no CTA).
+    var _isProdPol=(APP.currentClient&&APP.currentClient.client_type==='product');
+    var _polOpts={icon:'🛡️',title:'No policies on file',message:'No insurance policies on file.'+(_isProdPol?'':' Your advisor can add them during your review.')};
+    if(_isProdPol){_polOpts.ctaLabel='Add in My Financial Data';_polOpts.ctaOnclick="showClientPage('pfos')";_polOpts.ctaAriaLabel='Go to My Financial Data to add your insurance policies';}
+    el.innerHTML=_renderEmptyState('empty',_polOpts);return;
+  }
   var totalCoverage=policies.reduce(function(t,p){return t+(p.coverage||0);},0);
   var totalPremium=policies.reduce(function(t,p){return t+(p.premium||0);},0);
   var h='<div style="font-family:var(--fh);font-size:16px;font-weight:700;color:var(--wh);margin-bottom:12px">🛡️ My Insurance Policies</div>';
