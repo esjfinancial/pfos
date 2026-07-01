@@ -7174,6 +7174,18 @@ async function renderJourneyTimeline(){/* removed — journey tab deprecated */}
 
 // ── Compute current spending status (portal version of _acctSpendStatus) ──
 // Mirrors the pfos-main implementation but reads portal-side state.
+// #19: canonical monthly-expense resolver — MIRRORS the engine's getMonthlyExp (pfos-main:8990) so the
+// spending chart (catData) and the over-budget check (_portalSpendStatus) read the SAME figure as the engine
+// (CLAUDE.md §4): .total overrides; else the itemized subs (if any) win over the base amount; annual → /12.
+// (Handles subs stored as {amount,period} OR as a raw number — the latter is legacy portal data.)
+function getMonthlyExpense(ed){
+  if(!ed) return 0;
+  if(ed.total!=null&&!isNaN(parseFloat(ed.total))) return parseFloat(ed.total);
+  var v=parseFloat(ed.amount)||0; if(ed.period==='annual') v=v/12;
+  var subTotal=0;
+  if(ed.subs) Object.keys(ed.subs).forEach(function(sk){ var s=ed.subs[sk]; var sv=parseFloat(s&&s.amount!=null?s.amount:s)||0; if(s&&s.period==='annual') sv=sv/12; subTotal+=sv; });
+  return subTotal>0?subTotal:v;
+}
 function _portalSpendStatus(viewCtx){
   var fd=APP._portalFd||{};
   var S=fd.S||(_lastPfosState&&_lastPfosState.state)||{};
@@ -7244,17 +7256,8 @@ function _portalSpendStatus(viewCtx){
   Object.keys(bucketMap).forEach(function(bk){
     var spent=catSpend[bk]||0;
     if(spent<=0)return;
-    var budget=0;
     var ed=expData[bk];
-    if(ed){
-      if(ed.total!=null)budget=parseFloat(ed.total)||0;
-      else if(ed.amount!=null){
-        budget=parseFloat(ed.amount)||0;
-        if(ed.period==='annual')budget=budget/12;
-      } else if(ed.subs){
-        Object.keys(ed.subs).forEach(function(sk){budget+=(parseFloat(ed.subs[sk])||0);});
-      }
-    }
+    var budget=getMonthlyExpense(ed); // #19: canonical resolver — was amount-preferred + un-converted subs (false over-budget)
     if(budget<=0)return;
     var pct=Math.round(spent/budget*100);
     var catSev='ok';
@@ -10851,9 +10854,7 @@ function _portalSmartAlertsBlock(status,bills,monthEntries){
     var spent=catTotals[cat.key]||0;
     var ed=expData[cat.key];if(!ed)return;
     var budget=0;
-    if(ed.total!=null)budget=parseFloat(ed.total)||0;
-    else if(ed.amount!=null){budget=parseFloat(ed.amount)||0;if(ed.period==='annual')budget=budget/12;}
-    else if(ed.subs){Object.keys(ed.subs).forEach(function(sk){var sub=ed.subs[sk];budget+=(parseFloat(sub&&sub.amount)||parseFloat(sub)||0);});}
+    budget=getMonthlyExpense(ed); // #19: canonical resolver (was amount-preferred + un-converted annual subs)
     if(budget<=0)return;
     if(spent>=budget){
       alerts.push({icon:'🚨',color:'var(--rd)',text:cat.icon+' '+cat.label+': over budget by '+fmt(Math.round(spent-budget))+' ('+fmt(Math.round(spent))+' of '+fmt(Math.round(budget))+')'});
@@ -11464,11 +11465,7 @@ function _portalRenderSpendDashboard(){
       var spent=catTotals[bk]||0;
       var budget=0;
       var ed=expData[bk];
-      if(ed){
-        if(ed.total!=null)budget=parseFloat(ed.total)||0;
-        else if(ed.amount!=null){budget=parseFloat(ed.amount)||0;if(ed.period==='annual')budget=budget/12;}
-        else if(ed.subs){Object.keys(ed.subs).forEach(function(sk){budget+=(parseFloat(ed.subs[sk]&&ed.subs[sk].amount)||parseFloat(ed.subs[sk])||0);});}
-      }
+      budget=getMonthlyExpense(ed); // #19: canonical resolver (was amount-preferred + un-converted annual subs)
       return{key:bk,info:bucketMap[bk],spent:spent,budget:budget};
     }).filter(function(c){return c.spent>0||c.budget>0;}).sort(function(a,b){return b.spent-a.spent;});
     if(catList.length>0){
@@ -13219,19 +13216,7 @@ function renderSpendingAnalysis(){
   var catData=[];
   cats.forEach(function(cat){
     var ed=expData[cat.key];
-    var amt=0;
-    if(ed){
-      // Mirror the engine's canonical getMonthlyExp (pfos-main): total → amount(period-adjusted) → subs.
-      // (Previously read only ed.total/ed.subs and IGNORED ed.amount, so the canonical {amount,period}
-      //  expData shape computed 0 for every category and showed "No expense categories found".)
-      if(ed.total!=null&&!isNaN(parseFloat(ed.total))) amt=parseFloat(ed.total);
-      else {
-        var _base=parseFloat(ed.amount)||0; if(ed.period==='annual')_base=_base/12;
-        var _sub=0;
-        if(ed.subs)Object.keys(ed.subs).forEach(function(sk){var s=ed.subs[sk];var sv=parseFloat(s&&s.amount!=null?s.amount:s)||0;if(s&&s.period==='annual')sv=sv/12;_sub+=sv;});
-        amt=_sub>0?_sub:_base;
-      }
-    }
+    var amt=getMonthlyExpense(ed); // #19: shared canonical resolver (was an inline copy of the same logic)
     if(amt>0) catData.push({key:cat.key,label:cat.label,icon:cat.icon,amount:amt,leaked:ed&&ed.leakTagged});
   });
 
