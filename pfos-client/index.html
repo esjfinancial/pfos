@@ -244,6 +244,7 @@ div[style*="padding"]:not(.modal-bg *):not(#cplanRoot *):not(#cplanRoot) {
 .tip-pop{display:none;position:fixed;z-index:500;max-width:300px;padding:12px 14px;background:#0E0E38;border:1px solid rgba(91,155,255,.25);border-radius:4px;font-size:13px;color:rgba(226,232,240,.85);line-height:1.7;box-shadow:0 4px 20px rgba(0,0,0,.4)}
 .tip-pop.show{display:block}
 @keyframes celebPop{0%{opacity:0;transform:translate(-50%,-50%) scale(.3)}50%{opacity:1;transform:translate(-50%,-50%) scale(1.1)}100%{opacity:1;transform:translate(-50%,-50%) scale(1)}}
+@keyframes cpSpin{to{transform:rotate(360deg)}}
 .slbl{display:flex;align-items:center;gap:8px;font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.22em;text-transform:uppercase;color:#4D8EFF;margin-bottom:8px}
 .slbl::before{content:'';width:14px;height:2px;background:linear-gradient(90deg,var(--or),var(--bl))}
 
@@ -1313,7 +1314,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       <div class="sb-section" onclick="_cpToggleNav('finances')">My Finances<span class="sb-chev" id="chev-finances">▾</span></div>
       <div class="sb-group" id="navg-finances">
       <div class="sb-item active" id="cnav-overview" onclick="showClientPage('overview')"><span class="icon">📊</span> Dashboard</div>
-      <div class="sb-item" id="cnav-pfos" onclick="showClientPage('pfos')"><span class="icon">⚡</span> My Financial Data</div>
+      <div class="sb-item" id="cnav-pfos" onclick="showClientPage('pfos')"><span class="icon">⚡</span> My Financial Data <span id="cnavPlaidBadge" style="display:none;background:#A855F7;color:#fff;font-size:11px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px" title="New linked accounts to review">●</span></div>
       <div class="sb-item" id="cnav-plan" onclick="showClientPage('plan');initClientPlan()"><span class="icon">🗺️</span> My Financial Plan</div>
       <div class="sb-item" id="cnav-spending" onclick="showClientPage('spending');renderSpendingAnalysis()"><span class="icon">💰</span> My Spending <span id="cnavSpendBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:11px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
       <div class="sb-item" id="cnav-invest" onclick="showClientPage('invest');renderPortfolioView()"><span class="icon">📈</span> Investments <span id="cnavInvestLock" style="display:none" title="Pro+ feature — link accounts to unlock">🔒</span></div>
@@ -1368,6 +1369,10 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
            spending access. Hidden when no pending request, or when already granted. -->
       <div id="advisorRequestBanner" style="display:none"></div>
 
+      <!-- #78: PLAID STATUS + SYNCING banners at the TOP (new-accounts prominence); populated by _cpCheckPlaidPending -->
+      <div id="plaidStatusBanner" style="display:none;margin-bottom:12px"></div>
+      <div id="plaidSyncingBanner" style="display:none;margin-bottom:12px"></div>
+
       <!-- Onboarding Checklist (Phase 7) — shown for new clients with incomplete setup -->
       <div id="onboardingChecklist" style="display:none;margin-bottom:20px">
         <div class="info-card" style="border-color:rgba(91,155,255,.25);background:rgba(0,68,191,.04)">
@@ -1402,8 +1407,8 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
         </div>
       </div>
 
-      <!-- PLAID STATUS BANNER (Chunk 14, Pro+): reconnect (item error) + new-accounts prompts; populated by _cpCheckPlaidPending on open -->
-      <div id="plaidStatusBanner" style="display:none;margin-bottom:12px"></div>
+      <!-- #78: Plaid status + syncing banners now render at the TOP of the dashboard (moved up, after advisorRequestBanner). -->
+
 
       <!-- CORE MOBILE TOOLS -->
       <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px;margin-bottom:16px">
@@ -2976,6 +2981,8 @@ async function _cpLoadHoldings(){
     if(ids.length){ var {data:sRows,error:sErr}=await db.from('plaid_securities').select('*').in('security_id',ids); if(sErr) throw sErr; secRows=sRows||[]; }
     if(APP.currentClientId!==_cid) return; // re-check after the second await
     APP._holdings=_cpBuildHoldings(hRows, secRows);
+    // #72: stash the freshest linked-item sync time (RLS-scoped) for the "Synced N ago · Refresh" row.
+    try{ var {data:itRows}=await db.from('plaid_items').select('last_sync_at'); if(APP.currentClientId===_cid){ var _mx=null; (itRows||[]).forEach(function(it){ if(it&&it.last_sync_at){ var d=new Date(it.last_sync_at); if(!isNaN(d.getTime())&&(!_mx||d>_mx))_mx=d; } }); APP._holdingsSyncedAt=_mx?_mx.toISOString():null; } }catch(_e){}
   }catch(e){ if(APP.currentClientId===_cid) APP._holdings=[]; console.warn('_cpLoadHoldings:',e); } // never leave stale/undefined for the current client
 }
 
@@ -3097,7 +3104,8 @@ function renderPortfolioView(){
       h+='</div>';
     }
     h+='<div class="info-card" style="padding:14px">';
-    h+='<div class="info-card-title" style="margin-bottom:8px">Holdings</div>';
+    // #72: freshness row — "synced N ago · Refresh" (linked users only; manual has no sync metadata)
+    h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;flex-wrap:wrap"><span class="info-card-title" style="margin-bottom:0">Holdings</span>'+(APP._holdingsSyncedAt?'<span style="display:flex;align-items:center;gap:8px;font-size:12px;color:var(--mu)">'+_cpSyncedAgo(APP._holdingsSyncedAt)+' · <button onclick="_cpRefreshInvestments()" style="padding:3px 10px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:3px">↻ Refresh</button></span>':'')+'</div>';
     h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:13px;min-width:520px">';
     h+='<thead><tr style="color:var(--mu);font-family:var(--fh);font-size:11px;text-transform:uppercase;letter-spacing:.06em;text-align:right">';
     h+='<th style="text-align:left;padding:6px 8px">Holding</th><th style="padding:6px 8px">Qty</th><th style="padding:6px 8px">Value</th><th style="padding:6px 8px">Cost Basis</th><th style="padding:6px 8px">Gain / Loss</th><th style="padding:6px 8px">Alloc</th></tr></thead><tbody>';
@@ -26638,6 +26646,26 @@ async function _cpOpenManageAccounts(){
 // status chip; reuses the existing one-tap reconnect (_cpStartPlaidUpdateMode) + the _CP_PLAID_ERR copy.
 function _cpPlaidHealth(it){ it=it||{}; if(it.status==='error')return {level:'reauth',label:'Reconnect needed',color:'#EF4444',reconnect:true}; if(it.status==='archived')return {level:'archived',label:'Disconnected',color:'var(--mu)',reconnect:false}; if(it.needs_refresh)return {level:'attention',label:'Refreshing…',color:'#F59E0B',reconnect:false}; return {level:'healthy',label:'Connected',color:'#22C55E',reconnect:false}; }
 function _cpSyncedAgo(ts){ if(!ts)return ''; var d=new Date(ts); if(isNaN(d.getTime()))return ''; var days=Math.floor((Date.now()-d.getTime())/86400000); return days<=0?'synced today':(days===1?'synced yesterday':'synced '+days+'d ago'); }
+// #75: a global sync-in-progress / done / error banner, reused by the on-open drain and the #72 Refresh button.
+function _cpShowSyncBanner(state){
+  var host=document.getElementById('plaidSyncingBanner'); if(!host) return;
+  if(state==='hide'){ host.style.display='none'; host.innerHTML=''; return; }
+  var C={ syncing:['⟳','Syncing your accounts…','#F59E0B','rgba(245,158,11,.08)','rgba(245,158,11,.25)',1],
+          done:['✓','Your accounts are up to date','#22C55E','rgba(34,197,94,.08)','rgba(34,197,94,.25)',0],
+          error:['⚠','Sync ran into a problem — please try again shortly.','#EF4444','rgba(239,68,68,.08)','rgba(239,68,68,.25)',0] }[state];
+  if(!C) return;
+  host.innerHTML='<div style="display:flex;align-items:center;gap:10px;padding:11px 14px;border-radius:4px;background:'+C[3]+';border:1px solid '+C[4]+';font-size:13px;font-weight:700;color:'+C[2]+'"><span style="'+(C[5]?'display:inline-block;animation:cpSpin 1s linear infinite':'')+'">'+C[0]+'</span><span>'+C[1]+'</span></div>';
+  host.style.display='block';
+}
+// #72: manual investments Refresh — re-sync linked accounts, reload holdings, re-render, with #75's banner feedback.
+function _cpRefreshInvestments(){
+  if(typeof clientHasFeature==='function'&&!clientHasFeature('plaid'))return;
+  _cpShowSyncBanner('syncing');
+  Promise.resolve().then(function(){ return _cpPlaidRefreshSync({}); })
+    .then(function(){ if(typeof _cpLoadHoldings==='function')return _cpLoadHoldings(); })
+    .then(function(){ _cpShowSyncBanner('done'); setTimeout(function(){_cpShowSyncBanner('hide');},2500); if(_currentClientPage==='invest'&&typeof renderPortfolioView==='function')renderPortfolioView(); })
+    .catch(function(e){ console.warn('[plaid] refresh investments failed:',e); _cpShowSyncBanner('error'); setTimeout(function(){_cpShowSyncBanner('hide');},4000); });
+}
 function _cpRenderManageList(accounts, items){
   var el=document.getElementById('plaidManageList'); if(!el) return;
   var supported=(accounts||[]).filter(function(a){return a&&a.mapped_section&&a.mapped_section!=='ignore';});
@@ -26767,7 +26795,9 @@ async function _cpCheckPlaidPending(){
     // 1) DRAIN: any ACTIVE item flagged needs_refresh -> run the sync chain ONCE (the only S write). plaid-sync
     // clears needs_refresh server-side on success (the client has no UPDATE grant on plaid_items).
     if(items.some(function(it){ return it.needs_refresh && it.status==='active'; })){
-      try{ await _cpPlaidRefreshSync({}); }catch(e){ console.warn('[plaid] refresh drain failed:',e); }
+      _cpShowSyncBanner('syncing');   // #75: surface the on-open drain instead of syncing silently
+      try{ await _cpPlaidRefreshSync({}); _cpShowSyncBanner('done'); setTimeout(function(){_cpShowSyncBanner('hide');},2500); }
+      catch(e){ console.warn('[plaid] refresh drain failed:',e); _cpShowSyncBanner('error'); setTimeout(function(){_cpShowSyncBanner('hide');},4000); }
     }
     // 2) BANNERS: reconnect (status=error) + new-accounts (has_new_accounts).
     _cpRenderPlaidStatusBanner(items);
@@ -26802,6 +26832,7 @@ function _cpRenderPlaidStatusBanner(items){
   var host=document.getElementById('plaidStatusBanner'); if(!host) return;
   var errs=(items||[]).filter(function(it){ return it.status==='error'; });
   var news=(items||[]).filter(function(it){ return it.has_new_accounts && it.status!=='error'; });
+  var _pb=document.getElementById('cnavPlaidBadge'); if(_pb)_pb.style.display=news.length?'inline':'none';   // #78: nav badge on "My Financial Data"
   if(!errs.length && !news.length){ host.style.display='none'; host.innerHTML=''; return; }
   var html='';
   errs.forEach(function(it){
