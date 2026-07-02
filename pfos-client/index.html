@@ -1477,6 +1477,8 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
       </div>
       <!-- #101: engagement strip — surfaces the savings streak on the dashboard (badges/achievements one click away) -->
       <div id="engageStrip" style="display:none;margin-bottom:16px"></div>
+      <!-- subscriptions: compact overview stat → deep-links to the full card on Spending (Plaid-linked only) -->
+      <div id="subsStat" style="display:none;margin-bottom:16px"></div>
       <!-- #109: advisor touchpoints — unread advisor messages + recs pending review (advisory clients only) -->
       <div id="advisorTouchpointsCard" style="display:none;margin-bottom:16px"></div>
       <!-- Partner Status Card (couples only) -->
@@ -1581,6 +1583,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
     <div class="pg" id="cpg-spending">
       <div class="pg-title">My Spending</div>
       <div class="pg-sub">Where your money goes each month — categories, patterns, and insights</div>
+      <div id="subscriptionsCard" style="display:none;margin-bottom:16px"></div>
       <div id="spendingAnalysis"><div style="color:var(--mu);font-size:14px;padding:12px 0">Loading spending data...</div></div>
     </div>
 
@@ -2756,6 +2759,7 @@ function updateMobileTools(){
   renderClientTracking();
   if(typeof renderOnboardingChecklist==='function')renderOnboardingChecklist(); // #98: auto-show the guided checklist on the dashboard for incomplete-setup clients (self-gates — hides when done)
   if(typeof renderEngageStrip==='function')renderEngageStrip(); // #101: streak on the dashboard overview
+  if(typeof renderSubscriptionsStat==='function')renderSubscriptionsStat(); // subscriptions: compact overview stat (Plaid-linked only)
   if(typeof renderWelcomeBack==='function')renderWelcomeBack(); // #103: "what changed since your last visit" banner on 7+ day return
   if(typeof renderAdvisorTouchpoints==='function')renderAdvisorTouchpoints(); // #109: advisor touchpoints card (async, advisory-only)
   loadSupabaseSnapshots();
@@ -3365,6 +3369,76 @@ function _cpApplyIncomeConfirm(streams,confirmMap){
   var anyOn=false, hasMap=(confirmMap&&typeof confirmMap==='object');
   (streams||[]).forEach(function(s){ var on=(hasMap&&(s.key in confirmMap))?!!confirmMap[s.key]:s.suggested; s.confirmed=on; if(on)anyOn=true; });
   return anyOn;
+}
+
+// §2.4d — recurring SUBSCRIPTION detection (client-side, from the linked-txn stream). CONSERVATIVE by design so
+// what we surface is almost always a real subscription: an OUTFLOW merchant seen in >=3 distinct months, ~once a
+// month (charges/active-month <= 1.34 — rejects groceries/gas that hit many times a month) with a STABLE amount
+// (max/min <= 1.25 — rejects variable bills). Dismissed merchants ("not a subscription") are excluded. Uses APP._txns
+// (the rich merchant-bearing 24-mo stream); the advisor side can't mirror this directly (no raw-txn / merchant access).
+var _cpSubsLast=[];
+function _cpSubKey(t){ var m=(t.merchant==null?'':String(t.merchant)).trim(); if(m)return m; var n=(t.name==null?'':String(t.name)).trim(); return n||'Charge'; }
+function _cpDetectSubscriptions(txns, dismissed){
+  dismissed=dismissed||{};
+  var by={};
+  (txns||[]).forEach(function(t){ if(!t||t.isTransfer||t.excluded)return; var amt=parseFloat(t.amount)||0; if(amt<=0)return; // outflow only (plaid: +amt = spend)
+    var key=_cpSubKey(t); if(dismissed[key])return;
+    var s=by[key]; if(!s){ s=by[key]={key:key,label:key,amts:[],count:0,_mo:{},lastMk:null,lastDate:'',cat:(t.bucket||t.category||'')}; }
+    s.amts.push(amt); s.count++; var mk=_cpMonthKey(t.date); if(mk!=null){ s._mo[mk]=1; if(s.lastMk==null||mk>s.lastMk){ s.lastMk=mk; s.lastDate=t.date; } }
+  });
+  var subs=[];
+  Object.keys(by).forEach(function(kk){ var s=by[kk]; var monthsSeen=0; for(var x in s._mo)monthsSeen++;
+    if(monthsSeen<3)return;                               // recurring across >=3 distinct months
+    if(s.count > monthsSeen*1.34)return;                  // ~once/month (rejects many-charges-a-month merchants)
+    var srt=s.amts.slice().sort(function(a,b){return a-b;}); var lo=srt[0], hi=srt[srt.length-1];
+    if(lo<=0 || hi/lo > 1.25)return;                      // stable amount (rejects variable bills)
+    var med=srt[Math.floor(srt.length/2)];
+    subs.push({merchant:s.label, monthlyAmount:Math.round(med), monthsSeen:monthsSeen, lastDate:s.lastDate, category:s.cat, key:s.key});
+  });
+  subs.sort(function(a,b){ return (b.monthlyAmount-a.monthlyAmount)||(a.key<b.key?-1:(a.key>b.key?1:0)); });
+  var monthlyTotal=subs.reduce(function(t,s){return t+s.monthlyAmount;},0);
+  return {subs:subs, count:subs.length, monthlyTotal:Math.round(monthlyTotal), annualTotal:Math.round(monthlyTotal*12)};
+}
+// dismissed-merchant persistence — the "not a subscription" safety valve so a false positive never misleads.
+function _cpSubsDismissed(){ try{ var raw=localStorage.getItem('pfos_subs_dismissed_'+APP.currentClientId); var arr=raw?JSON.parse(raw):[]; var m={}; (arr||[]).forEach(function(k){m[k]=1;}); return m; }catch(_){ return {}; } }
+function _cpDismissSubAt(i){ var s=_cpSubsLast[i]; if(!s)return; try{ var raw=localStorage.getItem('pfos_subs_dismissed_'+APP.currentClientId); var arr=raw?JSON.parse(raw):[]; if(arr.indexOf(s.key)<0)arr.push(s.key); localStorage.setItem('pfos_subs_dismissed_'+APP.currentClientId,JSON.stringify(arr)); }catch(_){}
+  if(typeof renderSubscriptionsCard==='function')renderSubscriptionsCard(); if(typeof renderSubscriptionsStat==='function')renderSubscriptionsStat(); }
+// Full card (Spending page). Plaid-gated; loads the 24-mo txn stream on demand.
+function renderSubscriptionsCard(){
+  var el=document.getElementById('subscriptionsCard'); if(!el) return;
+  if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display='block';
+  if(APP._txns===undefined){ el.innerHTML='<div class="info-card" style="margin-bottom:16px">'+_renderEmptyState('loading',{message:'Scanning your transactions for subscriptions…'})+'</div>'; if(typeof _cpLoadTransactions==='function'){ _cpLoadTransactions(24).then(function(){ if(APP._txns===undefined)APP._txns=[]; renderSubscriptionsCard(); }); } return; }
+  var d=_cpDetectSubscriptions(APP._txns, _cpSubsDismissed()); _cpSubsLast=d.subs;
+  var h='<div class="info-card" style="margin-bottom:16px"><div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px"><span style="font-size:16px">🔁</span><span class="info-card-title" style="margin:0">Recurring Subscriptions</span>';
+  if(d.count) h+='<span style="margin-left:auto;font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(d.monthlyTotal)+'/mo</span><span style="font-size:12px;color:var(--mu)">'+fmt(d.annualTotal)+'/yr</span>';
+  h+='</div>';
+  if(!d.count){ h+='<div style="font-size:13px;color:var(--mu);line-height:1.6">No recurring subscriptions detected in your linked transactions yet. As more months sync, we\'ll surface any charge that recurs monthly at a steady amount.</div>'; }
+  else {
+    h+='<div style="font-size:12px;color:var(--mu);margin-bottom:6px">'+d.count+' recurring charge'+(d.count===1?'':'s')+' (seen 3+ months at a steady amount). Not a subscription? Dismiss it.</div>';
+    d.subs.forEach(function(s,i){ var when=''; try{ when=_dLoc(s.lastDate).toLocaleDateString('en-US',{month:'short',day:'numeric'}); }catch(_){}
+      h+='<div style="display:flex;align-items:center;gap:10px;padding:9px 0;border-top:1px solid var(--bd)">'
+        +'<div style="flex:1;min-width:0"><div style="font-size:14px;color:var(--wh);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">'+esc(s.merchant)+'</div><div style="font-size:11px;color:var(--mu)">'+s.monthsSeen+' months'+(when?' · last '+when:'')+'</div></div>'
+        +'<div style="font-family:var(--fd);font-size:15px;color:var(--wh)">'+fmt(s.monthlyAmount)+'<span style="font-size:11px;color:var(--mu)">/mo</span></div>'
+        +'<button onclick="_cpDismissSubAt('+i+')" title="Not a subscription — hide it" aria-label="Dismiss subscription" style="background:none;border:1px solid var(--bd);color:var(--mu);border-radius:4px;min-width:44px;min-height:44px;width:32px;height:32px;cursor:pointer;flex-shrink:0;font-size:13px">✕</button>'
+        +'</div>';
+    });
+  }
+  h+='</div>'; el.innerHTML=h;
+}
+// Compact overview stat → deep-links to the full card on Spending. Loads txns quietly; hides when none detected.
+function renderSubscriptionsStat(){
+  var el=document.getElementById('subsStat'); if(!el)return;
+  if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')){ el.style.display='none'; el.innerHTML=''; return; }
+  if(APP._txns===undefined){ el.style.display='none'; if(typeof _cpLoadTransactions==='function'){ _cpLoadTransactions(24).then(function(){ if(APP._txns===undefined)APP._txns=[]; renderSubscriptionsStat(); }); } return; }
+  var d=_cpDetectSubscriptions(APP._txns, _cpSubsDismissed());
+  if(!d.count){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display='block';
+  el.innerHTML='<div onclick="showClientPage(\'spending\');if(typeof renderSubscriptionsCard===\'function\')renderSubscriptionsCard();" role="button" tabindex="0" aria-label="View your '+d.count+' recurring subscriptions" style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;cursor:pointer;min-height:44px">'
+    +'<span style="font-size:18px">🔁</span>'
+    +'<div style="flex:1;min-width:0"><span style="color:var(--wh);font-weight:700;font-family:var(--fh);font-size:15px">'+d.count+'</span> <span style="color:var(--mu);font-size:13px">recurring subscription'+(d.count===1?'':'s')+'</span></div>'
+    +'<span style="font-family:var(--fd);font-size:15px;color:var(--wh)">'+fmt(d.monthlyTotal)+'<span style="font-size:11px;color:var(--mu)">/mo</span></span>'
+    +'<span style="color:#5B9BFF;font-size:14px">&rarr;</span></div>';
 }
 
 // PURE: a custom-range cash-flow report. Expense source = the 24-mo txns when any
@@ -13324,6 +13398,7 @@ function _portalZeroIncomeBudgetBars(){
   return h;
 }
 function renderSpendingAnalysis(){
+  if(typeof renderSubscriptionsCard==='function')renderSubscriptionsCard(); // subscriptions: full card atop the Spending page (own container)
   var el=document.getElementById('spendingAnalysis');
   if(!el) return;
   // Chunk 11: lazily load Plaid recurring streams (Pro+) into the module cache, then re-render ONCE when
