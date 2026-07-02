@@ -37346,39 +37346,11 @@ function _cpRenderPlanV2(){
   //     (a.amountSelf), since the partner contributes a.amountSpouse from
   //     their own surplus.
   //   • Self-owned cards — count the full a.amount as before.
-  var _isHybridHH=(CPLAN._householdType==='hybrid');
-  var allocated=CPLAN.allocations.reduce(function(t,a){
-    if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return t;
-    // Active IBC policy: once "marked active" it's written to pfos-main as a real
-    // policy whose premium is a recurring EXPENSE that already reduces surplus
-    // (via getInsurancePremiumsAuto). The IBC card's a.amount IS that premium, so
-    // counting it here too would double-charge. Skip it. The IBC debt/cash-value
-    // projection reads a.amount directly, not via this sum, so it's unaffected.
-    if(a._linkedPolicyId&&a._ibcState==='active')return t;
-    if(_isHybridHH&&a.owner==='joint'){
-      // Use this user's portion of the joint contribution. Fall back to half
-      // the combined amount when amountSelf isn't set yet (newly-converted or
-      // pre-dual-slider data).
-      var selfPart=parseFloat(a.amountSelf);
-      if(isNaN(selfPart)||selfPart===0)selfPart=(parseFloat(a.amount)||0)/2;
-      return t+selfPart;
-    }
-    return t+(parseFloat(a.amount)||0);
-  },0);
-  // Recurring static premiums on completed action-only items (life, disability, umbrella,
-  // estate-recurring, annuity-recurring) eat into ongoing budget alongside the slider
-  // allocations. Subtract them here so the deployment bar legend's "available to allocate"
-  // reflects reality. One-time charges (entry.is_recurring=false) don't set _staticPremium
-  // in _cpFinalizeActionComplete, so they correctly stay out of this total.
-  var _premTypes_unalloc={protection:1,umbrella:1,estate:1,annuity_research:1,iul:1,wl:1,ibc:1};
-  var staticPremTotal=0;
-  CPLAN.allocations.forEach(function(a){
-    if(a&&a._completed&&a._staticPremium>0&&_premTypes_unalloc[a.type]&&(a._staticFreq==null||a._staticFreq==='monthly')){
-      staticPremTotal+=parseFloat(a._staticPremium)||0;
-    }
-  });
-  var unalloc=Math.max(0,CPLAN.surplus-allocated-staticPremTotal);
-  var allocPct=CPLAN.surplus>0?Math.round(allocated/CPLAN.surplus*100):0;
+  // Deployment summary — SINGLE SOURCE (_cpDeploySummary), the SAME accounting the live drag update in
+  // _cpSlide now uses, so the "Deploying / breathing room / available" headline can never diverge from the
+  // slider caps again (§3/§4). (Was computed inline here; the drag update recomputed it with a crude raw sum.)
+  var _ds=_cpDeploySummary();
+  var allocated=_ds.allocated, unalloc=_ds.unalloc, allocPct=_ds.allocPct;
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15);// Default 15% breathing room
   // Header bar
   h+='<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:16px">';
@@ -37395,8 +37367,8 @@ function _cpRenderPlanV2(){
   // Compute the breathing room reserve (the dollars set aside per the breathing %) vs
   // available-to-allocate (the rest of unspent surplus that could be allocated but isn't).
   // These are two different numbers — we display them separately so users aren't confused.
-  var _brReserveTop=Math.round((CPLAN.surplus||0)*(brPct/100));
-  var _availTop=Math.max(0,unalloc-_brReserveTop);
+  var _brReserveTop=_ds.brReserve;
+  var _availTop=_ds.avail;
   h+='<div style="font-size:13px;color:var(--mu)"><span id="cpSurplusLine">Deploying <strong style="color:var(--gr)">'+fmt(allocated)+'</strong>/mo ('+allocPct+'% of surplus)'+(_brReserveTop>0?' · <span style="color:var(--gr)">'+fmt(_brReserveTop)+' breathing room</span>':'')+(_availTop>0?'<br><span style="color:#5B9BFF">'+fmt(_availTop)+' available to allocate</span>':'')+'</span></div></div>';   // #48: breathing room + available (owner: mirror the advisor view; the dedicated Breathing Room widget below also shows it)
   h+='<div style="display:flex;gap:6px;align-items:center">';
   // Mode toggle
@@ -41715,6 +41687,40 @@ function _cpWorkingPartnerIncomeRemaining(retiredOwner){
 // Returns dollars-per-month available for new allocation, optionally excluding one slider.
 // available = surplus − breathing-room reservation − sum of all OTHER allocations
 //           − sum of completed action-only static premiums (recurring policy/umbrella/etc.)
+// ── SINGLE SOURCE for the plan deployment headline ("Deploying $X · $Y breathing room · $Z available to
+// allocate"). Used by BOTH _cpRenderPlanV2 (initial render) and _cpSlide (live drag update) so the headline
+// can never diverge from the slider caps again (the §3/§4 trap). Mirrors _cpAvailableBudget's accounting:
+//   • hybrid joint cards → only THIS user's share (amountSelf); fall back to half when unset
+//   • skip partner-shared (non-joint) cards + active-IBC-policy cards (their premium already reduces surplus)
+//   • completed insurance/action-only recurring static premiums eat the pool
+// Returns { allocated, staticPrem, unalloc, brReserve, avail, allocPct }.
+function _cpDeploySummary(){
+  var surplus=CPLAN.surplus||0;
+  var _isHybridHH=(CPLAN._householdType==='hybrid');
+  var allocated=(CPLAN.allocations||[]).reduce(function(t,a){
+    if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return t;
+    if(a._linkedPolicyId&&a._ibcState==='active')return t;
+    if(_isHybridHH&&a.owner==='joint'){
+      var selfPart=parseFloat(a.amountSelf);
+      if(isNaN(selfPart)||selfPart===0)selfPart=(parseFloat(a.amount)||0)/2;
+      return t+selfPart;
+    }
+    return t+(parseFloat(a.amount)||0);
+  },0);
+  var _premTypes={protection:1,umbrella:1,estate:1,annuity_research:1,iul:1,wl:1,ibc:1};
+  var staticPrem=0;
+  (CPLAN.allocations||[]).forEach(function(a){
+    if(a&&a._completed&&a._staticPremium>0&&_premTypes[a.type]&&(a._staticFreq==null||a._staticFreq==='monthly')){
+      staticPrem+=parseFloat(a._staticPremium)||0;
+    }
+  });
+  var unalloc=Math.max(0,surplus-allocated-staticPrem);
+  var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15);
+  var brReserve=Math.round(surplus*(brPct/100));
+  var avail=Math.max(0,unalloc-brReserve);
+  var allocPct=surplus>0?Math.round(allocated/surplus*100):0;
+  return {allocated:allocated,staticPrem:staticPrem,unalloc:unalloc,brReserve:brReserve,avail:avail,allocPct:allocPct};
+}
 function _cpAvailableBudget(excludeIdx){
   var surplus=CPLAN.surplus||0;
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
@@ -48381,11 +48387,11 @@ function _cpSlide(i,v){if(CPLAN._pendingReview)return;
   // snap it down to the live cap. This replaces the over-budget banner — the
   // system silently auto-limits instead of warning after the fact.
   // (IRS limits are still applied below via _cpEnforce.)
-  var _surplusSlide=CPLAN.surplus||0;
-  var _brPctSlide=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
-  var _budgetSlide=Math.round(_surplusSlide*(1-_brPctSlide));
-  var _othersTotal=CPLAN.allocations.reduce(function(t,al,j){return j===i?t:t+(parseFloat(al.amount)||0);},0);
-  var _availForThis=Math.max(0,_budgetSlide-_othersTotal);
+  // Snap to the SAME pool accounting the slider cap-notes + headline use (_cpAvailableBudget: surplus − breathing
+  // − deployed − static premiums, incl. hybrid amountSelf + shared/cascade skips) so a drag can't push past what
+  // the cap note promises. (Was a crude surplus−breathing−Σ(raw amounts) that ignored static premiums / hybrid
+  // splits, letting an over-deploy the caps forbid.) IRS limits are still enforced separately below via _cpEnforce.
+  var _availForThis=(typeof _cpAvailableBudget==='function')?_cpAvailableBudget(i):Math.max(0,Math.round((CPLAN.surplus||0)*(1-((CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100)))-CPLAN.allocations.reduce(function(t,al,j){return j===i?t:t+(parseFloat(al.amount)||0);},0));
   if(_newAmt>_availForThis)_newAmt=_availForThis;
   CPLAN.allocations[i].amount=_newAmt;_cpEnforce();
   // Sync the dragged slider's DOM to the (possibly-snapped) value so the thumb
@@ -48460,8 +48466,11 @@ function _cpSlide(i,v){if(CPLAN._pendingReview)return;
   // 2. Update deployment bar + the "Deploying $X" surplus-line headline. The headline update MUST run independent
   //    of the (removed) cpDeployBar — it was nested inside `if(bar){…}` where bar is always null, so the headline
   //    went stale on every drag. Now it updates live.
-  var allocated2=CPLAN.allocations.reduce(function(t,a2){return t+(a2.amount||0);},0);
-  var unalloc2=Math.max(0,CPLAN.surplus-allocated2);
+  // SINGLE SOURCE: same _cpDeploySummary the initial render (_cpRenderPlanV2) uses, so a slider drag keeps the
+  // headline exactly consistent with the caps (was a crude raw Σ(amount) that dropped static premiums + hybrid
+  // self-portions → the headline went wrong the moment you dragged).
+  var _ds=_cpDeploySummary();
+  var allocated2=_ds.allocated, unalloc2=_ds.unalloc;
   var bar=document.getElementById('cpDeployBar');
   if(bar){
     var bh='';CPLAN.allocations.forEach(function(a3){if(a3.amount>0){var w=CPLAN.surplus>0?Math.max(1,Math.round(a3.amount/CPLAN.surplus*100)):0;bh+='<div style="height:100%;width:'+w+'%;background:'+CP_COL[a3.type]+';opacity:0.6;transition:width .3s"></div>';}});
@@ -48470,11 +48479,7 @@ function _cpSlide(i,v){if(CPLAN._pendingReview)return;
   }
   var sl=document.getElementById('cpSurplusLine');
   if(sl){
-    var pct=CPLAN.surplus>0?Math.round(allocated2/CPLAN.surplus*100):0;
-    var _brPctSlide=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
-    var _brResSlide=Math.round((CPLAN.surplus||0)*_brPctSlide);
-    var _availSlide=Math.max(0,unalloc2-_brResSlide);
-    sl.innerHTML='Deploying <strong style="color:var(--gr)">'+fmt(allocated2)+'</strong>/mo ('+pct+'% of surplus)'+(_brResSlide>0?' · <span style="color:var(--gr)">'+fmt(_brResSlide)+' breathing room</span>':'')+(_availSlide>0?'<br><span style="color:#5B9BFF">'+fmt(_availSlide)+' available to allocate</span>':'');
+    sl.innerHTML='Deploying <strong style="color:var(--gr)">'+fmt(_ds.allocated)+'</strong>/mo ('+_ds.allocPct+'% of surplus)'+(_ds.brReserve>0?' · <span style="color:var(--gr)">'+fmt(_ds.brReserve)+' breathing room</span>':'')+(_ds.avail>0?'<br><span style="color:#5B9BFF">'+fmt(_ds.avail)+' available to allocate</span>':'');
   }
   // 4. Live-update debt strategy comparison numbers (no re-render, no drag
   //    focus loss). Cheap enough to run every tick. Only fires for debt
