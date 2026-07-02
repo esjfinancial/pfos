@@ -4283,12 +4283,28 @@ async function renderAdvisorTouchpoints(){
     el.innerHTML='<div style="padding:14px 16px;background:rgba(91,155,255,.06);border:1px solid rgba(91,155,255,.22);border-left:3px solid #5B9BFF;border-radius:4px"><div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:#5B9BFF;margin-bottom:8px">👤 From your advisor</div><div style="display:flex;gap:8px;flex-wrap:wrap">'+parts.join('')+'</div></div>';
   }catch(e){ el.style.display='none'; }
 }
+// TRUE savings streak: the run of consecutive most-recent months with POSITIVE net cash flow, derived from the
+// client's snapshot history (client_snapshots → APP._supabaseSnapshots, latest netCF per month) plus the current
+// month's live netCF. RESETS on a negative/zero month and STOPS at a month gap (an unrecorded month can't be
+// counted). Replaces the old per-client localStorage counter that only ever incremented on page visits, never
+// reset, counted non-consecutive months, and was device-local. Snapshot dates are parsed component-wise (not
+// new Date(dateStr), which is UTC and would shift the month at boundaries) — timezone-safe.
+function _cpStreakMonthKey(y,m){return y+'-'+(m<10?'0':'')+m;}
+function _cpComputeStreak(c){
+  var snaps=(typeof APP!=='undefined'&&APP._supabaseSnapshots)||[],byMonth={};
+  snaps.forEach(function(s){ if(s&&s.date){ var p=String(s.date).split('-'); if(p.length>=2)byMonth[_cpStreakMonthKey(parseInt(p[0]),parseInt(p[1])-1)]=(s.netCF!=null?s.netCF:0); } });
+  var now=new Date(),curK=_cpStreakMonthKey(now.getFullYear(),now.getMonth());
+  if(byMonth[curK]===undefined&&c&&c.netCF!=null)byMonth[curK]=c.netCF;
+  var streak=0,y=now.getFullYear(),m=now.getMonth();
+  for(var i=0;i<48;i++){ var k=_cpStreakMonthKey(y,m); if(byMonth[k]===undefined)break; if(byMonth[k]>0)streak++; else break; m--; if(m<0){m=11;y--;} }
+  return streak;
+}
 // #101: surface the savings streak on the dashboard overview (it otherwise only lives on the Engagement page).
 function renderEngageStrip(){
   var el=document.getElementById('engageStrip'); if(!el) return;
   var fd=_lastPfosState||{}; var c=fd.calcs||{};
   if(!c.inc){ el.style.display='none'; return; }   // needs data to be meaningful
-  var streak=0; try{streak=parseInt(localStorage.getItem('pfos_savings_streak_'+APP.currentClientId))||0;}catch(_){}
+  var streak=_cpComputeStreak(c);
   el.style.display='block';
   el.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px">'
     +'<div style="display:flex;align-items:center;gap:6px;font-size:13px"><span style="font-size:18px">🔥</span><span style="color:var(--wh);font-weight:700;font-family:var(--fh);font-size:15px">'+streak+'</span><span style="color:var(--mu)">month'+(streak===1?'':'s')+' of positive cash flow</span></div>'
@@ -4342,14 +4358,7 @@ function renderSavingsStreak(){
   var barEl=document.getElementById('streakBar');
   if(!countEl) return;
   var fd=_lastPfosState||{};var c=fd.calcs||{};
-  var streak=0;
-  try{streak=parseInt(localStorage.getItem('pfos_savings_streak_'+APP.currentClientId))||0;}catch(e){}
-  // Auto-increment if positive cash flow this month
-  if(c.netCF>0){
-    var lastCheck=localStorage.getItem('pfos_streak_month_'+APP.currentClientId);
-    var thisMonth=new Date().getFullYear()+'-'+new Date().getMonth();
-    if(lastCheck!==thisMonth){streak++;localStorage.setItem('pfos_savings_streak_'+APP.currentClientId,streak);localStorage.setItem('pfos_streak_month_'+APP.currentClientId,thisMonth);}
-  }
+  var streak=_cpComputeStreak(c); // true consecutive-months-of-positive-cash-flow from snapshot history (see helper)
   countEl.textContent=streak;
   var milestones=[3,7,14,30,60,90,180,365];
   var nextMilestone=milestones.find(function(m){return m>streak;})||365;
@@ -6596,6 +6605,10 @@ async function loadClientPortalData(){
   setTimeout(function(){showSatisfactionPulse();},30000);
   // Check if client is part of a couple
   checkCoupleLink();
+  // Populate the dashboard's advisor-recommendations card. Previously never called here → the whole surface
+  // (recs, journey roadmap, "I Completed This", "Ask Your Advisor") was dead for advisory clients. The loader
+  // self-gates: it hides the section for product/self-serve clients with no recs.
+  try{ if(APP.currentClientId) loadClientRecommendations(APP.currentClientId); }catch(_e){}
 }
 async function loadClientRecommendations(clientId){
   try{
@@ -6605,6 +6618,7 @@ async function loadClientRecommendations(clientId){
       .order('created_at',{ascending:false});
     var recs = data||[];
     APP_RECS = recs;
+    var recSection = document.getElementById('clientRecsSection');
     var recList    = document.getElementById('clientRecsList');
     if(!recSection || !recList) return;
     var isProduct = APP.currentClient && APP.currentClient.client_type === 'product';
@@ -9546,18 +9560,10 @@ var _portalCatList=[
 // Portal-side equivalent of pfos-main's getMonthlyExp() — normalizes expData
 // entries (annual → /12, sum sub-line items if present) to a monthly figure.
 function _portalGetMonthlyExp(key){
+  // Single-source through the canonical resolver, which HONORS ed.total. The old inline copy ignored .total, so
+  // "Where Every Dollar Goes" showed pre-move numbers while every other budget panel showed the new ones.
   var S=(_lastPfosState&&_lastPfosState.state)||{};
-  var d=(S.expData||{})[key];
-  if(!d)return 0;
-  var v=parseFloat(d.amount)||0;
-  if(d.period==='annual')v=v/12;
-  var subTotal=0;
-  if(d.subs)Object.keys(d.subs).forEach(function(sk){
-    var s=d.subs[sk]||{};
-    var sv=parseFloat(s.amount)||0;
-    subTotal+=s.period==='annual'?sv/12:sv;
-  });
-  return subTotal>0?subTotal:v;
+  return getMonthlyExpense((S.expData||{})[key]);
 }
 // SVG donut renderer mirroring pfos-main's _svgDonut signature/output exactly
 function _portalSvgDonut(data,size,label,opts){
@@ -37262,7 +37268,13 @@ function _cpRenderPlanV2(){
   // 'plan_builder' feature (Core, post-M0) → a READ-ONLY ranked-priority preview + upgrade panel instead
   // of the interactive builder. Portal only — the advisor profile twin (_cpRenderPlanFull) must NEVER get this.
   if(window.PFOS_FLAGS&&PFOS_FLAGS.planTeaser&&typeof clientHasFeature==='function'&&!clientHasFeature('plan_builder')){_cpRenderPlanTeaser();return;}
-  if(!CPLAN.allocations.length&&!CPLAN.hasAdvisor){_cpRenderFork();return;}
+  // No allocations yet: a self-serve (product) client gets the build/AI/consult fork; an ADVISORY client must get
+  // the advisor-pending view, NOT the bare self-serve builder shell. The initial-load path routes this, but a
+  // re-render (e.g. a postMessage data refresh) used to fall through here for advisory clients (gate bypass).
+  if(!CPLAN.allocations.length){
+    if(CPLAN.hasAdvisor){ if(typeof _cpRenderAdvisorPending==='function'){_cpRenderAdvisorPending();return;} }
+    else { _cpRenderFork();return; }
+  }
   var h='';
   // Stage flag-cards → seed starting amounts → re-type education UP-FRONT, before the "Deploying $X/mo" headline below
   // sums allocation amounts. The same three calls also run ~270 lines down (right before the card list); they're
@@ -48394,21 +48406,24 @@ function _cpSlide(i,v){if(CPLAN._pendingReview)return;
   // Update this slider's own cap note too
   var noteSelf=document.getElementById('cpCapNote'+i);
   if(noteSelf)noteSelf.innerHTML=_cpEffectiveCapNote(a.type,i);
-  // 2. Update deployment bar
+  // 2. Update deployment bar + the "Deploying $X" surplus-line headline. The headline update MUST run independent
+  //    of the (removed) cpDeployBar — it was nested inside `if(bar){…}` where bar is always null, so the headline
+  //    went stale on every drag. Now it updates live.
+  var allocated2=CPLAN.allocations.reduce(function(t,a2){return t+(a2.amount||0);},0);
+  var unalloc2=Math.max(0,CPLAN.surplus-allocated2);
   var bar=document.getElementById('cpDeployBar');
-  if(bar){var allocated2=CPLAN.allocations.reduce(function(t,a2){return t+a2.amount;},0);var unalloc2=Math.max(0,CPLAN.surplus-allocated2);
+  if(bar){
     var bh='';CPLAN.allocations.forEach(function(a3){if(a3.amount>0){var w=CPLAN.surplus>0?Math.max(1,Math.round(a3.amount/CPLAN.surplus*100)):0;bh+='<div style="height:100%;width:'+w+'%;background:'+CP_COL[a3.type]+';opacity:0.6;transition:width .3s"></div>';}});
     if(unalloc2>0)bh+='<div style="height:100%;width:'+Math.round(unalloc2/Math.max(CPLAN.surplus,1)*100)+'%;background:rgba(100,116,139,.1)"></div>';
     bar.innerHTML=bh;
-    // 3. Update surplus line — split breathing room reserve from available-to-allocate
-    var sl=document.getElementById('cpSurplusLine');
-    if(sl){
-      var pct=CPLAN.surplus>0?Math.round(allocated2/CPLAN.surplus*100):0;
-      var _brPctSlide=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
-      var _brResSlide=Math.round((CPLAN.surplus||0)*_brPctSlide);
-      var _availSlide=Math.max(0,unalloc2-_brResSlide);
-      sl.innerHTML='Deploying <strong style="color:var(--gr)">'+fmt(allocated2)+'</strong>/mo ('+pct+'% of surplus)'+(_brResSlide>0?' · <span style="color:var(--gr)">'+fmt(_brResSlide)+' breathing room</span>':'')+(_availSlide>0?'<br><span style="color:#5B9BFF">'+fmt(_availSlide)+' available to allocate</span>':'');   // #48: breathing room + available (lockstep with the initial render; mirrors advisor)
-    }
+  }
+  var sl=document.getElementById('cpSurplusLine');
+  if(sl){
+    var pct=CPLAN.surplus>0?Math.round(allocated2/CPLAN.surplus*100):0;
+    var _brPctSlide=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
+    var _brResSlide=Math.round((CPLAN.surplus||0)*_brPctSlide);
+    var _availSlide=Math.max(0,unalloc2-_brResSlide);
+    sl.innerHTML='Deploying <strong style="color:var(--gr)">'+fmt(allocated2)+'</strong>/mo ('+pct+'% of surplus)'+(_brResSlide>0?' · <span style="color:var(--gr)">'+fmt(_brResSlide)+' breathing room</span>':'')+(_availSlide>0?'<br><span style="color:#5B9BFF">'+fmt(_availSlide)+' available to allocate</span>':'');
   }
   // 4. Live-update debt strategy comparison numbers (no re-render, no drag
   //    focus loss). Cheap enough to run every tick. Only fires for debt
@@ -50230,10 +50245,15 @@ function cplanSave(){
 }
 function cplanProposeChanges(){
   if(!APP.currentClientId)return;
+  // Guard against double-submit: already pending advisor review, or a submit already in flight → don't fire a
+  // duplicate proposed_plan_changes write + duplicate advisor notification email.
+  if(CPLAN._pendingReview||CPLAN._proposeInFlight){ if(typeof _cpToast==='function')_cpToast(CPLAN._pendingReview?'Your changes are already with your advisor.':'Sending your request…'); return; }
+  CPLAN._proposeInFlight=true;
   var _cpPr=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
   var _prId=(_cpPr&&_cpPr.household_type==='joint')?_cpPr.client_a_id:APP.currentClientId;
   var changes={proposed:CPLAN.allocations,original:CPLAN.advisorPlan,clientId:APP.currentClientId,clientName:(APP.currentClient&&APP.currentClient.name)||(APP.user?APP.user.email:'Client'),debtStrategy:CPLAN.debtStrategy,created:new Date().toISOString(),status:'pending'};
   db.from('client_profiles').update({proposed_plan_changes:changes}).eq('client_id',_prId).then(function(r){
+    CPLAN._proposeInFlight=false;
     if(!r.error){
       // Lock client view until advisor responds
       CPLAN._proposedChanges=changes;CPLAN._pendingReview=true;CPLAN.modified=false;CPLAN.exploring=false;
