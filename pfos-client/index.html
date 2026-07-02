@@ -5385,7 +5385,7 @@ async function autoSaveSnapshot(clientId, calcs){
       ret_gap:       Math.round((typeof CPLAN!=='undefined'&&CPLAN._sim&&c.fiNumber>0)?Math.max(0,c.fiNumber-(CPLAN._sim.projRetValue||0)):(c.retGap||0)),
       snapshot_data: {expBreak:expBreak,goals:goals,debts:debts,blendedReturn:c.blendedRetReturn||0,
         // Plan simulation data (when plan exists)
-        planRetVal:(typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.retirement)?CPLAN._sim.retirement[Math.min(30,Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35)))]||0:0,
+        planRetVal:(typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.retirement)?CPLAN._sim.retirement[Math.min(CPLAN._sim.retirement.length-1,Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35)))]||0:0,
         planNW:(typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.netWorth)?CPLAN._sim.netWorth[CPLAN._sim.netWorth.length-1]||0:0,
         planRetIncome:(typeof CPLAN!=='undefined'&&CPLAN._sim)?CPLAN._sim.projRetIncome||0:0,
         planAllocCount:(typeof CPLAN!=='undefined'&&CPLAN.allocations)?CPLAN.allocations.filter(function(a){return a.amount>0;}).length:0,
@@ -17794,6 +17794,9 @@ async function _calcScenariosLoad(){
     if(r&&r.data&&r.data.calc_scenarios&&typeof r.data.calc_scenarios==='object'&&!Array.isArray(r.data.calc_scenarios)) _calcScenarios=r.data.calc_scenarios;
   }catch(e){ console.warn('[calcScen] load failed',e&&e.message); }
   _calcScenLoaded=true;
+  // If a calc opened BEFORE scenarios finished loading (e.g. right after a fresh page load), the restore ran
+  // against an empty store and showed profile defaults — re-apply it now that the saved scenario is present.
+  try{ if(_currentCalcRender&&document.getElementById('_csHeader')&&typeof _calcScheduleRestore==='function') _calcScheduleRestore(); }catch(_e){}
 }
 function _calcScenariosSaveSoon(){ if(_calcScenSaveT)clearTimeout(_calcScenSaveT); _calcScenSaveT=setTimeout(_calcScenariosFlush,900); }
 async function _calcScenariosFlush(){
@@ -42214,7 +42217,7 @@ function _cpRenderIncomeReplacement(){
   if(sim&&typeof sim.projRetIncome==='number'&&sim.projRetIncome>0){
     retIncome=sim.projRetIncome;
   } else if(sim&&sim.retirement&&sim.retirement.length>0){
-    var _retYrsToAge65=Math.max(1,Math.min(30,(CPLAN.retirementAge||65)-(CPLAN.age||35)));
+    var _retYrsToAge65=Math.max(1,Math.min(sim.retirement.length-1,(CPLAN.retirementAge||65)-(CPLAN.age||35)));
     var retAtRetire=sim.retirement[_retYrsToAge65]||sim.retirement[sim.retirement.length-1]||0;
     retIncome=Math.round(_cpSustainableMonthly(retAtRetire/Math.pow(1.03,_retYrsToAge65),_cpYearsInRetirement(),0.01));
   } else {
@@ -44950,8 +44953,10 @@ function _cpRunCheckInFlow(){
   _cpRenderAccountabilityBanner();
 }
 
+// Projection horizon — accumulate to age 95 (dynamic per current age; no retirement drawdown modeled yet).
+function _cpHorizonYears(){var a=(typeof CPLAN!=='undefined'&&parseFloat(CPLAN.age))||35;return Math.max(10,Math.round(95-a));}
 function _cpRunSimulation(){
-  var years=30;
+  var years=_cpHorizonYears();
   var maxMonths=years*12;
 
   // Reset the match-claim ledger so this simulation cycle establishes its own
@@ -46401,7 +46406,7 @@ function _cpRenderChart(targetId,bucket){
       return;
     }
   }
-  var W=600,H=260,padL=50,padR=55,padT=24,padB=28;var years=30;
+  var W=600,H=260,padL=50,padR=55,padT=24,padB=28;var years=_cpHorizonYears();
 
   // ── Use simulation data if available, else fall back to static ──
   var sim=CPLAN._sim;
@@ -46550,7 +46555,12 @@ function _cpRenderChart(targetId,bucket){
   for(var g=0;g<=4;g++){var gv=minV+(maxV-minV)*g/4;var gy=yf(gv);svg+='<line x1="'+padL+'" y1="'+gy+'" x2="'+(W-padR)+'" y2="'+gy+'" stroke="rgba(0,68,191,.06)" stroke-width="0.5"/>';svg+='<text x="'+(padL-4)+'" y="'+(gy+3)+'" fill="rgba(100,116,139,.5)" font-size="11" text-anchor="end" font-family="var(--fh)">'+fmtK(Math.round(gv))+'</text>';}
   if(minV<0&&maxV>0)svg+='<line x1="'+padL+'" y1="'+yf(0)+'" x2="'+(W-padR)+'" y2="'+yf(0)+'" stroke="rgba(100,116,139,.2)" stroke-width="0.5" stroke-dasharray="3,3"/>';
   var _chartAge=CPLAN.age||35;
-  [0,5,10,15,20,25,30].forEach(function(yr5){svg+='<text x="'+x(yr5)+'" y="'+(H-padB+14)+'" fill="rgba(100,116,139,.4)" font-size="11" text-anchor="middle" font-family="var(--fh)">Age '+(_chartAge+yr5)+'</text>';});
+  // x-axis age ticks span the FULL horizon (dynamic to ~age 95) — ~6 evenly-spaced marks on 5-year steps,
+  // always including the endpoint (was hardcoded [0..30], which stopped the labels at age 65).
+  var _axStep=Math.max(5,Math.round(years/6/5)*5),_axTicks=[];
+  for(var _axt=0;_axt<=years;_axt+=_axStep)_axTicks.push(_axt);
+  if(_axTicks[_axTicks.length-1]!==years)_axTicks.push(years);
+  _axTicks.forEach(function(yr5){svg+='<text x="'+x(yr5)+'" y="'+(H-padB+14)+'" fill="rgba(100,116,139,.4)" font-size="11" text-anchor="middle" font-family="var(--fh)">Age '+(_chartAge+yr5)+'</text>';});
 
   // ── Displacement bands: proportioned between baseline and plan ──
   if(_cpTierHas('displacement_bands')){
