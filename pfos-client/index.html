@@ -7279,6 +7279,16 @@ function _cvAccounts(S,lens){
   return out;
 }
 function _cvInvLabel(t){ var m={brokerage:'Brokerage','401k':'401(k)',roth401k:'Roth 401(k)',roth:'Roth IRA',trad_ira:'IRA',ira:'IRA',hsa:'HSA',invest:'Investment'}; return m[String(t||'').toLowerCase()]||(t||'Investment'); }
+// HYBRID households keep their SHARED (joint) accounts in couple_links.joint_financial_data — assembled by
+// pfos-main and ABSENT from each partner's financial_data.S — NOT as owner==='joint' rows in the personal
+// arrays. So the couple-view "Ours" tab must source them from there, or it's permanently empty for hybrid.
+function _cvJointAccounts(jfd){
+  jfd=jfd||{}; var out=[];
+  (jfd.debts||[]).forEach(function(d){ if(!d)return; var b=parseFloat(d.balance)||0; if(b<=0)return; out.push({name:d.name||d.type||'Debt',balance:b,kind:'debt'}); });
+  (jfd.investments||[]).forEach(function(i){ if(!i)return; if(String(i.type||'').toLowerCase()==='crypto')return; var b=parseFloat(i.balance)||0; if(b<=0)return; out.push({name:i.name||_cvInvLabel(i.type),balance:b,kind:'asset'}); });
+  (jfd.retAccounts||[]).forEach(function(r){ if(!r)return; var b=parseFloat(r.balance)||0; if(b<=0)return; out.push({name:r.name||r.type||'Retirement',balance:b,kind:'asset'}); });
+  return out;
+}
 function _cvAcctList(accts,emptyMsg){
   if(!accts||!accts.length) return '<div style="font-size:12px;color:var(--mu);padding:8px 0">'+(emptyMsg||'No accounts listed.')+'</div>';
   var net=0, h='';
@@ -7368,7 +7378,9 @@ async function renderCoupleView(){
       h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🏦 Household Accounts</div>'+_cvAcctList(_all,'No itemized accounts yet — add accounts in My Financial Data.')+'</div>';
     } else {
       var _tid='cvacct_'+Math.random().toString(36).slice(2,8);
-      var _mine=_cvAccounts(myS,'personal'), _their=_cvAccounts(pS,'personal'), _ours=_cvAccounts(myS,'joint').concat(_cvAccounts(pS,'joint'));
+      // Hybrid: joint accounts live in couple_links.joint_financial_data (not owner==='joint' rows in S) →
+      // read them from the link. Separate: joint-tagged rows (if any) still come from each partner's arrays.
+      var _mine=_cvAccounts(myS,'personal'), _their=_cvAccounts(pS,'personal'), _ours=(_hh==='hybrid')?_cvJointAccounts(link.joint_financial_data):_cvAccounts(myS,'joint').concat(_cvAccounts(pS,'joint'));
       h+='<div class="info-card" style="padding:14px;margin-bottom:14px"><div style="font-family:var(--fh);font-size:13px;font-weight:700;color:var(--wh);margin-bottom:8px">🏦 Accounts</div><div style="display:flex;gap:6px;margin-bottom:10px">';
       [['mine','Mine'],['theirs',esc(pName)],['ours','Ours']].forEach(function(t,i){ h+='<button onclick="_cvAcctTab(\''+_tid+'\',\''+t[0]+'\')" id="'+_tid+'_tab_'+t[0]+'" style="flex:1;padding:6px;font-family:var(--fh);font-size:12px;font-weight:700;border:1px solid '+(i===0?'rgba(91,155,255,.5)':'var(--bd)')+';border-radius:3px;cursor:pointer;background:'+(i===0?'rgba(91,155,255,.15)':'transparent')+';color:'+(i===0?'#5B9BFF':'var(--mu)')+'">'+t[1]+'</button>'; });
       h+='</div><div id="'+_tid+'_mine">'+_cvAcctList(_mine,'No personal accounts listed.')+'</div><div id="'+_tid+'_theirs" style="display:none">'+_cvAcctList(_their,esc(pName)+' has no accounts listed yet.')+'</div><div id="'+_tid+'_ours" style="display:none">'+_cvAcctList(_ours,'No shared (joint) accounts yet — mark an account as joint to see it here.')+'</div></div>';
@@ -34648,6 +34660,12 @@ async function _cpSelectApproachHybrid(key,aiData){
     _cpToast&&_cpToast('Cannot generate dual plan — partner client id missing');
     return;
   }
+  // C2 re-entry guard: a rapid double-click on approach cards re-enters this fn while the first call is
+  // suspended at its dual-write await — the second call would rebuild CPLAN.allocations mid-flight and fire
+  // a second concurrent state_c_dual_plan_write RPC (racing both spouses' rows). Block re-entry until the
+  // in-flight write settles. Set synchronously BEFORE the first await (below) so the second click always sees
+  // it; cleared in the RPC try's finally. (Same pattern as cplanProposeChanges' _proposeInFlight.)
+  if(CPLAN._hybridWriteInFlight){ _cpToast&&_cpToast('Your plan is still being set up — one moment.'); return; }
 
   // ── Type-normalization maps (used by joint cards + partner allocations) ──
   // MUST mirror what _cpConvertAIRecs uses (line ~24299) — the frontend
@@ -34901,6 +34919,7 @@ async function _cpSelectApproachHybrid(key,aiData){
   // The toast helper exists across the file; fall through to console if not.
   _cpToast&&_cpToast('Generating dual plan...');
 
+  CPLAN._hybridWriteInFlight=true; // set before the await so a concurrent re-entry (C2) is blocked; cleared in finally
   try{
     var rpcRes=await db.rpc('state_c_dual_plan_write',{
       p_couple_link_id:couple.id,
@@ -34930,7 +34949,7 @@ async function _cpSelectApproachHybrid(key,aiData){
     CPLAN._selectedApproach=null;
     _cpShowApproachFork&&_cpShowApproachFork();
     return;
-  }
+  }finally{ CPLAN._hybridWriteInFlight=false; } // clear on every exit (success fall-through, error-return, catch-return)
 
   // ── Step F: render the requesting user's plan locally ──
   if(typeof _cpCaptureSnapshot==='function')_cpCaptureSnapshot('approach_selected','user','Loaded plan: '+key+' approach (Hybrid dual)');
