@@ -6348,6 +6348,8 @@ async function loadClientDataIntoPFOS(clientId){
   if(typeof _cpUpdateAdvisoryNav==='function')_cpUpdateAdvisoryNav();
   // Load calculator tier access and send to iframe
   if(mode==='client'&&APP.currentClientId) loadCalcTiers(APP.currentClientId);
+  // Preload saved calculator scenarios (My-Scenario edits + Someone-Else scratch) so they restore on calc open
+  if(APP.currentClientId){ _calcScenLoaded=false; _calcScenariosLoad(); }
 }
 async function loadClientCoupleStatus(){
   if(!APP.currentClientId) return;
@@ -17354,7 +17356,10 @@ function openToolCalc(funcName,source){
   var titleEl=document.getElementById('insCalcTitle');if(titleEl) titleEl.textContent='Calculator';
   var el=document.getElementById('insCalcContent');if(el) el.innerHTML=_renderEmptyState('loading',{message:'Loading calculator…'});
   trackCalcOpen(funcName,source||'tool_grid');
-  var _ip=document.getElementById('calcInfoPanel');if(_ip){_ip.style.display='none';_ip.textContent=CALC_INFO[funcName]||'';}setTimeout(function(){if(typeof window[funcName]==='function') window[funcName]();},50);
+  var _ip=document.getElementById('calcInfoPanel');if(_ip){_ip.style.display='none';_ip.textContent=CALC_INFO[funcName]||'';}
+  if(!_calcListenerBound){var _cc=document.getElementById('insCalcContent');if(_cc){_cc.addEventListener('input',_calcOnAnyInput);_cc.addEventListener('change',_calcOnAnyInput);_calcListenerBound=true;}}
+  if(!_calcScenLoaded)_calcScenariosLoad();
+  setTimeout(function(){_calcRun(true);},50);
 }
 
 function _rerunCalcToggle(forOther){
@@ -17715,16 +17720,21 @@ function _opSaveValues(){
 
 function _opLive(){
   _opSaveValues();
+  // Persist the someone-else mini-profile with this calc's scenario (so it re-opens intact).
+  var _ope=_calcScenEntry(); if(_ope){_ope.otherProfile=JSON.parse(JSON.stringify(_otherProfile)); _calcScenariosSaveSoon();}
   if(_opDebounce) clearTimeout(_opDebounce);
   _opDebounce=setTimeout(function(){
     var focusId=document.activeElement?document.activeElement.id:'';
     var cursorPos=-1;
     if(focusId&&document.activeElement.selectionStart!==undefined) cursorPos=document.activeElement.selectionStart;
     var c=document.getElementById('insCalcContent');
+    _calcSwitching=true; // suppress stray input events during this programmatic re-render
     if(c) c.innerHTML='';
     if(_currentCalcRender && typeof window[_currentCalcRender]==='function'){
       window[_currentCalcRender]();
     }
+    _calcScheduleRestore(); // bring back their someone-else calc-field edits across the (possibly async) re-render
+    setTimeout(function(){_calcSwitching=false;},180);
     if(focusId){
       var restore=document.getElementById(focusId);
       if(restore){restore.focus();if(cursorPos>=0)try{restore.setSelectionRange(cursorPos,cursorPos);}catch(e){}}
@@ -17746,7 +17756,147 @@ function cDebts(prefix){return isForMe(prefix)?(S.debts||[]):[];}
 function cRet(prefix){return isForMe(prefix)?(S.retAccounts||[]):[];}
 function cCS(prefix){return 0;}
 
-function calcToggleHTML(){return window.PFOSEngine.ui.calcToggleHTML.apply(null,arguments);}
+// ═══════════════════════════════════════════════════════════════════════════
+// CALC SCENARIOS — per-user saved scenarios + isolated "Someone Else" + Reset.
+// Header renders on every calc that calls calcToggleHTML(prefix,cb) (~40 calcs).
+// Persists to client_profiles.calc_scenarios (JSONB) keyed by render-fn + mode.
+// (Was: a cosmetic For-Me/For-Other toggle whose onclick never wired _calcForOther.)
+// ═══════════════════════════════════════════════════════════════════════════
+function calcToggleHTML(prefix,cb){
+  var meAct=!_calcForOther;
+  var baseBtn='padding:7px 14px;border:none;cursor:pointer;font-family:var(--fh);font-size:12px;font-weight:700;min-height:34px;transition:.12s;';
+  var actS='background:#5B9BFF;color:#0b1220;';
+  var inS='background:transparent;color:var(--mu);';
+  var resetLabel=_calcForOther?'🗑 Clear':'↺ Reset';
+  var resetTitle=_calcForOther?'Clear all fields for this someone-else scenario':'Reset to your own profile data';
+  var hdr='<div id="_csHeader" style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px">'
+    +'<div style="display:inline-flex;border:1px solid var(--bd);border-radius:6px;overflow:hidden">'
+    +'<button type="button" onclick="_calcSetMode(false)" style="'+baseBtn+(meAct?actS:inS)+'">👤 My Scenario</button>'
+    +'<button type="button" onclick="_calcSetMode(true)" style="'+baseBtn+(_calcForOther?actS:inS)+'">👥 Someone Else</button>'
+    +'</div>'
+    +'<div style="display:inline-flex;gap:6px;align-items:center">'
+    +'<button type="button" onclick="_calcResetScenario()" title="'+resetTitle+'" style="padding:7px 12px;border:1px solid var(--bd);background:transparent;color:var(--mu);cursor:pointer;font-family:var(--fh);font-size:12px;font-weight:700;min-height:34px;border-radius:6px;transition:.12s" onmouseover="this.style.borderColor=\'var(--or)\';this.style.color=\'var(--wh)\'" onmouseout="this.style.borderColor=\'var(--bd)\';this.style.color=\'var(--mu)\'">'+resetLabel+'</button>'
+    +'</div></div>';
+  return hdr+(_calcForOther?_otherProfileBox():'');
+}
+
+// ── Scenario persistence (dedicated column; independent of financial_data) ──
+var _calcScenarios={};       // { "<renderFn>": { mine:{id:val}, other:{id:val}, otherProfile:{...} } }
+var _calcScenLoaded=false, _calcRestoring=false, _calcScenSaveT=null, _calcListenerBound=false, _calcSwitching=false, _calcRestoreTimers=[];
+function _calcScenTargetId(){
+  try{ if(typeof getCoupleForClient==='function'){ var cp=getCoupleForClient(APP.currentClientId); if(cp&&cp.household_type==='joint'&&cp.client_a_id) return cp.client_a_id; } }catch(e){}
+  return (typeof APP!=='undefined'&&APP.currentClientId)||null;
+}
+async function _calcScenariosLoad(){
+  var id=_calcScenTargetId(); if(!id){_calcScenLoaded=true;return;}
+  try{
+    var r=await db.from('client_profiles').select('calc_scenarios').eq('client_id',id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(r&&r.data&&r.data.calc_scenarios&&typeof r.data.calc_scenarios==='object'&&!Array.isArray(r.data.calc_scenarios)) _calcScenarios=r.data.calc_scenarios;
+  }catch(e){ console.warn('[calcScen] load failed',e&&e.message); }
+  _calcScenLoaded=true;
+}
+function _calcScenariosSaveSoon(){ if(_calcScenSaveT)clearTimeout(_calcScenSaveT); _calcScenSaveT=setTimeout(_calcScenariosFlush,900); }
+async function _calcScenariosFlush(){
+  var id=_calcScenTargetId(); if(!id)return;
+  try{ await db.from('client_profiles').update({calc_scenarios:_calcScenarios}).eq('client_id',id); }
+  catch(e){ console.warn('[calcScen] save failed',e&&e.message); }
+}
+function _calcScenEntry(){ var fn=_currentCalcRender; if(!fn)return null; if(!_calcScenarios[fn])_calcScenarios[fn]={}; return _calcScenarios[fn]; }
+function _calcCurMode(){ return _calcForOther?'other':'mine'; }
+
+// Snapshot every id'd field inside the calc body (excludes header + otherProfile box, which persist separately).
+function _calcSnapshotInputs(){
+  if(_calcRestoring||_calcSwitching)return;
+  var fn=_currentCalcRender; if(!fn)return;
+  var host=document.getElementById('insCalcContent'); if(!host||!host.querySelector('#_csHeader'))return; // only calcs that render the scenarios header
+  var e=_calcScenEntry(); if(!e)return;
+  var snap={},nodes=host.querySelectorAll('input[id],select[id],textarea[id]');
+  for(var i=0;i<nodes.length;i++){
+    var el=nodes[i],id=el.id;
+    if(!id||id.indexOf('_op_')===0)continue;                 // otherProfile handled separately
+    if(el.type==='button'||el.type==='submit'||el.type==='file')continue;
+    if(el.type==='checkbox'||el.type==='radio')snap[id]=el.checked?1:0; else snap[id]=el.value;
+  }
+  e[_calcCurMode()]=snap;
+  if(_calcForOther)e.otherProfile=JSON.parse(JSON.stringify(_otherProfile));
+  _calcScenariosSaveSoon();
+}
+// Re-apply a saved snapshot to the calc inputs. Only TOUCHES fields whose value differs (so a
+// no-op restore doesn't re-trigger compute → avoids feedback loops with the MutationObserver below).
+function _calcNorm(v){ return String(v==null?'':v).replace(/,/g,''); }  // commas are display-only (autoComma) — compare on the raw number
+function _calcRestoreInputs(){
+  var fn=_currentCalcRender; if(!fn)return;
+  var e=_calcScenarios[fn]; if(!e)return;
+  var host=document.getElementById('insCalcContent'); if(!host)return;
+  var snap=e[_calcCurMode()]; if(!snap)return;
+  _calcRestoring=true;
+  try{
+    Object.keys(snap).forEach(function(id){
+      var el=document.getElementById(id); if(!el||!host.contains(el))return;
+      if(el.type==='checkbox'||el.type==='radio'){
+        if(el.checked!==!!snap[id]){ el.checked=!!snap[id]; try{el.dispatchEvent(new Event('input',{bubbles:true}));}catch(_e){} try{el.dispatchEvent(new Event('change',{bubbles:true}));}catch(_e){} }
+        return;
+      }
+      if(_calcNorm(el.value)===_calcNorm(snap[id]))return;   // already matches (comma-insensitive) → no-op, prevents an observer loop
+      el.value=snap[id];
+      if(_calcNorm(el.value)!==_calcNorm(snap[id]))el.value=_calcNorm(snap[id]); // number inputs reject comma-formatted values → set the raw number
+      try{el.dispatchEvent(new Event('input',{bubbles:true}));}catch(_e){}
+      try{el.dispatchEvent(new Event('change',{bubbles:true}));}catch(_e){}
+    });
+  }catch(err){}
+  _calcRestoring=false;
+}
+// A calc's async edge re-render can land after the initial restore and blank the inputs. Restore now,
+// then keep re-applying on ANY re-render of the calc body (MutationObserver) until the user edits or a
+// settle window elapses — robust to a stale in-flight compute from the outgoing mode.
+var _calcRestoreObs=null, _calcRestoreObsStop=null;
+function _calcCancelRestore(){
+  _calcRestoreTimers.forEach(clearTimeout); _calcRestoreTimers=[];
+  if(_calcRestoreObs){try{_calcRestoreObs.disconnect();}catch(_){} _calcRestoreObs=null;}
+  if(_calcRestoreObsStop){clearTimeout(_calcRestoreObsStop);_calcRestoreObsStop=null;}
+}
+function _calcScheduleRestore(){
+  _calcCancelRestore();
+  _calcRestoreInputs();
+  var host=document.getElementById('insCalcContent'); if(!host||!window.MutationObserver)return;
+  _calcRestoreObs=new MutationObserver(function(){ if(!_calcRestoring)_calcRestoreInputs(); });
+  try{ _calcRestoreObs.observe(host,{childList:true,subtree:true}); }catch(_){}
+  _calcRestoreObsStop=setTimeout(_calcCancelRestore,1500);
+}
+// Only true user edits snapshot — ignore programmatic dispatches (restore, slider init, etc.).
+function _calcOnAnyInput(ev){
+  if(_calcSwitching)return;         // ignore stray events during a render/mode-switch (e.g. a deferred blur-change straddling the flip)
+  if(!ev||!ev.isTrusted)return;     // only real user edits snapshot — not programmatic restore/render dispatches
+  var t=ev.target; if(!t||!t.id||t.id.indexOf('_op_')===0)return;
+  _calcCancelRestore();             // the user is editing — stop re-applying the snapshot over their input
+  _calcSnapshotInputs();
+}
+// Render the current calc, restoring the saved snapshot for the active mode.
+function _calcRun(hydrateOther){
+  var fn=_currentCalcRender; if(!fn||typeof window[fn]!=='function')return;
+  if(_calcForOther&&hydrateOther){
+    var e=_calcScenarios[fn];
+    _otherProfile=(e&&e.otherProfile)?JSON.parse(JSON.stringify(e.otherProfile)):{age:0,income:0,expenses:0,creditScore:0,riskProfile:''};
+  }
+  _calcSwitching=true;              // suppress stray/late input events (deferred blur-change, slider init) during this render
+  var host=document.getElementById('insCalcContent'); if(host)host.innerHTML='';
+  window[fn]();
+  _calcScheduleRestore();
+  setTimeout(function(){_calcSwitching=false;},180); // window closes well before a user could type into the re-rendered calc
+}
+function _calcSetMode(other){
+  other=!!other; if(other===_calcForOther)return;
+  _calcForOther=other; _calcRun(true);
+}
+function _calcResetScenario(){
+  var fn=_currentCalcRender; if(!fn)return;
+  var e=_calcScenarios[fn];
+  if(_calcForOther){ if(e){delete e.other;delete e.otherProfile;} _otherProfile={age:0,income:0,expenses:0,creditScore:0,riskProfile:''}; }
+  else { if(e){delete e.mine;} }
+  if(e&&!e.mine&&!e.other&&!e.otherProfile)delete _calcScenarios[fn];
+  _calcScenariosSaveSoon();
+  _calcRun(false);
+}
 
 function calcShareCTA(){return window.PFOSEngine.ui.calcShareCTA.apply(null,arguments);}
 
