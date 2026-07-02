@@ -4376,7 +4376,7 @@ function renderBadges(){
     {id:'debt_free_ish',icon:'⚡',name:'Debt Crusher',desc:'DTI under 20%',earned:c.inc>0&&(c.dti||100)<20},
     {id:'nw_positive',icon:'📈',name:'Net Positive',desc:'Positive net worth',earned:(c.netWorth||0)>0},
     {id:'nw_100k',icon:'💎',name:'Six Figures',desc:'Net worth over $100K',earned:(c.netWorth||0)>=100000},
-    {id:'balanced',icon:'⚖️',name:'Balanced',desc:'All scores 5+',earned:c.inc>0&&Object.keys({cfScore:1,protScore:1,growScore:1,effScore:1}).every(function(k){var sc=(fd.scores||{})[k];return sc!=null&&sc>=5;})}
+    {id:'balanced',icon:'⚖️',name:'Balanced',desc:'All scores 5+',earned:c.inc>0&&Object.keys({cfScore:1,protScore:1,growScore:1,effScore:1}).every(function(k){var sc=(fd.calcs||{})[k];return sc!=null&&sc>=5;})}
   ];
   // #102: celebrate a NEWLY-earned badge (seed silently on the first-ever render so pre-existing badges don't spam).
   try{
@@ -7281,12 +7281,15 @@ async function renderCoupleView(){
     var myFd=(myProfile&&myProfile.financial_data)?myProfile.financial_data:{};var myC=myFd.calcs||{};var myS=myFd.S||{};
     var pFd=(partnerProfile&&partnerProfile.financial_data)?partnerProfile.financial_data:{};var pC=pFd.calcs||{};var pS=pFd.S||{};
     var pName=(partnerClient&&partnerClient.name)?String(partnerClient.name).split(' ')[0]:'Partner';
-    // Combined metrics
-    var combInc=(myC.inc||0)+(pC.inc||0);
-    var combNW=(myC.netWorth||0)+(pC.netWorth||0);
-    var combDebt=(myC.totalDebt||0)+(pC.totalDebt||0);
-    var combCF=(myC.netCF||0)+(pC.netCF||0);
-    var combSav=combInc>0?((myC.netCF||0)+(pC.netCF||0))/combInc*100:0;
+    // Combined metrics. JOINT: the whole household's calcs live ENTIRELY on client_a's row (the joint save writes
+    // the merged household there); client_b's row is a stale/leftover copy. Summing myC+pC double-counts — so for
+    // joint use client_a's row alone as the household total. (separate/hybrid correctly sum each partner's calcs.)
+    var _hhC=(_hh==='joint')?((APP.currentClientId===link.client_a_id)?myC:pC):null;
+    var combInc=_hhC?(_hhC.inc||0):((myC.inc||0)+(pC.inc||0));
+    var combNW=_hhC?(_hhC.netWorth||0):((myC.netWorth||0)+(pC.netWorth||0));
+    var combDebt=_hhC?(_hhC.totalDebt||0):((myC.totalDebt||0)+(pC.totalDebt||0));
+    var combCF=_hhC?(_hhC.netCF||0):((myC.netCF||0)+(pC.netCF||0));
+    var combSav=combInc>0?(combCF)/combInc*100:0;
     var h='';
     // Combined header
     h+='<div style="text-align:center;padding:16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;margin-bottom:14px">';
@@ -30702,7 +30705,7 @@ function renderClientAnalysis(){
   // ═══════════════════════════════════════════════════
   h+=secH('🩺','Diagnostic Scores','linear-gradient(180deg,#5B9BFF,rgba(91,155,255,.3))');
   h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin-bottom:20px">';
-  [{k:'cfScore',l:'Cash Flow',sub:'+'+fmt(c.netCF||0)+'/mo'},{k:'protScore',l:'Protection',sub:(c.efMonths||0).toFixed(1)+' mo EF'},{k:'growScore',l:'Growth',sub:(c.savingsRate||0).toFixed(1)+'% saved'},{k:'effScore',l:'Efficiency',sub:(c.leakCount||0)+' leaks'}].forEach(function(s){
+  [{k:'cfScore',l:'Cash Flow',sub:((c.netCF||0)>=0?'+':'')+fmt(c.netCF||0)+'/mo'},{k:'protScore',l:'Protection',sub:(c.efMonths||0).toFixed(1)+' mo EF'},{k:'growScore',l:'Growth',sub:(c.savingsRate||0).toFixed(1)+'% saved'},{k:'effScore',l:'Efficiency',sub:(c.leakCount||0)+' leaks'}].forEach(function(s){
     var v=c[s.k]||0,cl=sc(v);
     var gbg=v>=7?'linear-gradient(135deg,rgba(34,197,94,.10),rgba(34,197,94,.02))':v>=5?'linear-gradient(135deg,rgba(234,179,8,.10),rgba(234,179,8,.02))':'linear-gradient(135deg,rgba(239,68,68,.10),rgba(239,68,68,.02))';
     h+='<div onclick="showClientPage(\'plan\');initClientPlan()" title="Open your plan to act on this score" style="padding:14px;background:'+gbg+';border:1px solid var(--bd);border-top:2px solid '+cl+';border-radius:4px;text-align:center;cursor:pointer">'; // #107: score → action deep-link
@@ -34937,6 +34940,15 @@ async function _cpRevertApproach(){
 // _planCommitted flag which hides Switch/Compare/Revert UI from the plan page.
 // After commit, Audit is the only modification path forward.
 async function _cpCommitPlan(){
+  // Guard: never permanently commit an empty / $0 plan (a zeroed-out DIY plan, a $0 AI/edge response, or a
+  // hybrid selection whose async allocation load hasn't landed yet). Require at least one funded step or a real
+  // action item before locking in — commit is one-way (Switch/Compare/Revert hide forever).
+  var _funded=(CPLAN.allocations||[]).some(function(a){return (parseFloat(a&&a.amount)||0)>0;});
+  var _hasAction=(CPLAN.allocations||[]).some(function(a){return a&&typeof _cpActionOnlyTypes!=='undefined'&&_cpActionOnlyTypes[a.type];});
+  if(!(CPLAN.allocations&&CPLAN.allocations.length)||(!_funded&&!_hasAction)){
+    if(typeof _cpToast==='function')_cpToast('Add at least one funded step (or action item) before locking in your plan.');
+    return;
+  }
   var ok = await _cpConfirmModal({
     title: '🔒 Ready to use this plan?',
     message: 'This becomes your active financial plan — your dashboard, tracking, and next steps focus on it from here. You can refine it later through your Plan Audit.',
@@ -46581,6 +46593,10 @@ function _cpRenderChart(targetId,bucket){
     }
   }
 
+  // The DATA is authoritative for the x-axis, not a recomputed horizon: the sim arrays may have been built with
+  // a different CPLAN.age (e.g. the 35 default before the real age loaded) than _cpHorizonYears() returns now, so
+  // indexing baselineData[years] with the recomputed years overruns the array → NaN SVG coords. Clamp to the data.
+  if(Array.isArray(totalData)&&Array.isArray(baselineData))years=Math.max(1,Math.min(totalData.length,baselineData.length)-1);
   // ── Scale — include both lines + simulated if present ──
   var allVals=baselineData.concat(totalData);
   var simData=CPLAN._sim&&CPLAN._sim._simulated&&!_isRetView?CPLAN._sim._simulated:(CPLAN._sim&&CPLAN._sim._simulatedRet&&_isRetView?CPLAN._sim._simulatedRet:null);
