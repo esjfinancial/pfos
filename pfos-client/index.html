@@ -3403,13 +3403,32 @@ function _cpDetectSubscriptions(txns, dismissed){
 function _cpSubsDismissed(){ try{ var raw=localStorage.getItem('pfos_subs_dismissed_'+APP.currentClientId); var arr=raw?JSON.parse(raw):[]; var m={}; (arr||[]).forEach(function(k){m[k]=1;}); return m; }catch(_){ return {}; } }
 function _cpDismissSubAt(i){ var s=_cpSubsLast[i]; if(!s)return; try{ var raw=localStorage.getItem('pfos_subs_dismissed_'+APP.currentClientId); var arr=raw?JSON.parse(raw):[]; if(arr.indexOf(s.key)<0)arr.push(s.key); localStorage.setItem('pfos_subs_dismissed_'+APP.currentClientId,JSON.stringify(arr)); }catch(_){}
   if(typeof renderSubscriptionsCard==='function')renderSubscriptionsCard(); if(typeof renderSubscriptionsStat==='function')renderSubscriptionsStat(); }
+// Persist a compact summary onto the client's profile row so the ADVISOR deep-dive can PROJECT it read-only
+// (advisors have no raw-transaction access). Writes at most once per change per session (sig dedup), targeting the
+// latest profile row by id (client_id isn't strictly unique) — mirrors the canonical select-then-update pattern.
+var _cpSubsPersisted=null;
+function _cpPersistSubsSummary(d){
+  try{
+    if(!APP.currentClientId || typeof db==='undefined' || !db) return;
+    if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')) return;
+    var sig=d.count+'|'+d.monthlyTotal+'|'+((d.subs||[]).map(function(s){return s.key+':'+s.monthlyAmount;}).join(','));
+    if(sig===_cpSubsPersisted) return; _cpSubsPersisted=sig;
+    var summary={ count:d.count, monthlyTotal:d.monthlyTotal, annualTotal:d.annualTotal,
+      subs:(d.subs||[]).slice(0,25).map(function(s){return {merchant:s.merchant, monthlyAmount:s.monthlyAmount, monthsSeen:s.monthsSeen, lastDate:s.lastDate};}),
+      computedAt:new Date().toISOString() };
+    var _sid=APP.currentClientId;
+    db.from('client_profiles').select('id').eq('client_id',_sid).order('updated_at',{ascending:false}).limit(1).maybeSingle().then(function(ex){
+      if(ex&&ex.data&&ex.data.id){ db.from('client_profiles').update({subs_summary:summary}).eq('id',ex.data.id).then(function(){},function(e){ if(window.console)console.warn('subs summary persist:',e&&e.message); }); }
+    },function(){});
+  }catch(_){}
+}
 // Full card (Spending page). Plaid-gated; loads the 24-mo txn stream on demand.
 function renderSubscriptionsCard(){
   var el=document.getElementById('subscriptionsCard'); if(!el) return;
   if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')){ el.style.display='none'; el.innerHTML=''; return; }
   el.style.display='block';
   if(APP._txns===undefined){ el.innerHTML='<div class="info-card" style="margin-bottom:16px">'+_renderEmptyState('loading',{message:'Scanning your transactions for subscriptions…'})+'</div>'; if(typeof _cpLoadTransactions==='function'){ _cpLoadTransactions(24).then(function(){ if(APP._txns===undefined)APP._txns=[]; renderSubscriptionsCard(); }); } return; }
-  var d=_cpDetectSubscriptions(APP._txns, _cpSubsDismissed()); _cpSubsLast=d.subs;
+  var d=_cpDetectSubscriptions(APP._txns, _cpSubsDismissed()); _cpSubsLast=d.subs; _cpPersistSubsSummary(d);
   var h='<div class="info-card" style="margin-bottom:16px"><div style="display:flex;align-items:baseline;gap:8px;flex-wrap:wrap;margin-bottom:10px"><span style="font-size:16px">🔁</span><span class="info-card-title" style="margin:0">Recurring Subscriptions</span>';
   if(d.count) h+='<span style="margin-left:auto;font-family:var(--fd);font-size:18px;color:var(--wh)">'+fmt(d.monthlyTotal)+'/mo</span><span style="font-size:12px;color:var(--mu)">'+fmt(d.annualTotal)+'/yr</span>';
   h+='</div>';
@@ -3431,7 +3450,7 @@ function renderSubscriptionsStat(){
   var el=document.getElementById('subsStat'); if(!el)return;
   if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')){ el.style.display='none'; el.innerHTML=''; return; }
   if(APP._txns===undefined){ el.style.display='none'; if(typeof _cpLoadTransactions==='function'){ _cpLoadTransactions(24).then(function(){ if(APP._txns===undefined)APP._txns=[]; renderSubscriptionsStat(); }); } return; }
-  var d=_cpDetectSubscriptions(APP._txns, _cpSubsDismissed());
+  var d=_cpDetectSubscriptions(APP._txns, _cpSubsDismissed()); _cpPersistSubsSummary(d);
   if(!d.count){ el.style.display='none'; el.innerHTML=''; return; }
   el.style.display='block';
   el.innerHTML='<div onclick="showClientPage(\'spending\');if(typeof renderSubscriptionsCard===\'function\')renderSubscriptionsCard();" role="button" tabindex="0" aria-label="View your '+d.count+' recurring subscriptions" style="display:flex;align-items:center;gap:10px;padding:12px 14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:4px;cursor:pointer;min-height:44px">'
