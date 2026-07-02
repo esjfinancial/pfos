@@ -2776,9 +2776,15 @@ function updateMobileTools(){
     nwEl.textContent=c.inc?fmtK(nw):'—';
   }
   if(nwTrend&&c.inc){
-    var prev=fd.prevNetWorth;
+    // NW trend: compare current net worth to the most recent recorded snapshot (client_snapshots →
+    // APP._supabaseSnapshots, ascending). The old fd.prevNetWorth never existed → the trend was always dead
+    // ("Trend builds over time" forever). Reads the cached snapshots; self-heals on the next render if the
+    // async fetch (loadSupabaseSnapshots, fired just above) hasn't landed on the very first paint.
+    var _nwSnaps=(typeof APP!=='undefined'&&APP._supabaseSnapshots)||[];
+    var prev=null;
+    for(var _si=_nwSnaps.length-1;_si>=0;_si--){ var _sv=_nwSnaps[_si]&&_nwSnaps[_si].netWorth; if(_sv!=null&&isFinite(_sv)){ prev=_sv; break; } }
     if(prev!=null){
-      var delta=c.netWorth-prev;
+      var delta=(c.netWorth||0)-prev;
       var arrow=delta>=0?'↑':'↓';
       var dCol=delta>=0?'var(--gr)':'var(--rd)';
       nwTrend.innerHTML='<span style="color:'+dCol+'">'+arrow+' '+fmtK(Math.abs(delta))+'</span> <span style="color:var(--mu)">since last snapshot</span>';
@@ -2792,7 +2798,6 @@ function updateMobileTools(){
     var dayOfMonth=new Date().getDate();
     var daysInMonth=new Date(new Date().getFullYear(),new Date().getMonth()+1,0).getDate();
     var monthPct=Math.round(dayOfMonth/daysInMonth*100);
-    var budgetUsed=c.baseExp>0?Math.round((c.baseExp*(dayOfMonth/daysInMonth))/(c.baseExp)*100):0;
     var pulseCol=netCF>=500?'var(--gr)':netCF>=0?'var(--yl)':'var(--rd)';
     cfVal.style.color=pulseCol;
     cfVal.textContent=netCF>=0?'+'+fmtK(netCF):fmtK(netCF);
@@ -3329,6 +3334,7 @@ async function _cpLoadTransactions(months){
   if(!db||!APP.currentClientId) return;
   if(typeof clientHasFeature==='function' && !clientHasFeature('plaid')){ APP._txns=[]; return; }
   var _cid=APP.currentClientId, n=(parseInt(months,10)||24);
+  APP._txnMonthsLoaded=n; // track the loaded span so a custom Reports range beyond it triggers a refetch (not silent-empty months)
   var now=new Date(), sd=new Date(now.getFullYear(), now.getMonth()-(n-1), 1);
   var _mm=sd.getMonth()+1, startStr=sd.getFullYear()+'-'+(_mm<10?'0'+_mm:_mm)+'-01';
   try{
@@ -3908,7 +3914,17 @@ function _cpSetReportCustom(){
   var sk=toKey(s.value), ek=toKey(e.value);
   if(!isFinite(sk)||!isFinite(ek)||sk>ek) return;
   if((ek-sk+1)>120){ if(typeof _cpToast==='function')_cpToast('Pick a range of 10 years or less.'); return; } // bound the report loop
-  _cpReportRange={startKey:sk,endKey:ek}; renderReportsView();
+  _cpReportRange={startKey:sk,endKey:ek};
+  // If the range reaches further back than the transactions we've loaded (default 24mo), refetch the full
+  // span FIRST — otherwise months beyond the loaded window render as empty/zero (silent truncation). Paint the
+  // loading state directly (don't null APP._txns → renderReportsView, which would fire its own hardcoded 24mo load and race).
+  var _now=new Date(), _curKey=_now.getFullYear()*12+_now.getMonth(), _monthsNeeded=_curKey-sk+1;
+  if(_monthsNeeded>(APP._txnMonthsLoaded||24) && typeof _cpLoadTransactions==='function'){
+    var _rv=document.getElementById('reportsView'); if(_rv&&typeof _renderEmptyState==='function')_rv.innerHTML=_renderEmptyState('loading',{message:'Loading your full history…'});
+    _cpLoadTransactions(_monthsNeeded).then(function(){ if(APP._txns===undefined)APP._txns=[]; if(_currentClientPage==='insights')renderReportsView(); });
+    return;
+  }
+  renderReportsView();
 }
 // §2.4a Reports screen: range picker + cash-flow summary + monthly net bars + top categories. READ-ONLY / metric-inert.
 function renderReportsView(){
@@ -13758,7 +13774,12 @@ async function generateProgressReport(clientId){
   openModal('progressReportModal');
   try{
     // Load client info
-    var client = [...(APP.myClients||[]),(APP.allClients||[])].find(function(c){return c.id===clientId;}) || {name:'Client'};
+    // Resolve the client record: advisor arrays (myClients/allClients) OR — in the CLIENT PORTAL, where those
+    // arrays are empty — the logged-in client itself (APP.currentClient). Without the currentClient fallback the
+    // report title always degraded to the literal "Client".
+    var client = [...(APP.myClients||[]),...(APP.allClients||[])].find(function(c){return c.id===clientId;})
+      || ((APP.currentClient && (APP.currentClient.id===clientId || APP.currentClientId===clientId)) ? APP.currentClient : null)
+      || {name:'Client'};
     // Load snapshots
     const {data:snaps} = await db.from('client_snapshots').select('*').eq('client_id',clientId).order('snapshot_date',{ascending:true});
     var snapshots = snaps||[];
