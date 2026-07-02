@@ -5386,7 +5386,7 @@ async function autoSaveSnapshot(clientId, calcs){
       snapshot_data: {expBreak:expBreak,goals:goals,debts:debts,blendedReturn:c.blendedRetReturn||0,
         // Plan simulation data (when plan exists)
         planRetVal:(typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.retirement)?CPLAN._sim.retirement[Math.min(CPLAN._sim.retirement.length-1,Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35)))]||0:0,
-        planNW:(typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.netWorth)?CPLAN._sim.netWorth[CPLAN._sim.netWorth.length-1]||0:0,
+        planNW:(typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.netWorth)?CPLAN._sim.netWorth[Math.min(30,CPLAN._sim.netWorth.length-1)]||0:0, // keep this persisted field's 30-year meaning stable across the horizon change (old rows are 30y)
         planRetIncome:(typeof CPLAN!=='undefined'&&CPLAN._sim)?CPLAN._sim.projRetIncome||0:0,
         planAllocCount:(typeof CPLAN!=='undefined'&&CPLAN.allocations)?CPLAN.allocations.filter(function(a){return a.amount>0;}).length:0,
         planDeployed:(typeof CPLAN!=='undefined'&&CPLAN.allocations)?CPLAN.allocations.reduce(function(t,a){return t+(a.amount||0);},0):0
@@ -17350,7 +17350,7 @@ function openToolCalc(funcName,source){
     if(el) el.innerHTML='<div style="text-align:center;padding:40px 20px"><div style="font-size:48px;margin-bottom:12px">🔒</div><div style="font-family:var(--fd);font-size:24px;color:var(--or);margin-bottom:8px">'+tierLabel+' Feature</div><div style="font-size:13px;color:var(--mu);margin-bottom:20px;max-width:400px;margin-left:auto;margin-right:auto;line-height:1.7"><strong>'+calcName+'</strong> is available on the <strong style="color:var(--or)">'+tierLabel+'</strong> plan.</div></div>';
     return;
   }
-  _currentCalcRender=funcName;_calcForOther=false;
+  _currentCalcRender=funcName;_calcForOther=false;_calcUserEdited=false;
   var modal=document.getElementById('insuranceCalcModal');if(modal){modal.classList.add('open');modal.style.display='flex';}
   document.body.style.overflow='hidden';
   var titleEl=document.getElementById('insCalcTitle');if(titleEl) titleEl.textContent='Calculator';
@@ -17780,31 +17780,53 @@ function calcToggleHTML(prefix,cb){
   return hdr+(_calcForOther?_otherProfileBox():'');
 }
 
-// ── Scenario persistence (dedicated column; independent of financial_data) ──
-var _calcScenarios={};       // { "<renderFn>": { mine:{id:val}, other:{id:val}, otherProfile:{...} } }
-var _calcScenLoaded=false, _calcRestoring=false, _calcScenSaveT=null, _calcListenerBound=false, _calcSwitching=false, _calcRestoreTimers=[];
-function _calcScenTargetId(){
+// ── Scenario persistence (dedicated column; PER-USER namespaced; independent of financial_data) ──
+// Shape: { "<clientId>": { "<renderFn>": { mine:{id:val}, other:{id:val}, otherProfile:{...} } } }.
+// Joint households share ONE row (client_a's) but each partner writes under their OWN clientId key, so
+// partners never clobber each other. Loads always MERGE (never blind-overwrite) and flushes never run before
+// the load has landed, so a slow read can't wipe the column.
+var _calcScenarios={};
+var _calcScenLoaded=false, _calcRestoring=false, _calcScenSaveT=null, _calcListenerBound=false, _calcSwitching=false, _calcRestoreTimers=[], _calcScenRowId=null, _calcUserEdited=false;
+function _calcScenTargetId(){  // the ROW to store in — joint shares client_a's row (per-user separation is via the JSONB key)
   try{ if(typeof getCoupleForClient==='function'){ var cp=getCoupleForClient(APP.currentClientId); if(cp&&cp.household_type==='joint'&&cp.client_a_id) return cp.client_a_id; } }catch(e){}
   return (typeof APP!=='undefined'&&APP.currentClientId)||null;
 }
+function _calcScenUserKey(){ return (typeof APP!=='undefined'&&APP.currentClientId)||'_'; }
+function _calcScenRoot(){ var k=_calcScenUserKey(); if(!_calcScenarios[k]||typeof _calcScenarios[k]!=='object'||Array.isArray(_calcScenarios[k]))_calcScenarios[k]={}; return _calcScenarios[k]; }
 async function _calcScenariosLoad(){
   var id=_calcScenTargetId(); if(!id){_calcScenLoaded=true;return;}
   try{
-    var r=await db.from('client_profiles').select('calc_scenarios').eq('client_id',id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(r&&r.data&&r.data.calc_scenarios&&typeof r.data.calc_scenarios==='object'&&!Array.isArray(r.data.calc_scenarios)) _calcScenarios=r.data.calc_scenarios;
+    var r=await db.from('client_profiles').select('id,calc_scenarios').eq('client_id',id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(r&&r.data){
+      _calcScenRowId=r.data.id||null;
+      var col=r.data.calc_scenarios;
+      if(col&&typeof col==='object'&&!Array.isArray(col)){
+        // Migrate the pre-namespace flat format ({renderFn:{...}}) under this user's key.
+        var keys=Object.keys(col);
+        if(keys.length&&keys.every(function(k){return /^render/.test(k);})){ var wrap={}; wrap[_calcScenUserKey()]=col; col=wrap; }
+        // MERGE DB into memory, preferring any in-memory edits already made during the load window.
+        Object.keys(col).forEach(function(uk){
+          if(!_calcScenarios[uk]||typeof _calcScenarios[uk]!=='object'){ _calcScenarios[uk]=col[uk]; return; }
+          Object.keys(col[uk]||{}).forEach(function(fn){ if(!_calcScenarios[uk][fn])_calcScenarios[uk][fn]=col[uk][fn]; });
+        });
+      }
+    }
   }catch(e){ console.warn('[calcScen] load failed',e&&e.message); }
   _calcScenLoaded=true;
-  // If a calc opened BEFORE scenarios finished loading (e.g. right after a fresh page load), the restore ran
-  // against an empty store and showed profile defaults — re-apply it now that the saved scenario is present.
-  try{ if(_currentCalcRender&&document.getElementById('_csHeader')&&typeof _calcScheduleRestore==='function') _calcScheduleRestore(); }catch(_e){}
+  // Re-apply restore ONLY if the user hasn't already started editing this calc (don't revert their typing).
+  try{ if(!_calcUserEdited&&_currentCalcRender&&document.getElementById('_csHeader')&&typeof _calcScheduleRestore==='function') _calcScheduleRestore(); }catch(_e){}
 }
 function _calcScenariosSaveSoon(){ if(_calcScenSaveT)clearTimeout(_calcScenSaveT); _calcScenSaveT=setTimeout(_calcScenariosFlush,900); }
 async function _calcScenariosFlush(){
+  if(!_calcScenLoaded){ _calcScenariosSaveSoon(); return; }   // never write before the load lands (would wipe other users'/calcs' data)
   var id=_calcScenTargetId(); if(!id)return;
-  try{ await db.from('client_profiles').update({calc_scenarios:_calcScenarios}).eq('client_id',id); }
-  catch(e){ console.warn('[calcScen] save failed',e&&e.message); }
+  try{
+    var q=db.from('client_profiles').update({calc_scenarios:_calcScenarios});
+    q=_calcScenRowId?q.eq('id',_calcScenRowId):q.eq('client_id',id);   // target the exact row we read (client_id has no UNIQUE constraint)
+    await q;
+  }catch(e){ console.warn('[calcScen] save failed',e&&e.message); }
 }
-function _calcScenEntry(){ var fn=_currentCalcRender; if(!fn)return null; if(!_calcScenarios[fn])_calcScenarios[fn]={}; return _calcScenarios[fn]; }
+function _calcScenEntry(){ var fn=_currentCalcRender; if(!fn)return null; var root=_calcScenRoot(); if(!root[fn])root[fn]={}; return root[fn]; }
 function _calcCurMode(){ return _calcForOther?'other':'mine'; }
 
 // Snapshot every id'd field inside the calc body (excludes header + otherProfile box, which persist separately).
@@ -17817,7 +17839,7 @@ function _calcSnapshotInputs(){
   for(var i=0;i<nodes.length;i++){
     var el=nodes[i],id=el.id;
     if(!id||id.indexOf('_op_')===0)continue;                 // otherProfile handled separately
-    if(el.type==='button'||el.type==='submit'||el.type==='file')continue;
+    if(el.type==='button'||el.type==='submit'||el.type==='file'||el.type==='hidden')continue; // skip hidden derived-state (e.g. CCPayoff's ccp_data JSON) — restoring it would desync the visible rows
     if(el.type==='checkbox'||el.type==='radio')snap[id]=el.checked?1:0; else snap[id]=el.value;
   }
   e[_calcCurMode()]=snap;
@@ -17829,7 +17851,7 @@ function _calcSnapshotInputs(){
 function _calcNorm(v){ return String(v==null?'':v).replace(/,/g,''); }  // commas are display-only (autoComma) — compare on the raw number
 function _calcRestoreInputs(){
   var fn=_currentCalcRender; if(!fn)return;
-  var e=_calcScenarios[fn]; if(!e)return;
+  var e=_calcScenRoot()[fn]; if(!e)return;
   var host=document.getElementById('insCalcContent'); if(!host)return;
   var snap=e[_calcCurMode()]; if(!snap)return;
   _calcRestoring=true;
@@ -17864,13 +17886,14 @@ function _calcScheduleRestore(){
   var host=document.getElementById('insCalcContent'); if(!host||!window.MutationObserver)return;
   _calcRestoreObs=new MutationObserver(function(){ if(!_calcRestoring)_calcRestoreInputs(); });
   try{ _calcRestoreObs.observe(host,{childList:true,subtree:true}); }catch(_){}
-  _calcRestoreObsStop=setTimeout(_calcCancelRestore,1500);
+  _calcRestoreObsStop=setTimeout(_calcCancelRestore,3200); // wide enough for an async calc (e.g. BTID awaits an edge call) to render its inputs before we stop re-applying
 }
 // Only true user edits snapshot — ignore programmatic dispatches (restore, slider init, etc.).
 function _calcOnAnyInput(ev){
   if(_calcSwitching)return;         // ignore stray events during a render/mode-switch (e.g. a deferred blur-change straddling the flip)
   if(!ev||!ev.isTrusted)return;     // only real user edits snapshot — not programmatic restore/render dispatches
   var t=ev.target; if(!t||!t.id||t.id.indexOf('_op_')===0)return;
+  _calcUserEdited=true;             // mark this calc as user-touched so a late scenario load won't revert their typing
   _calcCancelRestore();             // the user is editing — stop re-applying the snapshot over their input
   _calcSnapshotInputs();
 }
@@ -17878,7 +17901,7 @@ function _calcOnAnyInput(ev){
 function _calcRun(hydrateOther){
   var fn=_currentCalcRender; if(!fn||typeof window[fn]!=='function')return;
   if(_calcForOther&&hydrateOther){
-    var e=_calcScenarios[fn];
+    var e=_calcScenRoot()[fn];
     _otherProfile=(e&&e.otherProfile)?JSON.parse(JSON.stringify(e.otherProfile)):{age:0,income:0,expenses:0,creditScore:0,riskProfile:''};
   }
   _calcSwitching=true;              // suppress stray/late input events (deferred blur-change, slider init) during this render
@@ -17893,10 +17916,10 @@ function _calcSetMode(other){
 }
 function _calcResetScenario(){
   var fn=_currentCalcRender; if(!fn)return;
-  var e=_calcScenarios[fn];
+  var root=_calcScenRoot(),e=root[fn];
   if(_calcForOther){ if(e){delete e.other;delete e.otherProfile;} _otherProfile={age:0,income:0,expenses:0,creditScore:0,riskProfile:''}; }
   else { if(e){delete e.mine;} }
-  if(e&&!e.mine&&!e.other&&!e.otherProfile)delete _calcScenarios[fn];
+  if(e&&!e.mine&&!e.other&&!e.otherProfile)delete root[fn];
   _calcScenariosSaveSoon();
   _calcRun(false);
 }
@@ -30453,6 +30476,11 @@ var _cpScenEngine={
 function _cpEngineCapture(ids){
   var sA=CPLAN.allocations,sS=CPLAN._sim,sSur=CPLAN.surplus,sRA=CPLAN.retirementAge,sM=CPLAN._projectionMode,out=null;
   try{
+    // Run base + scenario in PREVIEW (ungated/full-trajectory) mode so the scenario's marginal delta reflects
+    // its full potential and is directionally correct regardless of how many cards the user has marked Done.
+    // (Coherence note: for a "tracked"-mode user this delta is measured on the ungated base but applied to the
+    // gated page line, so its impact is slightly OVER-stated — accepted; measuring in the gated mode instead
+    // produced wrong-signed deltas for real plans.)
     CPLAN._projectionMode='preview';
     CPLAN.allocations=JSON.parse(JSON.stringify(sA));
     (ids||[]).forEach(function(id){if(_cpScenEngine[id])_cpScenEngine[id]();});
@@ -30463,7 +30491,15 @@ function _cpEngineCapture(ids){
   return out;
 }
 var _cpScenBaseCache=null;
-function _cpScenSig(){try{return ((typeof APP!=='undefined'&&APP.currentClientId)||'')+'|'+_cpNum(CPLAN.surplus)+'|'+_cpNum(CPLAN.retirementAge)+'|'+_cpNum(CPLAN.age)+'|'+(CPLAN.allocations||[]).map(function(a){return a.type+':'+_cpNum(a.amount);}).join(',');}catch(e){return '';}}
+// Cache key must cover EVERYTHING _cpRunSimulation reads — else a plan edit (debt paydown, mark-done,
+// income/expense change) leaves a stale base/delta cached and the simulated line goes incoherent.
+function _cpScenSig(){try{return ((typeof APP!=='undefined'&&APP.currentClientId)||'')
+  +'|'+_cpNum(CPLAN.surplus)+'|'+_cpNum(CPLAN.income)+'|'+_cpNum(CPLAN.expenses)
+  +'|'+_cpNum(CPLAN.retirementAge)+'|'+_cpNum(CPLAN.age)+'|'+_cpNum(CPLAN.efBal)+'|'+_cpNum(CPLAN.efTarget)
+  +'|'+_cpNum(CPLAN.totalDebt)+'|'+(CPLAN.debtStrategy||'')+'|'+(CPLAN._projectionMode||'auto')+'|'+((CPLAN._catchUpBoosts||[]).length)
+  +'|D'+(CPLAN.debts||[]).map(function(d){return _cpNum(d.balance)+':'+_cpNum(d.rate)+':'+_cpNum(d.min||d.payment);}).join(',')
+  +'|A'+(CPLAN.allocations||[]).map(function(a){return a.type+':'+_cpNum(a.amount)+':'+(a._completed?1:0)+':'+(a.owner||'');}).join(',');
+}catch(e){return '';}}
 function _cpPreviewBase(){var sig=_cpScenSig();if(_cpScenBaseCache&&_cpScenBaseCache.sig===sig)return _cpScenBaseCache.t;var t=_cpEngineCapture([])||{nw:[],ret:[]};_cpScenBaseCache={sig:sig,t:t};return t;}
 function _cpClearScenCache(){_cpScenBaseCache=null;_cpDeltaMemo={sig:null,m:{}};}
 // Grounded per-year impact for lump/shock events on the user's REAL numbers (invested = current growth balance).
@@ -30503,18 +30539,21 @@ function _calcScenImpact(sc){var d=_cpScenDeltaArr([sc.id],false);return d[_Yend
 function _calcScenRetImpact(sc){var d=_cpScenDeltaArr([sc.id],true);return d[_Yend(d)]||0;}
 function _cpProjBase(useRet){var arr=_cpSimArr(useRet);return arr.length?_cpNum(arr[_Yend(arr)]):0;}
 function _cpIsRetView(){return CPLAN._chartView==='retirement';}
+var _cpSimLiveT=null;
 function _cpSimLiveUpdate(slKey,val){
   _cpSim.custom[slKey]=parseFloat(val)||0;
-  // Update slider display without re-rendering page
+  // Update the slider display INSTANTLY (cheap) — smooth drag.
   var dispEl=document.getElementById('slDisp_'+slKey);
   if(dispEl){var sc=_cpScenDefs.find(function(s){return s.sl.some(function(x){return x.k===slKey;});});if(sc){var sl=sc.sl.find(function(x){return x.k===slKey;});dispEl.textContent=sl.u==='$'?fmt(parseFloat(val)||0):(parseFloat(val)||0)+sl.u;}}
-  // Update impact display for applied scenarios
+  // DEBOUNCE the heavy recompute — impacts + summary + chart each re-run the full plan simulation (now to
+  // age 95), so running it on every drag event janks. Fire once the slider settles.
+  if(_cpSimLiveT)clearTimeout(_cpSimLiveT);
+  _cpSimLiveT=setTimeout(_cpSimLiveRecompute,170);
+}
+function _cpSimLiveRecompute(){
   _cpScenDefs.forEach(function(sc2){if(_cpSim.scenarios[sc2.id]){var impEl=document.getElementById('scImp_'+sc2.id);if(impEl){var imp=Math.round(_calcScenImpact(sc2));impEl.textContent=fmtK(imp);impEl.style.color=imp>=0?'var(--gr)':'var(--or)';}}});
-  // Update expanded card's impact text (live preview)
   if(_cpSim._expanded){var expSc=_cpScenDefs.find(function(s){return s.id===_cpSim._expanded;});if(expSc){var expImpEl=document.getElementById('scExpImp_'+expSc.id);if(expImpEl){var expImp=Math.round(_calcScenImpact(expSc));expImpEl.textContent=fmtK(expImp);expImpEl.style.color=expImp>=0?'var(--gr)':'var(--or)';}}}
-  // Update summary
   _cpUpdateProjSummary();
-  // Update chart
   _cpUpdateProjChart();
 }
 function _cpUpdateProjSummary(){
@@ -30555,7 +30594,7 @@ function renderClientProjections(){
   h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px;margin-bottom:16px"><div id="projChart"></div></div>';
   // Summary with IDs for live update
   h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-bottom:20px">';
-  h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;margin-bottom:4px">BASE PLAN</div><div style="font-family:var(--fd);font-size:22px;color:#5B9BFF">'+fmtK(bv)+'</div><div style="font-size:11px;color:var(--mu)">'+yrs+' year</div></div>';
+  h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;margin-bottom:4px">BASE PLAN</div><div style="font-family:var(--fd);font-size:22px;color:#5B9BFF">'+fmtK(bv)+'</div><div style="font-size:11px;color:var(--mu)">to age '+Math.round((parseFloat(CPLAN.age)||35)+yrs)+'</div></div>';
   h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;margin-bottom:4px">SIMULATED</div><div id="projSimVal" style="font-family:var(--fd);font-size:22px;color:'+(sv2>bv?'var(--gr)':sv2<bv?'var(--or)':'var(--wh)')+'">'+fmtK(sv2)+'</div><div style="font-size:11px;color:var(--mu)">'+(any?'active':'none')+'</div></div>';
   h+='<div style="padding:14px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;text-align:center"><div style="font-size:11px;color:var(--mu);font-family:var(--fh);font-weight:700;letter-spacing:.06em;margin-bottom:4px">IMPACT</div><div id="projImpVal" style="font-family:var(--fd);font-size:22px;color:'+(df>0?'var(--gr)':df<0?'var(--rd)':'var(--mu)')+'">'+(df>=0?'+':'')+fmtK(df)+'</div><div id="projImpPct" style="font-size:11px;color:var(--mu)">'+(bv>0?(df/bv*100).toFixed(0)+'% change':'')+'</div></div></div>';
   // Scenario cards — exact tool card style
@@ -44954,7 +44993,7 @@ function _cpRunCheckInFlow(){
 }
 
 // Projection horizon — accumulate to age 95 (dynamic per current age; no retirement drawdown modeled yet).
-function _cpHorizonYears(){var a=(typeof CPLAN!=='undefined'&&parseFloat(CPLAN.age))||35;return Math.max(10,Math.round(95-a));}
+function _cpHorizonYears(){var a=(typeof CPLAN!=='undefined'&&parseFloat(CPLAN.age))||35;return Math.max(5,Math.round(95-a));}
 function _cpRunSimulation(){
   var years=_cpHorizonYears();
   var maxMonths=years*12;
