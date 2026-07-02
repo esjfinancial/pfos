@@ -6574,7 +6574,7 @@ async function _runBTID(){
 
   // ── Term premium estimate ──
   // CLUSTER 4: BTID simulation single-sourced -> window.PFOSEngine.calculators.btid. Render verbatim.
-  var _bt; try{ _bt=await pfosCalc('calculators','btid',[{age:age,health:health,coverage:coverage,termYrs:termYrs,budget:budget,invReturn:invReturn,fundFee:fundFee,aumFee:aumFee,cgRate:cgRate,consistency:consistency,permType:permType,wlGuar:wlGuar,wlDiv:wlDiv,wlLoad:wlLoad,iulIll:iulIll,iulLoad:iulLoad}]); }catch(_e){ calcErr('btid_results',_e); return; }
+  var _bt; try{ _bt=await pfosCalc('calculators','btid',[{age:age,health:health,coverage:coverage,termYrs:termYrs,budget:budget,invReturn:invReturn,fundFee:fundFee,aumFee:aumFee,cgRate:cgRate,consistency:consistency,permType:permType,wlGuar:wlGuar,wlDiv:wlDiv,wlLoad:wlLoad,iulIll:iulIll,iulLoad:iulLoad,iulCap:iulCap,iulFloor:iulFloor}]); }catch(_e){ calcErr('btid_results',_e); return; }
   if(!_bt)return;
   var termPrem=_bt.termPrem;
   var investDiff=_bt.investDiff;
@@ -6689,9 +6689,13 @@ async function _runBTID(){
   h+='</div>';
 
   // ── BEHAVIORAL RISK CALLOUT ──
-  var fullBTID=0;var mr=netInvReturn/12;
-  for(var mm=0;mm<termYrs*12;mm++) fullBTID=fullBTID*(1+mr)+investDiff;
-  var fullBTIDAfterTax=fullBTID-(fullBTID-investDiff*termYrs*12)*cgRate;
+  // Compare 100%-consistency vs YOUR consistency over the SAME age-90 horizon the engine uses: contribute for the
+  // term, then let the balance grow to age 90. The old loop stopped at the term, so it measured a term-length 100%
+  // scenario against the engine's full-horizon adjusted value — a horizon mismatch that could make the "cost of
+  // inconsistency" negative once post-term compounding was ignored on only one side.
+  var fullBTID=0;var mr=netInvReturn/12;var _horizonMo=Math.max(1,(90-age)*12);var _contribMo=Math.min(termYrs*12,_horizonMo);
+  for(var mm=0;mm<_horizonMo;mm++) fullBTID=fullBTID*(1+mr)+(mm<_contribMo?investDiff:0);
+  var fullBTIDAfterTax=fullBTID-(fullBTID-investDiff*_contribMo)*cgRate;
   var adjustedBTID=finalData.btidAfterTax;
   var behavioralCost=Math.round(fullBTIDAfterTax-adjustedBTID);
 
@@ -7302,6 +7306,10 @@ async function _runCarBuyVsLease(){
   });
   h+='</div>';
 
+  // ── Lease-end buyout (residual) — was a collected-but-unused input ──
+  var _leaseYrs=leaseTerm/12;var _carValEnd=price*(1-dep1);for(var _ry=1;_ry<_leaseYrs;_ry++)_carValEnd*=(1-depN);
+  h+='<div style="padding:10px;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.15);border-radius:4px;margin-bottom:12px;font-size:12px;color:var(--mu);line-height:1.7"><strong style="color:var(--pu)">🔑 Lease-end buyout:</strong> Your lease sets a residual (buyout) price of <strong style="color:var(--wh)">'+fmt(residual)+'</strong> after '+_leaseYrs+' years. The car\'s estimated value then is ~<strong style="color:var(--wh)">'+fmt(Math.round(_carValEnd))+'</strong> — buying it out '+(residual<=_carValEnd?'<span style="color:var(--gr)">looks favorable</span> (residual below market)':'<span style="color:var(--or)">looks pricey</span> (residual above market)')+'.</div>';
+
   // ── Equity Chart ──
   h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--gr);margin:8px 0 6px">Equity Built Over Time</div>';
   h+='<div id="cv_equity" style="margin-bottom:12px">';
@@ -7642,6 +7650,7 @@ function renderSocialSecurityCalc(){
   h+='<div class="fi"><label class="lb">Spouse PIA at 67 (0 if N/A)</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="ss_spousePIA" value="'+(spouseInc>0?Math.round(spouseInc*0.4):0)+'" oninput="calcSocialSecurity()" style="padding-left:22px;min-height:36px"></div></div></div>';
 
     h+='<div class="row"><div class="fi"><label class="lb">COLA (Cost-of-Living Adjustment) %/yr</label><input class="inp" type="number" id="ss_cola" value="2.5" step="0.5" oninput="calcSocialSecurity()" style="min-height:36px"></div><div class="fi"><label class="lb">Start Claiming Age</label><select class="sel" id="ss_startAge" onchange="calcSocialSecurity()" style="min-height:36px"><option value="62">62 (early)</option><option value="67" selected>67 (FRA)</option><option value="70">70 (max)</option></select></div></div>';
+  h+='<div class="row"><div class="fi"><label class="lb">Filing Status</label><select class="sel" id="ss_filing" onchange="calcSocialSecurity()" style="min-height:36px"><option value="single">Single</option><option value="mfj">Married Filing Jointly</option><option value="hoh">Head of Household</option></select></div></div>';
   h+='<div id="ss_results"></div>';
   el.innerHTML=h;calcSocialSecurity();
 }
@@ -7686,7 +7695,7 @@ async function _runSocialSecurity(){
   // _spouseBirthYr → ReferenceError that blanked the calc for couples; now passed explicitly).
   var _ssProf=S.profile||{};var _ssSpBirthYr=null;
   if(_ssProf.spDOB){var _ssSd=new Date(_ssProf.spDOB);if(!isNaN(_ssSd.getTime()))_ssSpBirthYr=_ssSd.getFullYear();}
-  var _ss; try{ _ss=await pfosCalc('calculators','socialSecurity',[{pia:pia,lifeExp:lifeExp,otherInc:otherInc,taxBrackPct:pf(gv('ss_taxBrack'))||22,spousePIA:spousePIA,colaPct:pf(gv('ss_cola'))||2.5,birthYr:birthYr,spouseBirthYr:_ssSpBirthYr}]); }catch(_e){ calcErr('ss_results',_e); return; }
+  var _ss; try{ _ss=await pfosCalc('calculators','socialSecurity',[{pia:pia,lifeExp:lifeExp,otherInc:otherInc,taxBrackPct:pf(gv('ss_taxBrack'))||22,spousePIA:spousePIA,colaPct:pf(gv('ss_cola'))||2.5,birthYr:birthYr,spouseBirthYr:_ssSpBirthYr,filing:gv('ss_filing')}]); }catch(_e){ calcErr('ss_results',_e); return; }
   if(!_ss)return;
   var fra=_ss.fra,fraStr=_ss.fraStr,at62=_ss.at62,atFRA=_ss.atFRA,at70=_ss.at70;
   var c62=_ss.c62,cFRA=_ss.cFRA,c70=_ss.c70,beFRA=_ss.beFRA,be70=_ss.be70;
@@ -7892,6 +7901,62 @@ function renderRepaymentComparison(){
 
   h+='<div id="rpc_results"></div>';
   el.innerHTML=h;calcRepaymentComparison();
+}
+function calcRepaymentComparison(){ calcDebounce('calcRepaymentComparison', _runRepaymentComparison); }
+async function _runRepaymentComparison(){
+  var bal=pf(gv('rpc_bal'))||50000;
+  var rate=pf(gv('rpc_rate'))||6;
+  var agi=pf(gv('rpc_agi'))||60000;
+  var famSize=parseInt(gv('rpc_famSize'))||1;
+  var el=document.getElementById('rpc_results');if(!el)return;
+
+  var _r; try{ _r=await pfosCalc('calculators','repaymentComparison',[{bal:bal,rate:rate,agi:agi,famSize:famSize}]); }catch(_e){ calcErr('rpc_results',_e); return; }
+  if(!_r||!_r.plans)return;
+  var plans=_r.plans, byKey={}; plans.forEach(function(p){byKey[p.key]=p;});
+  var lp=byKey[_r.lowestPaymentKey], lt=byKey[_r.lowestTotalKey], mf=_r.mostForgivenessKey?byKey[_r.mostForgivenessKey]:null;
+  var h='';
+
+  // ── Story hook ──
+  if(lp&&lt){
+    h+=calcStoryBox('📋','Your lowest monthly payment is <span style="color:var(--gr);font-weight:700">'+fmt(Math.round(lp.monthly))+'/mo</span> ('+lp.name+'), while <span style="color:#5B9BFF;font-weight:700">'+lt.name+'</span> costs the least overall at <span style="color:#5B9BFF;font-weight:700">'+fmtK(lt.totalPaid)+'</span>. Choose based on whether you need breathing room now or the lowest lifetime cost.','#5B9BFF');
+  }
+
+  // ── Highlight tiles ──
+  h+='<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px">';
+  h+=statTile(lp?fmt(Math.round(lp.monthly))+'/mo':'—','Lowest Payment'+(lp?' · '+lp.name:''),'var(--gr)');
+  h+=statTile(lt?fmtK(lt.totalPaid):'—','Lowest Total Cost'+(lt?' · '+lt.name:''),'#5B9BFF');
+  h+=statTile(mf?fmtK(mf.forgiven):'$0','Most Forgiveness'+(mf?' · '+mf.name:''),mf?'var(--or)':'var(--mu)');
+  h+='</div>';
+
+  // ── All-plans table ──
+  h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:var(--mu);margin:8px 0 6px">All Plans Compared</div>';
+  h+='<div style="overflow-x:auto"><table style="width:100%;border-collapse:collapse;font-size:12px">';
+  h+='<thead><tr style="color:var(--mu);border-bottom:1px solid var(--bd)"><th style="padding:6px 8px;text-align:left">Plan</th><th style="padding:6px 8px;text-align:right">Monthly</th><th style="padding:6px 8px;text-align:right">Total Paid</th><th style="padding:6px 8px;text-align:right">Payoff</th><th style="padding:6px 8px;text-align:right">Forgiven</th></tr></thead><tbody>';
+  plans.forEach(function(p){
+    var isLowPay=p.key===_r.lowestPaymentKey, isLowTot=p.key===_r.lowestTotalKey;
+    var rowBg=isLowPay?'rgba(34,197,94,.06)':isLowTot?'rgba(91,155,255,.06)':'transparent';
+    var badge=isLowPay?' <span style="color:var(--gr);font-size:10px">◀ lowest pmt</span>':isLowTot?' <span style="color:#5B9BFF;font-size:10px">◀ lowest cost</span>':'';
+    h+='<tr style="border-bottom:1px solid var(--bd);background:'+rowBg+'">';
+    h+='<td style="padding:6px 8px;color:var(--wh)" title="'+(p.note||'').replace(/"/g,'&quot;')+'">'+p.name+badge+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:var(--wh)">'+fmt(Math.round(p.monthly))+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right">'+fmtK(p.totalPaid)+'</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:var(--mu)">'+(p.months/12).toFixed(0)+' yr</td>';
+    h+='<td style="padding:6px 8px;text-align:right;color:'+(p.forgiven>0?'var(--or)':'var(--mu)')+'">'+(p.forgiven>0?fmtK(p.forgiven):'$0')+'</td>';
+    h+='</tr>';
+  });
+  h+='</tbody></table></div>';
+
+  // ── Forgiveness tax warning ──
+  if(plans.some(function(p){return p.forgivenTaxable&&p.forgiven>0;})){
+    h+='<div style="padding:10px;background:rgba(249,115,22,.05);border:1px solid rgba(249,115,22,.15);border-radius:4px;margin-top:10px;font-size:12px;color:var(--or);line-height:1.6">⚠️ <strong>Forgiven balances on IDR plans are taxable</strong> as ordinary income in the year of forgiveness (unlike tax-free PSLF). Budget for that tax bill — it can be large on a big forgiven balance.</div>';
+  }
+
+  // ── Per-plan notes ──
+  h+='<div style="margin-top:10px;font-size:11px;color:var(--mu);line-height:1.7">';
+  plans.forEach(function(p){ h+='<div style="margin-bottom:3px"><strong style="color:var(--wh)">'+p.name+':</strong> '+p.note+'</div>'; });
+  h+='</div>';
+
+  el.innerHTML=h;
 }
 
 // ═══════════════════════════════════════════════════════
@@ -10927,6 +10992,8 @@ function renderRefiVsFederal(){
   h+='<div class="fi"><label class="lb">Income Stability</label><select class="sel" id="rvf_stability" onchange="calcRefiVsFed()" style="min-height:36px"><option value="stable">Stable W-2</option><option value="variable">Variable / 1099</option><option value="unstable">Unstable / Job Seeking</option></select></div>';
   h+='<div class="fi"><label class="lb">Emergency Fund (months)</label><input class="inp" type="number" id="rvf_ef" value="'+efMonths+'" oninput="calcRefiVsFed()" style="min-height:36px"></div>';
   h+='<div class="fi"><label class="lb">IDR Forgiveness Yrs Left</label><input class="inp" type="number" id="rvf_idrYrs" value="15" min="0" max="25" oninput="calcRefiVsFed()" style="min-height:36px"></div>';
+  h+='<div class="fi"><label class="lb">AGI — income for IDR payment /yr</label><div class="inp-prefix"><span class="pfx">$</span><input class="inp" type="number" id="rvf_agi" value="'+(c.inc?Math.round(c.inc*12):60000)+'" oninput="calcRefiVsFed()" style="padding-left:22px;min-height:36px"></div><div style="font-size:8px;color:var(--mu);margin-top:2px">Used to model rising IDR payments (blank = flat estimate)</div></div>';
+  h+='<div class="fi"><label class="lb">Family Size</label><input class="inp" type="number" id="rvf_famSize" value="1" min="1" oninput="calcRefiVsFed()" style="min-height:36px"></div>';
   h+='</div></div>';
 
   // ── Private Loan Consolidation Section ──
@@ -10964,10 +11031,11 @@ async function _runRefiVsFed(){
   var credit=parseInt(gv('rvf_credit'))||720;
   var stability=gv('rvf_stability')||'stable';var ef=parseInt(gv('rvf_ef'))||2;
   var idrYrs=parseInt(gv('rvf_idrYrs'))||15;
+  var agi=pf(gv('rvf_agi'))||0;var famSize=parseInt(gv('rvf_famSize'))||1;
   var el=document.getElementById('rvf_results');if(!el)return;
 
   // Federal simulation (stay on current plan)
-  var _refi; try{ _refi=await pfosCalc('calculators','refiVsFed',[{bal:bal,fedRate:fedRate,fedPmt:fedPmt,plan:plan,pslfElig:pslfElig,pslf:pslf,newRate:newRate,newTerm:newTerm,stability:stability,ef:ef,idrYrs:idrYrs}]); }catch(_e){ calcErr('rvf_results',_e); return; }
+  var _refi; try{ _refi=await pfosCalc('calculators','refiVsFed',[{bal:bal,fedRate:fedRate,fedPmt:fedPmt,plan:plan,pslfElig:pslfElig,pslf:pslf,newRate:newRate,newTerm:newTerm,stability:stability,ef:ef,idrYrs:idrYrs,agi:agi,famSize:famSize}]); }catch(_e){ calcErr('rvf_results',_e); return; }
   if(!_refi)return;
   var fedN=_refi.fedN,fedTotal=_refi.fedTotal,fedInt=_refi.fedInt,idrForgive=_refi.idrForgive,idrTax=_refi.idrTax,pslRemain=_refi.pslRemain,pslForgive=_refi.pslForgive,refiPmt=_refi.refiPmt,refiTotal=_refi.refiTotal,refiInt=_refi.refiInt,intSavings=_refi.intSavings,netGain=_refi.netGain,riskScore=_refi.riskScore,risk=_refi.risk;
   var riskColor=risk==='HIGH'?'var(--rd)':risk==='MEDIUM'?'var(--or)':'var(--gr)';
@@ -11691,6 +11759,7 @@ function renderRothConversion(){
   h+='<div class="fi"><label class="lb">Retirement Age</label><input class="inp" type="number" id="rc_retAge" value="65" oninput="calcRothConv()" style="min-height:36px"></div></div>';
   h+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:10px"><div class="fi"><label class="lb">Expected Return %</label><input class="inp" type="number" id="rc_ret" value="7" step="0.5" oninput="calcRothConv()" style="min-height:36px"></div>';
   h+='<div class="fi"><label class="lb">State Tax Rate %</label><input class="inp" type="number" id="rc_state" value="5" step="0.5" oninput="calcRothConv()" style="min-height:36px"></div></div>';
+  h+='<div class="row"><div class="fi"><label class="lb">Filing Status</label><select class="sel" id="rc_filing" onchange="calcRothConv()" style="min-height:36px"><option value="single">Single</option><option value="mfj">Married Filing Jointly</option><option value="hoh">Head of Household</option></select></div></div>';
 
   h+='<div id="rc_results"></div>';
   el.innerHTML=h;calcRothConv();
@@ -11707,14 +11776,14 @@ async function _runRothConv(){
   var years=Math.max(1,retAge-age);
 
   // CLUSTER 2: Roth-conversion math single-sourced → window.PFOSEngine.calculators.rothConv. Render verbatim.
-  var _rc; try{ _rc=await pfosCalc('calculators','rothConv',[{tradBal:tradBal,convert:convert,income:income,retBracket:gv('rc_retBracket'),age:age,retAge:retAge,ret:gv('rc_ret'),stateTax:gv('rc_state')}]); }catch(_e){ calcErr('rc_results',_e); return; }
+  var _rc; try{ _rc=await pfosCalc('calculators','rothConv',[{tradBal:tradBal,convert:convert,income:income,retBracket:gv('rc_retBracket'),age:age,retAge:retAge,ret:gv('rc_ret'),stateTax:gv('rc_state'),filing:gv('rc_filing')}]); }catch(_e){ calcErr('rc_results',_e); return; }
   if(!_rc)return;
   var curBracket=_rc.curBracket,afterConvIncome=_rc.afterConvIncome,convBracket=_rc.convBracket,totalTaxRate=_rc.totalTaxRate,taxNow=_rc.taxNow,fvConvert=_rc.fvConvert,taxLater=_rc.taxLater,savings=_rc.savings,breakEvenYrs=_rc.breakEvenYrs,bracketCap=_rc.bracketCap,roomInBracket=_rc.roomInBracket,ladderYrs=_rc.ladderYrs,ladderTax=_rc.ladderTax;
 
   var h='';
 
   // ── Story Hook ──
-  if(savings>0) h+=calcStoryBox('✅','Converting <span style="color:var(--gr);font-weight:700">'+fmtK(convert)+' now saves '+fmtK(savings)+'</span> vs waiting. You are in the '+(curBracket*100)+'% bracket now vs projected '+(retBracket*100)+'% in retirement. Plus, Roth has <strong>no RMDs</strong> — your heirs inherit tax-free.','var(--gr)');
+  if(savings>0) h+=calcStoryBox('✅','Converting <span style="color:var(--gr);font-weight:700">'+fmtK(convert)+' now saves '+fmtK(savings)+' (present value)</span> vs waiting. You are in the '+(curBracket*100)+'% bracket now vs projected '+(retBracket*100)+'% in retirement. Plus, Roth has <strong>no RMDs</strong> — your heirs inherit tax-free.','var(--gr)');
   else h+=calcStoryBox('⚠️','Converting now costs <span style="color:var(--rd);font-weight:700">'+fmtK(Math.abs(savings))+' more</span> in taxes than waiting. Consider a smaller conversion to stay within your current bracket, or wait for a lower-income year.','var(--or)');
 
   // ── Convert Now vs Later Comparison ──
@@ -11736,7 +11805,7 @@ async function _runRothConv(){
 
   // ── Stats ──
   h+='<div style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;margin-bottom:12px">';
-  h+=statTile(fmtK(Math.abs(savings)),savings>0?'Tax Saved':'Extra Cost',savings>0?'var(--gr)':'var(--rd)');
+  h+=statTile(fmtK(Math.abs(savings)),savings>0?'Tax Saved (PV)':'Extra Cost (PV)',savings>0?'var(--gr)':'var(--rd)');
   h+=statTile(Math.round(curBracket*100)+'% → '+Math.round(retBracket*100)+'%','Bracket Shift',curBracket<retBracket?'var(--gr)':'var(--or)');
   h+=statTile(breakEvenYrs>0?breakEvenYrs+' yr':'N/A','Break-Even','#5B9BFF');
   h+=statTile(fmtK(roomInBracket),'Room in Bracket','var(--yl)');
@@ -13447,7 +13516,7 @@ async function _runCollegeSavings(){
      taxOnWithdraw:0,// already taxed
      stateTaxSaved:0,
      pros:['No contribution limit (gift tax applies above $18K/yr)','Any use — not restricted to education','Simple to set up','Child can invest in anything'],
-     cons:['CHILD\'S asset — devastating FAFSA impact (20%)','Irrevocable gift — child controls at 18/21','Kiddie tax on unearned income above $2,700 (2026)','Child may not use it for college'],
+     cons:['CHILD\'S asset — devastating FAFSA impact (20%)','Irrevocable gift — child controls at 18/21','Kiddie tax at your ~'+Math.round(bracket*100)+'% rate on unearned income above $2,700 (2026)','Child may not use it for college'],
      aidImpact:'HIGH — student asset (20% FAFSA hit)',aidColor:'var(--rd)',
      flexibility:'HIGH — any purpose',flexColor:'var(--gr)'},
 
@@ -16396,9 +16465,9 @@ async function _runPolicyAudit(){
   el.style.display='';
 
   var isUL=type==='ul';var isIUL=type==='iul';var isWL=type==='wl';var isUnsure=type==='unsure';
-  var _pa; try{ _pa=await pfosCalc('calculators','policyAudit',[{age:age,issueAge:issueAge,premium:premium,cv:cv,curRate:curRate,guarRate:guarRate,annualCOI:annualCOI,loans:loans,stoppedPrem:stoppedPrem}]); }catch(_e){ calcErr('pa_results',_e); return; }
+  var _pa; try{ _pa=await pfosCalc('calculators','policyAudit',[{age:age,issueAge:issueAge,premium:premium,cv:cv,curRate:curRate,guarRate:guarRate,annualCOI:annualCOI,loans:loans,stoppedPrem:stoppedPrem,deathBenefit:db}]); }catch(_e){ calcErr('pa_results',_e); return; }
   if(!_pa)return;
-  var policyYears=_pa.policyYears,annualPrem=_pa.annualPrem,totalPremPaid=_pa.totalPremPaid,interestEarned=_pa.interestEarned,coiGap=_pa.coiGap,premGap=_pa.premGap,netCV=_pa.netCV,lapseAge=_pa.lapseAge,lapseAgeGuar=_pa.lapseAgeGuar,premNeeded=_pa.premNeeded;
+  var policyYears=_pa.policyYears,annualPrem=_pa.annualPrem,totalPremPaid=_pa.totalPremPaid,interestEarned=_pa.interestEarned,coiGap=_pa.coiGap,premGap=_pa.premGap,netCV=_pa.netCV,lapseAge=_pa.lapseAge,lapseAgeGuar=_pa.lapseAgeGuar,premNeeded=_pa.premNeeded,sevenPayLimit=_pa.sevenPayLimit,mecRisk=_pa.mecRisk,mecHeadroom=_pa.mecHeadroom;
 
   // Scoring — same 10 checks as before
   var checks=[];var totalScore=0;var maxScore=0;
@@ -16473,6 +16542,18 @@ async function _runPolicyAudit(){
     h+='<div style="font-size:12px;color:var(--mu);line-height:1.7">'+ck.detail+'</div>';
     h+='</div>';
   });
+
+  // MEC (7-pay) risk screen — shown when a death benefit is known
+  if(sevenPayLimit>0){
+    var mecCol=mecRisk?'var(--rd)':'var(--gr)';
+    h+='<div style="padding:12px 14px;background:'+(mecRisk?'rgba(239,68,68,.06)':'rgba(34,197,94,.05)')+';border:1px solid '+(mecRisk?'rgba(239,68,68,.2)':'rgba(34,197,94,.15)')+';border-radius:4px;margin:12px 0;font-size:12px;color:var(--mu);line-height:1.7">';
+    h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;color:'+mecCol+';margin-bottom:4px">'+(mecRisk?'⚠️ Possible MEC — 7-Pay Limit Exceeded':'✅ MEC Screen — Within the 7-Pay Limit')+'</div>';
+    h+='Estimated 7-pay premium limit: <strong style="color:var(--wh)">'+fmt(sevenPayLimit)+'/yr</strong> · Your premium: <strong style="color:var(--wh)">'+fmt(annualPrem)+'/yr</strong>. ';
+    if(mecRisk){ h+='Paying above the 7-pay limit in the first 7 years turns the policy into a <strong style="color:var(--rd)">Modified Endowment Contract</strong> — loans and withdrawals then tax as gains-first, with a 10% penalty before age 59½. '; }
+    else { h+='You have about <strong style="color:var(--gr)">'+fmt(mecHeadroom)+'/yr</strong> of headroom before MEC status. '; }
+    h+='<em style="color:var(--mu)">Approximate screen — confirm the exact 7-pay limit with your carrier.</em>';
+    h+='</div>';
+  }
 
   // Rescue options if score < 60%
   if(overallPct<60&&(isUL||isIUL||isUnsure)){
