@@ -30406,36 +30406,99 @@ var _cpScenDefs=[
   {id:'debt_faster',icon:'⚡',nm:'Pay Off Debt Faster',d:'Extra payment now, invest it after',c:'#5B9BFF',showIf:function(){return (CPLAN.totalDebt||0)>0;},sl:[{k:'df_amt',l:'Extra payment/mo',mn:50,mx:2000,st:50,df:300,u:'$'}]}
 ];
 function _sv(k,d){return _cpSim.custom[k]!==undefined?_cpSim.custom[k]:d;}
-function _calcScenImpact(sc){
-  var yrs=20,bv=(CPLAN._sim&&CPLAN._sim.netWorth)?CPLAN._sim.netWorth[Math.min(yrs,CPLAN._sim.netWorth.length-1)]||0:0;
-  switch(sc.id){
-    case 'raise':return CPLAN.income*(_sv('raise_pct',10)/100)*12*yrs*1.3;
-    case 'paycut':return -CPLAN.income*(_sv('paycut_pct',15)/100)*12*yrs*.8;
-    case 'child':return -_sv('child_cost',1500)*12*yrs;
-    case 'house':return -_sv('house_pmt',2000)*12*yrs*.6;
-    case 'job_loss':return -CPLAN.income*_sv('job_mo',4);
-    case 'market':return -bv*(_sv('mkt_drop',30)/100)*.7;
-    case 'spouse_w':return _sv('sp_inc',4000)*12*yrs*1.2;
-    case 'spouse_s':return -_sv('sp_loss',3000)*12*yrs*.8;
-    case 'windfall':return _sv('wf_amt',50000)*Math.pow(1.07,yrs);
-    case 'early_ret':return -bv*(_sv('er_yrs',5)/yrs)*.4;
-    // Save More for Retirement — future value of the extra monthly contribution at the plan's blended
-    // return, over years-to-retirement (capped at the projection window). Real annuity FV, not a heuristic.
-    case 'save_more':{var _r=(((typeof S!=='undefined'&&S.calcs&&S.calcs.blendedRetReturn)||7))/100,_m=_sv('sm_amt',500),_Y=Math.min(yrs,Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35))),_i=_r/12,_n=_Y*12;return _i>0?_m*((Math.pow(1+_i,_n)-1)/_i):_m*_n;}
-    // Pay Off Debt Faster — the extra payment earns a guaranteed return equal to the client's weighted-avg
-    // debt APR until the balance clears, then the freed cashflow invests at the blended return. Two-phase FV.
-    case 'debt_faster':{var _ex=_sv('df_amt',300),_ae=_ex*12,_td=CPLAN.totalDebt||0;if(_td<=0||_ae<=0)return 0;var _ws=0,_wb=0;(CPLAN.debts||[]).forEach(function(_d){var _b=parseFloat(_d.balance)||0,_rt=parseFloat(_d.rate)||0;if(_b>0){_ws+=_b*_rt;_wb+=_b;}});var _dr=(_wb>0?_ws/_wb:12)/100,_rr=(((typeof S!=='undefined'&&S.calcs&&S.calcs.blendedRetReturn)||7))/100;var _py=Math.min(yrs,_td/_ae);var _fv1=_dr>0?_ae*((Math.pow(1+_dr,_py)-1)/_dr):_ae*_py;var _rem=Math.max(0,yrs-_py);var _fvb=_fv1*Math.pow(1+_rr,_rem);var _fvn=_rr>0?_ae*((Math.pow(1+_rr,_rem)-1)/_rr):_ae*_rem;return _fvb+_fvn;}
-    default:return 0;
-  }
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+// ACCURATE SCENARIO IMPACTS — the "what if" scenarios reflect what would ACTUALLY happen to THIS user.
+// Cashflow / debt / retire-early scenarios re-run the real 30-yr plan engine (_cpRunSimulation) in preview
+// mode with the change routed through the user's own allocations, and diff the resulting net-worth &
+// retirement trajectories (so cascade ripples — e.g. a raise that funds the EF sooner → earlier debt payoff
+// — are captured). Lump/shock events (windfall/market/job-loss), which the engine has no clean lever for,
+// use a grounded closed-form on the user's REAL portfolio + blended return. Impacts are the MARGINAL effect,
+// applied on top of the displayed plan line. (Replaces the old fixed fudge-factor multipliers.)
+// ═══════════════════════════════════════════════════════════════════════════════════════════════════
+function _cpScenBlend(){var r=(((typeof S!=='undefined'&&S.calcs&&S.calcs.blendedRetReturn)||7))/100;return r>0?r:0.07;}
+function _cpNum(x){return parseFloat(x)||0;}
+function _cpGrowthIdxs(){var o=[];(CPLAN.allocations||[]).forEach(function(a,i){var t=a.type;if(t==='debt'&&!a._ibcDebtStrategy)return;if(t==='ef'||t==='custom'||t==='house')return;o.push(i);});return o;}
+function _cpRetIdxs(){var o=[];(CPLAN.allocations||[]).forEach(function(a,i){if(/^(roth|401k|roth401k|trad_ira|solo401k|sep_ira|hsa|iul|wl|ibc)$/.test(a.type)||a._ibcDebtStrategy)o.push(i);});return o;}
+function _cpSavRate(){var s=(((typeof S!=='undefined'&&S.calcs&&S.calcs.savingsRate)||30))/100;return Math.max(0.15,Math.min(0.7,s));}
+// Route a monthly cashflow change into the plan: only the SAVED fraction (the user's real savings rate) is
+// invested/disinvested through the growth allocations — so it affects net worth AND retirement; the rest is
+// spent/freed and doesn't accumulate. A raise invests a realistic slice (not 100%); an expense cuts savings
+// proportionally. (CPLAN is already a clone here.)
+function _cpRouteCash(delta){
+  var inv=delta*_cpSavRate();
+  CPLAN.surplus=Math.max(0,_cpNum(CPLAN.surplus)+inv);
+  var idxs=_cpGrowthIdxs().filter(function(i){return _cpNum(CPLAN.allocations[i].amount)>0;});
+  if(idxs.length){
+    var tot=0;idxs.forEach(function(i){tot+=_cpNum(CPLAN.allocations[i].amount);});
+    var scale=tot>0?Math.max(0,(tot+inv)/tot):1;
+    idxs.forEach(function(i){CPLAN.allocations[i].amount=Math.max(0,_cpNum(CPLAN.allocations[i].amount)*scale);});
+  } else { var g=_cpGrowthIdxs();if(g.length)CPLAN.allocations[g[0]].amount=Math.max(0,_cpNum(CPLAN.allocations[g[0]].amount)+inv); }
 }
-// Per-scenario RETIREMENT-nest-egg impact — the retirement line reflects each scenario's real effect on
-// retirement savings, not a flat share of net worth. Weight = the fraction of the scenario's impact that
-// lands in the retirement bucket: portfolio/contribution scenarios ~full; spending/liquidity events small.
-var _scenRetW={save_more:1.0,debt_faster:0.9,market:1.0,early_ret:1.0,windfall:0.6,raise:0.5,paycut:0.5,spouse_w:0.5,spouse_s:0.5,job_loss:0.4,child:0.25,house:0.25};
-function _calcScenRetImpact(sc){var w=_scenRetW[sc.id];if(w===undefined)w=0.5;return _calcScenImpact(sc)*w;}
-// Aggregate active (+ live-preview expanded) scenario impact for the active view (retirement vs net worth).
-function _cpScenAdj(useRet){var a=0;_cpScenDefs.forEach(function(sc){if(_cpSim.scenarios[sc.id])a+=(useRet?_calcScenRetImpact(sc):_calcScenImpact(sc));});if(_cpSim._expanded&&!_cpSim.scenarios[_cpSim._expanded]){var e=_cpScenDefs.find(function(s){return s.id===_cpSim._expanded;});if(e)a+=(useRet?_calcScenRetImpact(e):_calcScenImpact(e));}return a;}
-function _cpProjBase(useRet){if(!CPLAN._sim)return 0;var arr=useRet?CPLAN._sim.retirement:CPLAN._sim.netWorth;return (arr&&arr.length)?arr[Math.min(20,arr.length-1)]||0:0;}
+// Engine perturbations — each mutates the (already-cloned) CPLAN per the scenario's slider value.
+var _cpScenEngine={
+  raise:function(){_cpRouteCash(_cpNum(CPLAN.income)*(_sv('raise_pct',10)/100));},
+  paycut:function(){_cpRouteCash(-_cpNum(CPLAN.income)*(_sv('paycut_pct',15)/100));},
+  child:function(){_cpRouteCash(-_sv('child_cost',1500));},
+  house:function(){_cpRouteCash(-_sv('house_pmt',2000));},
+  spouse_w:function(){_cpRouteCash(_sv('sp_inc',4000));},
+  spouse_s:function(){_cpRouteCash(-_sv('sp_loss',3000));},
+  save_more:function(){var r=_cpRetIdxs(),i=r.length?r[0]:(_cpGrowthIdxs()[0]);if(i==null)return;var d=_sv('sm_amt',500);CPLAN.surplus=Math.max(0,_cpNum(CPLAN.surplus)+d);CPLAN.allocations[i].amount=_cpNum(CPLAN.allocations[i].amount)+d;},
+  debt_faster:function(){var di=-1;(CPLAN.allocations||[]).forEach(function(a,i){if(a.type==='debt'&&di<0)di=i;});if(di<0)return;var d=_sv('df_amt',300);CPLAN.surplus=Math.max(0,_cpNum(CPLAN.surplus)+d);CPLAN.allocations[di].amount=_cpNum(CPLAN.allocations[di].amount)+d;},
+  early_ret:function(){CPLAN.retirementAge=Math.max(_cpNum(CPLAN.age)+1,_cpNum(CPLAN.retirementAge||65)-_sv('er_yrs',5));}
+};
+// Re-run the engine with a set of scenario ids applied, in preview mode; capture the trajectories; restore.
+function _cpEngineCapture(ids){
+  var sA=CPLAN.allocations,sS=CPLAN._sim,sSur=CPLAN.surplus,sRA=CPLAN.retirementAge,sM=CPLAN._projectionMode,out=null;
+  try{
+    CPLAN._projectionMode='preview';
+    CPLAN.allocations=JSON.parse(JSON.stringify(sA));
+    (ids||[]).forEach(function(id){if(_cpScenEngine[id])_cpScenEngine[id]();});
+    _cpRunSimulation();var s=CPLAN._sim||{};
+    out={nw:(s.netWorth||[]).slice(),ret:(s.retirement||[]).slice()};
+  }catch(e){out=null;}
+  finally{CPLAN.allocations=sA;CPLAN.surplus=sSur;CPLAN.retirementAge=sRA;CPLAN._projectionMode=sM;CPLAN._sim=sS;}
+  return out;
+}
+var _cpScenBaseCache=null;
+function _cpScenSig(){try{return ((typeof APP!=='undefined'&&APP.currentClientId)||'')+'|'+_cpNum(CPLAN.surplus)+'|'+_cpNum(CPLAN.retirementAge)+'|'+_cpNum(CPLAN.age)+'|'+(CPLAN.allocations||[]).map(function(a){return a.type+':'+_cpNum(a.amount);}).join(',');}catch(e){return '';}}
+function _cpPreviewBase(){var sig=_cpScenSig();if(_cpScenBaseCache&&_cpScenBaseCache.sig===sig)return _cpScenBaseCache.t;var t=_cpEngineCapture([])||{nw:[],ret:[]};_cpScenBaseCache={sig:sig,t:t};return t;}
+function _cpClearScenCache(){_cpScenBaseCache=null;_cpDeltaMemo={sig:null,m:{}};}
+// Grounded per-year impact for lump/shock events on the user's REAL numbers (invested = current growth balance).
+function _cpGroundedDelta(id){
+  var base=_cpPreviewBase(),n=(base.nw||[]).length||31,r=_cpScenBlend(),dnw=[],dret=[],invested=(base.ret&&base.ret.length)?_cpNum(base.ret[0]):0;
+  for(var y=0;y<n;y++){var f=Math.pow(1+r,y);
+    if(id==='windfall'){var W=_sv('wf_amt',50000);dnw[y]=Math.round(W*f);dret[y]=Math.round(W*f);}                       // invested lump compounds at the plan's return
+    else if(id==='market'){var d=_sv('mkt_drop',30)/100;dnw[y]=-Math.round(invested*d*f);dret[y]=-Math.round(invested*d*f);} // one-time drop to invested; its lost compounding never recovers
+    else if(id==='job_loss'){var mo=_sv('job_mo',4),hit=_cpNum(CPLAN.expenses)*mo;dnw[y]=-Math.round(hit*f);dret[y]=-Math.round(hit*f*0.5);} // N months of expenses drawn down
+    else{dnw[y]=0;dret[y]=0;}
+  }
+  return {nw:dnw,ret:dret};
+}
+function _cpActiveScenIds(){var a=Object.keys(_cpSim.scenarios).filter(function(id){return _cpSim.scenarios[id];});if(_cpSim._expanded&&a.indexOf(_cpSim._expanded)<0)a.push(_cpSim._expanded);return a;}
+var _cpDeltaMemo={sig:null,m:{}};
+// Per-year DELTA (marginal scenario effect vs the preview base) for a set of ids + view. Memoized.
+function _cpScenDeltaArr(ids,useRet){
+  var bsig=_cpScenSig();if(_cpDeltaMemo.sig!==bsig)_cpDeltaMemo={sig:bsig,m:{}};
+  var slk=(ids||[]).slice().sort().join(',')+'|'+(ids||[]).map(function(id){var sc=_cpScenDefs.find(function(s){return s.id===id;});return sc?sc.sl.map(function(x){return _sv(x.k,x.df);}).join(':'):'';}).join(';');
+  var mk=(useRet?'r|':'n|')+slk;if(_cpDeltaMemo.m[mk])return _cpDeltaMemo.m[mk];
+  var base=_cpPreviewBase(),key=useRet?'ret':'nw',n=(base[key]||[]).length||31,out=new Array(n).fill(0);
+  var eng=(ids||[]).filter(function(id){return _cpScenEngine[id];}),grd=(ids||[]).filter(function(id){return !_cpScenEngine[id];});
+  if(eng.length){var es=_cpEngineCapture(eng);if(es)for(var y=0;y<n;y++)out[y]+=(_cpNum(es[key][y])-_cpNum(base[key][y]));}
+  grd.forEach(function(id){var gd=_cpGroundedDelta(id);for(var y2=0;y2<n;y2++)out[y2]+=_cpNum(gd[key][y2]);});
+  _cpDeltaMemo.m[mk]=out;return out;
+}
+// Impact horizon = the END of the projection (full compounded effect). Scenarios whose effect lands near
+// retirement (retire-early, save-more) are near-zero at year 20 — the endpoint captures their real impact.
+function _Yend(arr){return arr&&arr.length?arr.length-1:0;}
+function _cpSimArr(useRet){return (CPLAN._sim&&CPLAN._sim[useRet?'retirement':'netWorth'])||[];}   // CPLAN._sim uses netWorth/retirement (my captured objects use nw/ret)
+// The simulated chart trajectory = the displayed plan line + the active scenarios' marginal delta.
+function _cpScenTraj(useRet){var pageBase=_cpSimArr(useRet),d=_cpScenDeltaArr(_cpActiveScenIds(),useRet),out=[];for(var y=0;y<pageBase.length;y++)out[y]=Math.round(_cpNum(pageBase[y])+_cpNum(d[y]));return out;}
+// Aggregate (all active) impact at the horizon for the summary cards.
+function _cpScenAdj(useRet){var d=_cpScenDeltaArr(_cpActiveScenIds(),useRet);return Math.round(d[_Yend(d)]||0);}
+// Standalone horizon impact of ONE scenario (net-worth / retirement) for its card.
+function _calcScenImpact(sc){var d=_cpScenDeltaArr([sc.id],false);return d[_Yend(d)]||0;}
+function _calcScenRetImpact(sc){var d=_cpScenDeltaArr([sc.id],true);return d[_Yend(d)]||0;}
+function _cpProjBase(useRet){var arr=_cpSimArr(useRet);return arr.length?_cpNum(arr[_Yend(arr)]):0;}
 function _cpIsRetView(){return CPLAN._chartView==='retirement';}
 function _cpSimLiveUpdate(slKey,val){
   _cpSim.custom[slKey]=parseFloat(val)||0;
@@ -30462,13 +30525,11 @@ function _cpUpdateProjSummary(){
 }
 function _cpUpdateProjChart(){
   if(!CPLAN._sim||!CPLAN._sim.netWorth)return;
-  var adj=_cpScenAdj(false),adjRet=_cpScenAdj(true);
-  // Store simulated data as separate arrays — don't modify the plan line. The retirement line reshapes by
-  // the scenarios' RETIREMENT impact (adjRet), not a flat 70% of the net-worth impact.
-  if(adj!==0||adjRet!==0){
-    var len=CPLAN._sim.netWorth.length-1;
-    CPLAN._sim._simulated=CPLAN._sim.netWorth.map(function(v,i){var pct=len>0?i/len:1;return Math.round(v+adj*pct);});
-    if(CPLAN._sim.retirement){var lenR=CPLAN._sim.retirement.length-1;CPLAN._sim._simulatedRet=CPLAN._sim.retirement.map(function(v,i){var pct=lenR>0?i/lenR:1;return Math.round(v+adjRet*pct);});}
+  // The simulated lines are the REAL per-year trajectories (plan line + the active scenarios' true marginal
+  // delta from re-running the engine / grounded lump math) — not a linear ramp of a single endpoint number.
+  if(_cpActiveScenIds().length){
+    CPLAN._sim._simulated=_cpScenTraj(false);
+    if(CPLAN._sim.retirement)CPLAN._sim._simulatedRet=_cpScenTraj(true);
   } else {
     CPLAN._sim._simulated=null;
     CPLAN._sim._simulatedRet=null;
@@ -30484,7 +30545,7 @@ function renderClientProjections(){
   var el=document.getElementById('clientProjectionsContent');if(!el)return;
   _cpEnsurePlanLoaded();
   if(typeof CPLAN==='undefined'||!CPLAN._sim){el.innerHTML=_renderEmptyState('empty',{icon:'📈',title:'No Plan Data',message:'Create a financial plan first.',ctaLabel:'Build My Plan →',ctaOnclick:'showClientPage(\'plan\');initClientPlan()'});return;}
-  var h='',yrs=20,_isRet=_cpIsRetView(),bv=_cpProjBase(_isRet);
+  var h='',yrs=Math.max(1,((CPLAN._sim&&CPLAN._sim.netWorth&&CPLAN._sim.netWorth.length)||31)-1),_isRet=_cpIsRetView(),bv=_cpProjBase(_isRet);
   var adj=_cpScenAdj(_isRet),any=false;_cpScenDefs.forEach(function(s){if(_cpSim.scenarios[s.id])any=true;});
   var sv2=Math.round(bv+adj),df=sv2-bv;
   // Chart
@@ -30498,7 +30559,7 @@ function renderClientProjections(){
   h+='<div style="font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.12em;text-transform:uppercase;color:#5B9BFF;margin-bottom:10px">Life Event Scenarios</div>';
   h+='<div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:20px">';
   _cpScenDefs.filter(function(s){return !s.showIf||s.showIf();}).forEach(function(sc){
-    var on=_cpSim.scenarios[sc.id],ex=_cpSim._expanded===sc.id,imp=Math.round(_calcScenImpact(sc));
+    var on=_cpSim.scenarios[sc.id],ex=_cpSim._expanded===sc.id,imp=(on||ex)?Math.round(_calcScenImpact(sc)):0;
     h+='<div style="background:var(--bg-card);border:1px solid '+(on?'rgba(91,155,255,.4)':'var(--bd)')+';border-radius:2px;overflow:hidden;transition:border-color .15s,box-shadow .15s'+(on?';box-shadow:0 0 16px rgba(91,155,255,.08)':'')+'">';
     // Card header — matches tool card exactly
     h+='<button onclick="_cpSimApply(\''+sc.id+'\')" title="Click to '+(on?'remove from':'add to')+' your projection" style="display:flex;align-items:center;gap:12px;padding:16px;background:var(--bg-card);border:none;cursor:pointer;transition:border-color .15s,background .15s;text-align:left;min-height:56px;width:100%" onmouseover="this.style.borderColor=\'#5B9BFF\';this.style.background=\'rgba(0,68,191,.08)\'" onmouseout="this.style.borderColor=\'var(--bd)\';this.style.background=\'var(--bg-card)\'">';
