@@ -1704,11 +1704,18 @@ async function doClientRegister(){
           created_at:        new Date().toISOString()
         });
 
-        // 5. Send portal invitation to spouse via invite system
+        // 5. Send the spouse a SET-PASSWORD (recovery) email. Their auth account was pre-created in step 3
+        //    (required so the spouse's own clients-row insert passes the "email = own jwt" RLS policy), so the
+        //    old token-invite → signup form (doInviteSignup → auth.signUp) failed with "user already registered"
+        //    and dead-ended the partner. Instead use the password-recovery flow (same as doForgot): the link
+        //    lands in #type=recovery → doSetNewPassword sets their real password on the existing account → they
+        //    can sign in. Keep the portal_invites row so the couple-status nudge shows a pending state.
+        //    NOTE: the client-side "resend invite" nudge (sendPartnerInvite/resendPartnerInvite in pfos-client)
+        //    still uses the token flow and has the same limitation for couple-registered partners — separate fix.
         try{
           var _invToken=crypto.randomUUID();
           await db.from('portal_invites').insert({client_id:clientBId,email:spouseEmail,token:_invToken,status:'pending',source:'couple_registration',created_at:new Date().toISOString()});
-          db.functions.invoke('send-portal-invite',{body:{email:spouseEmail,token:_invToken,clientName:spouseName,inviterName:name,source:'couple_registration'}}).catch(function(ex){console.warn('Couple invite email failed:',ex);});
+          db.auth.resetPasswordForEmail(spouseEmail).then(function(r){ if(r&&r.error) console.warn('Couple set-password email failed:',r.error.message); }).catch(function(ex){console.warn('Couple set-password email failed:',ex);});
         }catch(ex){console.warn('Couple invite setup failed:',ex);}
       }
     }
@@ -1767,6 +1774,13 @@ async function doClientRegister(){
         }}).catch(function(){});
       }catch(e){}
     }
+
+    // The couple flow signed the SPOUSE in (step 3, so their own row insert passed RLS), replacing the primary's
+    // session on this browser. Sign out so a refresh doesn't route the primary into the partner's portal — the UI
+    // above already asks the primary to sign in with their own credentials. (Placed AFTER the best-effort
+    // notification invokes so those still carry a valid session.) Individual registrations don't need this — their
+    // leftover session is the user's own.
+    if(isCouple){ try{ await db.auth.signOut(); }catch(_so){} }
 
   }catch(e){
     window._registrationInProgress = false;
