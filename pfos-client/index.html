@@ -3553,81 +3553,110 @@ function _cpCashFlowBars(months,W,H){
   svg+='</svg>'; return svg;
 }
 
-// ── §2.4b (M2) income→category Sankey ────────────────────────────────────────
-// PURE model: a balanced 2-column flow. Left = Income (+ Deficit when overspent);
-// Right = top-8 categories (+ Other remainder + Saved when net>0). Conservation:
-// Σleft == Σright == total (income+max(0,-net) == expense+max(0,net)). Null when
-// there's nothing to show. The testable seam (reads only the report object).
-function _cpSankeyModel(rep,opts){
-  if(!rep) return null;
-  var income=Math.round(rep.totalIncome||0), expense=Math.round(rep.totalExpense||0);
-  var net=(rep.net==null?(income-expense):Math.round(rep.net)), saved=Math.max(0,net);
-  var cats=(rep.byCategory||[]).slice(0,8).filter(function(c){ return c&&(c.total||0)>0; });
-  var shown=cats.reduce(function(s,c){ return s+Math.round(c.total||0); },0);
-  var rights=cats.map(function(c){ var m=_cpSpendCatMeta(c.key); return {label:m.l,value:Math.round(c.total),color:m.c}; });
-  var other=expense-shown;
-  if(other>0.5) rights.push({label:'Other',value:Math.round(other),color:'#94A3B8'});
-  // When expense data is incomplete (caller flags it), the positive "net" is mostly UN-tracked spend, not real
-  // savings — label it honestly as "Untracked" so the Sankey doesn't overstate savings.
-  if(saved>0.5) rights.push({label:(opts&&opts.savedIsUntracked)?'Untracked':'Saved',value:Math.round(saved),color:(opts&&opts.savedIsUntracked)?'#94A3B8':'#64748B'}); // muted slate — keep spending colors the focus of "Where It Went"
-  if(!rights.length) return null;
-  // CONSERVATION by construction: total = Σrights (the actual drawn sum), then the LEFT side is DERIVED to
-  // match — Income covers what it can, the remainder is the Deficit. This stays balanced regardless of the
-  // independent ±$ rounding of category/income/expense (e.g. cats summing slightly above expense).
-  var total=rights.reduce(function(s,r){ return s+r.value; },0);
-  if(!(total>0)) return null;
-  var incL=Math.min(income,total), lefts=[{label:'Income',value:incL,color:'#22C55E'}], defL=total-incL;
-  if(defL>0.5) lefts.push({label:'Deficit',value:defL,color:'#EF4444'});
-  return { lefts:lefts, rights:rights, total:total };
+// [REMOVED] The Monarch-style income→category Sankey (_cpSankeyModel / _cpRenderSankey) was replaced by the
+// ranked-bar "Where It Went" view below (_cpWhereItWentHtml), per owner direction to be distinct from Monarch.
+
+// ── "Where It Went" — the ranked-bar spending view that REPLACES the Sankey. Leads with a savings
+// verdict, ranks spending with month-over-month deltas, then shows the plan deploying the kept
+// surplus + the guilt-free breathing-room reserve. Beats Monarch on usefulness, not chart novelty. ──
+function _wiwChip(kind,text){
+  var s=kind==='good'?'color:#8ff0b4;background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.28)'
+    :kind==='warn'?'color:#ffd08a;background:rgba(245,165,36,.12);border:1px solid rgba(245,165,36,.28)'
+    :'color:var(--mu);background:rgba(139,147,184,.12);border:1px solid rgba(139,147,184,.24)';
+  return '<span style="font-size:12px;font-weight:600;padding:4px 10px;border-radius:20px;display:inline-block;'+s+'">'+text+'</span>';
 }
-// SVG flow renderer: left source bars + bezier ribbons (colored by destination) + right category bars + legend.
-function _cpRenderSankey(model,W,H){
-  if(!model||!model.rights||!model.rights.length||!(model.total>0)) return '';
-  var nodeW=9, padT=16, padB=8, padL=8, labelW=150, total=model.total;
-  var leftX=padL, rightX=W-labelW-nodeW, midX=(leftX+nodeW+rightX)/2, plotH=H-padT-padB;
-  var nR=model.rights.length, gap=Math.max(2.5, Math.min(9, (plotH*0.42)/nR)); // node padding turns the blob into distinct bands
-  var rAvail=plotH-(nR-1)*gap;
-  // TRUE (income-side) heights vs DISPLAY (destination-side) heights. A single band that dwarfs the rest
-  // (e.g. a 90%+-savings "Saved" band over a long range) would crush every spending band into an unreadable
-  // sliver — defeating "Where It Went". So CAP any one destination band at CAPFRAC of the plot and redistribute
-  // the freed height to the others ∝ their true size, keeping the spending breakdown legible. Amounts on the
-  // labels stay EXACT (the chart never lies about $); a capped band is marked "≈" + a note. Income side stays true.
-  var rawH=model.rights.map(function(nd){ return (nd.value/total)*rAvail; });
-  // Only cap when there are ≥3 bands: with just 2, the single "other" band is already legible (or falls to the
-  // legend), and capping would force BOTH to equal height (a 92/8 split → 50/50) — more misleading than helpful.
-  // At ≥3 only ONE band can exceed 50%, so it alone is compressed while the rest keep their RELATIVE proportions
-  // (uniformly scaled up into the freed height) — defensible, and flagged not-to-scale.
-  var CAPFRAC=0.5, capH=rAvail*CAPFRAC, capped=false, freed=0, uncRaw=0;
-  if(nR>=3){ rawH.forEach(function(h){ if(h>capH){ freed+=(h-capH); capped=true; } else { uncRaw+=h; } }); }
-  var dispH=rawH.map(function(h){ if(capped&&h>capH) return capH; return (capped&&uncRaw>0)? h+freed*(h/uncRaw) : h; });
-  var svg='<svg viewBox="0 0 '+W+' '+H+'" style="width:100%;height:auto" role="img" aria-label="Income to category flow">';
-  // ribbons: left endpoints stack at TRUE heights (matching the income bar), right endpoints at DISPLAY heights
-  var lY=padT, rY=padT, rows=[];
-  model.rights.forEach(function(nd,i){ rows.push({nd:nd, lt:lY, lb:lY+rawH[i], rt:rY, rb:rY+dispH[i], cap:(capped&&rawH[i]>capH)}); lY+=rawH[i]; rY+=dispH[i]+gap; });
-  rows.forEach(function(r){
-    var p='M'+(leftX+nodeW)+','+r.lt.toFixed(2)+' C'+midX+','+r.lt.toFixed(2)+' '+midX+','+r.rt.toFixed(2)+' '+rightX+','+r.rt.toFixed(2)+' L'+rightX+','+r.rb.toFixed(2)+' C'+midX+','+r.rb.toFixed(2)+' '+midX+','+r.lb.toFixed(2)+' '+(leftX+nodeW)+','+r.lb.toFixed(2)+' Z';
-    svg+='<path d="'+p+'" fill="'+r.nd.color+'" opacity="0.55" stroke="'+r.nd.color+'" stroke-width="0.6"><title>'+_cpEscHtml(r.nd.label)+': '+fmt(Math.round(r.nd.value))+'</title></path>';
+// one ranked row: name (+color chip for spend), $ on the bar, a % subtitle, and a right-side delta/tag
+// NOTE: a global GHL reset rule — div[style*="padding"]{background:var(--bg)!important} — strips the background off
+// ANY div whose inline style contains "padding". So bar fills MUST NOT use inline padding (it would kill the gradient);
+// the $ inset is done with margin-left on the inner span instead, and colored boxes below re-assert bg with !important.
+function _wiwBar(label,color,amt,subPct,widthPct,rightTxt,rightCol,isPlan){
+  var h='<div style="display:grid;grid-template-columns:minmax(126px,164px) 1fr;gap:10px;align-items:center;margin:7px 0">';
+  h+='<div style="min-width:0"><div style="font-size:13px;color:'+(isPlan?'#e2fff0':'var(--wh)')+';line-height:1.22;overflow-wrap:anywhere;display:flex;align-items:flex-start;gap:6px">'
+    +(isPlan?'':'<span style="display:inline-block;width:8px;height:8px;border-radius:2px;flex:0 0 auto;margin-top:4px;background:'+color+'"></span>')+_cpEscHtml(label)+'</div>'
+    +(subPct!=null?'<div style="font-size:11px;color:'+(isPlan?'#7bcf9a':'var(--mu)')+';margin-top:2px">'+subPct+'% of income</div>':'')+'</div>';
+  h+='<div style="display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center">'
+    +'<div style="height:24px;background:rgba(255,255,255,.05);border-radius:6px;overflow:hidden"><div style="height:100%;width:'+widthPct+'%;min-width:4px;border-radius:6px;background:linear-gradient(90deg,'+color+','+color+'cc);display:flex;align-items:center"><span style="font-family:var(--fd);font-size:14px;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.5);margin-left:9px">'+fmt(Math.round(amt))+'</span></div></div>'
+    +'<div style="font-size:12px;font-weight:600;white-space:nowrap;min-width:52px;text-align:right;color:'+(rightCol||'var(--mu)')+'">'+(rightTxt||'')+'</div>'
+  +'</div></div>';
+  return h;
+}
+// The plan-deployment + breathing-room block (the moat). Sources the client's real plan (CPLAN).
+function _cpWiwPlanHtml(){
+  if(typeof CPLAN==='undefined' && typeof _cpEnsurePlanLoaded==='function'){ try{_cpEnsurePlanLoaded();}catch(_e){} }
+  var hasPlan=(typeof CPLAN!=='undefined' && CPLAN.allocations && CPLAN.allocations.some(function(a){return a&&(parseFloat(a.amount)||0)>0;}));
+  var breatheCard=function(head,copy,amt){
+    return '<div style="display:flex;align-items:center;gap:14px;margin-top:14px !important;padding:14px 16px !important;border-radius:12px;background:linear-gradient(180deg,rgba(94,234,212,.10),rgba(94,234,212,.03)) !important;border:1px solid rgba(94,234,212,.26)">'
+      +'<div style="font-size:24px;flex:0 0 auto">🌿</div>'
+      +'<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-weight:600;font-size:14px;color:#a7f3e0">'+head+'</div><div style="font-size:12px;color:var(--mu);margin-top:3px;line-height:1.5">'+copy+'</div></div>'
+      +(amt!=null?'<div style="font-family:var(--fd);font-size:28px;color:#5eead4;flex:0 0 auto">'+fmt(Math.round(amt))+'</div>':'')+'</div>';
+  };
+  if(!hasPlan){
+    return breatheCard('This is yours to keep.','Build a plan and PFOS puts some of what you save to work on your goals — the rest stays your breathing room. '
+      +'<span onclick="showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan();" style="color:#5eead4;cursor:pointer;font-weight:600;white-space:nowrap">Build my plan →</span>',null);
+  }
+  var ds=(typeof _cpDeploySummary==='function')?_cpDeploySummary():{allocated:0,brReserve:0};
+  var allocs=CPLAN.allocations.filter(function(a){return a&&(parseFloat(a.amount)||0)>0;})
+    .slice().sort(function(a,b){return (parseFloat(b.amount)||0)-(parseFloat(a.amount)||0);});
+  var pMax=(parseFloat(allocs[0].amount)||0)||1;
+  var h='<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin:22px 4px 4px !important;padding-bottom:6px !important;border-bottom:1px solid rgba(34,197,94,.28);background:transparent !important">'
+    +'<span style="font-family:var(--fh);font-weight:700;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#8ff0b4">▸ Put to work by your plan</span>'
+    +'<span style="font-size:12px;color:#8ff0b4;white-space:nowrap">'+fmt(ds.allocated)+'/mo</span></div>';
+  allocs.slice(0,6).forEach(function(a){ var amt=parseFloat(a.amount)||0; var nm=(a.customName||CP_NM[a.type]||a.type); var ic=(CP_IC[a.type]||'📋');
+    h+=_wiwBar(ic+' '+nm,'#22C55E',amt,null,Math.round(amt/pMax*100),'','',true);
   });
-  // left source bar(s) — Income (green) [+ Deficit (red)], contiguous, TRUE heights (matches the ribbon left edges)
-  var lYb=padT;
-  model.lefts.forEach(function(nd){ var h=(nd.value/total)*rAvail; svg+='<rect x="'+leftX+'" y="'+lYb.toFixed(2)+'" width="'+nodeW+'" height="'+h.toFixed(2)+'" fill="'+nd.color+'" rx="1.5"><title>'+_cpEscHtml(nd.label)+': '+fmt(Math.round(nd.value))+'</title></rect>'; lYb+=h; });
-  // right destination bars (DISPLAY heights) + ON-CHART labels (name + amount) for bands tall enough; "≈" if capped
-  rows.forEach(function(r){ var bh=r.rb-r.rt;
-    svg+='<rect x="'+rightX+'" y="'+r.rt.toFixed(2)+'" width="'+nodeW+'" height="'+bh.toFixed(2)+'" fill="'+r.nd.color+'" rx="1.5"></rect>';
-    if(bh>=9){ var cy=((r.rt+r.rb)/2+3.2).toFixed(1);
-      svg+='<text x="'+(rightX+nodeW+6)+'" y="'+cy+'" fill="var(--wh)" font-size="10.5" font-family="var(--fh)">'+_cpEscHtml(r.nd.label)+'</text>';
-      svg+='<text x="'+(W-4)+'" y="'+cy+'" fill="var(--mu)" font-size="9.5" text-anchor="end">'+(r.cap?'≈':'')+fmt(Math.round(r.nd.value))+'</text>'; }
+  if(ds.brReserve>0){ h+=breatheCard('Breathing room','Yours — no plan, no guilt. Your plan deliberately leaves this untouched.',ds.brReserve); }
+  h+='<div style="font-size:10.5px;color:var(--mu);text-align:center;margin-top:7px;opacity:.85">Your plan\'s monthly game plan for the money you keep.</div>';
+  return h;
+}
+// The full "Where It Went" card body (everything under the card title).
+function _cpWhereItWentHtml(rep,trends,hasPrior,priorRep,unreliable){
+  var inc=rep.totalIncome||0, exp=rep.totalExpense||0, net=(rep.net==null?inc-exp:rep.net);
+  var srHide=(rep.savingsRate==null||unreliable), deficit=(net<0);
+  var pctInc=function(v){ return inc>0?Math.round(v/inc*100):0; };
+  var byKey={}; (trends||[]).forEach(function(t){ byKey[t.key]=t; });
+  var h='';
+  // ── verdict ── srHide (incomplete/estimated data) DOMINATES: net & savings rate can't be trusted, so present
+  // neutrally rather than asserting a deficit the sparse data doesn't actually support.
+  var neutral=srHide;
+  var coinP=inc>0?Math.min(100,Math.max(0,Math.round(exp/inc*100))):100;
+  var coinCol=neutral?'var(--mu)':(deficit?'var(--rd)':'var(--gr)');
+  var coinNum=neutral?'~':(deficit?'!':pctInc(net)+'%');
+  var coinLbl=neutral?'tracked':(deficit?'over':'saved');
+  h+='<div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:14px">';
+  h+='<div style="width:92px;height:92px;border-radius:50%;flex:0 0 auto;display:grid;place-items:center;position:relative;background:conic-gradient(rgba(139,147,184,.30) 0 '+coinP+'%, '+coinCol+' '+coinP+'% 100%)">'
+    +'<div style="position:absolute;inset:9px;border-radius:50%;background:var(--bg-card)"></div>'
+    +'<div style="position:relative;text-align:center"><div style="font-family:var(--fd);font-size:26px;line-height:.8;color:'+coinCol+'">'+coinNum+'</div><div style="font-family:var(--fh);font-weight:700;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--mu)">'+coinLbl+'</div></div></div>';
+  h+='<div style="flex:1 1 240px;min-width:220px">';
+  if(neutral) h+='<div style="font-family:var(--fh);font-weight:600;font-size:17px;color:var(--wh);line-height:1.2;margin-bottom:8px">Your spending here looks incomplete, so we can\'t show a reliable savings rate yet. <span style="font-weight:400;font-size:13px;color:var(--mu)">Track a full month to unlock it.</span></div>';
+  else if(deficit) h+='<div style="font-family:var(--fh);font-weight:600;font-size:18px;color:var(--wh);line-height:1.15;margin-bottom:8px">You spent <b style="color:var(--rd)">'+fmt(Math.round(-net))+' more</b> than you earned this period.</div>';
+  else h+='<div style="font-family:var(--fh);font-weight:600;font-size:18px;color:var(--wh);line-height:1.15;margin-bottom:8px">You saved <b style="color:var(--gr)">'+fmt(Math.round(net))+'</b> — <b style="color:var(--gr)">'+pctInc(net)+'% of your income</b>.</div>';
+  h+='<div style="display:flex;flex-wrap:wrap;gap:8px">';
+  if(!neutral){ // when data is incomplete, show NO verdict chip — the "track a full month" line already says why
+    if(!deficit){
+      h+=_wiwChip(pctInc(net)>=20?'good':'warn',(pctInc(net)>=20?'✓ Above':'Below')+' the 20% target');
+      if(hasPrior&&priorRep&&priorRep.savingsRate!=null){ var d=Math.round((rep.savingsRate!=null?rep.savingsRate:pctInc(net))-priorRep.savingsRate); if(d!==0) h+=_wiwChip(d>0?'good':'warn',(d>0?'▲ +':'▼ ')+Math.abs(d)+' pts vs prior'); }
+    } else {
+      h+=_wiwChip('warn','Spending outran income');
+    }
+  }
+  h+='</div></div></div>';
+  // ── biggest mover ──
+  if(hasPrior){
+    var mv=null; (trends||[]).forEach(function(t){ if(t.dir==='up'&&t.deltaPct!=null){ var up=t.total-(t.priorTotal||0); if(!mv||up>mv.up) mv={t:t,up:up}; } });
+    if(mv&&mv.up>0){ var mm=_cpSpendCatMeta(mv.t.key); h+='<div style="margin:0 0 14px !important;padding:10px 12px !important;border-radius:9px;font-size:13px;color:var(--wh);background:rgba(245,165,36,.08) !important;border:1px solid rgba(245,165,36,.2);border-left:3px solid #F5A524">🔺 <b style="color:#ffcf87">'+_cpEscHtml(mm.l)+'</b> rose the most — up '+fmt(Math.round(mv.up))+' ('+mv.t.deltaPct+'%) vs the prior period.</div>'; }
+  }
+  // ── spent bars ──
+  h+='<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin:16px 4px 4px !important;padding-bottom:6px !important;border-bottom:1px solid var(--bd);background:transparent !important"><span style="font-family:var(--fh);font-weight:700;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:var(--mu)">Spent</span><span style="font-size:12px;color:var(--mu);white-space:nowrap">'+fmt(exp)+(neutral?'':' · '+pctInc(exp)+'% of income')+'</span></div>';
+  var maxCat=(rep.byCategory[0]&&rep.byCategory[0].total)||1;
+  rep.byCategory.slice(0,8).forEach(function(c){ var meta=_cpSpendCatMeta(c.key), tr=byKey[c.key], rt='',rc='var(--mu)';
+    if(hasPrior&&tr){ if(tr.dir==='up'){rt='▲ '+(tr.deltaPct!=null?Math.abs(tr.deltaPct)+'%':'');rc='var(--rd)';} else if(tr.dir==='down'){rt='▼ '+(tr.deltaPct!=null?Math.abs(tr.deltaPct)+'%':'');rc='var(--gr)';} else if(tr.dir==='new'){rt='new';} }
+    h+=_wiwBar(meta.l,meta.c,c.total,neutral?null:pctInc(c.total),Math.round(c.total/maxCat*100),rt,rc,false);
   });
-  // column headers
-  svg+='<text x="'+leftX+'" y="11" fill="var(--mu)" font-size="9" font-weight="700" text-anchor="start" font-family="var(--fh)" letter-spacing="0.6">INCOME</text>';
-  svg+='<text x="'+(rightX+nodeW+6)+'" y="11" fill="var(--mu)" font-size="9" font-weight="700" text-anchor="start" font-family="var(--fh)" letter-spacing="0.6">WHERE IT WENT</text>';
-  svg+='</svg>';
-  // compact legend (covers any tiny band that had no on-chart label)
-  var leg='<div style="display:flex;flex-wrap:wrap;gap:4px 12px;margin-top:4px;justify-content:center">';
-  model.lefts.concat(model.rights).forEach(function(nd){ leg+='<div style="font-size:11px;color:var(--mu);display:flex;align-items:center;gap:3px"><span style="width:8px;height:8px;border-radius:1px;background:'+nd.color+'"></span>'+_cpEscHtml(nd.label)+' '+fmt(Math.round(nd.value))+'</div>'; });
-  leg+='</div>';
-  if(capped) leg+='<div style="font-size:10px;color:var(--mu);text-align:center;margin-top:3px;opacity:.85">≈ heights adjusted for legibility (not to scale) — the amounts are exact</div>';
-  return svg+leg;
+  // ── plan + breathing room ──
+  h+=_cpWiwPlanHtml();
+  // ── ledger (only when the saved figure is trustworthy) ──
+  if(!deficit&&!srHide) h+='<div style="margin-top:16px !important;text-align:center;font-size:12px;color:var(--mu);padding:10px !important;background:rgba(91,155,255,.05) !important;border:1px solid var(--bd);border-radius:9px">Every dollar accounted for — <b style="color:var(--wh)">'+fmt(exp)+'</b> spent + <b style="color:var(--wh)">'+fmt(Math.round(net))+'</b> kept = <b style="color:var(--wh)">'+fmt(inc)+'</b> earned</div>';
+  return h;
 }
 
 // ── §2.5 (M2) merchant + category analytics + trends ─────────────────────────
@@ -3986,13 +4015,14 @@ function renderReportsView(){
     h+='</div>';
   }
   h+='<div class="info-card" style="padding:14px;margin-bottom:12px"><div class="info-card-title" style="margin-bottom:8px">Monthly Net Cash Flow</div>'+_cpCashFlowBars(rep.months,600,200)+'</div>';
+  // Prior-period report + category deltas — computed here so "Where It Went" can lead with the ▲/▼ vs last period (also reused by Top Merchants below).
+  var _span=endKey-startKey+1;
+  var _priorRep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey-_span, endKey:startKey-1, fallbackIncome:calcs.inc||0, incomeStreams:_incomeConfirm});
+  var _trends=_cpTrendDiff(rep.byCategory, _priorRep.byCategory, 'key');
+  var _hasPrior=(_priorRep.byCategory&&_priorRep.byCategory.length>0);
   h+='<div class="info-card" style="padding:14px"><div class="info-card-title" style="margin-bottom:8px">Where It Went</div>';
   if(rep.byCategory.length){
-    var _sankey=(rep.totalIncome>0&&rep.totalExpense>0)?_cpSankeyModel(rep,{savedIsUntracked:_cfUnreliable}):null; // §2.4b income→category flow
-    if(_sankey) h+='<div style="margin-bottom:10px">'+_cpRenderSankey(_sankey,600,210)+'</div>';
-    var maxCat=rep.byCategory[0].total||1;
-    rep.byCategory.slice(0,10).forEach(function(c){ var meta=_cpSpendCatMeta(c.key), pct=rep.totalExpense>0?Math.round(c.total/rep.totalExpense*100):0;
-      h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:3px"><span style="color:var(--wh)">'+ev(meta.l)+'</span><span style="color:var(--mu)">'+fmt(c.total)+' · '+pct+'%</span></div><div style="height:5px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+Math.round(c.total/maxCat*100)+'%;background:'+meta.c+';border-radius:2px"></div></div></div>'; });
+    h+=_cpWhereItWentHtml(rep,_trends,_hasPrior,_priorRep,_cfUnreliable); // ranked bars + savings verdict + deltas + plan deployment + breathing room (replaced the Monarch-style Sankey)
   } else {
     var _anyData=((APP._txns&&APP._txns.length)||(S.spendingEntries&&S.spendingEntries.length));
     // #73: a linked user with no transactions yet is WAITING FOR THEIR FIRST SYNC — say so, don't imply "nothing here".
@@ -4003,9 +4033,7 @@ function renderReportsView(){
     else { h+=_renderEmptyState('empty',{icon:'📊',title:'No spending yet',message:'No transactions yet — link a bank or add expenses to get started.',ctaLabel:'Add my financial data',ctaOnclick:"showClientPage('pfos')",ctaAriaLabel:'Go to My Financial Data to add expenses or link a bank'}); }
   }
   h+='</div>';
-  // ── §2.5 Top Merchants (plaid merchant_name dimension) ──
-  var _span=endKey-startKey+1;
-  var _priorRep=_cpCashFlowReport({txns:APP._txns||[], spendEntries:S.spendingEntries||[], snapshots:snaps, startKey:startKey-_span, endKey:startKey-1, fallbackIncome:calcs.inc||0, incomeStreams:_incomeConfirm});
+  // ── §2.5 Top Merchants (plaid merchant_name dimension) — _span/_priorRep computed above the card ──
   var _merch=_cpMerchantReport(APP._txns||[], startKey, endKey);
   var _priorMerchRep=_cpMerchantReport(APP._txns||[], startKey-_span, startKey-1);
   var _hasPriorMerch=_priorMerchRep.merchants.length>0; // no prior window data → suppress the "new"/Δ noise (everything would read "new")
@@ -4017,16 +4045,7 @@ function renderReportsView(){
       h+='<div style="margin-bottom:8px"><div style="display:flex;justify-content:space-between;gap:8px;font-size:12px;margin-bottom:3px"><span style="color:var(--wh);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">'+ev(m.name)+' <span style="color:var(--mu);font-size:11px">×'+m.count+'</span></span><span style="color:var(--mu);white-space:nowrap;flex-shrink:0">'+fmt(m.total)+(_dt?' <span style="color:'+_ac+'">'+_dt+'</span>':'')+'</span></div><div style="height:5px;background:rgba(0,68,191,.08);border-radius:2px;overflow:hidden"><div style="height:100%;width:'+Math.round(m.total/_mMax*100)+'%;background:#5B9BFF;border-radius:2px"></div></div></div>'; });
   } else { h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">'+(_plaidLinked?'Top merchants appear once your linked transactions sync.':'Link a bank to see your top merchants.')+'</div>'; }
   h+='</div>';
-  // ── §2.5 Category Trends (this period vs the prior equal window) ──
-  var _trends=_cpTrendDiff(rep.byCategory, _priorRep.byCategory, 'key');
-  var _hasPrior=(_priorRep.byCategory&&_priorRep.byCategory.length>0);
-  h+='<div class="info-card" style="padding:14px;margin-top:12px"><div class="info-card-title" style="margin-bottom:8px">Category Trends'+(_hasPrior?' <span style="font-size:11px;color:var(--mu);font-weight:400">vs prior '+_span+' mo</span>':'')+'</div>';
-  if(_trends.length){
-    _trends.slice(0,10).forEach(function(t){ var _m=_cpSpendCatMeta(t.key), _trendSpan='';
-      if(_hasPrior){ var _ar=(t.dir==='up'?'▲':(t.dir==='down'?'▼':(t.dir==='new'?'•':'–'))), _ac=(t.dir==='up'?'var(--rd)':(t.dir==='down'?'var(--gr)':'var(--mu)')), _dt=(t.dir==='new'?'new':(t.deltaPct==null?'—':Math.abs(t.deltaPct)+'%')); _trendSpan=' <span style="color:'+_ac+';font-weight:700">'+_ar+' '+_dt+'</span>'; } // no prior window → just the amount + bar, no "new" on every row
-      h+='<div style="display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-top:1px solid var(--bd)"><span style="color:var(--wh);font-size:12px"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:'+_m.c+';margin-right:6px"></span>'+ev(_m.l)+'</span><span style="font-size:12px"><span style="color:var(--mu)">'+fmt(t.total)+'</span>'+_trendSpan+'</span></div>'; });
-  } else { h+='<div style="color:var(--mu);font-size:13px;padding:12px 0;text-align:center">No category data in this range.</div>'; }
-  h+='</div>';
+  // (Category Trends card removed — folded into the "Where It Went" ranked bars, which now carry the ▲/▼ deltas.)
   el.innerHTML=h;
   if(typeof renderNetWorthTimeline==='function')try{renderNetWorthTimeline('reportsNwTimeline');}catch(_e){} // §2.3 fused past+future chart into the card above (after innerHTML so the div exists)
 }
