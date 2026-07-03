@@ -1979,15 +1979,15 @@ async function renderRequestsContent(){
 }
 async function _approveAgent(userId){
   if(!confirm('Approve this agent?'))return;
-  try{await db.from('users').update({status:'active'}).eq('id',userId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  try{var _r=await db.from('users').update({status:'active'}).eq('id',userId);if(_r.error)throw _r.error;renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);} // H3: .update() resolves {error} on an RLS-blocked write — was reported as success
 }
 async function _rejectAgent(userId){
   var reason=prompt('Rejection reason (optional):');
-  try{await db.from('users').update({status:'rejected',rejection_message:reason||null}).eq('id',userId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);} // persist the reason (was discarded → agent always saw the generic fallback)
+  try{var _r=await db.from('users').update({status:'rejected',rejection_message:reason||null}).eq('id',userId);if(_r.error)throw _r.error;renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);} // H3: check .error; persist the reason (was discarded → agent always saw the generic fallback)
 }
 async function _approveUnlink(reqId,clientId){
   if(!confirm('Approve this unlink request?'))return;
-  try{await db.from('unlink_requests').update({status:'approved'}).eq('id',reqId);await db.from('clients').update({user_id:null}).eq('id',clientId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  try{var _r1=await db.from('unlink_requests').update({status:'approved'}).eq('id',reqId);if(_r1.error)throw _r1.error;var _r2=await db.from('clients').update({user_id:null}).eq('id',clientId);if(_r2.error)throw _r2.error;renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);} // H3: both writes were unchecked — a blocked 2nd write showed "approved" while the client stayed linked
 }
 async function _approveDelReq(reqId,clientId){
   if(!confirm('This will PERMANENTLY delete the client account and ALL associated data. Are you sure?'))return;
@@ -2003,7 +2003,7 @@ async function _approveDelReq(reqId,clientId){
   }catch(e){alert('Error: '+e.message);}
 }
 async function _denyRequest(table,reqId){
-  try{await db.from(table).update({status:'denied'}).eq('id',reqId);renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);}
+  try{var _r=await db.from(table).update({status:'denied'}).eq('id',reqId);if(_r.error)throw _r.error;renderRequestsContent();_updateRequestsBadge();}catch(e){alert('Error: '+e.message);} // H3: check .error
 }
 // ── AGENTS PAGE (admin-only in dashboard) ────────────────────────────────────
 async function renderAgentsPage(){
@@ -2041,7 +2041,7 @@ async function renderAgentsPage(){
         '<div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">'
           +(isSusp
             ? '<button class="pfos-btn pfos-btn-bl" onclick="restoreAgentAccess(\''+agent.id+'\')">Restore</button>'
-            : '<button class="pfos-btn" onclick="revokeAgentAccess(\''+agent.id+'\')" style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:var(--rd)">Suspend</button>')
+            : '<button class="pfos-btn" onclick="revokeAgentAccess(\''+agent.id+'\',\''+esc(agent.name||agent.email)+'\')" style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:var(--rd)">Suspend</button>') // M7: pass the name (like the Delete button) so the confirm isn't "Suspend undefined?"
           +'<button class="pfos-btn" onclick="confirmDeleteAgent(\''+agent.id+'\',\''+esc(agent.name||agent.email)+'\')" style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:var(--rd)">Delete</button>'
         +'</div>')
     +'</div>';
@@ -2280,22 +2280,11 @@ function updatePendingBadge(){
     if(b){b.textContent=count;b.style.display=count>0?'inline':'none';}
   }).catch(function(){});
 }
-function updateUnlinkBadge(){
-  if(APP.role!=='admin') return;
-  db.from('unlink_requests').select('id').eq('status','pending').then(function(r){
-    var count=(r.data||[]).length;
-    var b=document.getElementById('unlinkBadge');
-    if(b){b.textContent=count;b.style.display=count>0?'inline':'none';}
-  }).catch(function(){});
-}
-function updateDeletionBadge(){
-  if(APP.role!=='admin') return;
-  db.from('deletion_requests').select('id').eq('status','pending').then(function(r){
-    var count=(r.data||[]).length;
-    var b=document.getElementById('deletionBadge');
-    if(b){b.textContent=count;b.style.display=count>0?'inline':'none';}
-  }).catch(function(){});
-}
+// M9: updateUnlinkBadge/updateDeletionBadge were DEAD — they wrote to elements ('unlinkBadge'/'deletionBadge')
+// that don't exist, yet fired a Supabase count query on every renderDashboard. The real request badges are driven
+// by _updateRequestsBadge. No-op'd to drop the two wasted per-render round-trips (call sites left harmless).
+function updateUnlinkBadge(){}
+function updateDeletionBadge(){}
 
 function initSupabase(cb){
   if(window.supabase && window.supabase.createClient){
@@ -5026,13 +5015,14 @@ async function submitSituationChange(){
     // Send as a notification to the agent (stored as message)
     var clientId = APP.currentClientId;
     if(clientId){
-      await db.from('messages').insert({
+      var _mi=await db.from('messages').insert({
         client_id: clientId,
         sender: 'client',
         content: '[Situation Changed] ' + text.trim(),
         is_read: false,
         created_at: new Date().toISOString()
       });
+      if(_mi.error)throw _mi.error; // H1-class: was unchecked → "advisor notified" while the message never persisted
     }
     setBtnLoading('situationBtn', false, 'Notify My Advisor');
     closeModal('situationModal');
@@ -5053,7 +5043,8 @@ async function submitDeletionRequest(){
   if(confirm.trim()!=='DELETE'){ alert('Please type DELETE in uppercase to confirm.'); return; }
   setBtnLoading('deletionSubmitBtn',true,'Submitting...');
   try{
-    await db.from('deletion_requests').insert({client_id:APP.currentClientId,reason:reason.trim()||null,status:'pending',created_at:new Date().toISOString()});
+    var _dr=await db.from('deletion_requests').insert({client_id:APP.currentClientId,reason:reason.trim()||null,status:'pending',created_at:new Date().toISOString()});
+    if(_dr.error)throw _dr.error; // H1-class: was unchecked → a GDPR/erasure request "submitted" while it never persisted
     logAuditEvent('deletion_requested','client',APP.currentClientId,{reason:reason.trim()});
     setBtnLoading('deletionSubmitBtn',false,'Submit Deletion Request');
     closeModal('deletionRequestModal');
@@ -5366,10 +5357,11 @@ async function sendSingleReminder(clientId, email, name, reviewDate, btnEl){
   try{
     var lastDate = reviewDate ? new Date(reviewDate).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}) : null;
     var daysSince = reviewDate ? Math.floor((Date.now()-new Date(reviewDate).getTime())/86400000) : null;
-    await db.functions.invoke('send-notification',{body:{
+    var _sr=await db.functions.invoke('send-notification',{body:{
       type:'review_reminder', clientId:clientId, clientName:name, clientEmail:email,
       lastReviewDate:lastDate, daysSinceReview:daysSince, nextReviewDate:null
     }});
+    if(_sr.error||(_sr.data&&_sr.data.ok===false))throw new Error((_sr.error&&_sr.error.message)||'send failed'); // H2: invoke() resolves {error} on an edge failure — don't report "✓ Sent" when the email didn't go
     if(btnEl){ btnEl.textContent='✓ Sent'; btnEl.style.color='var(--gr)'; btnEl.style.borderColor='rgba(34,197,94,.3)'; }
   }catch(e){
     alert('Failed to send reminder: '+e.message);
@@ -5389,10 +5381,11 @@ async function sendOverdueReminders(){
     try{
       var lastDate = (c.last_review_date||c.next_review_date) ? new Date(c.last_review_date||c.next_review_date).toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'}) : null;
       var daysSince = (c.last_review_date||c.next_review_date) ? Math.floor((Date.now()-new Date(c.last_review_date||c.next_review_date).getTime())/86400000) : null;
-      await db.functions.invoke('send-notification',{body:{
+      var _or=await db.functions.invoke('send-notification',{body:{
         type:'review_reminder', clientId:c.id, clientName:c.name||'', clientEmail:c.email,
         lastReviewDate:lastDate, daysSinceReview:daysSince, nextReviewDate:c.next_review_date?new Date(c.next_review_date).toLocaleDateString("en-US",{month:"long",day:"numeric",year:"numeric"}):null
       }});
+      if(_or.error||(_or.data&&_or.data.ok===false))throw new Error((_or.error&&_or.error.message)||'send failed'); // H2: count a failed send as failed, not "0 failed"
       sent++;
     }catch(e){ failed++; }
   }
@@ -9349,7 +9342,7 @@ function renderInsOverlapCalc(){
   h+='<strong style="color:var(--wh)">📋 Your Profile — Insurance Portfolio:</strong><br>';
   h+='<span style="color:#5B9BFF;font-weight:600">'+policies.length+' policies</span> · Total premiums: <span style="color:var(--or);font-weight:600">'+fmt(totalPremium)+'/mo</span> ('+fmtK(totalPremium*12)+'/yr) · Income: '+fmtK(inc)+'/yr · Net worth: '+fmtK(nw);
   if(spouseInc>0) h+='<br>👥 Spouse income: '+fmtK(spouseInc)+'/yr — couple mode active';
-  h+='<br>Risk profile: <span style="color:#5B9BFF;font-weight:600;text-transform:capitalize">'+((S.riskProfile||"moderate"))+'</span> — influences coverage recommendations';
+  h+='<br>Risk profile: <span style="color:#5B9BFF;font-weight:600;text-transform:capitalize">'+esc((S.riskProfile&&S.riskProfile.label)||(typeof S.riskProfile==='string'?S.riskProfile:'')||"moderate")+'</span> — influences coverage recommendations'; // M6: S.riskProfile is an object {score,label,...} once the questionnaire is done → was rendering "[object Object]"
   h+='</div>';
 
   // ── Empty State ──

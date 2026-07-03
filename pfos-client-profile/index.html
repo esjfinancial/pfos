@@ -3967,7 +3967,7 @@ function renderIBCHealthMonitor(financialData){
     var type=p.type||'Whole Life';
 
     // Health indicators
-    var loanUtil=db_>0?((loanBal/cv)*100):0;
+    var loanUtil=cv>0?((loanBal/cv)*100):0; // M12: guard the DIVISOR (cv), not db_ — a policy with a death benefit but blank cash value gave loanBal/0 = Infinity% + a full-red bar
     var loanCol=loanUtil<=50?'var(--gr)':loanUtil<=80?'var(--yl)':'var(--rd)';
     var loanStatus=loanUtil<=50?'Healthy':loanUtil<=80?'Moderate':'High Utilization';
     var cvGrowth=yrs>0&&prem>0?((cv/(prem*yrs)-1)*100):0;
@@ -4765,7 +4765,7 @@ async function sendPortalInvite(){
     // Generate secure token
     var token=crypto.randomUUID?crypto.randomUUID():(Date.now().toString(36)+Math.random().toString(36).slice(2));
     // Insert invite record
-    await db.from('portal_invites').insert({
+    var _pi=await db.from('portal_invites').insert({
       client_id:APP.currentClientId,
       advisor_id:APP.user?APP.user.id:null,
       email:APP.currentClient.email,
@@ -4774,15 +4774,17 @@ async function sendPortalInvite(){
       created_at:new Date().toISOString(),
       expires_at:new Date(Date.now()+30*24*60*60*1000).toISOString()
     });
+    if(_pi.error)throw _pi.error; // H1-class: was unchecked → "✓ Invite Sent!" with no record/email on a silent failure
     // Send email via edge function
     var advisorName=(APP.userData&&APP.userData.name)||'Your financial advisor';
-    await db.functions.invoke('send-portal-invite',{body:{
+    var _pe=await db.functions.invoke('send-portal-invite',{body:{
       email:APP.currentClient.email,
       clientName:APP.currentClient.name||'',
       advisorName:advisorName,
       inviteToken:token,
       portalUrl:'https://pfos.esjfinancial.com/pfos?tab=client&invite='+token
     }});
+    if(_pe.error||(_pe.data&&_pe.data.ok===false))throw new Error((_pe.error&&_pe.error.message)||'invite email failed'); // H1-class: the invite email failing silently still showed "✓ Invite Sent!"
     APP.currentClient._inviteSent=true;
     APP.currentClient._inviteSentDate=new Date().toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'});
     btn.textContent='✓ Invite Sent!';btn.style.color='var(--gr)';btn.style.borderColor='rgba(34,197,94,.25)';
@@ -5112,22 +5114,25 @@ function _autoSaveSession(){
   if(dur > 0) _persistSessionNote(_sessionClientId, notes, dur);
 }
 async function _persistSessionNote(clientId, notes, durationMin){
-  if(!clientId) return;
+  if(!clientId) return false;
   try{
-    await db.from('session_notes').insert({
+    var _sn=await db.from('session_notes').insert({
       client_id: clientId,
       agent_id: APP.user ? APP.user.id : null,
       notes: notes||null,
       duration_min: durationMin||0,
       created_at: new Date().toISOString()
     });
-  }catch(e){ console.warn('session note save:', e); }
+    if(_sn&&_sn.error)throw _sn.error; // H1-class: return success so the caller doesn't show "saved" on a silent failure
+    return true;
+  }catch(e){ console.warn('session note save:', e); return false; }
 }
 async function saveSessionNote(){
   var clientId = APP.currentClientId; if(!clientId) return;
   var notes = (document.getElementById('sessionNotesInput')||{}).value||'';
   var dur = _sessionStart ? Math.round((Date.now()-_sessionStart)/60000) : 0;
-  await _persistSessionNote(clientId, notes, dur);
+  var _ok = await _persistSessionNote(clientId, notes, dur);
+  if(!_ok){ if(typeof _advShowToast==='function')_advShowToast('Session note didn’t save — please retry.','error'); return; } // H1-class: was showing "saved" unconditionally
   var saved = document.getElementById('sessionNoteSaved');
   if(saved){ saved.style.display='inline'; setTimeout(function(){saved.style.display='none';},2000); }
   loadSessionNotes(clientId);
@@ -5437,7 +5442,9 @@ async function saveRecommendation(){
   try {
     var error;
     if(editId){
-      const res = await db.from('advisor_recommendations').update(data).eq('id', editId);
+      // H10: editing the TEXT must not reset status→'pending' or reassign created_by — strip both (+ created_at) from the update.
+      var _upd=Object.assign({},data); delete _upd.status; delete _upd.created_by; delete _upd.created_at;
+      const res = await db.from('advisor_recommendations').update(_upd).eq('id', editId);
       error = res.error;
     } else {
       data.created_at = new Date().toISOString();
@@ -6078,8 +6085,9 @@ async function saveClientNotes(){
   var notes=(document.getElementById('advisorNotes')||{}).value||'';
   try{
     const { data:ex } = await db.from('client_profiles').select('id').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    if(ex){ await db.from('client_profiles').update({notes,updated_at:new Date().toISOString()}).eq('id',ex.id); }
-    else { await db.from('client_profiles').insert({client_id:APP.currentClientId,notes,financial_data:{},scores:{},updated_at:new Date().toISOString()}); }
+    var _nr; if(ex){ _nr=await db.from('client_profiles').update({notes,updated_at:new Date().toISOString()}).eq('id',ex.id); }
+    else { _nr=await db.from('client_profiles').insert({client_id:APP.currentClientId,notes,financial_data:{},scores:{},updated_at:new Date().toISOString()}); }
+    if(_nr&&_nr.error)throw _nr.error; // H1-class: was unchecked → "notes saved" shown on a silent RLS/network failure (the catch below surfaces the error)
     var el=document.getElementById('notesSaved'); if(el){ el.style.display='inline'; setTimeout(()=>el.style.display='none',2000); }
   }catch(e){ console.error('saveClientNotes error:',e); _advShowToast('Notes save failed: '+e.message,'error'); }
 }
@@ -6142,7 +6150,7 @@ async function saveClientData(){
     const { data:ex } = await db.from('client_profiles').select('id').eq('client_id',_scSaveId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
     var pp={client_id:_scSaveId,financial_data:{S:stateData,calcs},scores,updated_at:new Date().toISOString()};
     if(_scIsV2) pp.allow_data_downgrade=true;
-    if(ex){ await db.from('client_profiles').update(pp).eq('id',ex.id); } else { await db.from('client_profiles').insert(pp); }
+    if(ex){ var _u=await db.from('client_profiles').update(pp).eq('id',ex.id); if(_u.error)throw _u.error; } else { var _in=await db.from('client_profiles').insert(pp); if(_in.error)throw _in.error; } // H1: .update()/.insert() resolve {error} — was showing "saved" on an RLS/network failure (the catch below surfaces the real error toast)
     await db.from('clients').update({last_review_date:new Date().toISOString().split('T')[0]}).eq('id',_scClientId);
     // Auto-save daily snapshot for trend tracking (Phase 4)
     autoSaveSnapshot(_scClientId, calcs);
@@ -6825,11 +6833,15 @@ window.addEventListener('message', async function(e){
         record.purpose=pd.purpose||null;
       }
       // Duplicate check: same client + carrier + product
-      var dupQuery=db.from('policy_tracking').select('id').eq('client_id',APP.currentClientId).eq('carrier',carrier);
+      var _dupIds=[APP.currentClientId];
+      var _dupCouple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
+      if(_dupCouple&&_dupCouple.household_type==='joint')_dupIds=[_dupCouple.client_a_id,_dupCouple.client_b_id]; // M10: couple-scope the dup-check (mirrors PFOS_POLICY_DELETED) so re-auditing as A doesn't miss a policy under B and insert a duplicate
+      var dupQuery=db.from('policy_tracking').select('id,client_id').in('client_id',_dupIds).eq('carrier',carrier);
       if(productName)dupQuery=dupQuery.eq('product_name',productName);
-      var {data:existing}=await dupQuery.maybeSingle();
+      var {data:existing}=await dupQuery.order('created_at',{ascending:false}).limit(1).maybeSingle(); // M10: .maybeSingle() THREW on ≥2 matches (which a self-only dup-check created in joint households) → the catch swallowed it and it kept inserting more; limit(1) makes the upsert idempotent
       if(existing&&existing.id){
-        await db.from('policy_tracking').update(record).eq('id',existing.id);
+        var _updRec=record; if(existing.client_id&&existing.client_id!==APP.currentClientId){ _updRec=Object.assign({},record); delete _updRec.client_id; } // M10: update in place but DON'T reassign a policy that lives under the partner's row (record.client_id would otherwise move it)
+        await db.from('policy_tracking').update(_updRec).eq('id',existing.id);
         console.log('[PFOS-CP] Updated existing policy_tracking record:',existing.id);
       } else {
         await db.from('policy_tracking').insert(record);
@@ -28436,11 +28448,11 @@ async function _cpSavePlan(){
       var ex=await db.from('client_profiles').select('id,allocation_plan').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       if(ex&&ex.data){
         var _plan=_cpMergePlanEnvelope(ex.data.allocation_plan,CPLAN.allocations);
-        await db.from('client_profiles').update({
+        var _su=await db.from('client_profiles').update({
           allocation_plan:_plan,
           plan_status:'draft',
           updated_at:new Date().toISOString()
-        }).eq('id',ex.data.id);
+        }).eq('id',ex.data.id); if(_su.error)throw _su.error; // H1: was unchecked → "✓ Saved!" on a failed write
       }
     }
     CPLAN._planStatus='draft';CPLAN.modified=false;
@@ -28448,7 +28460,7 @@ async function _cpSavePlan(){
     if(typeof _cpCaptureSnapshot==='function')_cpCaptureSnapshot('manual_save','advisor','Advisor saved draft');
     var btn=document.querySelector('[onclick="_cpSavePlan()"]');
     if(btn){btn.textContent='✓ Saved!';setTimeout(function(){btn.textContent='💾 Save Plan';},1500);}
-  }catch(e){console.warn('Plan save failed:',e);}
+  }catch(e){console.warn('Plan save failed:',e);if(typeof _advShowToast==='function')_advShowToast('Save failed: '+(e&&e.message||e),'error');var _sb=document.querySelector('[onclick="_cpSavePlan()"]');if(_sb)_sb.textContent='💾 Save Plan';} // H1: surface the failure instead of a silent false "Saved!"
 }
 
 // ── PUBLISH PLAN: makes the plan visible to the client + sends notifications ──
@@ -28477,7 +28489,7 @@ async function _cpPublishPlan(){
       var ex=await db.from('client_profiles').select('id,allocation_plan').eq('client_id',APP.currentClientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
       if(!ex||!ex.data){throw new Error('Client profile row not found');}
       var planObj=_cpMergePlanEnvelope(ex.data.allocation_plan,CPLAN.allocations);
-      await db.from('client_profiles').update({allocation_plan:planObj,plan_status:'published',plan_published_at:nowIso,updated_at:nowIso}).eq('id',ex.data.id);
+      var _pu=await db.from('client_profiles').update({allocation_plan:planObj,plan_status:'published',plan_published_at:nowIso,updated_at:nowIso}).eq('id',ex.data.id); if(_pu.error)throw _pu.error; // H1: was unchecked → "Published" (+ client emailed) while the DB kept the old plan
     }
     // ── Stage 4 write-back: sync shared-goal planned contributions to shared_goals ──
     // Each Combined-tab shared-goal card carries _sharedGoalRowId. Persist its planned
@@ -28584,7 +28596,7 @@ async function _cpApproveChanges(){
     if(!ex||!ex.data){throw new Error('Client profile row not found');}
     var nowIso=new Date().toISOString();
     var newPlan={allocations:pc.proposed,debtStrategy:pc.debtStrategy||CPLAN.debtStrategy};
-    await db.from('client_profiles').update({allocation_plan:newPlan,plan_status:'published',plan_published_at:nowIso,proposed_plan_changes:null,updated_at:nowIso}).eq('id',ex.data.id);
+    var _au=await db.from('client_profiles').update({allocation_plan:newPlan,plan_status:'published',plan_published_at:nowIso,proposed_plan_changes:null,updated_at:nowIso}).eq('id',ex.data.id); if(_au.error)throw _au.error; // H1: was unchecked → "approved & republished, client notified" while the DB kept the old plan
     CPLAN.allocations=JSON.parse(JSON.stringify(pc.proposed));
     if(pc.debtStrategy)CPLAN.debtStrategy=pc.debtStrategy;
     CPLAN._planStatus='published';CPLAN._planPublishedAt=nowIso;CPLAN._proposedChanges=null;CPLAN.modified=false;
