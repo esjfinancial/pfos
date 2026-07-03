@@ -2030,10 +2030,14 @@ async function approveUnlinkRequest(reqId, coupleLinkId, requestingClientId){
       var _clnB = await _jmAdminUnlinkClean(couple.client_b_id);
       if(!_clnB.ok){ alert('Unlink aborted — could not clean partner row:\n'+_clnB.error+'\n\nThe link was NOT deleted. Note: the primary row was already cleaned and can be restored from its backup if needed.'); return; }
     }
-    // 2. Delete the couple link
-    await db.from('couple_links').delete().eq('id',coupleLinkId);
-    // 3. Mark request approved
+    // 2. Mark the request approved BEFORE deleting the link. unlink_requests.couple_link_id is
+    //    ON DELETE CASCADE → deleting couple_links first cascade-removes this very row, so the
+    //    update no-oped (dead). Ordering it first records the status while the row still exists
+    //    (and keeps it correct if the FK is ever softened from CASCADE); the cascade below then
+    //    removes the request as intended.
     await db.from('unlink_requests').update({status:'approved'}).eq('id',reqId);
+    // 3. Delete the couple link (cascade-removes the unlink_requests row updated above)
+    await db.from('couple_links').delete().eq('id',coupleLinkId);
     logAuditEvent('unlink_approved','couple_link',coupleLinkId,{request_id:reqId,requesting_client:requestingClientId,partner_client:partnerId});
     // 4. Notify the OTHER client (the one who didn't request it)
     if(partnerId){
@@ -2147,6 +2151,7 @@ async function rejectDeletionRequest(reqId){
   var msg=prompt('Optional: Reason for rejection'); if(msg===null) return;
   try{
     await db.from('deletion_requests').update({status:'rejected',admin_message:msg.trim()||null}).eq('id',reqId);
+    logAuditEvent('deletion_rejected','deletion_request',reqId,{reason:msg.trim()||null}); // was unlogged — mirrors client_deleted (approve) + unlink_rejected
     renderDeletionRequestsPage();
   }catch(e){ alert('Error: '+e.message); }
 }
@@ -2675,6 +2680,7 @@ async function inviteAgent(){
 
     // Send password-reset email so the agent sets their own password
     await db.auth.resetPasswordForEmail(email);
+    logAuditEvent('agent_invited','agent',newUserId,{email:email,name:name||email.split('@')[0]}); // was unlogged — creating a staff account is sensitive; mirrors agent_approved/agent_suspended/agent_deleted
 
     await loadAgents();
     await renderAgentsPage();
