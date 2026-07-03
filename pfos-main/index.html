@@ -6434,12 +6434,14 @@ function saveSnapshot(){
     alreadySpent:pf((document.getElementById('snapSpent')||{}).value),
     billsPaid:pf((document.getElementById('snapBills')||{}).value)
   };
+  (S._touched=S._touched||{}).snapshot=true; // C6: persist the calibration snapshot (was reverted by the section-merge on next save)
   closeModal('snapModal');
   calc();renderHome();
 }
 function skipSnapshot(){
   var now=new Date();
   S.snapshot={setupDate:now.toISOString(),month:now.getMonth(),year:now.getFullYear(),dayOfMonth:now.getDate(),alreadySpent:0,billsPaid:0,checkingBalance:0,savingsBalance:0,skipped:true};
+  (S._touched=S._touched||{}).snapshot=true; // C6: persist the skipped-snapshot marker
   renderHome();
 }
 
@@ -7300,6 +7302,14 @@ function _spendSplitParts(e){
 // dedupe, cap 24 chars/tag and 12 tags/entry. MUST stay byte-identical to the pfos-client _normTags mirror.
 function _normTag(t){ return String(t==null?'':t).trim().toLowerCase().replace(/\s+/g,' ').replace(/[^a-z0-9 _\-]/g,'').slice(0,24).trim(); }
 function _normTags(arr){ var out=[],seen={}; (Array.isArray(arr)?arr:[]).forEach(function(t){ var n=_normTag(t); if(n&&!seen[n]&&out.length<12){seen[n]=1;out.push(n);} }); return out; }
+// C3: after a spend side-effect mutates a PROTECTED section, mark it touched so the section-merge save
+// doesn't revert the balance change (mirrors the QUICK_ADD pattern; used by every reverse/apply/adjust path).
+function _touchSpendMethod(m){
+  if(!S._touched)S._touched={};
+  if(m==='credit_card'||m==='financed')S._touched.debts=true;
+  else if(m==='emergency_fund')S._touched.assets=true;
+  else if(m==='policy_loan'){S._touched.policies=true;S._touched.ibcPolicies=true;}
+}
 function _applySpendSideEffects(e){
   if(!e)return; var amt=parseFloat(e.amount)||0; var pd=e.payment_detail||{};
   if(e.payment_method==='credit_card'){ var _cd=_cardDebt(pd); if(_cd)_cd.balance=(parseFloat(_cd.balance)||0)+amt; }
@@ -7385,15 +7395,14 @@ function saveSpendingEntry(){
   if(!S.spendingEntries)S.spendingEntries=[];
   if(_qaEditIdx>=0)S.spendingEntries[_qaEditIdx]=entry;else S.spendingEntries.push(entry);
   if(!S._touched)S._touched={};S._touched.spendingEntries=true; // #2 MF: mark touched so the section-merge save doesn't drop the new/edited entry
-  if(entry.payment_method==='credit_card'||entry.payment_method==='financed')S._touched.debts=true; // side-effect mutated S.debts (protected) — else the balance bump / new financed debt is reverted on save
-  if(entry.payment_method==='emergency_fund')S._touched.assets=true; // side-effect reduced aSavings (protected assets) — else the drawdown is reverted
+  _touchSpendMethod(entry.payment_method); if(_qaOld)_touchSpendMethod(_qaOld.payment_method); // C3: persist debts/assets/policies mutated by the side-effect (incl. the OLD method reversed on a method-change edit — was missing policy_loan)
   _qaEditIdx=-1;calc();closeModal('quickAddModal');if(_currentSection==='home')renderHome();
 }
 function editSpendingEntry(idx){openQuickAdd(idx);}
 function deleteSpendingEntry(idx){
   if(!S.spendingEntries||!S.spendingEntries[idx])return;var e=S.spendingEntries[idx];
   _reverseSpendSideEffects(e); // #3 MF: full reversal (was card+EF only — financed debt & policy loan leaked)
-  S.spendingEntries.splice(idx,1);if(!S._touched)S._touched={};S._touched.spendingEntries=true;calc();if(_currentSection==='home')renderHome();
+  S.spendingEntries.splice(idx,1);if(!S._touched)S._touched={};S._touched.spendingEntries=true;_touchSpendMethod(e.payment_method);calc();if(_currentSection==='home')renderHome(); // C3: persist the reversed debts/assets/policies
 }
 function updateProfileSidebar(){
   var nm=getFullName();
@@ -10151,7 +10160,7 @@ function _plaidMaybePromptSpendOverlaps(){
 function _plaidReplaceSpendOverlaps(){
   try{
     var ov=window._plaidSpendOverlaps||[];
-    ov.forEach(function(o){ var i=S.spendingEntries.indexOf(o.manual); if(i>=0) S.spendingEntries.splice(i,1); }); // remove manual copy only
+    ov.forEach(function(o){ var i=S.spendingEntries.indexOf(o.manual); if(i>=0){ _reverseSpendSideEffects(o.manual); _touchSpendMethod(o.manual&&o.manual.payment_method); S.spendingEntries.splice(i,1); } }); // remove the manual copy AND reverse its card/financed/EF/policy side-effect (C3 rev: was leaving the balance inflated + un-flagged, unlike every other delete path)
     S._touched=S._touched||{}; S._touched.spendingEntries=true;
     if(typeof renderHome==='function' && _currentSection==='home') renderHome();
     calc();
@@ -13890,6 +13899,7 @@ function deApplyImplementationEffect(recIdx){
     if(!S.expData)S.expData={};
     if(!S.expData['insurance'])S.expData['insurance']={};
     S.expData['insurance'].amount=(parseFloat(S.expData['insurance'].amount)||0)+amt;
+    (S._touched=S._touched||{}).expData=true; // C2: persist the applied insurance premium (else the section-merge reverts the whole apply-rec loop)
     // Auto-update coverage amount
     var covEl=document.getElementById('liCoverage');
     if(covEl){
@@ -13963,6 +13973,7 @@ function deApplyImplementationEffect(recIdx){
         }
         targetAcct.contrib = requestedNewContrib;
         applied = true;
+        (S._touched=S._touched||{}).retAccounts=true; // C2: persist the applied contribution
         // Linked income update for pre-tax payroll-deducted contributions only.
         // Roth payroll (post-tax) and IRA accounts don't reduce taxable wages
         // and aren't withheld from payroll in the same way, so no income-card
@@ -13970,6 +13981,7 @@ function deApplyImplementationEffect(recIdx){
         if(_isPayrollDeducted(targetAcct.type) && !_isRoth401kFamily(targetAcct.type) && capDelta > 0){
           var linkResult = _applyLinkedIncomePretaxUpdate(targetIdx, capDelta);
           if(linkResult.linked){
+            (S._touched=S._touched||{}).incomeSources=true; // C2: persist the linked paycheck pretax/take-home change
             console.log('[apply-rec] Linked income update: src['+linkResult.srcIdx+'] +$'+linkResult.deltaPerCheck.toFixed(2)+' per check pretax 401k, -$'+linkResult.takeHomeReductionPerCheck.toFixed(2)+' per check take-home (marginal rate '+(linkResult.marginalRate*100).toFixed(1)+'%)');
           } else {
             console.log('[apply-rec] No detailed-mode income source to link — Retirement updated, Income card unchanged. User should update paycheck details manually.');
@@ -13977,7 +13989,10 @@ function deApplyImplementationEffect(recIdx){
         }
       }
     }
-    if(!applied){var el=document.getElementById('retContrib');if(el)el.value=String(pf(el.value)+amt);}
+    if(!applied){ // rev F1 (owner: guard + note): no contributable retirement account — DON'T fabricate one or flag it (retContrib is derived from S.retAccounts and evaporates). Note it; the client adds an account first.
+      console.warn('[apply-rec] No retirement account to apply the contribution to — skipped. Client should add a retirement account first.');
+      if(typeof _pmToast==='function'){try{_pmToast('Add a retirement account first, then apply this recommendation.');}catch(_e){}}
+    }
     // Re-render the panels we just modified so the DOM reflects new state.
     if(typeof renderRetAccounts === 'function') renderRetAccounts();
     if(typeof renderIncomeRow === 'function') renderIncomeRow();
@@ -13987,30 +14002,44 @@ function deApplyImplementationEffect(recIdx){
     if(!S.expData)S.expData={};
     if(!S.expData['discretionary'])S.expData['discretionary']={};
     S.expData['discretionary'].amount=Math.max(0,(parseFloat(S.expData['discretionary'].amount)||0)-amt);
+    (S._touched=S._touched||{}).expData=true; // C2: persist the discretionary cut
   }
   if(r.section==='emergency_fund'||r.flagId==='ef_none'||r.flagId==='ef_low'){
     // Add to savings
     var savEl=document.getElementById('aSavings');
     if(savEl) savEl.value=String((parseFloat(savEl.value)||0)+amt);
     if(S.assets) S.assets.savings=(S.assets.savings||0)+amt;
+    (S._touched=S._touched||{}).assets=true; // C2: persist the EF top-up
   }
   if(r.section==='debt'||r.flagId==='high_debt'||r.flagId==='dti_high'){
     // Increase extra debt payment — apply to highest-rate debt
     if(S.debts&&S.debts.length){
       var sorted=S.debts.slice().sort(function(a,b){return(b.rate||0)-(a.rate||0);});
-      if(sorted[0]) sorted[0].min=(sorted[0].min||0)+amt;
+      if(sorted[0]){ sorted[0].min=(sorted[0].min||0)+amt; (S._touched=S._touched||{}).debts=true; } // C2: persist the extra debt payment
     }
   }
   if(r.section==='investment'||r.flagId==='idle_cash'){
-    // Move cash to investments
+    // Move cash to investments — the durable section is S.investments (calc() re-derives S.assets.invest from
+    // sum(S.investments[].balance)), so bump the first non-crypto investment account; only fall back to the legacy
+    // S.assets.invest scalar when the client has NO investment accounts (the one case where calc() keeps it). [rev F2]
     var invEl=document.getElementById('aInvest');
     if(invEl) invEl.value=String((parseFloat(invEl.value)||0)+amt);
-    if(S.assets) S.assets.invest=(S.assets.invest||0)+amt;
+    var _iv0=null; if(Array.isArray(S.investments)){ for(var _ivi=0;_ivi<S.investments.length;_ivi++){ if(S.investments[_ivi]&&(S.investments[_ivi].type||'').toLowerCase()!=='crypto'){ _iv0=S.investments[_ivi]; break; } } }
+    if(_iv0){ _iv0.balance=(parseFloat(_iv0.balance)||0)+amt; (S._touched=S._touched||{}).investments=true; }
+    else { if(S.assets) S.assets.invest=(S.assets.invest||0)+amt; (S._touched=S._touched||{}).assets=true; }
   }
   if(r.section==='education'||r.flagId==='edu_gap'){
-    // Increase education savings contribution
-    if(S.eduChildren&&S.eduChildren.length){
-      S.eduChildren[0].contrib=(S.eduChildren[0].contrib||0)+amt;
+    // Increase education savings contribution — M21: was S.eduChildren (never assigned → always no-op); the real array is S.children.
+    // The funding-gap projection reads child.accounts[].contrib; the cash-flow expense reads the legacy child.contrib
+    // (getEduContribAuto) — bump BOTH (separate consumers, no double-count) so the rec moves the gap AND the cash flow. [rev F3]
+    if(S.children&&S.children.length){
+      var _per=amt/S.children.length; // rev (owner): split the education allocation EVENLY across ALL children (was dumped on child[0], under-funding the others)
+      S.children.forEach(function(_ch0){
+        if(!_ch0.accounts||!_ch0.accounts.length){ _ch0.accounts=[{type:_ch0.acctType||'529',balance:parseFloat(_ch0.savings)||0,contrib:parseFloat(_ch0.contrib)||0,grossReturn:_ch0.grossReturn!=null?_ch0.grossReturn:7,fundFee:_ch0.fundFee!=null?_ch0.fundFee:0.5,advFee:_ch0.advFee!=null?_ch0.advFee:0}]; }
+        _ch0.accounts[0].contrib=(parseFloat(_ch0.accounts[0].contrib)||0)+_per;
+        _ch0.contrib=(parseFloat(_ch0.contrib)||0)+_per;
+      });
+      (S._touched=S._touched||{}).children=true; // C2: persist the education contribution bump
     }
   }
   // Cascade: recalculate everything and re-render
@@ -15436,6 +15465,7 @@ function submitAdvisorRequestFromModal(){
         S.spendingEntries=S.spendingEntries.filter(function(e){return !(e&&String(e.id)===String(_delId));});
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
+        _touchSpendMethod(_delCur.payment_method); // C3: persist the reversed debts/assets/policies (else the reversal is undone on save)
         try{if(typeof calc==='function')calc();}catch(e){}
         clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
@@ -15485,6 +15515,7 @@ function submitAdvisorRequestFromModal(){
         if(_ed.tags!==undefined){ var _et2=_normTags(_ed.tags); if(_et2.length)_cur.tags=_et2; else delete _cur.tags; }
         if(!S._touched)S._touched={};
         S._touched.spendingEntries=true;
+        _touchSpendMethod(_oldMethod); _touchSpendMethod(_cur.payment_method); // C3: persist the reversed OLD + applied NEW side-effects (debts/assets/policies) across a method or amount edit
         try{if(typeof calc==='function')calc();}catch(e){}
         clearTimeout(S._syncTimer);S._syncTimer=setTimeout(_doSync,300);
         if(_currentSection==='home'&&typeof renderHome==='function'){try{renderHome();}catch(e){}}
@@ -15517,6 +15548,7 @@ function submitAdvisorRequestFromModal(){
             _bChanged=true; _bNeedCalc=true;
           } else if(op.op==='delete'){
             _reverseSpendSideEffects(ent); // no-op for linked (debit/no detail); reverses card/financed/EF/policy for manual
+            _touchSpendMethod(ent.payment_method); // C3: persist the reversed debts/assets/policies for a bulk delete
             _bDel[String(op.id)]=true;
             _bChanged=true; _bNeedCalc=true;
           } else if(op.op==='addTags'||op.op==='removeTags'){
