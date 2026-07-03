@@ -1880,6 +1880,7 @@ async function approveAgent(agentId){
   try{
     const {error}=await db.from('users').update({status:'active'}).eq('id',agentId);
     if(error){ alert('Approval failed: '+error.message); return; }
+    logAuditEvent('agent_approved','agent',agentId,{});
     // Send approval notification email
     var {data:agentData}=await db.from('users').select('email,name').eq('id',agentId).maybeSingle();
     if(agentData && agentData.email){
@@ -1896,6 +1897,7 @@ async function rejectAgent(agentId){
   try{
     const {error}=await db.from('users').update({status:'rejected',rejection_message:msg||null}).eq('id',agentId);
     if(error){ alert('Rejection failed: '+error.message); return; }
+    logAuditEvent('agent_rejected','agent',agentId,{reason:msg||null});
     // Send rejection notification email
     var {data:agentData}=await db.from('users').select('email,name').eq('id',agentId).maybeSingle();
     if(agentData && agentData.email){
@@ -2032,6 +2034,7 @@ async function approveUnlinkRequest(reqId, coupleLinkId, requestingClientId){
     await db.from('couple_links').delete().eq('id',coupleLinkId);
     // 3. Mark request approved
     await db.from('unlink_requests').update({status:'approved'}).eq('id',reqId);
+    logAuditEvent('unlink_approved','couple_link',coupleLinkId,{request_id:reqId,requesting_client:requestingClientId,partner_client:partnerId});
     // 4. Notify the OTHER client (the one who didn't request it)
     if(partnerId){
       await db.from('client_notifications').insert({
@@ -2061,6 +2064,7 @@ async function rejectUnlinkRequest(reqId, requestingClientId){
       status:'rejected',
       admin_message: reason.trim()||null
     }).eq('id',reqId);
+    logAuditEvent('unlink_rejected','unlink_request',reqId,{requesting_client:requestingClientId,reason:reason.trim()||null});
     await db.from('client_notifications').insert({
       client_id: requestingClientId,
       type: 'unlink_rejected',
@@ -2482,6 +2486,7 @@ async function archiveClient(clientId){
   if(!confirm('Archive this client? Their status will be set to "Sold".')) return;
   try{
     await db.from('clients').update({status:'sold',updated_at:new Date().toISOString()}).eq('id',clientId);
+    logAuditEvent('client_archived','client',clientId,{status:'sold'});
     var idx=(APP.allClients||[]).findIndex(function(c){return c.id===clientId;});
     if(idx>=0) APP.allClients[idx].status='sold';
     renderInactiveClients();
@@ -2504,6 +2509,7 @@ async function bulkArchiveInactive(){
   checked.forEach(function(cb){ids.push(cb.value);});
   try{
     await db.from('clients').update({status:'sold',updated_at:new Date().toISOString()}).in('id',ids);
+    logAuditEvent('clients_bulk_archived','client',null,{ids:ids,count:ids.length,status:'sold'});
     ids.forEach(function(id){
       var idx=(APP.allClients||[]).findIndex(function(c){return c.id===id;});
       if(idx>=0) APP.allClients[idx].status='sold';
@@ -2726,6 +2732,7 @@ async function revokeAgentAccess(agentId, agentName){
   try{
     const { error } = await db.from('users').update({ role: 'suspended' }).eq('id', agentId);
     if(error){ alert('Failed: ' + error.message); return; }
+    logAuditEvent('agent_suspended','agent',agentId,{agent_name:agentName});
     // Update local agent record
     var a = APP.agents.find(function(a){ return a.id===agentId; });
     if(a) a.role = 'suspended';
@@ -2737,6 +2744,7 @@ async function restoreAgentAccess(agentId){
   try{
     const { error } = await db.from('users').update({ role: 'agent' }).eq('id', agentId);
     if(error){ alert('Failed: ' + error.message); return; }
+    logAuditEvent('agent_restored','agent',agentId,{});
     var a = APP.agents.find(function(a){ return a.id===agentId; });
     if(a) a.role = 'agent';
     if(APP.agentMap[agentId]) APP.agentMap[agentId].role = 'agent';
@@ -2788,6 +2796,7 @@ async function deleteAgent(agentId){
     // Delete the agent from users table
     const { error: e3 } = await db.from('users').delete().eq('id', agentId);
     if(e3){ alert('Error deleting agent: ' + e3.message); return; }
+    logAuditEvent('agent_deleted','agent',agentId,{reassigned_pfos:pfosClients.length,reassigned_other:otherClients.length});
 
     // Update local state
     APP.agents = APP.agents.filter(function(a){ return a.id!==agentId; });
@@ -2867,6 +2876,7 @@ async function updateHouseholdType(coupleLinkId, newType){
     }
     const { error } = await db.from('couple_links').update({ household_type: newType }).eq('id', coupleLinkId);
     if(error){ alert('Failed: ' + error.message); return; }
+    logAuditEvent('household_type_changed','couple_link',coupleLinkId,{from:curType0,to:newType});
     var cl = APP_COUPLES.find(function(c){ return c.id===coupleLinkId; });
     if(cl) cl.household_type = newType;
     renderCouplesPage();
@@ -2881,6 +2891,7 @@ async function unlinkCouple(coupleLinkId, nameA, nameB){
   try{
     const { error } = await db.from('couple_links').delete().eq('id', coupleLinkId);
     if(error){ alert('Failed: ' + error.message); return; }
+    logAuditEvent('couple_unlinked','couple_link',coupleLinkId,{name_a:nameA,name_b:nameB});
     APP_COUPLES = APP_COUPLES.filter(function(c){ return c.id!==coupleLinkId; });
     renderCouplesPage();
     // Refresh profile if viewing one of these clients
