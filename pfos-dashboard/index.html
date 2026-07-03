@@ -2248,10 +2248,56 @@ async function updateHouseholdType(coupleLinkId, newType){
     if(cl) cl.household_type = newType;
   }catch(e){ alert('Could not update household type: '+e.message); }
 }
+// Couple-unlink cleanup (§3 copy of the pfos-admin helper): strip a client's spouse items + park joint items
+// before the link is deleted, so an unlink never leaves a half-merged profile. Returns {ok,error}.
+var _JM_MERGE_ARRAYS_ADMIN = ['incomeSources','retAccounts','investments','debts','goals'];
+var _JM_SP_FIELDS_ADMIN = ['spFirstName','spLastName','spEmail','spOccupation','spouse_employment_type','spouseEmploymentType','spEmploymentType','spDOB','spCurrentAge','spRetAge','spRetIncome','spSsBenefit','spAnnualIncome','spouseInfo','_spouseAnnualGross','_spouseAnnualPretax'];
+async function _jmAdminUnlinkClean(clientId){
+  if(!clientId) return {ok:false, error:'no clientId'};
+  try{
+    var r = await db.from('client_profiles')
+      .select('id,financial_data,previous_financial_data,previous_financial_data_2')
+      .eq('client_id', clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    if(r.error) return {ok:false, error:r.error.message};
+    if(!r.data || !r.data.financial_data || !r.data.financial_data.S){ return {ok:true, noop:true}; }
+    var fd = r.data.financial_data;
+    var S = JSON.parse(JSON.stringify(fd.S));
+    var parked = Array.isArray(S._pendingJointCleanup) ? S._pendingJointCleanup.slice() : [];
+    _JM_MERGE_ARRAYS_ADMIN.forEach(function(arr){
+      if(!Array.isArray(S[arr])) return;
+      var keep = [];
+      S[arr].forEach(function(it){
+        var o = (it && it.owner) ? String(it.owner) : 'self';
+        if(o==='spouse'){ return; }
+        if(o==='joint'){ var p = Object.assign({}, it); p._cleanupArr = arr; parked.push(p); return; }
+        keep.push(it);
+      });
+      S[arr] = keep;
+    });
+    if(S.profile && typeof S.profile==='object'){ _JM_SP_FIELDS_ADMIN.forEach(function(f){ if(f in S.profile) delete S.profile[f]; }); }
+    _JM_SP_FIELDS_ADMIN.forEach(function(f){ if(f in S) delete S[f]; });
+    if(parked.length) S._pendingJointCleanup = parked; else delete S._pendingJointCleanup;
+    var fdNew = Object.assign({}, fd, {S:S});
+    var pp = { financial_data:fdNew, allow_data_downgrade:true, updated_at:new Date().toISOString(), previous_financial_data:fd };
+    if(r.data.previous_financial_data) pp.previous_financial_data_2 = r.data.previous_financial_data;
+    if(r.data.previous_financial_data_2) pp.previous_financial_data_3 = r.data.previous_financial_data_2;
+    var w = await db.from('client_profiles').update(pp).eq('id', r.data.id);
+    if(w.error) return {ok:false, error:w.error.message};
+    return {ok:true, parked:parked.length};
+  }catch(e){ return {ok:false, error:e.message}; }
+}
 async function unlinkCouple(coupleLinkId, nameA, nameB){
   if(APP.role !== 'admin'){ alert('Only admins can unlink couples.'); return; }
-  if(!confirm('Permanently unlink '+nameA+' and '+nameB+'? This cannot be undone.')) return;
+  if(!confirm('Permanently unlink '+nameA+' and '+nameB+'?\n\nEach partner\'s spouse data is stripped and shared (joint) items parked for review — no profile is deleted.')) return;
   try{
+    // Clean BOTH rows before deleting the link — was a bare delete with NO cleanup → both profiles left half-merged.
+    const { data: _cpl } = await db.from('couple_links').select('client_a_id,client_b_id').eq('id',coupleLinkId).maybeSingle();
+    if(_cpl){
+      var _clnA = await _jmAdminUnlinkClean(_cpl.client_a_id);
+      if(!_clnA.ok){ alert('Unlink aborted — could not clean the primary row:\n'+_clnA.error+'\n\nThe link was NOT deleted.'); return; }
+      var _clnB = await _jmAdminUnlinkClean(_cpl.client_b_id);
+      if(!_clnB.ok){ alert('Unlink aborted — could not clean the partner row:\n'+_clnB.error+'\n\nThe link was NOT deleted (primary already cleaned; restorable from backup).'); return; }
+    }
     await db.from('couple_links').delete().eq('id', coupleLinkId);
     APP_COUPLES = (APP_COUPLES||[]).filter(function(c){ return c.id !== coupleLinkId; });
     renderCouplesPage();
