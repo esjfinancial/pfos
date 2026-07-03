@@ -1297,7 +1297,9 @@ function renderCoupleBadge(client){
 function openNewClientModal(){ /* N shortcut — no new-client form on admin page; no-op */ }
 async function updateClientAgent(clientId, agentId){
   try{
-    await db.from('clients').update({ user_id: agentId||null }).eq('id', clientId);
+    var _u = await db.from('clients').update({ user_id: agentId||null }).eq('id', clientId);
+    if(_u&&_u.error) throw new Error(_u.error.message); // L4: don't audit-log "reassigned" (or update the UI) if the write silently failed
+    logAuditEvent('client_agent_reassigned','client',clientId,{new_agent:agentId||null}); // L4: audit-log the reassignment (sibling client mutations log; this one didn't)
     var idx = (APP.allClients||[]).findIndex(function(c){ return c.id===clientId; });
     if(idx>=0) APP.allClients[idx].user_id = agentId||null;
   }catch(e){ alert('Could not reassign agent: '+e.message); }
@@ -1383,7 +1385,7 @@ CREATE TABLE IF NOT EXISTS users (
   email    TEXT,
   name     TEXT,
   role     TEXT NOT NULL DEFAULT 'agent'
-           CHECK (role IN ('admin','agent')),
+           CHECK (role IN ('admin','agent','suspended')),
   status   TEXT NOT NULL DEFAULT 'active'
            CHECK (status IN ('pending','active','rejected')),
   rejection_message TEXT,
@@ -1401,7 +1403,7 @@ CREATE TABLE IF NOT EXISTS clients (
                    CHECK (status IN ('new','active','review_due','advisory','sold')),
   tier             TEXT,
   pfos_tier        TEXT DEFAULT 'none'
-                   CHECK (pfos_tier IN ('none','core','pro','pro_plus')),
+                   CHECK (pfos_tier IN ('none','core','pro','pro_plus','comp')),
   trial_start_date TIMESTAMPTZ,
   client_type      TEXT DEFAULT 'advisory'
                    CHECK (client_type IN ('advisory','product')),
@@ -1444,7 +1446,7 @@ CREATE TABLE IF NOT EXISTS files (
 -- ══════════════════════════════════════════════
 -- ALTER TABLE clients
 --   ADD COLUMN IF NOT EXISTS pfos_tier TEXT DEFAULT 'none'
---   CHECK (pfos_tier IN ('none','core','pro','pro_plus'));
+--   CHECK (pfos_tier IN ('none','core','pro','pro_plus','comp'));
 --
 -- ALTER TABLE clients
 --   ADD COLUMN IF NOT EXISTS trial_start_date TIMESTAMPTZ;
@@ -2500,7 +2502,9 @@ async function archiveClient(clientId){
 async function markClientReviewed(clientId){
   var today=new Date().toISOString().split('T')[0];
   try{
-    await db.from('clients').update({last_review_date:today}).eq('id',clientId); // no updated_at column on clients (see archiveClient)
+    var _u = await db.from('clients').update({last_review_date:today}).eq('id',clientId); // no updated_at column on clients (see archiveClient)
+    if(_u&&_u.error) throw new Error(_u.error.message); // L4: don't audit-log "reviewed" if the write silently failed
+    logAuditEvent('client_reviewed','client',clientId,{last_review_date:today}); // L4: audit-log the review (sibling mutations log; this one didn't)
     var idx=(APP.allClients||[]).findIndex(function(c){return c.id===clientId;});
     if(idx>=0) APP.allClients[idx].last_review_date=today;
     renderInactiveClients();

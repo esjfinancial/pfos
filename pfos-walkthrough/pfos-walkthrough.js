@@ -37,7 +37,10 @@ function detectContext(){
     } else if(currentPage === 'dashboard' || currentPage === 'client-profile'){
       currentRole = 'advisor';
     } else if(currentPage === 'client'){
-      currentRole = 'client';
+      // L3a: branch advisory (advisor-managed) vs product/self-serve so advisor-only tour content is correct
+      // (the Messages step switches to advisor messaging, and the Advisor Activity step is hidden for product).
+      var _ct = (window.APP && window.APP.currentClient && window.APP.currentClient.client_type) || '';
+      currentRole = (_ct === 'advisory') ? 'client-advisor' : 'client-product';
     }
     initWalkthrough();
   }, WT_DELAY);
@@ -410,7 +413,6 @@ function getDashContextTips(){
     return {icon:'🔄',title:'Rec Pipeline Help',items:[
       {tip:'Status workflow',detail:'Recommendations flow: Draft → Pending → Proposed → Agreed → Submitted → Active → Implemented.'},
       {tip:'Compliance rate',detail:'Shows the percentage of recommendations that have been fully implemented.'},
-      {tip:'Starter packs',detail:'Use bulk templates to quickly add common recommendation sets for new clients.'},
       {tip:'Effectiveness',detail:'90-day tracking shows whether implemented recommendations are actually improving the client\'s situation.'},
     ]};
   }
@@ -567,7 +569,7 @@ function getMainSteps(role){
 
   s.push({
     target:'#navTools', position: mob?'top':'right',
-    icon:'🔧', title:'93 Financial Calculators',
+    icon:'🔧', title:'62 Financial Calculators',
     body:'Every financial question has a calculator — affordability, loans, retirement, insurance, student loans, tax strategy, behavioral finance, and more. All personalized with your data.',
     before: function(){ nav('tools'); }
   });
@@ -624,7 +626,7 @@ function getDashboardSteps(){
     {target:'#nav-new-client',position:mob?'bottom':'right',icon:'➕',title:'Add New Client',body:'Create advisory or product clients. Set their tier, assign an advisor, send portal invitations, and link couples — all from one form.',before:function(){nav('advisory-clients');}},
     {target:'#nav-reviews',position:mob?'bottom':'right',icon:'📅',title:'Reviews',body:'Track all scheduled client reviews. See overdue, upcoming, and completed reviews. Send reminder emails with one click.',before:function(){nav('reviews');}},
     {target:'#nav-priority',position:mob?'bottom':'right',icon:'🎯',title:'Priority Dashboard',body:'Clients ranked by urgency — overdue reviews, missing data, low health scores. Color-coded so you never miss a follow-up.',before:function(){nav('priority');if(typeof renderPriorityDashboard==='function')renderPriorityDashboard();}},
-    {target:'#nav-rec-pipeline',position:mob?'bottom':'right',icon:'🔄',title:'Recommendation Pipeline',body:'Track every recommendation from draft to implementation. Compliance rates, effectiveness scoring, and bulk starter packs for new clients.',before:function(){nav('rec-pipeline');if(typeof renderRecPipeline==='function')renderRecPipeline();}},
+    {target:'#nav-rec-pipeline',position:mob?'bottom':'right',icon:'🔄',title:'Recommendation Pipeline',body:'Track every recommendation from draft to implementation. Compliance rates and effectiveness scoring.',before:function(){nav('rec-pipeline');if(typeof renderRecPipeline==='function')renderRecPipeline();}},
     {target:'#nav-agent-tools',position:mob?'bottom':'right',icon:'🧰',title:'Financial Tools (62 Calculators)',body:'All 62 calculators with a client selector at the top. Select a client to pre-fill their data, or choose Manual Input to enter a custom profile. Run any calculator, then save the results as a recommendation directly to that client\'s profile — all without leaving this page.',before:function(){nav('agent-tools');}},
     {target:'#nav-leaderboard',position:mob?'bottom':'right',icon:'🏆',title:'Client Leaderboard',body:'See your healthiest clients, top compliance rates, and top savers. Great for identifying success stories and clients who need attention.',before:function(){nav('leaderboard');if(typeof renderClientLeaderboard==='function')renderClientLeaderboard();}},
     {target:'#nav-my-performance',position:mob?'bottom':'right',icon:'📊',title:'My Performance',body:'Your personal metrics — total clients, reviews completed, recommendations implemented, sessions logged, and average client health score.',before:function(){nav('my-performance');if(typeof renderAdvisorPerformancePage==='function')renderAdvisorPerformancePage();}},
@@ -666,7 +668,7 @@ function getClientPortalSteps(role){
   var mob = window.innerWidth < 768;
   function nav(pg){ if(typeof showClientPage==='function') showClientPage(pg); }
 
-  return [
+  var _steps=[
     {target:'center',icon:'👋',title:'Welcome to Your Financial Portal',body:'Your personal financial hub — scores, reports, tools, and communication, all in one place. Let\'s walk through everything.',delay:100},
     {target:'#cnav-overview',position:mob?'bottom':'right',icon:'📊',title:'Overview',body:'Your dashboard with 4 health scores, key metrics, and financial summary. This updates automatically as your data changes.',before:function(){nav('overview');}},
     {target:'#cnav-pfos',position:mob?'bottom':'right',icon:'⚡',title:'My Financial Data',body:'View and update all your financial data — income, expenses, debts, retirement, insurance, and more. This is where you build your complete financial picture.',before:function(){nav('pfos');}},
@@ -689,6 +691,10 @@ function getClientPortalSteps(role){
     {target:'#wt-replay',position:'left',icon:'❓',title:'Need Help Anytime?',body:'This button is always in the bottom-right corner. Tap it for <strong>instant help</strong> specific to whatever screen you\'re viewing.'},
     {target:'#cnav-overview',position:mob?'bottom':'right',icon:'🎉',title:'You\'re Ready!',body:'You have access to everything you need to manage your financial life. Start with your Overview to see where you stand.<br><br>Click <strong>❓</strong> anytime for help.',before:function(){nav('overview');}},
   ];
+  // L3a: product/self-serve clients have no advisor → hide the Advisor Activity step. Advisory clients keep it,
+  // and the Messages step above already switches to advisor messaging when role==='client-advisor'.
+  if(role!=='client-advisor') _steps=_steps.filter(function(s){return s.target!=='#cnav-activity';});
+  return _steps;
 }
 
 // ── BOOT ──
