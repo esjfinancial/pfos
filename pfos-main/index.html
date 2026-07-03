@@ -4234,10 +4234,11 @@ function _pfosRunMigration(){
 // then post the updated joint items back to pfos-client for couple_links write.
 //
 // "AB resolution" — couple_links has client_a_id and client_b_id. Each joint
-// item carries share_pct_a (% A contributes) and share_pct_b (% B contributes).
-// They don't need to sum to 100; each spouse owns their own share number.
-// Default 50 on migration; new items default 50/50. Each spouse edits only
-// their own share field.
+// item carries share_pct_a (A's ownership %) and share_pct_b (B's ownership %).
+// Stored COMPLEMENTARY (a + b = 100) so the household total never double-counts.
+// The UI collects each partner's share as a DOLLAR amount (owner preference — "I never
+// wanted percentages"); _hybridUpdate*SharePct converts $ → % and sets BOTH fields.
+// Default 50/50. (The engine still reads the %s — unchanged — so no rebuild/migration.)
 
 function _hybridIsClientA(){
   // Returns true if the current user is client_a, false if client_b.
@@ -4381,9 +4382,14 @@ function _hybridUpdateIncomeSharePct(idx, val){
   if(S.householdType !== 'hybrid') return;
   if(!S._jointItems || !Array.isArray(S._jointItems.incomeSources)) return;
   if(idx < 0 || idx >= S._jointItems.incomeSources.length) return;
-  var pct = Math.max(0, Math.min(100, parseFloat(val) || 0));
+  // `val` is now a DOLLAR amount (the user's share of this joint income). Convert to an ownership % and store
+  // BOTH partners' shares COMPLEMENTARY (a + b = 100) so the household total never double-counts.
+  var it = S._jointItems.incomeSources[idx];
+  var total = parseFloat(it.amount) || 0;
+  var dollar = Math.max(0, parseFloat(val) || 0);
+  var pct = total > 0 ? Math.max(0, Math.min(100, dollar / total * 100)) : 50;
   var field = _hybridShareField();
-  S._jointItems.incomeSources[idx][field] = pct;
+  it[field] = pct; it[field === 'share_pct_a' ? 'share_pct_b' : 'share_pct_a'] = 100 - pct;
   _postJointItemsWrite();
   if(typeof calc === 'function') calc();
 }
@@ -4489,9 +4495,13 @@ function _hybridUpdateInvSharePct(idx, val){
   if(S.householdType !== 'hybrid') return;
   if(!S._jointItems || !Array.isArray(S._jointItems.investments)) return;
   if(idx < 0 || idx >= S._jointItems.investments.length) return;
-  var pct = Math.max(0, Math.min(100, parseFloat(val) || 0));
+  // `val` is a DOLLAR amount now (the user's share of this joint balance) → complementary ownership %.
+  var it = S._jointItems.investments[idx];
+  var total = parseFloat(it.balance) || 0;
+  var dollar = Math.max(0, parseFloat(val) || 0);
+  var pct = total > 0 ? Math.max(0, Math.min(100, dollar / total * 100)) : 50;
   var field = _hybridShareField();
-  S._jointItems.investments[idx][field] = pct;
+  it[field] = pct; it[field === 'share_pct_a' ? 'share_pct_b' : 'share_pct_a'] = 100 - pct;
   _postJointItemsWrite();
   if(typeof renderHybridExpenseBreakdown === 'function') renderHybridExpenseBreakdown();
   if(typeof calc === 'function') calc();
@@ -4611,9 +4621,13 @@ function _hybridUpdateDebtSharePct(idx, val){
   if(S.householdType !== 'hybrid') return;
   if(!S._jointItems || !Array.isArray(S._jointItems.debts)) return;
   if(idx < 0 || idx >= S._jointItems.debts.length) return;
-  var pct = Math.max(0, Math.min(100, parseFloat(val) || 0));
+  // `val` is a DOLLAR amount now (the user's share of this joint debt) → complementary ownership %.
+  var it = S._jointItems.debts[idx];
+  var total = parseFloat(it.balance) || 0;
+  var dollar = Math.max(0, parseFloat(val) || 0);
+  var pct = total > 0 ? Math.max(0, Math.min(100, dollar / total * 100)) : 50;
   var field = _hybridShareField();
-  S._jointItems.debts[idx][field] = pct;
+  it[field] = pct; it[field === 'share_pct_a' ? 'share_pct_b' : 'share_pct_a'] = 100 - pct;
   _postJointItemsWrite();
   if(typeof renderHybridExpenseBreakdown === 'function') renderHybridExpenseBreakdown();
   if(typeof calc === 'function') calc();
@@ -8589,11 +8603,11 @@ function _hybridJointIncomeRowHtml(src, i){
         +'<span>Joint</span>'
       +'</label>'
       +'<div style="display:flex;align-items:center;gap:6px">'
-        +'<span>My share:</span>'
-        +'<input class="inp" type="number" min="0" max="100" step="5" value="'+myShare+'" oninput="_hybridUpdateIncomeSharePct('+i+',this.value)" style="width:60px;padding:4px 6px;text-align:right">'
-        +'<span>%</span>'
+        +'<span>My share:</span><span style="color:var(--mu)">$</span>'
+        +'<input class="inp" type="number" min="0" step="50" value="'+Math.round((parseFloat(src.amount)||0)*myShare/100)+'" oninput="_hybridUpdateIncomeSharePct('+i+',this.value)" style="width:80px;padding:4px 6px;text-align:right" title="Your dollar share of this joint income — the rest is your partner\'s">'
+        +'<span>/mo</span>'
       +'</div>'
-      +'<span style="color:rgba(148,163,184,.5);font-size:10px">Your portion: $'+Math.round((parseFloat(src.amount)||0)*myShare/100).toLocaleString()+'/mo</span>'
+      +'<span style="color:rgba(148,163,184,.5);font-size:10px">of $'+Math.round(parseFloat(src.amount)||0).toLocaleString()+' joint · partner $'+Math.round((parseFloat(src.amount)||0)*(100-myShare)/100).toLocaleString()+'/mo</span>'
     +'</div>'
   +'</div>';
 }
@@ -8646,11 +8660,10 @@ function _hybridJointInvRowHtml(a, i){
         +'<span>Joint</span>'
       +'</label>'
       +'<div style="display:flex;align-items:center;gap:6px">'
-        +'<span>My share:</span>'
-        +'<input class="inp" type="number" min="0" max="100" step="5" value="'+myShare+'" oninput="_hybridUpdateInvSharePct('+i+',this.value)" style="width:60px;padding:4px 6px;text-align:right">'
-        +'<span>%</span>'
+        +'<span>My share:</span><span style="color:var(--mu)">$</span>'
+        +'<input class="inp" type="number" min="0" step="500" value="'+myBalShare+'" oninput="_hybridUpdateInvSharePct('+i+',this.value)" style="width:90px;padding:4px 6px;text-align:right" title="Your dollar share of this joint balance — the rest is your partner\'s">'
       +'</div>'
-      +'<span style="color:rgba(148,163,184,.5);font-size:10px">Your portion: $'+myBalShare.toLocaleString()+' bal · $'+myContribShare.toLocaleString()+'/mo contrib</span>'
+      +'<span style="color:rgba(148,163,184,.5);font-size:10px">of $'+bal.toLocaleString()+' joint · partner $'+Math.round(bal*(100-myShare)/100).toLocaleString()+' · your contrib $'+myContribShare.toLocaleString()+'/mo</span>'
     +'</div>'
   +'</div>';
   return h;
@@ -8689,11 +8702,10 @@ function _hybridJointDebtRowHtml(d, i){
         +'<span>Joint</span>'
       +'</label>'
       +'<div style="display:flex;align-items:center;gap:6px">'
-        +'<span>My share:</span>'
-        +'<input class="inp" type="number" min="0" max="100" step="5" value="'+myShare+'" oninput="_hybridUpdateDebtSharePct('+i+',this.value)" style="width:60px;padding:4px 6px;text-align:right">'
-        +'<span>%</span>'
+        +'<span>My share:</span><span style="color:var(--mu)">$</span>'
+        +'<input class="inp" type="number" min="0" step="500" value="'+myBalShare+'" oninput="_hybridUpdateDebtSharePct('+i+',this.value)" style="width:90px;padding:4px 6px;text-align:right" title="Your dollar share of this joint debt — the rest is your partner\'s">'
       +'</div>'
-      +'<span style="color:rgba(148,163,184,.5);font-size:10px">Your portion: $'+myBalShare.toLocaleString()+' bal · $'+myMinShare.toLocaleString()+'/mo min</span>'
+      +'<span style="color:rgba(148,163,184,.5);font-size:10px">of $'+bal.toLocaleString()+' joint · partner $'+Math.round(bal*(100-myShare)/100).toLocaleString()+' · your min $'+myMinShare.toLocaleString()+'/mo</span>'
     +'</div>'
   +'</div>';
 }
