@@ -638,7 +638,7 @@ tbody td{padding:11px 14px;font-size:13px;color:rgba(226,232,240,.8)}
       Your session will expire due to inactivity. Click below to stay logged in.
     </div>
     <div style="display:flex;gap:10px">
-      <button class="btn btn-gh" style="flex:1" onclick="doLogout()">Sign Out</button>
+      <button class="btn btn-gh" style="flex:1" onclick="doLogout(true)">Sign Out</button>
       <button class="btn btn-or" style="flex:2" onclick="extendSession()">Stay Logged In</button>
     </div>
   </div>
@@ -1254,9 +1254,18 @@ function clearLoginFailures(email){
   try{ localStorage.removeItem(_rateLimitKey(email)); }catch(e){}
 }
 
-function _rateLimitKey(email){ return 'rl_' + btoa(email.toLowerCase().trim()).slice(0,20); }
+function _rateLimitKey(email){ try{ return 'rl_' + btoa(unescape(encodeURIComponent(email.toLowerCase().trim()))); }catch(e){ return 'rl_'+String(email||'').toLowerCase().trim(); } } // L1: was .slice(0,20) → long emails sharing a ~15-byte prefix collided into one bucket (one locked account could lock a DIFFERENT user); use the full unique encoding
+function _isValidEmail(e){ return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(e||'').trim()); } // L1: basic format check — used by the login/register/forgot forms (they only checked non-empty)
 
-async function doLogout(){ try{ await db.auth.signOut(); }catch(e){ console.error('Sign out error:',e); } }
+async function doLogout(explicit){
+  // H6 (security): on an EXPLICIT sign-out, clear the biometric SESSION tokens so the next person on a shared/kiosk
+  // device can't Face-ID straight back into the just-closed session. Enrollment (registered/cred/user_id) survives and
+  // the next password login re-stores fresh tokens. Idle-timeout/resume call doLogout() WITHOUT explicit=true, so
+  // biometric still unlocks after an idle lock. (The keepKeys wipe loop in _triggerSignOut is unreachable — it returns
+  // through here first — so the token clear has to live in doLogout itself.)
+  if(explicit){ try{ localStorage.removeItem('pfos_biometric_token'); localStorage.removeItem('pfos_biometric_refresh'); }catch(e){} }
+  try{ await db.auth.signOut(); }catch(e){ console.error('Sign out error:',e); }
+}
 
 // ── SUPABASE SETUP SQL ────────────────────────────────────────────────────────
 function logSetupSQL(){
@@ -1450,13 +1459,12 @@ async function doClientLogin(){
 async function doForgot(){
   var email = v('forgotEmail');
   if(!email){ showLoginErr('Please enter your email.'); return; }
-  try{
-    var res = await db.auth.resetPasswordForEmail(email);
-    if(res.error){ showLoginErr(res.error.message); return; }
-    showLoginMsg('Reset link sent — check your email.');
-  }catch(e){
-    showLoginErr('Could not send reset email. Check your connection and try again.');
-  }
+  if(!_isValidEmail(email)){ showLoginErr('Please enter a valid email address.'); return; } // L1: was non-empty only
+  if(typeof checkLoginRateLimit==='function' && !checkLoginRateLimit(email)) return; // L1: respect an active lockout (was completely unthrottled)
+  try{ await db.auth.resetPasswordForEmail(email); }catch(e){}
+  // L1: uniform response regardless of whether the account exists — the old code showed the raw Supabase error on
+  // failure and a "sent" message on success, which let an attacker enumerate registered emails.
+  showLoginMsg('If an account exists for that email, a password reset link has been sent.');
 }
 
 function setLoginTab(tab){
@@ -1638,6 +1646,8 @@ async function doClientRegister(){
   if(isCouple && spouseEmail.toLowerCase()===email.toLowerCase()){
     showRegErr(errId,"Partner email must be different from your email."); return;
   }
+  if(!_isValidEmail(email)){ showRegErr(errId,'Please enter a valid email address.'); return; } // L1: was non-empty only → a malformed email created an unconfirmable auth account + a stranded clients row
+  if(isCouple && !_isValidEmail(spouseEmail)){ showRegErr(errId,"Please enter a valid partner email address."); return; } // L1
   if(!(document.getElementById('clientTosCheck')||{}).checked){
     showRegErr(errId,'You must agree to the Terms of Service.'); return;
   }
@@ -1679,13 +1689,21 @@ async function doClientRegister(){
     var clientAId = insRes.data ? insRes.data.id : null;
 
     // ── 3–5. Couple flow ──────────────────────────────────────────────────
+    var _coupleSpouseExists=false; // H9: set true when the partner email is already registered → keep primary solo
     if(isCouple && clientAId){
       // 3. Create spouse auth account (random temp pass) + clients row
       // Must signUp first so resetPasswordForEmail has a user to send to.
       var _tv = new Uint8Array(16); crypto.getRandomValues(_tv);
       var spouseTempPass = 'Tmp!' + Array.from(_tv, function(b){ return ('0'+b.toString(36)).slice(-2); }).join('').slice(0,10) + 'A1';
       var spouseAuthRes = await db.auth.signUp({ email: spouseEmail, password: spouseTempPass });
-      // signUp may fail if email already registered — that is OK, we still create the clients row
+      // H9 (owner: keep primary as solo): detect an ALREADY-REGISTERED partner email. Supabase returns an error,
+      // or (enumeration-safe) a user with an EMPTY identities[] array, when the email already exists. We must NOT
+      // insert a second clients row then — clients.email is not uniquely constrained, so a duplicate would orphan
+      // the partner's real account and point couple_links at a phantom. Finish the PRIMARY as a normal solo product
+      // client instead; the couple can be formed later via the existing partner-invite flow.
+      var _sAuthU = spouseAuthRes && spouseAuthRes.data && spouseAuthRes.data.user;
+      _coupleSpouseExists = !!((spouseAuthRes && spouseAuthRes.error) || (_sAuthU && Array.isArray(_sAuthU.identities) && _sAuthU.identities.length===0));
+      if(!_coupleSpouseExists){
       var spouseData = {
         name:spouseName, email:spouseEmail, status:'new', client_type:'product',
         pfos_tier:'pro_plus', created_at: new Date().toISOString()
@@ -1718,6 +1736,7 @@ async function doClientRegister(){
           db.auth.resetPasswordForEmail(spouseEmail).then(function(r){ if(r&&r.error) console.warn('Couple set-password email failed:',r.error.message); }).catch(function(ex){console.warn('Couple set-password email failed:',ex);});
         }catch(ex){console.warn('Couple invite setup failed:',ex);}
       }
+      } // end if(!_coupleSpouseExists) — H9: skip spouse+link creation when the partner email already exists
     }
 
     // ── Reset form ────────────────────────────────────────────────────────
@@ -1733,7 +1752,9 @@ async function doClientRegister(){
     document.getElementById('clientLoginForm').style.display    = 'block';
 
     window._registrationInProgress = false;
-    if(isCouple){
+    if(isCouple && _coupleSpouseExists){
+      showLoginMsg('Your account is ready — sign in with your credentials. That partner email is already registered, so we set you up as an individual for now; you can connect your partner later from inside your portal.');
+    } else if(isCouple){
       showLoginMsg('Both accounts created! Sign in with your credentials. Your partner will receive an invitation email to set up their account.');
     } else {
       showLoginMsg('Account created! Sign in with your new credentials.');
@@ -1762,8 +1783,8 @@ async function doClientRegister(){
       }}).catch(function(){});
     }catch(e){}
 
-    // If couple, send welcome to spouse too
-    if(isCouple && spouseEmail){
+    // If couple, send welcome to spouse too (skip when the partner already had an account — H9 solo path)
+    if(isCouple && !_coupleSpouseExists && spouseEmail){
       try{
         db.functions.invoke('send-notification',{body:{
           type:'welcome_client',
@@ -2322,22 +2343,15 @@ window.pfosBioSignIn=function(){
       // should always clear on sign-out.
       var keepKeys = {
         'pfos_bio_dismissed': true,
-        // Biometric enrollment + session — the user has explicitly opted into
-        // biometric login as their auth method on this device. Preserving the
-        // tokens means biometric login actually skips the password entirely
-        // (which is the point). Wiping them on every sign-out means biometric
-        // succeeds at WebAuthn but Supabase setSession() then fails for lack
-        // of a token — defeating the feature.
-        //
-        // Refresh tokens rotate on use and expire on Supabase's side (~1 week
-        // of inactivity by default), so stale tokens don't accumulate forever.
-        // Cross-user attack is prevented by the SIGNED_IN handler at line ~758
-        // which wipes everything when a different user signs in.
+        // Biometric ENROLLMENT survives sign-out (the user opted into biometric login on this device). But H6
+        // (security, owner: mitigate/harden): the Supabase access/refresh TOKENS are NO LONGER kept — clearing them
+        // on sign-out closes the "signed out on a shared/kiosk device, next person Face-IDs into the previous
+        // session" hole and stops a still-valid refresh token from outliving logout (XSS-exfil window). Biometric
+        // still unlocks after idle/tab-close WITHIN a login session (tokens present) and re-stores fresh tokens on
+        // the next password login — it just no longer skips the password after an EXPLICIT sign-out.
         'pfos_biometric_registered': true,
         'pfos_biometric_cred': true,
-        'pfos_biometric_user_id': true,
-        'pfos_biometric_token': true,
-        'pfos_biometric_refresh': true
+        'pfos_biometric_user_id': true
       };
       for(var i=0;i<localStorage.length;i++){
         var k = localStorage.key(i);
