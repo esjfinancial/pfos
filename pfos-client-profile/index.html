@@ -4589,11 +4589,22 @@ async function autoSaveSnapshot(clientId, calcs){
     if(existing) return; // already have one today
     await db.from('client_snapshots').insert({
       client_id:    clientId,
-      net_worth:    calcs.netWorth||0,
-      income:       calcs.inc||0,
-      total_debt:   calcs.totalDebt||0,
+      net_worth:    Math.round(calcs.netWorth||0),
+      income:       Math.round(calcs.inc||0),
+      expenses:     Math.round(calcs.baseExp||0),           // H14: the 11 fields below exist in the table + are READ by the trend charts/deltas but were never written → flat-0 lines & "from $0" deltas
+      net_cf:       Math.round(calcs.netCF||0),             // H14
+      total_assets: Math.round(calcs.totalAssets||0),       // H14
+      total_debt:   Math.round(calcs.totalDebt||0),
+      dti:          Math.round((calcs.dti||0)*10)/10,       // H14
+      ef_months:    Math.round((calcs.efMonths||0)*10)/10,  // H14
+      savings_rate: Math.round((calcs.savingsRate||0)*10)/10,
       cf_score:     calcs.cfScore||0,
-      savings_rate: calcs.savingsRate||0,
+      prot_score:   calcs.protScore||0,                     // H14
+      grow_score:   calcs.growScore||0,                     // H14
+      eff_score:    calcs.effScore||0,                      // H14
+      ret_bal:      Math.round((typeof CPLAN!=='undefined'&&CPLAN._sim&&CPLAN._sim.projRetValue)?CPLAN._sim.projRetValue:0), // H14
+      fi_number:    Math.round(calcs.fiNumber||0),          // H14
+      ret_gap:      Math.round((typeof CPLAN!=='undefined'&&CPLAN._sim&&calcs.fiNumber>0)?Math.max(0,calcs.fiNumber-(CPLAN._sim.projRetValue||0)):(calcs.retGap||0)), // H14
       snapshot_date:today,
       created_at:   new Date().toISOString()
     });
@@ -6774,7 +6785,7 @@ window.addEventListener('message', async function(e){
         record.annuity_surrender_period=ed.surrenderPeriodYears||null;
         record.surrender_charge_current=ed.currentSurrenderChargePct||0;
         record.premium_type=ed.premiumType||null;
-        record.premium_annual=ed.premium||0;
+        record.premium_annual=(((ed.premiumFrequency||'').toLowerCase()==='monthly')?(parseFloat(ed.premium)||0)*12:(parseFloat(ed.premium)||0)); // M11: extractedData carries premiumFrequency ('monthly|annual|single'); a monthly-quoted premium was stored verbatim as annual (12× low). Only 'monthly' is multiplied; 'annual'/'single'/unknown stay as-is (prior behavior).
         record.original_cap_rate=ed.capRate||null;
         record.current_cap_rate=ed.capRate||0;
         record.annuity_original_cap_rate=ed.capRate||null;
@@ -7215,12 +7226,15 @@ window.addEventListener('message', async function(e){
   if(msg.type === 'SAVE_ADVISOR_RECS' && msg.recommendations && APP.currentClientId){
     try{
       var clientId = APP.currentClientId;
-      // Upsert: delete existing for client, then insert new set
-      await db.from('advisor_recommendations').delete().eq('client_id', clientId);
+      // Upsert: delete the client's DE-synced recs, then insert the new DE set.
+      // M24: scope the delete to source='decision_engine' — advisor-authored (modal) recs have source NULL and MUST survive
+      // (they used to be wiped because DE.advisorPlan never loads the table's rows).
+      await db.from('advisor_recommendations').delete().eq('client_id', clientId).eq('source','decision_engine');
       if(msg.recommendations.length){
         var rows = msg.recommendations.map(function(r){
           return {
             client_id:      clientId,
+            source:         'decision_engine', // M24: tag DE-synced rows so the scoped delete above clears only these, never advisor-authored recs
             created_by:     APP.user ? APP.user.id : null,
             section:        r.section       || 'general',
             priority:       r.priority      || 'medium',
@@ -8946,6 +8960,27 @@ function _cpHelpPanelHtml(audience){
 function _cpTierHas(feature){return true;}
 function _cpUpgradeHint(feature,tierNeeded){return '';}
 // Old single-render entry point used by debounced detailed-mode setters.
+// C4 (owner: "the advisor is not supposed to get an AI planner — they do it themselves"): these AI-plan-GENERATION
+// controls (approach fork / select / revert / regenerate / compare-to-AI) + the client-only couple/agent controls
+// were copied into this advisor page from the CLIENT portal (where the AI planner IS a feature) but their handlers
+// live only in pfos-client's newer plan engine, so they threw ReferenceError on click. The advisor plans manually,
+// so they don't belong here at all → HIDE them (CSS below). The stubs are a belt-and-suspenders no-op in case any
+// is reached by a path CSS doesn't cover. (A full render-cleanup that stops emitting them is a low-priority follow-up.)
+(function(){ try{
+  var _c4=document.createElement('style');
+  _c4.textContent='[onclick*="_cpShowApproachFork"],[onclick*="_cpSelectApproach"],[onclick*="_cpRevertApproach"],[onclick*="_cpShowPlanComparison"],[onclick*="_cpRegenerateAiConfirm"],[onclick*="_cpRequestAgent"],[onclick*="_cpSendChangeRequest"]{display:none !important}';
+  (document.head||document.documentElement).appendChild(_c4);
+}catch(e){} })();
+function _cpC4NotWired(){ /* no-op: advisor plans manually; these AI-planner controls are hidden and not part of the advisor workflow */ }
+function _cpRequestAgent(){ _cpC4NotWired(); }
+function _cpSelectApproach(){ _cpC4NotWired(); }
+function _cpRevertApproach(){ _cpC4NotWired(); }
+function _cpShowApproachFork(){ _cpC4NotWired(); }
+function _cpShowPlanComparison(){ _cpC4NotWired(); }
+function _cpSelectNonIBCStrategy(){ _cpC4NotWired(); }
+function _cpStageRequest(){ _cpC4NotWired(); }
+function _cpSendChangeRequest(){ _cpC4NotWired(); }
+function _cpRegenerateAiConfirm(){ _cpC4NotWired(); }
 function _cpRender(){_cpRenderPlanFull();}
 // Education vehicle labels (used inside cards for `edu` type)
 var CP_EDU_VEH_NM={'529':'529 Plan','coverdell':'Coverdell ESA','utma':'UTMA/UGMA','wl':'Whole Life Cash Value','iul':'IUL Cash Value'};
