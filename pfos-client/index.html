@@ -3583,7 +3583,7 @@ function _wiwBar(label,color,amt,subPct,widthPct,rightTxt,rightCol,isPlan){
 // The plan-deployment + breathing-room block (the moat). Sources the client's real plan (CPLAN).
 function _cpWiwPlanHtml(){
   if(typeof CPLAN==='undefined' && typeof _cpEnsurePlanLoaded==='function'){ try{_cpEnsurePlanLoaded();}catch(_e){} }
-  var hasPlan=(typeof CPLAN!=='undefined' && CPLAN.allocations && CPLAN.allocations.some(function(a){return a&&(parseFloat(a.amount)||0)>0;}));
+  var hasPlan=(typeof CPLAN!=='undefined' && CPLAN.allocations && CPLAN.allocations.some(function(a){return _cpAllocPoolDraw(a)>0;})); // M1/rev: gate on pool-draw so a plan whose only positive cards are partner-shared/cascade doesn't render an empty "put to work" section
   var breatheCard=function(head,copy,amt){
     return '<div style="display:flex;align-items:center;gap:14px;margin-top:14px !important;padding:14px 16px !important;border-radius:12px;background:linear-gradient(180deg,rgba(94,234,212,.10),rgba(94,234,212,.03)) !important;border:1px solid rgba(94,234,212,.26)">'
       +'<div style="font-size:24px;flex:0 0 auto">🌿</div>'
@@ -3595,13 +3595,13 @@ function _cpWiwPlanHtml(){
       +'<span onclick="showClientPage(\'plan\');if(typeof initClientPlan===\'function\')initClientPlan();" style="color:#5eead4;cursor:pointer;font-weight:600;white-space:nowrap">Build my plan →</span>',null);
   }
   var ds=(typeof _cpDeploySummary==='function')?_cpDeploySummary():{allocated:0,brReserve:0};
-  var allocs=CPLAN.allocations.filter(function(a){return a&&(parseFloat(a.amount)||0)>0;})
-    .slice().sort(function(a,b){return (parseFloat(b.amount)||0)-(parseFloat(a.amount)||0);});
-  var pMax=(parseFloat(allocs[0].amount)||0)||1;
+  var allocs=CPLAN.allocations.filter(function(a){return _cpAllocPoolDraw(a)>0 && !(a._linkedPolicyId&&a._ibcState==='active');}) // M1: same set + per-card share the header (ds.allocated) counts — hybrid joint shows the self-share; partner-shared/cascade/active-IBC-policy cards excluded to match ds.allocated (repay term is a minor residual)
+    .slice().sort(function(a,b){return _cpAllocPoolDraw(b)-_cpAllocPoolDraw(a);});
+  var pMax=(allocs[0]?_cpAllocPoolDraw(allocs[0]):0)||1;
   var h='<div style="display:flex;justify-content:space-between;align-items:baseline;gap:12px;margin:22px 4px 4px !important;padding-bottom:6px !important;border-bottom:1px solid rgba(34,197,94,.28);background:transparent !important">'
     +'<span style="font-family:var(--fh);font-weight:700;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#8ff0b4">▸ Put to work by your plan</span>'
     +'<span style="font-size:12px;color:#8ff0b4;white-space:nowrap">'+fmt(ds.allocated)+'/mo</span></div>';
-  allocs.slice(0,6).forEach(function(a){ var amt=parseFloat(a.amount)||0; var nm=(a.customName||CP_NM[a.type]||a.type); var ic=(CP_IC[a.type]||'📋');
+  allocs.slice(0,6).forEach(function(a){ var amt=_cpAllocPoolDraw(a); var nm=(a.customName||CP_NM[a.type]||a.type); var ic=(CP_IC[a.type]||'📋');
     h+=_wiwBar(ic+' '+nm,'#22C55E',amt,null,Math.round(amt/pMax*100),'','',true);
   });
   if(ds.brReserve>0){ h+=breatheCard('Breathing room','Yours — no plan, no guilt. Your plan deliberately leaves this untouched.',ds.brReserve); }
@@ -6496,7 +6496,11 @@ async function submitUnlinkRequest(){
 function freshCalcs(fd){
   try{
     var S=fd&&fd.S, hh=S&&S.householdType;
-    if(window.PFOSEngine&&window.PFOSEngine.computeCalcs&&S&&S.profile){
+    if(window.PFOSEngine&&window.PFOSEngine.computeCalcs&&S&&S.profile&&hh!=='joint'&&hh!=='hybrid'){
+      // C1: couples (joint/hybrid) need the runtime _jointItems assembly that lives in pfos-main and is ABSENT
+      // from fd.S — recomputing here from the primary's partial S understates household NW/savings/DTI/EF and
+      // feeds the AI plan wrong numbers. Only self-contained households (single/separate) recompute on read;
+      // couples keep the stored backfilled-canonical calcs (pfos-main refreshes them on edit). [siblings keep this guard]
       return window.PFOSEngine.computeCalcs(S);
     }
   }catch(e){}
@@ -6534,7 +6538,7 @@ async function loadClientPortalData(){
   }catch(e){}
   if(profile && profile.financial_data){
     var fd = profile.financial_data, scores = profile.scores || {}, calcs = freshCalcs(fd);
-    APP._portalCalcs=calcs; APP._portalFd=fd;
+    APP._portalCalcs=calcs; APP._portalFd=fd; APP._portalFd.calcs=calcs; // M2: consumers reading APP._portalFd.calcs (e.g. Analysis) must see the fresh recompute, not the stale stored fd.calcs
     // Section B hook: if this row carries parked joint items AND the client is now
     // individual (no couple link), prompt keep/drop shortly after load. Fires once;
     // the resolver clears _pendingJointCleanup and persists the result.
@@ -6607,7 +6611,7 @@ async function loadClientPortalData(){
       : '<div style="font-size:13px;color:rgba(226,232,240,.7);line-height:1.7">View your full action plan in your latest report.</div>');
     if(window.PFOS_FLAGS&&PFOS_FLAGS.decisionCards&&PFOS_FLAGS.decisionCardsHeadline&&typeof _cpRenderLivingHeadline==='function'){ _cpRenderLivingHeadline(); }   // Section C — living headline supersedes the static CTA when ON
     // Update mobile tools with current financial data
-    _lastPfosState={state:fd.S||{},calcs:fd.calcs||{}};
+    _lastPfosState={state:fd.S||{},calcs:calcs||{}}; // M2: fresh calcs (freshCalcs), not stale stored fd.calcs — CF-pulse/streak/welcome-back/analysis all read _lastPfosState.calcs and diverged from the cards until the iframe's first PFOS_DATA_CHANGE
     updateMobileTools();
   } else {
     // No profile data yet — show prompts to get started
@@ -7307,6 +7311,7 @@ function _cvJointAccounts(jfd){
   (jfd.debts||[]).forEach(function(d){ if(!d)return; var b=parseFloat(d.balance)||0; if(b<=0)return; out.push({name:d.name||d.type||'Debt',balance:b,kind:'debt'}); });
   (jfd.investments||[]).forEach(function(i){ if(!i)return; if(String(i.type||'').toLowerCase()==='crypto')return; var b=parseFloat(i.balance)||0; if(b<=0)return; out.push({name:i.name||_cvInvLabel(i.type),balance:b,kind:'asset'}); });
   (jfd.retAccounts||[]).forEach(function(r){ if(!r)return; var b=parseFloat(r.balance)||0; if(b<=0)return; out.push({name:r.name||r.type||'Retirement',balance:b,kind:'asset'}); });
+  (jfd.linkedCash||[]).forEach(function(lc){ if(!lc||lc.include===false)return; var b=parseFloat(lc.balance)||0; if(b<=0)return; out.push({name:lc.name||lc.subtype||'Cash',balance:b,kind:'asset'}); }); // M15: hybrid joint linked-cash was dropped from the "Ours" tab (personal reader _cvAccounts includes it) → Net understated
   return out;
 }
 function _cvAcctList(accts,emptyMsg){
@@ -14095,8 +14100,16 @@ function _queueFailedSave(clientId,payload){
 async function _replayPendingSaves(){
   try{var queue=JSON.parse(localStorage.getItem('pfos_save_queue')||'[]');if(!queue.length)return;
   var remaining=[];for(var i=0;i<queue.length;i++){var q=queue[i];if(Date.now()-q.ts>86400000)continue;
-  try{var ex=await db.from('client_profiles').select('id').eq('client_id',q.clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-  if(ex&&ex.data){q.payload.allow_data_downgrade=true;var{error}=await db.from('client_profiles').update(q.payload).eq('id',ex.data.id);if(error)remaining.push(q);else console.log('[PFOS] ✓ Queued save replayed');}
+  try{var ex=await db.from('client_profiles').select('id,updated_at').eq('client_id',q.clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+  if(ex&&ex.data){
+    // M14: don't let a stale offline save clobber newer data. If the DB row was written AFTER this save was queued
+    // (another device / the partner / a later session advanced it), the queued payload is obsolete → DROP it rather
+    // than downgrade the DB. Only when the DB has NOT advanced past q.ts do we replay (with the downgrade flag so a
+    // legit offline save isn't blocked by the data-protection trigger).
+    var _dbTs=ex.data.updated_at?Date.parse(ex.data.updated_at):0;
+    if(_dbTs&&q.ts&&_dbTs>q.ts){ console.log('[PFOS] queued save is stale (DB advanced since it was queued) — dropping to avoid clobbering newer data'); continue; }
+    q.payload.allow_data_downgrade=true;var{error}=await db.from('client_profiles').update(q.payload).eq('id',ex.data.id);if(error)remaining.push(q);else console.log('[PFOS] ✓ Queued save replayed');
+  }
   }catch(e){remaining.push(q);}}
   localStorage.setItem('pfos_save_queue',JSON.stringify(remaining));if(!remaining.length)localStorage.removeItem('pfos_save_queue');}catch(e){}
 }
@@ -14297,15 +14310,17 @@ window.addEventListener('message',async function(e){
         try{
           const { data: cl } = await db.from('couple_links').select('joint_financial_data').eq('id', coupleLinkId).maybeSingle();
           var existing = (cl && cl.joint_financial_data) || {};
-          // Initialize merged shape — preserves anything already there
-          var merged = {
+          // H8: start from a COPY of the whole existing record so we preserve goals / linkedCash / expenses /
+          // filingStatus / _lastCompletionChange (written by the other joint-write paths) — the old hand-picked
+          // shape overwrote the column and silently dropped them. Then overlay the 5 arrays we're merging.
+          var merged = Object.assign({}, existing, {
             incomeSources: Array.isArray(existing.incomeSources) ? existing.incomeSources.slice() : [],
             expData:       (existing.expData && typeof existing.expData === 'object') ? existing.expData : {},
             retAccounts:   Array.isArray(existing.retAccounts) ? existing.retAccounts.slice() : [],
             investments:   Array.isArray(existing.investments) ? existing.investments.slice() : [],
             debts:         Array.isArray(existing.debts) ? existing.debts.slice() : [],
             _lastChange:   existing._lastChange || null
-          };
+          });
           // Dedup helper: looks for an item with the same name (or label/source/type)
           // and approximately the same amount/balance. If found, skip the incoming
           // item (the partner already migrated the shared item from their side).
@@ -14972,7 +14987,7 @@ window.addEventListener('message',async function(e){
             exS=_mergeJointState(exS,_exBrS);
           }catch(_eMx){ console.warn('[jm] preserve-baseline merge failed, using primary-only:',_eMx&&_eMx.message); }
         }
-        var _protectedSections=['retAccounts','incomeSources','debts','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash','budget','categories','reconcile'];
+        var _protectedSections=['retAccounts','incomeSources','debts','investments','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash','budget','categories','reconcile']; // M13: 'investments' was missing → an empty incoming investments[] could wipe a populated DB copy (engine _PROTECTED_ARRAYS already includes it)
         _protectedSections.forEach(function(sec){
           if(!touched[sec]){
             var exVal=exS[sec];
@@ -15184,9 +15199,18 @@ window.addEventListener('beforeunload',function(){
     try{
       var calcs=_lastPfosState.calcs||{};
       var _blState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _blState._touched;
+      // H7: for a V2-JOINT couple the in-memory state is the MERGED self+spouse state (spouse items carry owner:'spouse').
+      // The raw keepalive PATCH targets the PRIMARY (client_a) row and CANNOT de-merge (that needs the async
+      // _jmDemergeWriteB + the section-merge baseline) → it would pollute A's row with spouse items and leave B stale.
+      // Skip it for that case; the localStorage backup above already preserves the last edit locally, and the debounced
+      // save de-merges properly. (Hybrid/separate keep per-partner state in S with no owner:'spouse' rows, so they save.)
+      var _blHasSpouse=_JOINT_MERGE_ARRAYS.some(function(k){ var arr=_blState[k]; return Array.isArray(arr)&&arr.some(function(x){return x&&x.owner==='spouse';}); }); // H7: use the EXACT set _mergeJointState spouse-tags (incl. goals + linkedCash) so a couple where partner B has only a goal/linked-cash still triggers the guard
+      if(_blHasSpouse){ console.log('[PFOS] beforeunload: V2-joint merged state — skipping raw keepalive PATCH (would write spouse items to the primary row un-de-merged); localStorage backup + debounced de-merge cover it'); }
+      else {
       var payload={financial_data:{S:_blState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
       var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+_lastSaveClientId+'&order=updated_at.desc&limit=1';
       fetch(url,{method:'PATCH',headers:{'Content-Type':'application/json','apikey':SUPABASE_ANON_KEY,'Authorization':'Bearer '+SUPABASE_ANON_KEY,'Prefer':'return=minimal'},body:JSON.stringify(payload),keepalive:true}).catch(function(){});
+      }
     }catch(e){}
     }
   }
@@ -38846,7 +38870,12 @@ function _cpBuildCard(a,idx,isUnassigned){
     var _surplusMD = CPLAN.surplus||0;
     var _brPctMD = (CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
     var _budgetMD = Math.round(_surplusMD*(1-_brPctMD));
-    var _othersDeltaMD = (CPLAN.allocations||[]).reduce(function(t,al,j){return j===idx?t:t+(parseFloat(al.amount)||0);},0);
+    var _othersDeltaMD = (CPLAN.allocations||[]).reduce(function(t,al,j){
+      if(j===idx)return t;
+      if(al&&al._sharedOwnerClientId&&al._sharedOwnerClientId!==APP.currentClientId&&al.owner!=='joint')return t; // H11: partner-owned — spouse's pool
+      if(al&&al._cascadeSpawned===true)return t; // H11: virtual cascade absorber
+      return t+_cpAllocSelfAmt(al); // H11: hybrid joint card consumes only this user's share — this RENDER-time cap MUST match the _cpSlideMatchExtra drag handler (was left at full a.amount → card showed a smaller extra ceiling than the drag allowed)
+    },0);
     var _budgetCapTotalMD = _budgetMD - _othersDeltaMD + _curMD;
     // Total contribution cannot exceed the lesser of IRS cap and budget cap.
     var _totalMaxMD = Math.max(_curMD, Math.min(_irsMaxTotalMD, _budgetCapTotalMD));
@@ -41751,6 +41780,22 @@ function _cpWorkingPartnerIncomeRemaining(retiredOwner){
 //   • hybrid joint cards → only THIS user's share (amountSelf); fall back to half when unset
 //   • skip partner-shared (non-joint) cards + active-IBC-policy cards (their premium already reduces surplus)
 //   • completed insurance/action-only recurring static premiums eat the pool
+// ── Single source for hybrid pool accounting (H11) — every site that sums allocations against THIS user's
+// deployment pool must agree on: (a) a Hybrid JOINT card draws only the user's OWN share (amountSelf, half if
+// unset); (b) a partner-OWNED (non-joint) card draws from the spouse's pool (0 here); (c) a cascade-spawned
+// absorber is virtual (0 — the freed cash was already counted upstream). Used by _cpSliderMax / _cpSlideMatchExtra
+// / _cpEnforce / _cpWiwPlanHtml so they can't drift from _cpDeploySummary / _cpAvailableBudget again.
+function _cpAllocSelfAmt(a){ // the raw amount this allocation contributes (hybrid-self-aware); NO skip logic
+  if(!a)return 0;
+  if(CPLAN._householdType==='hybrid'&&a.owner==='joint'){ var s=parseFloat(a.amountSelf); if(isNaN(s)||s===0)s=(parseFloat(a.amount)||0)/2; return s; }
+  return parseFloat(a.amount)||0;
+}
+function _cpAllocPoolDraw(a){ // what this allocation draws from THIS user's pool (0 for partner-shared + cascade)
+  if(!a)return 0;
+  if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return 0;
+  if(a._cascadeSpawned===true)return 0;
+  return _cpAllocSelfAmt(a);
+}
 // Returns { allocated, staticPrem, unalloc, brReserve, avail, allocPct }.
 function _cpDeploySummary(){
   var surplus=CPLAN.surplus||0;
@@ -41758,6 +41803,7 @@ function _cpDeploySummary(){
   var allocated=(CPLAN.allocations||[]).reduce(function(t,a){
     if(a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return t;
     if(a._linkedPolicyId&&a._ibcState==='active')return t;
+    if(a._cascadeSpawned===true)return t; // H13-guard: virtual cascade absorber — freed cash already counted (was overstating "Deploying $X", allocPct could exceed 100%); matches _cpAvailableBudget/_cpSliderMax
     // Non-IBC policy-loan repayment competes for the same pool — include it so the headline matches the slider
     // caps (_cpAvailableBudget subtracts the same term). Was omitted → "available to allocate" overstated it.
     var _repay=(a&&a.monthlyLoanRepay>0&&!a._ibcDebtStrategy)?(parseFloat(a.monthlyLoanRepay)||0):0;
@@ -41881,7 +41927,8 @@ function _cpSliderMax(type,idx){
       // for full rationale. AI-emitted absorbers (only _overflowAbsorber:true,
       // not _cascadeSpawned) ARE counted as legitimate pool draws.
       if(a2._cascadeSpawned===true)return;
-      _othersSum+=parseFloat(a2.amount)||0;
+      if(a2._sharedOwnerClientId&&a2._sharedOwnerClientId!==APP.currentClientId&&a2.owner!=='joint')return; // H11: partner-owned card draws from the spouse's pool, not this slider's ceiling
+      _othersSum+=_cpAllocSelfAmt(a2); // H11: a Hybrid joint card consumes only THIS user's share (was full a.amount → slider max fell short of the drag-snap)
       // Static recurring premiums on completed insurance/action-only items
       // also occupy pool space — exclude them so the user can't double-spend.
       if(a2._completed&&a2._staticPremium>0&&_premStaticTypes[a2.type]&&(a2._staticFreq==null||a2._staticFreq==='monthly')){
@@ -47559,7 +47606,10 @@ function _cpSlideMatchExtra(i, side, v){if(CPLAN._pendingReview)return;
   var _brPctS = (CPLAN._breathingPct != null ? CPLAN._breathingPct : 15) / 100;
   var _budgetS = Math.round(_surplusS * (1 - _brPctS));
   var _othersDelta = (CPLAN.allocations || []).reduce(function(t, al, j){
-    return j === i ? t : t + (parseFloat(al.amount) || 0);
+    if(j === i)return t;
+    if(al&&al._sharedOwnerClientId&&al._sharedOwnerClientId!==APP.currentClientId&&al.owner!=='joint')return t; // H11: partner-owned — spouse's pool
+    if(al&&al._cascadeSpawned===true)return t; // H11: virtual cascade absorber
+    return t + _cpAllocSelfAmt(al); // H11: hybrid joint card consumes only this user's share (was full a.amount → match/extra bottomed out $ short of the true budget)
   }, 0);
   var totalMax = Math.max(cur, Math.min(irsMaxTotal, _budgetS - _othersDelta + cur));
   var extraCap = Math.max(0, totalMax - ceil);
@@ -50144,10 +50194,19 @@ function _cpEnforce(opts){
   var surplus=CPLAN.surplus||0;
   var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15)/100;
   var budgetCap=surplus*(1-brPct);
-  var total=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
+  var total=CPLAN.allocations.reduce(function(t,a){return t+_cpAllocPoolDraw(a);},0); // H11: measure THIS user's consumption (hybrid self-share; skip partner-shared + cascade) so a loaded hybrid plan isn't spuriously scaled down
   if(total>budgetCap&&total>0&&budgetCap>0){
     var scale=budgetCap/total;
-    CPLAN.allocations.forEach(function(a){a.amount=Math.round(a.amount*scale);});
+    var _hyb=(CPLAN._householdType==='hybrid');
+    CPLAN.allocations.forEach(function(a){ if(_cpAllocPoolDraw(a)<=0)return; // skip partner-shared + cascade (leave untouched)
+      if(_hyb&&a.owner==='joint'){
+        // H11: `total` is in SELF-SHARE space, so scale the SELF share (not the full amount) — else the scaled
+        // self-shares never actually reach budgetCap and the amount=self+spouse invariant breaks. Spouse's share
+        // is the spouse's own budget, left untouched; amount is recomposed to stay coherent.
+        var _curSelf=_cpAllocSelfAmt(a), _spouse=Math.max(0,(parseFloat(a.amount)||0)-_curSelf);
+        a.amountSelf=Math.round(_curSelf*scale); a.amountSpouse=Math.round(_spouse); a.amount=a.amountSelf+a.amountSpouse;
+      } else { a.amount=Math.round((parseFloat(a.amount)||0)*scale); }
+    });
     CPLAN._scaledOnLoad={from:Math.round(total),to:Math.round(budgetCap),at:Date.now()};
   }
 }
@@ -50235,7 +50294,7 @@ function cplanSave(){
   // the partner via shared_card_grants are filtered.
   var cleanAllocs=CPLAN.allocations.filter(function(a){
     return !(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint');
-  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',addressesIssueId:a.addressesIssueId||undefined,goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,_userAdded:a._userAdded===true,_liteSeededAmt:(a._liteSeededAmt!=null?a._liteSeededAmt:undefined),_autoResolvedFromPlaceholder:a._autoResolvedFromPlaceholder===true,
+  }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',addressesIssueId:a.addressesIssueId||undefined,goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_spawnedByOverflow:a._spawnedByOverflow===true,_spawnEventLabel:a._spawnEventLabel||'',_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,_userAdded:a._userAdded===true,_liteSeededAmt:(a._liteSeededAmt!=null?a._liteSeededAmt:undefined),_autoResolvedFromPlaceholder:a._autoResolvedFromPlaceholder===true,
   // _liteSeededAmt: the Core auto-seed's stamped amount (distinguishes a seeded default from a user-nudged slider so re-seeding never clobbers an edit). _autoResolvedFromPlaceholder: the retirement chooser was auto-resolved to a real vehicle in Core.
   // _userMadePersonal: sticky pin so an education card the user explicitly made personal is NOT re-jointified by the
   // _cpEduDefaultJoint auto-default on the next render/reload/regen. MUST be in this allowlist serializer or the pin is
