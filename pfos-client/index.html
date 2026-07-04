@@ -1658,7 +1658,7 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
     <!-- Financial Tools -->
     <div class="pg" id="cpg-tools">
       <div class="pg-title">🧰 Financial Tools</div>
-      <div class="pg-sub">93 calculators for every financial question — all personalized with your data</div>
+      <div class="pg-sub">62 calculators for every financial question — all personalized with your data</div>
       <div style="margin:14px 0"><input class="inp" type="text" id="clientToolSearch" placeholder="Search calculators..." oninput="searchClientTools()" style="width:100%;min-height:40px;font-size:14px;padding:10px 14px"></div>
       <div id="clientToolsGrid"></div>
     </div>
@@ -7006,7 +7006,8 @@ async function sendClientMessage(){
   var content = inp.value.trim(); if(!content) return;
   setBtnLoading('clientMsgBtn',true,'Sending...');
   try{
-    await db.from('messages').insert({client_id:APP.currentClientId,sender:'client',content,is_read:false,created_at:new Date().toISOString()});
+    var _r=await db.from('messages').insert({client_id:APP.currentClientId,sender:'client',content,is_read:false,created_at:new Date().toISOString()});
+    if(_r&&_r.error) throw new Error(_r.error.message); // audit silent-save: don't clear the input + show "sent" if the message insert failed
     inp.value='';
     setBtnLoading('clientMsgBtn',false,'Send Message');
     var conf = document.getElementById('clientMsgConfirm');
@@ -13658,7 +13659,8 @@ async function submitSituationChange(){
   setBtnLoading('situationBtn',true,'Sending...');
   try{
     // Create a message to advisor
-    await db.from('messages').insert({client_id:APP.currentClientId,sender:'client',content:'⚠️ My situation changed: '+content.trim(),is_read:false,created_at:new Date().toISOString()});
+    var _r=await db.from('messages').insert({client_id:APP.currentClientId,sender:'client',content:'⚠️ My situation changed: '+content.trim(),is_read:false,created_at:new Date().toISOString()});
+    if(_r&&_r.error) throw new Error(_r.error.message); // audit silent-save: surface a failed insert instead of a false "advisor notified"
     setBtnLoading('situationBtn',false,'Notify My Advisor');
     closeModal('situationModal');
     _cpToast('✓ Your advisor has been notified. They will review your situation and may reach out.');
@@ -14199,7 +14201,8 @@ async function submitDeletionRequest(){
   if(confirm.trim().toUpperCase()!=='DELETE'){ _cpToast('Type DELETE to confirm.'); return; }
   setBtnLoading('deletionSubmitBtn',true,'Submitting...');
   try{
-    await db.from('deletion_requests').insert({client_id:APP.currentClientId,reason:reason.trim()||null,status:'pending',created_at:new Date().toISOString()});
+    var _r=await db.from('deletion_requests').insert({client_id:APP.currentClientId,reason:reason.trim()||null,status:'pending',created_at:new Date().toISOString()});
+    if(_r&&_r.error) throw new Error(_r.error.message); // audit silent-save: a blocked insert shouldn't show "request submitted"
     logAuditEvent('deletion_requested','client',APP.currentClientId,{reason:reason.trim()});
     setBtnLoading('deletionSubmitBtn',false,'Submit Deletion Request');
     closeModal('deletionRequestModal');
@@ -15053,8 +15056,8 @@ window.addEventListener('message',async function(e){
       }
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
 
-      await _cpSectionMergeSave(state, calcs, scores, _saveToId, _cpSave);
-      _lastSaveDirty=false;
+      var _okDeb=await _cpSectionMergeSave(state, calcs, scores, _saveToId, _cpSave);
+      if(_okDeb)_lastSaveDirty=false; // audit: only mark clean on a SUCCESSFUL merge-save — a failed/queued save keeps _lastSaveDirty so the beforeunload keepalive still fires
       _cpLastGoodWeight[_saveToId]=_incWNow;// refresh recurring-guard baseline to accepted weight
       // Backup to localStorage for fast reload
       try{localStorage.setItem('pfos_fd_backup',JSON.stringify({S:state,calcs:calcs,ts:Date.now(),cid:_saveToId||APP.currentClientId}));}catch(e3){}
@@ -30538,7 +30541,7 @@ function renderClientProjections(){
   _cpEnsurePlanLoaded();
   if(typeof CPLAN==='undefined'||!CPLAN._sim){el.innerHTML=_renderEmptyState('empty',{icon:'📈',title:'No Plan Data',message:'Create a financial plan first.',ctaLabel:'Build My Plan →',ctaOnclick:'showClientPage(\'plan\');initClientPlan()'});return;}
   var h='',yrs=Math.max(1,((CPLAN._sim&&CPLAN._sim.netWorth&&CPLAN._sim.netWorth.length)||31)-1),_isRet=_cpIsRetView(),bv=_cpProjBase(_isRet);
-  var adj=_cpScenAdj(_isRet),any=false;_cpScenDefs.forEach(function(s){if(_cpSim.scenarios[s.id])any=true;});
+  var adj=_cpScenAdj(_isRet),any=false;_cpScenDefs.forEach(function(s){if(_cpSim.scenarios[s.id]&&(!s.showIf||s.showIf()))any=true;});// M25/audit: only count a scenario as active if its showIf still passes (matches _cpActiveScenIds); else the "scenarios active" flag diverges from the numbers
   var sv2=Math.round(bv+adj),df=sv2-bv;
   // Chart
   h+='<div style="background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;padding:14px;margin-bottom:16px"><div id="projChart"></div></div>';
@@ -41666,7 +41669,7 @@ function _cpAvailableBudget(excludeIdx){
     // Partner-shared cards (owned by the other spouse, just displayed in this
     // user's plan for visibility) do NOT consume THIS user's surplus. Skip them
     // so the user's own budget reflects only their own commitments.
-    if(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId)return;
+    if(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint')return; // audit metric-divergence: match _cpDeploySummary/_cpAllocPoolDraw — a JOINT-owned partner-hydrated card IS counted in a joint household (only truly partner-personal cards are skipped)
     // Cascade-engine-spawned absorber allocations are virtual destinations
     // for freed cascade cash whose amount IS the freed money (already counted
     // upstream via the source allocation that freed it). Counting again here
