@@ -5331,12 +5331,11 @@ async function doLogout(){
           var saveToId=APP.currentClientId;
           var couple=typeof getCoupleForClient==='function'?getCoupleForClient(APP.currentClientId):null;
           if(couple&&couple.household_type==='joint')saveToId=couple.client_a_id;
-          var _clState=JSON.parse(JSON.stringify(_lastPfosState.state));delete _clState._touched;
-          var _clWriteState=await _jmDemergeWriteB(couple,_clState);
-          var pp={client_id:saveToId,financial_data:{S:_clWriteState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
-          var ex=await db.from('client_profiles').select('id').eq('client_id',saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-          if(ex&&ex.data)await db.from('client_profiles').update(pp).eq('id',ex.data.id);
-          console.log('[PFOS] logout: saved ('+_logoutTouched.length+' sections touched)');
+          // Route through the canonical section-merge save (RAW state, _touched intact)
+          // so the logout write preserves untouched sections + rotates backups + de-merges
+          // V2-joint, instead of the old naive full-state overwrite that could clobber a
+          // section another tab/device advanced.
+          var _okLo=await _cpSectionMergeSave(_lastPfosState.state, calcs, {cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore}, saveToId, couple); console.log('[PFOS] logout: mergeSave '+(_okLo?'ok':'queued')+' ('+_logoutTouched.length+' sections touched)');
         }
       } else {
         console.log('[PFOS] logout: no sections touched — skipping save to protect existing data');
@@ -14127,22 +14126,19 @@ async function clientSaveOwnData(){
   if(!APP.currentClientId) return false;
   var siEl=document.getElementById('clientSaveIndicator'); if(siEl){siEl.className='save-indicator saving';siEl.textContent='⟳ Saving...';siEl.style.display='inline-flex';}
   try{
-    var stateData = _lastPfosState.state || {};
     var calcs     = _lastPfosState.calcs || {};
     var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
-    // V2 joint: route the save to client_a and de-merge spouse data to B's row.
-    // _jmDemergeWriteB returns stateData unchanged for non-V2/non-joint couples.
+    // Route through the canonical section-merge save so this secondary path can't
+    // clobber sections another tab/device advanced. Pass the RAW state (with
+    // _touched) — the helper preserves untouched sections and does its own V2-joint
+    // de-merge + backup rotation, which replaces the old allow_data_downgrade bypass.
     var _csClientId = APP.currentClientId;
     var _csCouple = (typeof getCoupleForClient==='function') ? getCoupleForClient(_csClientId) : null;
     var _csIsV2 = _csCouple && _csCouple.household_type==='joint' && _isJointModelV2(_csCouple);
     var _csSaveId = _csIsV2 ? _csCouple.client_a_id : _csClientId;
-    if(_csIsV2){ stateData = await _jmDemergeWriteB(_csCouple, stateData); }
-    var exRes=await db.from('client_profiles').select('id').eq('client_id',_csSaveId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-    var pp={client_id:_csSaveId,financial_data:{S:stateData,calcs},scores,updated_at:new Date().toISOString()};
-    if(_csIsV2) pp.allow_data_downgrade=true;
-    var saveRes;
-    if(exRes&&exRes.data){saveRes=await db.from('client_profiles').update(pp).eq('id',exRes.data.id);}else{saveRes=await db.from('client_profiles').insert(pp);}
-    if(saveRes&&saveRes.error){throw new Error(saveRes.error.message);}
+    var _state=_lastPfosState.state||{};
+    var _okSave=await _cpSectionMergeSave(_state, calcs, scores, _csSaveId, _csCouple);
+    if(!_okSave) throw new Error('save failed');
     // Auto-save daily snapshot for trend tracking (Phase 4)
     try{autoSaveSnapshot(_csClientId, calcs);}catch(e2){}
     if(siEl){siEl.className='save-indicator saved';siEl.textContent='✓ Saved';siEl.style.display='inline-flex';setTimeout(function(){siEl.className='save-indicator';siEl.style.display='none';},2500);}
@@ -14234,6 +14230,103 @@ function _cpStateWeight(s,c){
 }
 // Per-client last-known-good weight for the recurring catastrophic-drop guard.
 var _cpLastGoodWeight={};
+// ══ CANONICAL SECTION-MERGE SAVE ══
+// Single source of truth for the debounced save's section-level merge: re-read DB →
+// multi-tab conflict banner → preserve untouched _protectedSections against
+// state._touched → V2-joint de-merge to client_b row → 3-version backup rotation →
+// update/insert. Secondary save paths (clientSaveOwnData, logout background save)
+// route through here so they can no longer clobber sections another tab advanced.
+// The 5 params are the only inputs; everything else is a module-level global.
+async function _cpSectionMergeSave(state, calcs, scores, _saveToId, _cpSave){
+      // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
+      var ex=await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2,data_version').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+      if(ex&&ex.error){console.error('[PFOS] client_profiles SELECT failed:',ex.error.message);}
+      // ══ MULTI-TAB CONFLICT DETECTION ══
+      if(ex&&ex.data&&ex.data.data_version>0&&APP._lastDataVersion>0&&ex.data.data_version>APP._lastDataVersion){
+        console.warn('[PFOS] ⚠️ Another tab wrote (DB v'+ex.data.data_version+' > local v'+APP._lastDataVersion+'). Merging carefully.');
+        try{if(!document.getElementById('pfosConflictBanner')){var _cb=document.createElement('div');_cb.id='pfosConflictBanner';_cb.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9998;padding:11px 18px;background:#D97706 !important;color:#160F02 !important;font:700 13px/1.45 system-ui,sans-serif !important;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 2px 12px rgba(0,0,0,.35)';_cb.innerHTML='⚠ This profile was also edited in another tab or device — your changes were merged; reload to confirm you have the latest. <button onclick="window.location.reload()" style="padding:5px 14px;background:#1a1a1a;color:#fff;border:0;border-radius:3px;font:700 12px system-ui;cursor:pointer">Reload</button> <button onclick="this.parentElement.remove()" style="padding:5px 10px;background:transparent;color:rgba(0,0,0,.6);border:1px solid rgba(0,0,0,.3);border-radius:3px;cursor:pointer">Dismiss</button>';document.body.appendChild(_cb);}}catch(e){}
+      }
+      if(ex&&ex.data)APP._lastDataVersion=ex.data.data_version||0;
+      var mergedState=JSON.parse(JSON.stringify(state));
+      var touched=state._touched||{};
+      if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
+        var exS=ex.data.financial_data.S;
+        // V2 joint: `state` is the COMBINED view (A self/joint + B's items tagged
+        // spouse) and the de-merge below splits B's items back out to B's row.
+        // The untouched-section preservation must therefore baseline against the
+        // COMBINED existing (A's stored row merged with B's stored row), not A's
+        // row alone. Otherwise an untouched array (e.g. on a no-edit load→save) is
+        // restored to A-only data, stripping B's spouse items, and the de-merge
+        // then writes an empty/degraded B-row that the DB's data-protection trigger
+        // blocks — silently dropping B's joint contributions.
+        if(_cpSave && _cpSave.household_type==='joint' && _isJointModelV2(_cpSave)){
+          try{
+            var _exBr=await db.from('client_profiles').select('financial_data').eq('client_id',_cpSave.client_b_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+            var _exBrS=(_exBr&&_exBr.data&&_exBr.data.financial_data&&_exBr.data.financial_data.S)?_exBr.data.financial_data.S:null;
+            exS=_mergeJointState(exS,_exBrS);
+          }catch(_eMx){ console.warn('[jm] preserve-baseline merge failed, using primary-only:',_eMx&&_eMx.message); }
+        }
+        var _protectedSections=['retAccounts','incomeSources','debts','investments','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash','budget','categories','reconcile']; // M13: 'investments' was missing → an empty incoming investments[] could wipe a populated DB copy (engine _PROTECTED_ARRAYS already includes it)
+        _protectedSections.forEach(function(sec){
+          if(!touched[sec]){
+            var exVal=exS[sec];
+            if(exVal===undefined||exVal===null)return;
+            var exHasData=false;
+            if(Array.isArray(exVal))exHasData=exVal.length>0;
+            else if(typeof exVal==='object')exHasData=Object.keys(exVal).length>0;
+            else exHasData=!!exVal;
+            if(exHasData){
+              mergedState[sec]=exVal;
+              console.log('[PFOS] ✓ Preserved untouched section from existing:',sec);
+            }
+          }
+        });
+      }
+      delete mergedState._touched;
+      // ── Joint two-row model (V2): de-merge before writing ──
+      // Split combined view: B's items (owner=spouse) + sp* profile -> client_b row;
+      // A keeps self+joint. Write B here (backup rotation), persist A below.
+      if(_cpSave && _cpSave.household_type==='joint' && _isJointModelV2(_cpSave)){
+        try{
+          var _bIdWc=_cpSave.client_b_id;
+          var _bExc=await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',_bIdWc).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+          var _bBasec=(_bExc&&_bExc.data&&_bExc.data.financial_data&&_bExc.data.financial_data.S)?_bExc.data.financial_data.S:null;
+          var _splitc=_demergeJointState(mergedState,_bBasec);
+          var _ppBc={financial_data:{S:_splitc.bS,calcs:(_bExc&&_bExc.data&&_bExc.data.financial_data&&_bExc.data.financial_data.calcs)||{}},updated_at:new Date().toISOString()};
+          if(_bExc&&_bExc.data){
+            if(_bExc.data.financial_data){_ppBc.previous_financial_data=_bExc.data.financial_data;
+              if(_bExc.data.previous_financial_data)_ppBc.previous_financial_data_2=_bExc.data.previous_financial_data;
+              if(_bExc.data.previous_financial_data_2)_ppBc.previous_financial_data_3=_bExc.data.previous_financial_data_2;}
+            var _rBc=await db.from('client_profiles').update(_ppBc).eq('id',_bExc.data.id);
+            if(_rBc.error){console.error('[jm] B-row save failed:',_rBc.error.message); if(typeof _queueFailedSave==='function') _queueFailedSave(_bIdWc,{financial_data:_ppBc.financial_data,updated_at:_ppBc.updated_at});} // queue the partner-mirror write for retry — was silently dropped (A-row already queues)
+          } else {
+            var _rB2c=await db.from('client_profiles').insert({client_id:_bIdWc,financial_data:_ppBc.financial_data,updated_at:_ppBc.updated_at});
+            if(_rB2c.error){console.error('[jm] B-row insert failed:',_rB2c.error.message); if(typeof _queueFailedSave==='function') _queueFailedSave(_bIdWc,{financial_data:_ppBc.financial_data,updated_at:_ppBc.updated_at});}
+          }
+          mergedState=_splitc.aS;
+        }catch(_eJmc){console.warn('[jm] de-merge-on-write failed, writing combined to primary:',_eJmc&&_eJmc.message);}
+      }
+      var pp={client_id:_saveToId,financial_data:{S:mergedState,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
+
+      // ══ BACKUP: ALWAYS rotate 3 versions before overwriting ══
+      if(ex&&ex.data&&ex.data.financial_data){
+        pp.previous_financial_data=ex.data.financial_data;
+        if(ex.data.previous_financial_data)pp.previous_financial_data_2=ex.data.previous_financial_data;
+        if(ex.data.previous_financial_data_2)pp.previous_financial_data_3=ex.data.previous_financial_data_2;
+      }
+
+      if(ex&&ex.data){
+        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+        if(_r.error){
+          if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS] ⛔ Database blocked destructive overwrite');}
+          else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS] ⛔ Rate limit hit');}
+          else{console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message);_queueFailedSave(_saveToId,{financial_data:pp.financial_data,scores:pp.scores,updated_at:pp.updated_at});}
+          return false; // G4: signal failure to the secondary callers (clientSaveOwnData → "Save failed"; the queue/data-protection block still handles retry/guarding). The debounced handler ignores the return, so its behavior is unchanged.
+        } else {console.log('[PFOS] Auto-saved OK');_updateLastSaved();}
+      }
+      else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error){console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); return false;} else console.log('[PFOS] Inserted new profile'); }
+      return true;
+}
 window.addEventListener('message',async function(e){
   if(e.origin!==PFOS_ORIGIN) return;
   var msg=e.data; if(!msg||!msg.type) return;
@@ -14887,6 +14980,7 @@ window.addEventListener('message',async function(e){
     }
     if(!_pfosDataLoaded){console.log('[PFOS] Skipping save — data not loaded yet');return;}
     if(typeof _writeAlertStateSoon==='function') _writeAlertStateSoon(); // §4.2a (M4): refresh the alert snapshot after the edit settles (debounced)
+    _lastSaveDirty=true; // G4: mark an accepted edit as in-flight; _cpSectionMergeSave below sets it false on success. This makes the beforeunload keepalive gate fire ONLY when there are genuinely unflushed edits.
     try{
       var state=msg.state,calcs=state.calcs||{};
       // ══ FIRST-SAVE DATA PROTECTION ══
@@ -14959,92 +15053,7 @@ window.addEventListener('message',async function(e){
       }
       var scores={cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore};
 
-      // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
-      var ex=await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2,data_version').eq('client_id',_saveToId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-      if(ex&&ex.error){console.error('[PFOS] client_profiles SELECT failed:',ex.error.message);}
-      // ══ MULTI-TAB CONFLICT DETECTION ══
-      if(ex&&ex.data&&ex.data.data_version>0&&APP._lastDataVersion>0&&ex.data.data_version>APP._lastDataVersion){
-        console.warn('[PFOS] ⚠️ Another tab wrote (DB v'+ex.data.data_version+' > local v'+APP._lastDataVersion+'). Merging carefully.');
-        try{if(!document.getElementById('pfosConflictBanner')){var _cb=document.createElement('div');_cb.id='pfosConflictBanner';_cb.style.cssText='position:fixed;top:0;left:0;right:0;z-index:9998;padding:11px 18px;background:#D97706 !important;color:#160F02 !important;font:700 13px/1.45 system-ui,sans-serif !important;display:flex;align-items:center;justify-content:center;gap:12px;box-shadow:0 2px 12px rgba(0,0,0,.35)';_cb.innerHTML='⚠ This profile was also edited in another tab or device — your changes were merged; reload to confirm you have the latest. <button onclick="window.location.reload()" style="padding:5px 14px;background:#1a1a1a;color:#fff;border:0;border-radius:3px;font:700 12px system-ui;cursor:pointer">Reload</button> <button onclick="this.parentElement.remove()" style="padding:5px 10px;background:transparent;color:rgba(0,0,0,.6);border:1px solid rgba(0,0,0,.3);border-radius:3px;cursor:pointer">Dismiss</button>';document.body.appendChild(_cb);}}catch(e){}
-      }
-      if(ex&&ex.data)APP._lastDataVersion=ex.data.data_version||0;
-      var mergedState=JSON.parse(JSON.stringify(state));
-      var touched=state._touched||{};
-      if(ex&&ex.data&&ex.data.financial_data&&ex.data.financial_data.S){
-        var exS=ex.data.financial_data.S;
-        // V2 joint: `state` is the COMBINED view (A self/joint + B's items tagged
-        // spouse) and the de-merge below splits B's items back out to B's row.
-        // The untouched-section preservation must therefore baseline against the
-        // COMBINED existing (A's stored row merged with B's stored row), not A's
-        // row alone. Otherwise an untouched array (e.g. on a no-edit load→save) is
-        // restored to A-only data, stripping B's spouse items, and the de-merge
-        // then writes an empty/degraded B-row that the DB's data-protection trigger
-        // blocks — silently dropping B's joint contributions.
-        if(_cpSave && _cpSave.household_type==='joint' && _isJointModelV2(_cpSave)){
-          try{
-            var _exBr=await db.from('client_profiles').select('financial_data').eq('client_id',_cpSave.client_b_id).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-            var _exBrS=(_exBr&&_exBr.data&&_exBr.data.financial_data&&_exBr.data.financial_data.S)?_exBr.data.financial_data.S:null;
-            exS=_mergeJointState(exS,_exBrS);
-          }catch(_eMx){ console.warn('[jm] preserve-baseline merge failed, using primary-only:',_eMx&&_eMx.message); }
-        }
-        var _protectedSections=['retAccounts','incomeSources','debts','investments','children','goals','policies','stockOptions','ibcPolicies','assets','expData','expSub','profile','spendingEntries','snapshot','budgetRecommendations','linkedCash','budget','categories','reconcile']; // M13: 'investments' was missing → an empty incoming investments[] could wipe a populated DB copy (engine _PROTECTED_ARRAYS already includes it)
-        _protectedSections.forEach(function(sec){
-          if(!touched[sec]){
-            var exVal=exS[sec];
-            if(exVal===undefined||exVal===null)return;
-            var exHasData=false;
-            if(Array.isArray(exVal))exHasData=exVal.length>0;
-            else if(typeof exVal==='object')exHasData=Object.keys(exVal).length>0;
-            else exHasData=!!exVal;
-            if(exHasData){
-              mergedState[sec]=exVal;
-              console.log('[PFOS] ✓ Preserved untouched section from existing:',sec);
-            }
-          }
-        });
-      }
-      delete mergedState._touched;
-      // ── Joint two-row model (V2): de-merge before writing ──
-      // Split combined view: B's items (owner=spouse) + sp* profile -> client_b row;
-      // A keeps self+joint. Write B here (backup rotation), persist A below.
-      if(_cpSave && _cpSave.household_type==='joint' && _isJointModelV2(_cpSave)){
-        try{
-          var _bIdWc=_cpSave.client_b_id;
-          var _bExc=await db.from('client_profiles').select('id,financial_data,previous_financial_data,previous_financial_data_2').eq('client_id',_bIdWc).order('updated_at',{ascending:false}).limit(1).maybeSingle();
-          var _bBasec=(_bExc&&_bExc.data&&_bExc.data.financial_data&&_bExc.data.financial_data.S)?_bExc.data.financial_data.S:null;
-          var _splitc=_demergeJointState(mergedState,_bBasec);
-          var _ppBc={financial_data:{S:_splitc.bS,calcs:(_bExc&&_bExc.data&&_bExc.data.financial_data&&_bExc.data.financial_data.calcs)||{}},updated_at:new Date().toISOString()};
-          if(_bExc&&_bExc.data){
-            if(_bExc.data.financial_data){_ppBc.previous_financial_data=_bExc.data.financial_data;
-              if(_bExc.data.previous_financial_data)_ppBc.previous_financial_data_2=_bExc.data.previous_financial_data;
-              if(_bExc.data.previous_financial_data_2)_ppBc.previous_financial_data_3=_bExc.data.previous_financial_data_2;}
-            var _rBc=await db.from('client_profiles').update(_ppBc).eq('id',_bExc.data.id);
-            if(_rBc.error){console.error('[jm] B-row save failed:',_rBc.error.message); if(typeof _queueFailedSave==='function') _queueFailedSave(_bIdWc,{financial_data:_ppBc.financial_data,updated_at:_ppBc.updated_at});} // queue the partner-mirror write for retry — was silently dropped (A-row already queues)
-          } else {
-            var _rB2c=await db.from('client_profiles').insert({client_id:_bIdWc,financial_data:_ppBc.financial_data,updated_at:_ppBc.updated_at});
-            if(_rB2c.error){console.error('[jm] B-row insert failed:',_rB2c.error.message); if(typeof _queueFailedSave==='function') _queueFailedSave(_bIdWc,{financial_data:_ppBc.financial_data,updated_at:_ppBc.updated_at});}
-          }
-          mergedState=_splitc.aS;
-        }catch(_eJmc){console.warn('[jm] de-merge-on-write failed, writing combined to primary:',_eJmc&&_eJmc.message);}
-      }
-      var pp={client_id:_saveToId,financial_data:{S:mergedState,calcs:calcs},scores:scores,updated_at:new Date().toISOString()};
-
-      // ══ BACKUP: ALWAYS rotate 3 versions before overwriting ══
-      if(ex&&ex.data&&ex.data.financial_data){
-        pp.previous_financial_data=ex.data.financial_data;
-        if(ex.data.previous_financial_data)pp.previous_financial_data_2=ex.data.previous_financial_data;
-        if(ex.data.previous_financial_data_2)pp.previous_financial_data_3=ex.data.previous_financial_data_2;
-      }
-
-      if(ex&&ex.data){
-        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id);
-        if(_r.error){
-          if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS] ⛔ Database blocked destructive overwrite');}
-          else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS] ⛔ Rate limit hit');}
-          else{console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message);_queueFailedSave(_saveToId,{financial_data:pp.financial_data,scores:pp.scores,updated_at:pp.updated_at});}
-        } else {console.log('[PFOS] Auto-saved OK');_updateLastSaved();}
-      }
-      else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error)console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); else console.log('[PFOS] Inserted new profile'); }
+      await _cpSectionMergeSave(state, calcs, scores, _saveToId, _cpSave);
       _lastSaveDirty=false;
       _cpLastGoodWeight[_saveToId]=_incWNow;// refresh recurring-guard baseline to accepted weight
       // Backup to localStorage for fast reload
@@ -15206,6 +15215,7 @@ window.addEventListener('beforeunload',function(){
       // save de-merges properly. (Hybrid/separate keep per-partner state in S with no owner:'spouse' rows, so they save.)
       var _blHasSpouse=_JOINT_MERGE_ARRAYS.some(function(k){ var arr=_blState[k]; return Array.isArray(arr)&&arr.some(function(x){return x&&x.owner==='spouse';}); }); // H7: use the EXACT set _mergeJointState spouse-tags (incl. goals + linkedCash) so a couple where partner B has only a goal/linked-cash still triggers the guard
       if(_blHasSpouse){ console.log('[PFOS] beforeunload: V2-joint merged state — skipping raw keepalive PATCH (would write spouse items to the primary row un-de-merged); localStorage backup + debounced de-merge cover it'); }
+      else if(!_lastSaveDirty){ console.log('[PFOS] beforeunload: no unflushed edits (_lastSaveDirty=false) — skipping raw keepalive PATCH; the debounced merge-save already persisted this, and a full-state PATCH could clobber a section another tab advanced'); }
       else {
       var payload={financial_data:{S:_blState,calcs:calcs},scores:{cfScore:calcs.cfScore,protScore:calcs.protScore,growScore:calcs.growScore,effScore:calcs.effScore},updated_at:new Date().toISOString()};
       var url=SUPABASE_URL+'/rest/v1/client_profiles?client_id=eq.'+_lastSaveClientId+'&order=updated_at.desc&limit=1';
