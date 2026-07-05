@@ -1184,8 +1184,7 @@ input:focus+.bio-slider{box-shadow:0 0 0 2px rgba(91,155,255,.3)}
             <button class="filter-btn active" onclick="setProductFilter('all',this)">All Tiers</button>
             <button class="filter-btn" onclick="setProductFilter('none',this)">No Access</button>
             <button class="filter-btn" onclick="setProductFilter('core',this)">CORE</button>
-            <button class="filter-btn" onclick="setProductFilter('pro',this)">PRO</button>
-            <button class="filter-btn" onclick="setProductFilter('pro_plus',this)">PRO+</button>
+            <button class="filter-btn" onclick="setProductFilter('planning',this)">PLANNING</button>
             <button class="filter-btn" onclick="setProductFilter('comp',this)">COMP</button>
           </div>
         </div>
@@ -2475,8 +2474,8 @@ function pfosTierBadgeSmall(client){
   }
   if(!t || t === 'none' || t === 'undefined') return '<span style="font-family:var(--fh);font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:var(--mu);background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2)">No Access</span>';
   if(t === 'trial') return '<span style="font-family:var(--fh);font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:var(--or);background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.25)">TRIAL · '+daysLeft+'d</span>';
-  var m={core:'CORE',pro:'PRO',pro_plus:'PRO+',comp:'COMP'};
-  var col={core:'var(--mu)',pro:'#5B9BFF',pro_plus:'#A855F7',comp:'#22C55E'};
+  var m={core:'CORE',planning:'PLANNING',comp:'COMP'};
+  var col={core:'var(--mu)',planning:'#A855F7',comp:'#22C55E'};
   var c=col[t]||'var(--mu)';
   return '<span style="font-family:var(--fh);font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:'+c+';background:'+c+'1A;border:1px solid '+c+'33">'+(m[t]||t.toUpperCase())+'</span>';
 }
@@ -2529,12 +2528,12 @@ function renderSystemDashboard(){
   set('sys-product',  product.length);
 
   // Tier breakdown
-  var tierCounts = {core:0, pro:0, pro_plus:0, comp:0};
-  paid.forEach(function(c){ if(tierCounts[c.pfos_tier] !== undefined) tierCounts[c.pfos_tier]++; });
-  var tierColors = {core:'var(--mu)', pro:'#5B9BFF', pro_plus:'#A855F7', comp:'#22C55E'};
-  var tierLabels = {core:'CORE', pro:'PRO', pro_plus:'PRO+', comp:'COMP'};
+  var tierCounts = {core:0, planning:0, comp:0};
+  paid.forEach(function(c){ if(c.comp===true||c.pfos_tier==='comp') tierCounts.comp++; else if(c.pfos_tier==='planning'||c.pfos_tier==='pro_plus') tierCounts.planning++; else tierCounts.core++; });
+  var tierColors = {core:'var(--mu)', planning:'#A855F7', comp:'#22C55E'};
+  var tierLabels = {core:'CORE', planning:'PLANNING', comp:'COMP'};
   var tierHtml = '';
-  ['core','pro','pro_plus','comp'].forEach(function(t){
+  ['core','planning','comp'].forEach(function(t){
     var count = tierCounts[t];
     var pct   = paid.length > 0 ? Math.round(count/paid.length*100) : 0;
     var col   = tierColors[t];
@@ -2580,9 +2579,9 @@ function renderSystemDashboard(){
   set('sysPipeline', pipeHtml || '<div style="color:var(--mu);font-size:12px">No clients yet</div>');
 
   // Revenue metrics
-  var tierPrices = {core:0, pro:19, pro_plus:39, comp:0};
+  var tierPrices = {core:19.99, planning:49.99};
   var mrr = 0;
-  paid.forEach(function(c){ mrr += tierPrices[c.pfos_tier] || 0; });
+  paid.forEach(function(c){ if(c.comp) return; var _pt=c.pfos_tier==='pro_plus'?'planning':c.pfos_tier==='pro'?'core':c.pfos_tier; mrr += (tierPrices[_pt]||0) + (c.household?10:0); });
   var revHtml = '<div style="display:flex;justify-content:space-between;align-items:center;padding:8px 0">'
     +'<div style="font-size:12px;color:var(--mu)">Monthly Recurring</div>'
     +'<div style="font-family:var(--fh);font-size:16px;font-weight:800;color:var(--gr)">'+fmt(mrr)+'</div></div>'
@@ -2630,19 +2629,18 @@ async function updateClientAgent(clientId, agentId){
 }
 async function updateClientTier(clientId, tier){
   try{
-    var updates = { pfos_tier: tier };
-    if(tier && tier !== 'none' && tier !== 'core'){
-      // Set trial start if not already set
-      var existing = (APP.allClients||[]).find(function(c){ return c.id===clientId; });
-      if(!existing || !existing.trial_start_date){
-        updates.trial_start_date = new Date().toISOString().split('T')[0];
-      }
-    }
+    // M0: the dropdown encodes comp-Core / comp-Planning as composite values → split into pfos_tier + comp.
+    // Admin grants are DIRECT (no trial stamp; the old non-core→trial auto-grant is removed).
+    var comp=false, pfosTier=tier;
+    if(tier==='comp_core'){ pfosTier='core'; comp=true; }
+    else if(tier==='comp_planning'){ pfosTier='planning'; comp=true; }
+    else if(tier==='comp'){ pfosTier='planning'; comp=true; } // legacy dropdown value
+    var updates = { pfos_tier: pfosTier, comp: comp, trial_start_date: null }; // admin grant is DIRECT — clear any stale trial so it isn't misread as 'trial'
     await db.from('clients').update(updates).eq('id', clientId);
     var idx = (APP.allClients||[]).findIndex(function(c){ return c.id===clientId; });
-    if(idx>=0){ APP.allClients[idx].pfos_tier=tier; if(updates.trial_start_date) APP.allClients[idx].trial_start_date=updates.trial_start_date; }
+    if(idx>=0){ APP.allClients[idx].pfos_tier=pfosTier; APP.allClients[idx].comp=comp; APP.allClients[idx].trial_start_date=null; }
     var idx2 = APP.myClients.findIndex(function(c){ return c.id===clientId; });
-    if(idx2>=0){ APP.myClients[idx2].pfos_tier=tier; if(updates.trial_start_date) APP.myClients[idx2].trial_start_date=updates.trial_start_date; }
+    if(idx2>=0){ APP.myClients[idx2].pfos_tier=pfosTier; APP.myClients[idx2].comp=comp; APP.myClients[idx2].trial_start_date=null; }
   }catch(e){ alert('Could not update tier: '+e.message); }
 }
 function buildAgentDropdown(clientId, currentUserId, clientObj){
@@ -2953,7 +2951,7 @@ async function loadClientDataIntoPFOS(clientId){
   }
   var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'core';
   if(clientEffTier === 'none') clientEffTier = 'core';
-  var pfosTier = (mode === 'advisor') ? 'pro_plus' : clientEffTier;
+  var pfosTier = (mode === 'advisor') ? 'planning' : clientEffTier;
 
   // Seed _lastPfosState immediately so the Save button has correct data for this
   // client even if the advisor saves before the first PFOS_DATA_CHANGE fires (1500ms debounce)
@@ -4233,23 +4231,27 @@ async function renderDashboard(){
     reviewClients.filter(function(c){ if(!c.next_review_date) return false; var d=new Date(c.next_review_date); return d>=today && d<=in30; })
   );
 }
+// ── CANONICAL getEffectiveTier (M0) — MUST stay byte-identical across pfos-client / pfos-dashboard /
+// pfos-admin / pfos / pfos-client-profile. Static drift guard: _plaid_e2e/_g4-tier-resolver.mjs. ──
 function getEffectiveTier(client){
   if(!client || typeof client !== 'object') return 'none';
-  var t = client.pfos_tier||'none';
-  // Guard: 'none' always means no access regardless of trial_start_date
-  if(t === 'none') return 'none';
-  // Comp = permanent full access, no trial window needed
-  if(t === 'comp') return 'comp';
-  // Guard: if pfos_tier is the literal string 'trial' (legacy data from old code),
-  // treat it as 'core' since 'trial' is not a real tier — trial is a window on top of a tier
-  if(t === 'trial') t = 'core';
-  // Now check if within the 14-day trial window
-  var trialStart = client.trial_start_date ? new Date(client.trial_start_date) : null;
-  if(!trialStart) return t; // no trial_start_date = show purchased tier directly
-  var daysUsed = Math.floor((Date.now() - trialStart.getTime()) / 86400000);
-  // Trial only UPGRADES a sub-Pro tier; never downgrade a paid Pro/Pro+ client (comp returned above).
-  if(daysUsed < 14 && t!=='pro' && t!=='pro_plus') return 'trial';
-  return t; // trial expired (or paid tier already >= Pro) — resolve to purchased tier
+  var t = client.pfos_tier || 'none';
+  // M0 tier restructure: collapse legacy pro/pro_plus/'trial' + pre-migration 'comp' into the 2-tier model.
+  if(t === 'pro') t = 'core'; else if(t === 'pro_plus') t = 'planning'; else if(t === 'trial') t = 'core';
+  else if(t === 'comp') return 'planning'; // legacy comp row (pre-migration) = full access
+  // comp flag = free permanent access at its level (comp-Core or comp-Planning); never expires.
+  if(client.comp) return (t === 'planning') ? 'planning' : 'core';
+  // active/grace subscription → the purchased tier.
+  var sub = client.subscription_status;
+  if(sub === 'active' || sub === 'past_due' || sub === 'trialing') return (t === 'planning') ? 'planning' : 'core';
+  // 14-day Core trial (no active sub) → effective Core; Plaid + AI are denied in clientHasFeature/server.
+  if(client.trial_start_date && !sub){
+    var daysUsed = Math.floor((Date.now() - new Date(client.trial_start_date).getTime()) / 86400000);
+    if(daysUsed < 14) return 'trial';
+  }
+  // canceled/expired and not comp → locked (read-only); otherwise an admin-granted tier (e.g. advisory).
+  if(sub === 'canceled' || sub === 'unpaid' || t === 'none') return 'none';
+  return t;
 }
 function getTrialDaysLeft(client){
   if(!client || !client.trial_start_date) return 0;
@@ -4328,18 +4330,20 @@ function renderProductClientsTable(){
   var clients = (APP.allClients||[]).filter(function(c){ return c.client_type === 'product'; });
   var filtered = clients.filter(function(c){
     var tier = c.pfos_tier||'none';
+    if(c.comp===true||tier==='comp') tier='comp'; else if(tier==='pro_plus'||tier==='planning') tier='planning'; else if(tier==='pro') tier='core';
     var mF = APP_PRODUCT_FILTER==='all' || tier===APP_PRODUCT_FILTER;
     var mS = !search||(c.name||'').toLowerCase().includes(search.toLowerCase())||(c.email||'').toLowerCase().includes(search.toLowerCase());
     return mF && mS;
   });
   var html = filtered.map(function(c){
     var t = c.pfos_tier||'none';
+    var _tsel=(c.comp&&c.pfos_tier==='core')?'comp_core':(c.comp||c.pfos_tier==='comp')?'comp_planning':(c.pfos_tier==='pro_plus'?'planning':c.pfos_tier==='pro'?'core':(c.pfos_tier||'none'));
     var tierDrop = '<select class="tier-inline-sel" onchange="updateClientTier(\''+c.id+'\',this.value)" onclick="event.stopPropagation()">'
-      +'<option value="none"'+(t==='none'?' selected':'')+'>— None</option>'
-      +'<option value="core"'+(t==='core'?' selected':'')+'>CORE</option>'
-      +'<option value="pro"'+(t==='pro'?' selected':'')+'>PRO</option>'
-      +'<option value="pro_plus"'+(t==='pro_plus'?' selected':'')+'>PRO+</option>'
-      +'<option value="comp"'+(t==='comp'?' selected':'')+'>COMP</option>'
+      +'<option value="none"'+(_tsel==='none'?' selected':'')+'>— None</option>'
+      +'<option value="core"'+(_tsel==='core'?' selected':'')+'>CORE</option>'
+      +'<option value="planning"'+(_tsel==='planning'?' selected':'')+'>PLANNING</option>'
+      +'<option value="comp_core"'+(_tsel==='comp_core'?' selected':'')+'>COMP · Core</option>'
+      +'<option value="comp_planning"'+(_tsel==='comp_planning'?' selected':'')+'>COMP · Planning</option>'
       +'</select>';
     return "<tr onclick=\"openClientProfile('"+c.id+"')\">"
       +"<td><strong class='client-name' title='"+esc(c.name||'—')+"' style='color:var(--wh)'>"+esc(c.name||'—')+"</strong></td>"
@@ -4368,19 +4372,20 @@ function renderAllClientsTable(clients){
     var mS = !search||(c.name||'').toLowerCase().includes(search.toLowerCase())||(c.email||'').toLowerCase().includes(search.toLowerCase());
     return mF && mS;
   });
-  var t2l = {none:'No Access',core:'CORE',pro:'PRO',pro_plus:'PRO+'};
+  var t2l = {none:'No Access',core:'CORE',planning:'PLANNING',comp:'COMP'};
   var html = filtered.map(function(c){
     var t = c.pfos_tier||'none';
     var isProduct = c.client_type==='product';
     var typeBadge = isProduct
       ? '<span style="font-size:9px;font-family:var(--fh);font-weight:700;color:#A855F7;background:rgba(168,85,247,.1);border:1px solid rgba(168,85,247,.2);padding:2px 7px;border-radius:2px">Product</span>'
       : '<span style="font-size:9px;font-family:var(--fh);font-weight:700;color:#5B9BFF;background:rgba(0,68,191,.1);border:1px solid rgba(0,68,191,.2);padding:2px 7px;border-radius:2px">Advisory</span>';
+    var _tsel=(c.comp&&c.pfos_tier==='core')?'comp_core':(c.comp||c.pfos_tier==='comp')?'comp_planning':(c.pfos_tier==='pro_plus'?'planning':c.pfos_tier==='pro'?'core':(c.pfos_tier||'none'));
     var tierDrop = '<select class="tier-inline-sel" onchange="updateClientTier(\''+c.id+'\',this.value)" onclick="event.stopPropagation()">'
-      +'<option value="none"'+(t==='none'?' selected':'')+'>— None</option>'
-      +'<option value="core"'+(t==='core'?' selected':'')+'>CORE</option>'
-      +'<option value="pro"'+(t==='pro'?' selected':'')+'>PRO</option>'
-      +'<option value="pro_plus"'+(t==='pro_plus'?' selected':'')+'>PRO+</option>'
-      +'<option value="comp"'+(t==='comp'?' selected':'')+'>COMP</option>'
+      +'<option value="none"'+(_tsel==='none'?' selected':'')+'>— None</option>'
+      +'<option value="core"'+(_tsel==='core'?' selected':'')+'>CORE</option>'
+      +'<option value="planning"'+(_tsel==='planning'?' selected':'')+'>PLANNING</option>'
+      +'<option value="comp_core"'+(_tsel==='comp_core'?' selected':'')+'>COMP · Core</option>'
+      +'<option value="comp_planning"'+(_tsel==='comp_planning'?' selected':'')+'>COMP · Planning</option>'
       +'</select>';
     return "<tr onclick=\"openClientProfile('"+c.id+"')\">"
       +"<td><strong class='client-name' title='"+esc(c.name||'—')+"' style='color:var(--wh)'>"+esc(c.name||'—')+"</strong></td>"
@@ -4961,7 +4966,7 @@ async function loadAgentProfileIntoPFOS(){
     iframe.contentWindow.postMessage({
       type:'PFOS_LOAD',
       mode:'advisor',
-      tier:'pro_plus',
+      tier:'planning',
       clientId:'agent-'+APP.user.id,
       clientName:agentName+' (My Finances)',
       state:stateData,
@@ -5049,7 +5054,7 @@ function openEditClientModal(){
   toggleMcSpouse();
   var hasPlan = c.pfos_tier && c.pfos_tier !== 'none';
   setPurchased(hasPlan ? 'yes' : 'no');
-  if(hasPlan) document.getElementById('mc-pfos-tier').value=c.pfos_tier||'core';
+  if(hasPlan) document.getElementById('mc-pfos-tier').value=(c.comp&&c.pfos_tier==='core')?'comp_core':(c.comp||c.pfos_tier==='comp')?'comp_planning':(c.pfos_tier==='pro_plus'?'planning':c.pfos_tier==='pro'?'core':(c.pfos_tier||'core'));
   var agentSel = document.getElementById('mc-agentId');
   if(agentSel) agentSel.value = c.user_id || '';
   openModal('clientModal');
@@ -5077,22 +5082,22 @@ async function saveClientRecord(){
 
   if(APP.role === 'admin'){
     var purchased = document.getElementById('mc-purchased').value;
-    clientData.pfos_tier = purchased === 'yes' ? (v('mc-pfos-tier')||'core') : 'none';
-    // Set trial_start_date when granting access for the first time
-    if(purchased === 'yes'){
-      var editId2 = v('editClientId');
-      var existingC = editId2 ? [...APP.myClients,...(APP.allClients||[])].find(function(c){ return c.id===editId2; }) : null;
-      clientData.trial_start_date = (existingC && existingC.trial_start_date) ? existingC.trial_start_date : new Date().toISOString();
-    } else {
-      clientData.trial_start_date = null;
-    }
+    var _mcTier = purchased === 'yes' ? (v('mc-pfos-tier')||'core') : 'none';
+    // M0: split comp-Core/comp-Planning into pfos_tier + comp. Admin grants are DIRECT access (no trial stamp).
+    var _mcComp=false, _mcPfos=_mcTier;
+    if(_mcTier==='comp_core'){ _mcPfos='core'; _mcComp=true; }
+    else if(_mcTier==='comp_planning'){ _mcPfos='planning'; _mcComp=true; }
+    else if(_mcTier==='comp'){ _mcPfos='planning'; _mcComp=true; }
+    clientData.pfos_tier = _mcPfos;
+    clientData.comp = _mcComp;
+    clientData.trial_start_date = null;
   }
 
   setBtnLoading('saveClientBtn',true,'Saving...');
   var editId=v('editClientId'), error;
 
   // Columns that may not exist if migration hasn't been run
-  var newCols = ['pfos_tier','trial_start_date','client_type','marital_status','spouse_name','household_type'];
+  var newCols = ['pfos_tier','comp','trial_start_date','client_type','marital_status','spouse_name','household_type'];
   function stripNewCols(obj){ var f={};Object.keys(obj).forEach(function(k){if(newCols.indexOf(k)===-1)f[k]=obj[k];});return f; }
 
   try {
@@ -5547,10 +5552,10 @@ setTimeout(function(){
         <div class="fi" style="margin-bottom:0">
           <label class="lb">PFOS Tier</label>
           <select class="sel" id="mc-pfos-tier">
-            <option value="core">Core (free)</option>
-            <option value="pro">Pro ($19/mo)</option>
-            <option value="pro_plus">Pro+ ($39/mo)</option>
-            <option value="comp">Comp (full access)</option>
+            <option value="core">Core ($19.99/mo)</option>
+            <option value="planning">Planning ($49.99/mo)</option>
+            <option value="comp_core">Comp · Core (free)</option>
+            <option value="comp_planning">Comp · Planning (free)</option>
           </select>
         </div>
       </div>
@@ -5679,7 +5684,7 @@ function advOpenCalc(fn){
   // Tier check (for the selected client)
   if(!isCalcAllowed(fn)){
     var needed=getCalcTier(fn);
-    var tierLabel=needed==='pro_plus'?'Pro+':needed.charAt(0).toUpperCase()+needed.slice(1);
+    var tierLabel=needed.charAt(0).toUpperCase()+needed.slice(1);
     var calcName=(_calcAccess[fn]&&_calcAccess[fn].name)||fn.replace('render','').replace(/([A-Z])/g,' $1').trim();
     _advCurrentCalcName=fn;
     openModal('advCalcModal');

@@ -938,8 +938,8 @@ function pfosTierBadgeSmall(client){
   }
   if(!t || t === 'none' || t === 'undefined') return '<span style="font-family:var(--fh);font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:var(--mu);background:rgba(100,116,139,.08);border:1px solid rgba(100,116,139,.2)">No Access</span>';
   if(t === 'trial') return '<span style="font-family:var(--fh);font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:var(--or);background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.25)">TRIAL · '+daysLeft+'d</span>';
-  var m={core:'CORE',pro:'PRO',pro_plus:'PRO+'};
-  var col={core:'var(--mu)',pro:'#5B9BFF',pro_plus:'#A855F7'};
+  var m={core:'CORE',planning:'PLANNING',comp:'COMP'};
+  var col={core:'var(--mu)',planning:'#A855F7',comp:'#22C55E'};
   var c=col[t]||'var(--mu)';
   return '<span style="font-family:var(--fh);font-size:8px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;padding:2px 7px;border-radius:2px;color:'+c+';background:'+c+'1A;border:1px solid '+c+'33">'+(m[t]||t.toUpperCase())+'</span>';
 }
@@ -1103,7 +1103,7 @@ async function loadClientDataIntoPFOS(clientId){
   var stateData = (profile && profile.financial_data && profile.financial_data.S) ? profile.financial_data.S : null;
   var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'core';
   if(clientEffTier === 'none') clientEffTier = 'core';
-  var pfosTier = (mode === 'advisor') ? 'pro_plus' : clientEffTier;
+  var pfosTier = (mode === 'advisor') ? 'planning' : clientEffTier;
 
   // Seed _lastPfosState immediately so the Save button has correct data for this
   // client even if the advisor saves before the first PFOS_DATA_CHANGE fires (1500ms debounce)
@@ -1331,14 +1331,27 @@ function renderClientsTable(clients){
     +'</tbody></table>';
 }
 // ─────────────────────────────────────────────────────────────────────────────
+// ── CANONICAL getEffectiveTier (M0) — MUST stay byte-identical across pfos-client / pfos-dashboard /
+// pfos-admin / pfos / pfos-client-profile. Static drift guard: _plaid_e2e/_g4-tier-resolver.mjs. ──
 function getEffectiveTier(client){
-  if(!client) return 'none';
-  if(client.trial_start_date){
-    var diffDays = Math.floor((Date.now() - new Date(client.trial_start_date).getTime()) / (1000*60*60*24));
-    // Trial only UPGRADES a sub-Pro tier; never downgrade a paid Pro/Pro+/Comp client.
-    if(diffDays <= 14 && client.pfos_tier!=='pro' && client.pfos_tier!=='pro_plus' && client.pfos_tier!=='comp') return 'trial';
+  if(!client || typeof client !== 'object') return 'none';
+  var t = client.pfos_tier || 'none';
+  // M0 tier restructure: collapse legacy pro/pro_plus/'trial' + pre-migration 'comp' into the 2-tier model.
+  if(t === 'pro') t = 'core'; else if(t === 'pro_plus') t = 'planning'; else if(t === 'trial') t = 'core';
+  else if(t === 'comp') return 'planning'; // legacy comp row (pre-migration) = full access
+  // comp flag = free permanent access at its level (comp-Core or comp-Planning); never expires.
+  if(client.comp) return (t === 'planning') ? 'planning' : 'core';
+  // active/grace subscription → the purchased tier.
+  var sub = client.subscription_status;
+  if(sub === 'active' || sub === 'past_due' || sub === 'trialing') return (t === 'planning') ? 'planning' : 'core';
+  // 14-day Core trial (no active sub) → effective Core; Plaid + AI are denied in clientHasFeature/server.
+  if(client.trial_start_date && !sub){
+    var daysUsed = Math.floor((Date.now() - new Date(client.trial_start_date).getTime()) / 86400000);
+    if(daysUsed < 14) return 'trial';
   }
-  return client.pfos_tier || 'none';
+  // canceled/expired and not comp → locked (read-only); otherwise an admin-granted tier (e.g. advisory).
+  if(sub === 'canceled' || sub === 'unpaid' || t === 'none') return 'none';
+  return t;
 }
 function getTrialDaysLeft(client){
   if(!client || !client.trial_start_date) return 0;
@@ -2271,20 +2284,20 @@ async function downloadSystemReport(){
       (profs||[]).forEach(function(p){profMap[p.client_id]=p;});
     }
     var today = new Date().toISOString().split('T')[0];
-    var rows = [['Date','Agent Count','Total Clients','Advisory','Product','Core','Pro','Pro+','Avg CF Score','Avg Prot Score','Avg Net Worth']];
-    var counts = {advisory:0,product:0,core:0,pro:0,pro_plus:0};
+    var rows = [['Date','Agent Count','Total Clients','Advisory','Product','Core','Planning','Comp','Avg CF Score','Avg Prot Score','Avg Net Worth']];
+    var counts = {advisory:0,product:0,core:0,planning:0,comp:0};
     var totals = {cfScore:0,protScore:0,netWorth:0,n:0};
     allC.forEach(function(c){
       if(c.client_type!=='product') counts.advisory++; else counts.product++;
-      if(c.pfos_tier==='core') counts.core++;
-      else if(c.pfos_tier==='pro') counts.pro++;
-      else if(c.pfos_tier==='pro_plus'||c.pfos_tier==='comp') counts.pro_plus++;
+      if(c.comp===true||c.pfos_tier==='comp') counts.comp++;
+      else if(c.pfos_tier==='planning'||c.pfos_tier==='pro_plus') counts.planning++;
+      else counts.core++;
       var p = profMap[c.id];
       if(p&&p.scores){ totals.cfScore+=p.scores.cfScore||0; totals.protScore+=p.scores.protScore||0; totals.n++; }
       if(p&&p.financial_data&&p.financial_data.calcs) totals.netWorth+=p.financial_data.calcs.netWorth||0;
     });
     var n = totals.n||1;
-    rows.push([today,agents.length,allC.length,counts.advisory,counts.product,counts.core,counts.pro,counts.pro_plus,(totals.cfScore/n).toFixed(1),(totals.protScore/n).toFixed(1),(totals.netWorth/allC.length||0).toFixed(0)]);
+    rows.push([today,agents.length,allC.length,counts.advisory,counts.product,counts.core,counts.planning,counts.comp,(totals.cfScore/n).toFixed(1),(totals.protScore/n).toFixed(1),(totals.netWorth/allC.length||0).toFixed(0)]);
     // Per-agent breakdown
     rows.push([]);
     rows.push(['Agent Name','Agent Email','Client Count','Avg Health Score']);
@@ -2324,12 +2337,12 @@ function renderSystemDashboard(){
   set('sys-product',  product.length);
 
   // ── Tier breakdown ──
-  var tierCounts = {core:0, pro:0, pro_plus:0, comp:0};
-  paid.forEach(function(c){ if(tierCounts[c.pfos_tier] !== undefined) tierCounts[c.pfos_tier]++; });
-  var tierColors = {core:'var(--mu)', pro:'#5B9BFF', pro_plus:'#A855F7', comp:'#22C55E'};
-  var tierLabels = {core:'CORE', pro:'PRO', pro_plus:'PRO+', comp:'COMP'};
+  var tierCounts = {core:0, planning:0, comp:0};
+  paid.forEach(function(c){ if(c.comp===true||c.pfos_tier==='comp') tierCounts.comp++; else if(c.pfos_tier==='planning'||c.pfos_tier==='pro_plus') tierCounts.planning++; else tierCounts.core++; });
+  var tierColors = {core:'var(--mu)', planning:'#A855F7', comp:'#22C55E'};
+  var tierLabels = {core:'CORE', planning:'PLANNING', comp:'COMP'};
   var tierHtml = '';
-  ['core','pro','pro_plus','comp'].forEach(function(t){
+  ['core','planning','comp'].forEach(function(t){
     var count = tierCounts[t];
     var pct   = paid.length > 0 ? Math.round(count/paid.length*100) : 0;
     var col   = tierColors[t];
@@ -2404,11 +2417,12 @@ function renderSystemDashboard(){
   set('sysPipeline', pipeHtml || '<div style="color:var(--mu);font-size:13px">No data.</div>');
 
   // ── Revenue metrics ──
-  var compClients = allC.filter(function(c){ return c.pfos_tier === 'comp'; }).length;
-  var mrr = tierCounts.pro * 19 + tierCounts.pro_plus * 39;
+  var compClients = allC.filter(function(c){ return c.comp === true; }).length;
+  var householdCount = paid.filter(function(c){ return c.household && !c.comp; }).length;
+  var mrr = tierCounts.core * 19.99 + tierCounts.planning * 49.99 + householdCount * 10;
   var arr = mrr * 12;
   var avgRev = paid.length > 0 ? Math.round(mrr / paid.length) : 0;
-  var potentialMRR = unpaid.length * 19; // if all converted to PRO
+  var potentialMRR = unpaid.length * 19.99; // if all converted to Core
   function kv2(k,v,col){ return '<div class="kv"><span class="kk">'+k+'</span><span class="kv-val" style="color:'+(col||'var(--wh)')+'">'+v+'</span></div>'; }
   set('sysRevenue',
     kv2('Est. Monthly Recurring', '$'+mrr.toLocaleString(), 'var(--gr)')

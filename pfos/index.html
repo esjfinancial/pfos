@@ -1679,7 +1679,7 @@ async function doClientRegister(){
 
     // ── 2. Insert primary clients row ─────────────────────────────────────
     var primaryData = {
-      name:name, email:email, status:'new', client_type:'product', pfos_tier:'pro_plus',
+      name:name, email:email, status:'new', client_type:'product', pfos_tier:'none', trial_start_date: new Date().toISOString(),
       created_at: new Date().toISOString()
     };
     var insRes = await db.from('clients').insert(primaryData).select().single();
@@ -1709,7 +1709,7 @@ async function doClientRegister(){
       if(!_coupleSpouseExists){
       var spouseData = {
         name:spouseName, email:spouseEmail, status:'new', client_type:'product',
-        pfos_tier:'pro_plus', created_at: new Date().toISOString()
+        pfos_tier:'none', trial_start_date: new Date().toISOString(), created_at: new Date().toISOString()
       };
       var spouseRes = await db.from('clients').insert(spouseData).select().single();
       if(spouseRes.error){ window._registrationInProgress=false; showRegErr(errId, 'Partner account setup issue: ' + spouseRes.error.message); setBtnLoading('clientRegBtn', false, 'Create Both Accounts'); return; }
@@ -1882,16 +1882,27 @@ function advisorRevertImplemented(recId){ console.warn('advisorRevertImplemented
 function toggleRecLock(recId, locked){ console.warn('toggleRecLock: stub'); }
 function saveClientRecord(){ console.warn('saveClientRecord: stub — implement in dashboard.html'); }
 function saveRecommendation(){ console.warn('saveRecommendation: stub — implement in dashboard.html'); }
+// ── CANONICAL getEffectiveTier (M0) — MUST stay byte-identical across pfos-client / pfos-dashboard /
+// pfos-admin / pfos / pfos-client-profile. Static drift guard: _plaid_e2e/_g4-tier-resolver.mjs. ──
 function getEffectiveTier(client){
-  if(!client) return 'none';
-  if(client.trial_start_date){
-    var trialStart = new Date(client.trial_start_date);
-    var now = new Date();
-    var diffDays = Math.floor((now - trialStart) / (1000*60*60*24));
-    // Trial only UPGRADES a sub-Pro tier; never downgrade a paid Pro/Pro+/Comp client.
-    if(diffDays <= 14 && client.pfos_tier!=='pro' && client.pfos_tier!=='pro_plus' && client.pfos_tier!=='comp') return 'trial';
+  if(!client || typeof client !== 'object') return 'none';
+  var t = client.pfos_tier || 'none';
+  // M0 tier restructure: collapse legacy pro/pro_plus/'trial' + pre-migration 'comp' into the 2-tier model.
+  if(t === 'pro') t = 'core'; else if(t === 'pro_plus') t = 'planning'; else if(t === 'trial') t = 'core';
+  else if(t === 'comp') return 'planning'; // legacy comp row (pre-migration) = full access
+  // comp flag = free permanent access at its level (comp-Core or comp-Planning); never expires.
+  if(client.comp) return (t === 'planning') ? 'planning' : 'core';
+  // active/grace subscription → the purchased tier.
+  var sub = client.subscription_status;
+  if(sub === 'active' || sub === 'past_due' || sub === 'trialing') return (t === 'planning') ? 'planning' : 'core';
+  // 14-day Core trial (no active sub) → effective Core; Plaid + AI are denied in clientHasFeature/server.
+  if(client.trial_start_date && !sub){
+    var daysUsed = Math.floor((Date.now() - new Date(client.trial_start_date).getTime()) / 86400000);
+    if(daysUsed < 14) return 'trial';
   }
-  return client.pfos_tier || 'none';
+  // canceled/expired and not comp → locked (read-only); otherwise an admin-granted tier (e.g. advisory).
+  if(sub === 'canceled' || sub === 'unpaid' || t === 'none') return 'none';
+  return t;
 }
 function getTrialDaysLeft(client){
   if(!client || !client.trial_start_date) return 0;
@@ -2007,9 +2018,10 @@ function setPurchased(val){
         <div class="fi" style="margin-bottom:0">
           <label class="lb">PFOS Tier</label>
           <select class="sel" id="mc-pfos-tier">
-            <option value="core">Core (free)</option>
-            <option value="pro">Pro ($19/mo)</option>
-            <option value="pro_plus">Pro+ ($39/mo)</option>
+            <option value="core">Core ($19.99/mo)</option>
+            <option value="planning">Planning ($49.99/mo)</option>
+            <option value="comp_core">Comp · Core (free)</option>
+            <option value="comp_planning">Comp · Planning (free)</option>
           </select>
         </div>
       </div>

@@ -1881,9 +1881,10 @@ html[data-theme="light"] #_gridInfoTip{background:#FFFFFF!important;color:#33415
         <div id="mc-plan-row" style="display:none">
           <label class="lb" style="margin-bottom:6px;display:block">PFOS Plan</label>
           <select class="sel" id="mc-pfos-tier">
-            <option value="core">CORE — Basic tracking (one-time purchase)</option>
-            <option value="pro">PRO — Insights + projections (subscription)</option>
-            <option value="pro_plus">PRO+ — Full system + decision engine (subscription)</option>
+            <option value="core">CORE — Tracking + Plaid ($19.99/mo)</option>
+            <option value="planning">PLANNING — Full system + AI ($49.99/mo)</option>
+            <option value="comp_core">COMP · Core (free)</option>
+            <option value="comp_planning">COMP · Planning (free)</option>
           </select>
         </div>
       </div>
@@ -4858,25 +4859,44 @@ async function logAuditEvent(action, entityType, entityId, details){
   }catch(e){ console.warn('auditLog:',e); }
 }
 // ── FIX 7: UTILITY STUBS ─────────────────────────────────────────────────────
+// ── CANONICAL getEffectiveTier (M0) — MUST stay byte-identical across pfos-client / pfos-dashboard /
+// pfos-admin / pfos / pfos-client-profile. Static drift guard: _plaid_e2e/_g4-tier-resolver.mjs. ──
 function getEffectiveTier(client){
-  if(!client) return 'none';
-  if(client.trial_start_date){
-    var trialStart = new Date(client.trial_start_date);
-    var diffDays = Math.floor((Date.now() - trialStart.getTime()) / (1000*60*60*24));
-    // Trial only UPGRADES a sub-Pro tier; never downgrade a paid Pro/Pro+/Comp client (else a
-    // freshly-granted Pro+ client — whose grant stamps trial_start_date — loses Pro+ features for 14 days).
-    if(diffDays <= 14 && client.pfos_tier!=='pro' && client.pfos_tier!=='pro_plus' && client.pfos_tier!=='comp') return 'trial';
+  if(!client || typeof client !== 'object') return 'none';
+  var t = client.pfos_tier || 'none';
+  // M0 tier restructure: collapse legacy pro/pro_plus/'trial' + pre-migration 'comp' into the 2-tier model.
+  if(t === 'pro') t = 'core'; else if(t === 'pro_plus') t = 'planning'; else if(t === 'trial') t = 'core';
+  else if(t === 'comp') return 'planning'; // legacy comp row (pre-migration) = full access
+  // comp flag = free permanent access at its level (comp-Core or comp-Planning); never expires.
+  if(client.comp) return (t === 'planning') ? 'planning' : 'core';
+  // active/grace subscription → the purchased tier.
+  var sub = client.subscription_status;
+  if(sub === 'active' || sub === 'past_due' || sub === 'trialing') return (t === 'planning') ? 'planning' : 'core';
+  // 14-day Core trial (no active sub) → effective Core; Plaid + AI are denied in clientHasFeature/server.
+  if(client.trial_start_date && !sub){
+    var daysUsed = Math.floor((Date.now() - new Date(client.trial_start_date).getTime()) / 86400000);
+    if(daysUsed < 14) return 'trial';
   }
-  return client.pfos_tier || 'none';
+  // canceled/expired and not comp → locked (read-only); otherwise an admin-granted tier (e.g. advisory).
+  if(sub === 'canceled' || sub === 'unpaid' || t === 'none') return 'none';
+  return t;
 }
 function clientHasFeature(feature){
   var tier=APP.currentClient?getEffectiveTier(APP.currentClient):'none';
-  var tiers={none:0,core:1,trial:2,pro:2,pro_plus:3,comp:3};
+  // M0 2-tier model: locked/none=0, core & trial=1 (trial is effective-Core), planning=2. (comp resolves to core/planning in getEffectiveTier.)
+  var tiers={none:0,core:1,trial:1,planning:2};
   var level=tiers[tier]||0;
-  // plan_builder (M5.2e): level 1 = behavior-neutral today — every tier that has a plan satisfies it, so
-  // the Core plan-tab teaser branch in _cpRenderPlanV2 never fires for a real user (and it's also flag-gated
-  // OFF). M0 raises this to the Planning level so Core users get the read-only teaser instead of the builder.
-  var reqs={spending:1,calendar:1,payschedule:1,policies:2,estate:2,crossvalidation:2,tools_advanced:3,decision_engine:3,plaid:3,plan_builder:1,plan_builder_full:2};   // plan_builder_full (Section G) = the advanced/Pro builder; Core(1) gets the lite builder, Pro+(2/3) the full one
+  // A4 TRIAL FENCE: the 14-day Core trial EXCLUDES the two paid-cost features — Plaid (per-connection cost)
+  // and the AI planner (per-call cost, Planning-only) — even though the trial resolves to effective Core.
+  if(tier==='trial' && (feature==='plaid'||feature==='ai_planner')) return false;
+  // Feature → required level. Core(1): tracking, Plaid, LITE plan builder, insurance/estate TRACKING pages,
+  // cross-validation. Planning(2): full builder, AI planner, advanced-planning calcs, doc vault, IBC, tax, implementation.
+  var reqs={
+    spending:1,calendar:1,payschedule:1,plaid:1,plan_builder:1,crossvalidation:1,estate:1,policies:1,
+    plan_builder_full:2,tools_advanced:2,decision_engine:2,ai_planner:2,doc_vault:2,ibc:2,
+    retirement_advanced:2,fi_planning:2,mortgage_protection:2,college_planning:2,adv_projections:2,
+    scenario_compare:2,advisor_rec_center:2,tax_estimation:2
+  };   // plan_builder=Core(lite via litePlanner); plan_builder_full=Planning(full)
   // ── SANDBOX-TEST GATE (Plaid) ── While Plaid runs in PLAID_ENV=sandbox, restrict the account-linking
   // UI to KNOWN TEST ACCOUNTS so real Pro+/comp clients don't see "Link accounts" wired to fake sandbox
   // banks. REMOVE this entire block at the production cutover (PLAID_ENV=production), reverting Plaid to
@@ -4886,7 +4906,7 @@ function clientHasFeature(feature){
     var _plaidTestAllow={'avery.stone.test@example.com':1,'tests@example.com':1,'ad-demo@pfos.test':1,'individual@email.com':1,'hybrida@email.com':1,'hybridb@email.com':1,'jointa@email.com':1,'jointb@email.com':1,'separatea@email.com':1,'separateb@email.com':1,'santiago.efrain.es@gmail.com':1};
     if(!_plaidTestAllow[_em])return false;
   }
-  return level>=(reqs[feature]||3);
+  return level>=(reqs[feature]||2);
 }
 // ── Section G (litePlanner) — the LITE Core tier of the existing DIY plan builder. REUSE the builder; gate
 // features by tier, do NOT fork. _liteActive() is the single source of truth: litePlanner ON + the user lacks
@@ -5130,8 +5150,8 @@ function budgetV2Enabled(){
   }catch(_e){ return false; }
 }
 function renderTierGate(el,feature,title,desc){
-  var tierNeeded={spending:'Core',calendar:'Core',payschedule:'Core',policies:'Pro',estate:'Pro',crossvalidation:'Pro',tools_advanced:'Pro+',decision_engine:'Pro+',plaid:'Pro+'};
-  el.innerHTML='<div style="padding:48px 24px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:48px;margin-bottom:16px">🔒</div><div style="font-family:var(--fh);font-size:18px;font-weight:700;color:var(--wh);margin-bottom:8px">'+title+'</div><div style="font-size:14px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 20px">'+desc+'</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.1em;color:var(--pu);margin-bottom:12px">REQUIRES '+(tierNeeded[feature]||'PRO+')+' PLAN</div><button class="btn" style="width:auto;padding:12px 28px;font-size:14px;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.3);color:var(--pu);border-radius:4px" onclick="_cpToast(\''+((APP.currentClient&&APP.currentClient.client_type==='product')?'Upgrade your plan in Account Settings to unlock this.':'Contact your advisor to upgrade your plan.')+'\')">Upgrade Plan</button></div>';
+  var tierNeeded={spending:'Core',calendar:'Core',payschedule:'Core',plaid:'Core',policies:'Core',estate:'Core',crossvalidation:'Core',tools_advanced:'Planning',decision_engine:'Planning',ai_planner:'Planning',plan_builder_full:'Planning',doc_vault:'Planning',ibc:'Planning'};
+  el.innerHTML='<div style="padding:48px 24px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:48px;margin-bottom:16px">🔒</div><div style="font-family:var(--fh);font-size:18px;font-weight:700;color:var(--wh);margin-bottom:8px">'+title+'</div><div style="font-size:14px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 20px">'+desc+'</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.1em;color:var(--pu);margin-bottom:12px">REQUIRES '+(tierNeeded[feature]||'Planning')+' PLAN</div><button class="btn" style="width:auto;padding:12px 28px;font-size:14px;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.3);color:var(--pu);border-radius:4px" onclick="_cpToast(\''+((APP.currentClient&&APP.currentClient.client_type==='product')?'Upgrade your plan in Account Settings to unlock this.':'Contact your advisor to upgrade your plan.')+'\')">Upgrade Plan</button></div>';
 }
 function renderClientCalendar(){
   var el=document.getElementById('clientCalendarContent');if(!el)return;
@@ -6347,9 +6367,9 @@ async function loadClientDataIntoPFOS(clientId){
     stateData.householdType = couple.household_type;
   }
 
-  var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'core';
-  if(clientEffTier === 'none') clientEffTier = 'core';
-  var pfosTier = (mode === 'advisor') ? 'pro_plus' : clientEffTier;
+  var clientEffTier = APP.currentClient ? getEffectiveTier(APP.currentClient) : 'none';
+  // M0: do NOT promote a locked/expired ('none') client to Core — pass 'none' so the engine locks (read-only UX in Phase C2).
+  var pfosTier = (mode === 'advisor') ? 'planning' : clientEffTier;
 
   // Seed _lastPfosState immediately so the Save button has correct data for this
   // client even if the advisor saves before the first PFOS_DATA_CHANGE fires (1500ms debounce)
@@ -17337,7 +17357,7 @@ function renderClientToolsGrid(filterGroup){
     items.forEach(function(t){
       var tierLocked=!isCalcAllowed(t.calc);
       var tierBadge='';
-      if(_calcAccess[t.calc]){var tl=_calcAccess[t.calc].tier_required;if(tl==='pro'||tl==='pro_plus')tierBadge=' <span style="font-size:9px;font-family:var(--fh);font-weight:700;letter-spacing:.08em;padding:1px 5px;border-radius:2px;text-transform:uppercase;vertical-align:middle;'+(tl==='pro_plus'?'background:rgba(249,115,22,.12);color:var(--or)':'background:rgba(91,155,255,.12);color:#5B9BFF')+'">'+(tl==='pro_plus'?'PRO+':'PRO')+'</span>';}
+      if(_calcAccess[t.calc]){var tl=_calcAccess[t.calc].tier_required;if(tl==='planning')tierBadge=' <span style="font-size:9px;font-family:var(--fh);font-weight:700;letter-spacing:.08em;padding:1px 5px;border-radius:2px;text-transform:uppercase;vertical-align:middle;background:rgba(168,85,247,.12);color:var(--pu)">PLANNING</span>';}
       var lockStyle=tierLocked?'opacity:0.45;filter:grayscale(0.3);':'';
       var lockIcon=tierLocked?'<span style="position:absolute;top:8px;right:28px;font-size:13px;z-index:3">🔒</span>':'';
       h+='<div style="position:relative">'+lockIcon+'<button class="tcb" onclick="openToolCalc(\x27'+t.calc+'\x27)" style="display:flex;align-items:center;gap:12px;padding:16px;background:var(--bg-card);border:1px solid var(--bd);border-radius:2px;cursor:pointer;transition:border-color .15s,background .15s;text-align:left;min-height:56px;width:100%;'+lockStyle+'" onmouseover="this.style.borderColor=\x27#5B9BFF\x27;this.style.background=\x27rgba(0,68,191,.08)\x27" onmouseout="this.style.borderColor=\x27var(--bd)\x27;this.style.background=\x27var(--bg-card)\x27">';
@@ -17442,7 +17462,7 @@ function openToolCalc(funcName,source){
   if(_calcUsageId) trackCalcClose(true);
   if(!isCalcAllowed(funcName)){
     var needed=getCalcTier(funcName);
-    var tierLabel=needed==='pro_plus'?'Pro+':needed.charAt(0).toUpperCase()+needed.slice(1);
+    var tierLabel=needed.charAt(0).toUpperCase()+needed.slice(1);
     var calcName=(_calcAccess[funcName]&&_calcAccess[funcName].name)||funcName.replace('render','').replace(/([A-Z])/g,' $1').trim();
     var modal=document.getElementById('insuranceCalcModal');if(modal){modal.classList.add('open');modal.style.display='flex';}
     document.getElementById('insCalcTitle').textContent='🔒 '+calcName;
@@ -33429,7 +33449,7 @@ function _cpStartAIRec(){
   var plan=APP._portalFd&&APP._portalFd.allocation_plan;
   var gens=(plan&&plan.ai_generations)||[];
   var tier=CPLAN.tier||'core';
-  var maxGens=tier==='pro_plus'||tier==='comp'?9999:tier==='pro'?2:1;
+  var maxGens=(tier==='planning'||tier==='comp')?1:0;// M0: AI = Planning only, 1 generation (re-audit is separate: _cpAuditAvailability, 90-day)
   var now=Date.now();
   var cooldownMs=0;// testing mode — restore before production
   var lastGen=gens.length?new Date(gens[gens.length-1].date).getTime():0;
@@ -36755,9 +36775,9 @@ function _cpDoAIGenerate(){
             _plan.ai_generations.push({date:new Date().toISOString(),tier:CPLAN.tier});
             if(APP._portalFd)APP._portalFd.allocation_plan=_plan;
             var _tier=CPLAN.tier||'core';
-            var _maxG=_tier==='pro_plus'||_tier==='comp'?9999:_tier==='pro'?2:1;
+            var _maxG=(_tier==='planning'||_tier==='comp')?1:0;
             var _remain=Math.max(0,_maxG-_plan.ai_generations.length);
-            var _tierNames={core:'Core',pro:'Pro',pro_plus:'Pro+',comp:'Comp',trial:'Trial'};
+            var _tierNames={core:'Core',planning:'Planning',comp:'Comp',trial:'Trial',none:'Locked'};
             CPLAN._aiTierMsg=(_tierNames[_tier]||'Core')+' tier: '+_remain+' AI generation'+(_remain!==1?'s':'')+' remaining';
             // Persist approaches to Supabase IMMEDIATELY on landing — before the
             // user picks one. Previously the approaches lived only in memory
@@ -42299,7 +42319,7 @@ function _cpRenderIncomeReplacement(){
 // ── STRESS TESTS (Pro+ only) ──
 function _cpRenderStressTests(){
   var el=document.getElementById('cplanStressTests');if(!el)return;
-  if(!_cpTierHas('stress_tests')){el.innerHTML=_cpUpgradeHint('Stress Tests','pro_plus');return;}
+  if(!_cpTierHas('stress_tests')){el.innerHTML=_cpUpgradeHint('Stress Tests','planning');return;}
   if(CPLAN.income<=0||!CPLAN.allocations.some(function(a){return a.amount>0;})){el.innerHTML='';return;}
   var yrs=20;
   // Base plan projection
@@ -43564,13 +43584,11 @@ function initClientPlan(){
 }
 
 // ── TIER GATING ──
-// core=guided only, pro=guided+partial detailed, pro_plus/comp/trial=everything
+// M0 2-tier: core/trial = guided LITE builder only; planning/comp = everything (full builder).
 function _cpTierLevel(){
   var t=CPLAN.tier||'core';
-  if(t==='pro_plus'||t==='comp')return 3;
-  if(t==='pro')return 2;
-  if(t==='trial')return 3;// trial gets full access
-  return 1;// core
+  if(t==='planning'||t==='comp')return 3;// Planning = full builder
+  return 1;// core / trial / none = guided lite builder only (trial is effective Core)
 }
 function _cpTierHas(feature){
   var lv=_cpTierLevel();
@@ -43588,8 +43606,8 @@ function _cpTierHas(feature){
   return lv>=(gates[feature]||1);
 }
 function _cpUpgradeHint(feature,tierNeeded){
-  var labels={pro:'PRO',pro_plus:'PRO+'};
-  return'<div style="padding:12px 14px;text-align:center;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.12);border-radius:2px;margin-top:8px"><div style="font-size:13px;color:#A855F7;margin-bottom:4px">🔒 '+feature+'</div><div style="font-size:13px;color:var(--mu);margin-bottom:8px">This feature requires '+(labels[tierNeeded]||'PRO')+' or higher.</div><button onclick="if(typeof showUpgrade===\'function\')showUpgrade()" style="padding:6px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:2px;min-height:32px">Upgrade</button></div>';
+  var labels={core:'Core',planning:'Planning'};
+  return'<div style="padding:12px 14px;text-align:center;background:rgba(168,85,247,.04);border:1px solid rgba(168,85,247,.12);border-radius:2px;margin-top:8px"><div style="font-size:13px;color:#A855F7;margin-bottom:4px">🔒 '+feature+'</div><div style="font-size:13px;color:var(--mu);margin-bottom:8px">This feature requires '+(labels[tierNeeded]||'Planning')+' or higher.</div><button onclick="if(typeof showUpgrade===\'function\')showUpgrade()" style="padding:6px 16px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(168,85,247,.12);border:1px solid rgba(168,85,247,.3);color:#A855F7;cursor:pointer;border-radius:2px;min-height:32px">Upgrade</button></div>';
 }
 
 
@@ -48798,11 +48816,11 @@ async function _cpCaptureSnapshot(trigger,triggeredBy,notes){
 // Tier & cooldown gate — used both by the button-state renderer and the runner.
 function _cpAuditAvailability(){
   var tier=(CPLAN.tier||'core').toLowerCase();
-  var allowed=['pro','pro_plus','comp'].indexOf(tier)>=0;
+  var allowed=['planning','comp'].indexOf(tier)>=0;
   if(!allowed){
-    return {ok:false,reason:'tier',message:'Plan audit is available on Pro and above. Upgrade to access this feature.',tier:tier};
+    return {ok:false,reason:'tier',message:'Plan re-audit is a Planning feature. Upgrade to Planning to access it.',tier:tier};
   }
-  var cooldownDays=tier==='pro'?180:90;
+  var cooldownDays=90;// M0: on-demand quarterly re-audit for Planning
   var lastAuditAt=null;
   try{
     var plan=APP._portalFd&&APP._portalFd.allocation_plan;
