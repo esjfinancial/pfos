@@ -42,6 +42,11 @@ function detectContext(){
       var _ct = (window.APP && window.APP.currentClient && window.APP.currentClient.client_type) || '';
       currentRole = (_ct === 'advisory') ? 'client-advisor' : 'client-product';
     }
+    // Staff consoles (dashboard / client-profile) get NO auto walkthrough — the guided tour is a
+    // client-portal onboarding feature and is inappropriate on the advisor/admin management surfaces.
+    // These pages are staff-only, so this suppresses the reminder banner + tour + replay button for
+    // admin and agent alike. Owner request 2026-07-06.
+    if(currentPage === 'dashboard' || currentPage === 'client-profile' || (window.APP && window.APP._adminView)){ return; }
     initWalkthrough();
   }, WT_DELAY);
   return true;
