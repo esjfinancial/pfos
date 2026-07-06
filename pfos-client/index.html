@@ -5168,7 +5168,12 @@ function budgetV2Enabled(){
 }
 function renderTierGate(el,feature,title,desc){
   var tierNeeded={spending:'Core',calendar:'Core',payschedule:'Core',plaid:'Core',policies:'Core',estate:'Core',crossvalidation:'Core',tools_advanced:'Planning',decision_engine:'Planning',ai_planner:'Planning',plan_builder_full:'Planning',doc_vault:'Planning',ibc:'Planning'};
-  el.innerHTML='<div style="padding:48px 24px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:48px;margin-bottom:16px">🔒</div><div style="font-family:var(--fh);font-size:18px;font-weight:700;color:var(--wh);margin-bottom:8px">'+title+'</div><div style="font-size:14px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 20px">'+desc+'</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.1em;color:var(--pu);margin-bottom:12px">REQUIRES '+(tierNeeded[feature]||'Planning')+' PLAN</div><button class="btn" style="width:auto;padding:12px 28px;font-size:14px;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.3);color:var(--pu);border-radius:4px" onclick="'+((APP.currentClient&&APP.currentClient.client_type==='product')?'_cpOpenUpgrade()':"_cpToast('Contact your advisor to upgrade your plan.')")+'">Upgrade Plan</button></div>';
+  // Trial users are effective-CORE but are blocked from Plaid + the AI planner because those are
+  // PAID-only add-ons excluded from the free trial (A4) — NOT because they lack a tier. So the
+  // generic "REQUIRES Core PLAN" is misleading for them; mirror the billing-card wording instead.
+  var _tgEff=(APP.currentClient && typeof getEffectiveTier==='function')?getEffectiveTier(APP.currentClient):'none';
+  var _tgReq=(_tgEff==='trial' && (feature==='plaid'||feature==='ai_planner'))?'UNLOCKS ON A PAID PLAN':'REQUIRES '+(tierNeeded[feature]||'Planning')+' PLAN';
+  el.innerHTML='<div style="padding:48px 24px;text-align:center;background:linear-gradient(135deg,rgba(0,68,191,.06),rgba(91,155,255,.04));border:1px solid rgba(91,155,255,.15);border-radius:6px"><div style="font-size:48px;margin-bottom:16px">🔒</div><div style="font-family:var(--fh);font-size:18px;font-weight:700;color:var(--wh);margin-bottom:8px">'+title+'</div><div style="font-size:14px;color:var(--mu);line-height:1.7;max-width:420px;margin:0 auto 20px">'+desc+'</div><div style="font-family:var(--fh);font-size:13px;font-weight:700;letter-spacing:.1em;color:var(--pu);margin-bottom:12px">'+_tgReq+'</div><button class="btn" style="width:auto;padding:12px 28px;font-size:14px;background:rgba(168,85,247,.15);border:1px solid rgba(168,85,247,.3);color:var(--pu);border-radius:4px" onclick="'+((APP.currentClient&&APP.currentClient.client_type==='product')?'_cpOpenUpgrade()':"_cpToast('Contact your advisor to upgrade your plan.')")+'">Upgrade Plan</button></div>';
 }
 function renderClientCalendar(){
   var el=document.getElementById('clientCalendarContent');if(!el)return;
@@ -28286,6 +28291,12 @@ function _cpEnsurePlanLoaded(){
   // controls that should be visible. Default to 'self' on load.
   CPLAN.allocations.forEach(function(a){if(a&&!a.owner)a.owner='self';});
   if(saved.debtStrategy)CPLAN.debtStrategy=saved.debtStrategy;
+  // Load commit state so the Tracking page can distinguish a committed plan from an uncommitted
+  // draft. Without this, Tracking (which only checks allocations.length) shows a draft — or
+  // allocations left over from a pre-downgrade Planning build — as a live tracked plan, which
+  // contradicts the plan tab that still offers the build-fork.
+  if(saved.planCommitted)CPLAN._planCommitted=saved.planCommitted;
+  if(saved.planCommittedAt)CPLAN._planCommittedAt=saved.planCommittedAt;
   if(saved.approaches)CPLAN._approaches=saved.approaches;
   if(saved.selectedApproach)CPLAN._selectedApproach=saved.selectedApproach;
   var fd=APP._portalFd;if(fd&&fd.calcs){CPLAN.income=fd.calcs.inc||0;CPLAN.expenses=fd.calcs.baseExp||0;CPLAN.surplus=Math.max(0,(fd.calcs.netCF||0));CPLAN.totalDebt=fd.calcs.totalDebt||0;CPLAN.age=fd.age||parseInt((fd.S||{}).age)||35;CPLAN.debts=(fd.S||{}).debts||[];CPLAN.retirementAge=parseInt((fd.S&&fd.S.profile&&fd.S.profile.retAge))||CPLAN.retirementAge||65;CPLAN.retIncome=parseFloat((fd.S&&fd.S.profile&&fd.S.profile.retIncome))||0;CPLAN.spRetIncome=parseFloat((fd.S&&fd.S.profile&&fd.S.profile.spRetIncome))||0;}
@@ -29705,7 +29716,12 @@ function _trackMiss(idx){
 function renderClientPlanTracking(){
   var el=document.getElementById('clientTrackingContent');if(!el)return;
   _cpEnsurePlanLoaded();
-  if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length){el.innerHTML=_renderEmptyState('empty',{icon:'📋',title:'No Plan Yet',message:'Create a financial plan first.',ctaLabel:'Build My Plan →',ctaOnclick:'showClientPage(\'plan\');initClientPlan()'});return;}
+  // Self-serve (non-advisory) clients must COMMIT their plan before it shows as a live tracked plan.
+  // Otherwise an uncommitted draft (or leftover pre-downgrade allocations) renders as an active
+  // tracked plan, contradicting the plan tab which still shows the build-fork. Advisory clients are
+  // unchanged (the advisor publish flow governs their plan visibility).
+  var _trkSelfUncommitted=(typeof CPLAN!=='undefined') && !(APP.currentClient && APP.currentClient.client_type==='advisory') && !CPLAN._planCommitted;
+  if(typeof CPLAN==='undefined'||!CPLAN.allocations||!CPLAN.allocations.length||_trkSelfUncommitted){el.innerHTML=_renderEmptyState('empty',{icon:'📋',title:'No Committed Plan Yet',message:'Finish and commit your plan first to start tracking your progress.',ctaLabel:'Build My Plan →',ctaOnclick:'showClientPage(\'plan\');initClientPlan()'});return;}
   var h='',mk=_trackKey(),md=_cpTracking[mk]||{};
   // Helper: returns the actual monthly contribution the user is committed to
   // for this allocation. For linked cards (Type 1b), a.amount is the DELTA
@@ -43614,7 +43630,7 @@ function initClientPlan(){
     CPLAN.allocations=JSON.parse(JSON.stringify(CPLAN.advisorPlan));
     CPLAN.allocations.forEach(function(a){if(a.phase===undefined)a.phase=1;});
     _cpRenderPlanV2();
-  } else if((CPLAN._approaches && (CPLAN._approaches.traditional || CPLAN._approaches.tax_free || CPLAN._approaches.hybrid))
+  } else if((typeof clientHasFeature==='function' && clientHasFeature('plan_builder_full') && CPLAN._approaches && (CPLAN._approaches.traditional || CPLAN._approaches.tax_free || CPLAN._approaches.hybrid))
             || (CPLAN._diyPlan && CPLAN._diyPlan.allocations && CPLAN._diyPlan.allocations.some(function(a){return(parseFloat(a.amount)||0)>0;}))){
     // User has saved AI approaches or saved DIY work but never committed.
     // Land on the universal fork showing whatever exists. Per spec: this is
