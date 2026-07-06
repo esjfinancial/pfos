@@ -2038,6 +2038,7 @@ async function renderAgentsPage(){
       +'</div>'
       +(isAdmin ? '' :
         '<div style="display:flex;flex-direction:column;gap:5px;flex-shrink:0">'
+          +'<button class="pfos-btn pfos-btn-bl" onclick="_admOpenAdvisorDashboard(\''+agent.id+'\')" title="Open this advisor&#39;s dashboard, read-only (admin)">👁 View Dashboard</button>'
           +(isSusp
             ? '<button class="pfos-btn pfos-btn-bl" onclick="restoreAgentAccess(\''+agent.id+'\')">Restore</button>'
             : '<button class="pfos-btn" onclick="revokeAgentAccess(\''+agent.id+'\',\''+esc(agent.name||agent.email)+'\')" style="background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.25);color:var(--rd)">Suspend</button>') // M7: pass the name (like the Delete button) so the confirm isn't "Suspend undefined?"
@@ -2047,6 +2048,12 @@ async function renderAgentsPage(){
   }).join('');
 }
 function initials_(s){ if(!s) return '?'; var p=s.trim().split(' '); return p.length>1?(p[0][0]+p[p.length-1][0]).toUpperCase():s.slice(0,2).toUpperCase(); }
+// Admin-only: open an advisor's dashboard in read-only view-as mode (hands off via sessionStorage).
+function _admOpenAdvisorDashboard(advisorId){
+  if(APP.role!=='admin'||!advisorId) return;
+  try{ sessionStorage.setItem('pfos_admin_view_advisor', advisorId); }catch(e){}
+  window.location.href='https://pfos.esjfinancial.com/pfos-dashboard';
+}
 // ── AGENT MANAGEMENT ACTIONS (admin-only in dashboard) ───────────────────────
 function openInviteAgentModal(){
   if(APP.role!=='admin'){ alert('Only admins can invite agents.'); return; }
@@ -2361,6 +2368,16 @@ async function determineRoleAndRoute(){
     if(ud){
       APP.userData = ud;
       APP.role = ud.role || 'agent';
+      // ── ADMIN "Open Dashboard (view-as advisor)": load the target advisor's context, read-only unless
+      // that advisor has granted a live 24h edit window. Admin-only; the client-book still loads via the
+      // admin's broad access. ──
+      var _ava=null; try{ _ava=sessionStorage.getItem('pfos_admin_view_advisor'); }catch(e){}
+      if(ud.role==='admin' && _ava){
+        try{
+          const { data: va } = await db.from('users').select('id,email,name,role,admin_edit_until,admin_edit_requested_at,scheduling_url,advisor_plan,client_cap').eq('id', _ava).maybeSingle();
+          if(va){ APP._adminView=true; APP._adminViewAdvisorId=va.id; APP._viewAdvisor=va; APP._adminUserId=ud.id; }
+        }catch(e){ console.warn('admin view-as advisor load failed:', e); }
+      }
       // Block suspended accounts before routing
       if(APP.role === 'suspended'){
         showLoginErr('Your account has been suspended. Please contact an administrator.');
@@ -2617,7 +2634,43 @@ async function confirmDeleteClient(clientId){
     alert('Client deleted.');
   }catch(e){ alert('Delete failed: '+e.message); }
 }
+// ── Admin impersonation (view-as advisor): read-only + advisor-approved 24h edit window ──────────────
+function _admDashEditActive(){ var a=APP._viewAdvisor; return !!(a&&a.admin_edit_until&&new Date(a.admin_edit_until).getTime()>Date.now()); }
+function _admDashRO(){ return !!(APP._adminView && !_admDashEditActive()); }
+function _admDashGuard(){ if(_admDashRO()){ (typeof _advShowToast==='function')?_advShowToast('Admin view — read-only. Request edit access to make changes.','error'):alert('Admin view — read-only.'); return true; } return false; }
+async function _admDashRequestEdit(){
+  if(!APP._adminView||!APP._adminViewAdvisorId) return;
+  try{ var r=await db.from('users').update({admin_edit_requested_at:new Date().toISOString(), admin_edit_requested_by:APP._adminUserId||null}).eq('id',APP._adminViewAdvisorId); if(r&&r.error)throw new Error(r.error.message); if(APP._viewAdvisor)APP._viewAdvisor.admin_edit_requested_at=new Date().toISOString(); _admRenderViewBanner(); (typeof _advShowToast==='function')&&_advShowToast('Edit request sent — the advisor must approve it.','success'); }
+  catch(e){ (typeof _advShowToast==='function')&&_advShowToast('Request failed: '+(e.message||e),'error'); }
+}
+function _admExitView(){ try{ sessionStorage.removeItem('pfos_admin_view_advisor'); }catch(e){} window.location.href='https://pfos.esjfinancial.com/pfos-dashboard'; }
+function _admRenderViewBanner(){
+  if(!APP._adminView) return;
+  var bar=document.getElementById('admViewBanner');
+  if(!bar){ bar=document.createElement('div'); bar.id='admViewBanner'; bar.style.cssText='position:sticky;top:0;z-index:9998'; document.body.insertBefore(bar, document.body.firstChild); }
+  var name=(APP._viewAdvisor&&APP._viewAdvisor.name)||'advisor';
+  var exitBtn='<button onclick="_admExitView()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(226,232,240,.12);border:1px solid rgba(226,232,240,.25);color:#fff;cursor:pointer;border-radius:4px;min-height:32px">Exit</button>';
+  if(_admDashEditActive()){
+    var until=new Date(APP._viewAdvisor.admin_edit_until).toLocaleString();
+    bar.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;padding:9px 16px;background:rgba(34,197,94,.12);border-bottom:1px solid rgba(34,197,94,.4)"><span style="font-size:13px;color:#fff">✏️ <strong>Admin edit access</strong> to '+esc(name)+'&rsquo;s dashboard — expires '+esc(until)+'</span>'+exitBtn+'</div>';
+  } else {
+    var pending=!!(APP._viewAdvisor&&APP._viewAdvisor.admin_edit_requested_at);
+    var reqBtn=pending?'<span style="font-size:12px;color:rgba(226,232,240,.7)">Edit request pending advisor approval…</span>':'<button onclick="_admDashRequestEdit()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:#5B9BFF;border:none;color:#fff;cursor:pointer;border-radius:4px;min-height:32px">Request edit access</button>';
+    bar.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;padding:9px 16px;background:rgba(91,155,255,.15);border-bottom:1px solid rgba(91,155,255,.4)"><span style="font-size:13px;color:#fff">👁 <strong>Admin view</strong> of '+esc(name)+'&rsquo;s dashboard — read-only.</span>'+reqBtn+exitBtn+'</div>';
+  }
+}
+function _admRenderApproveBanner(){
+  if(APP._adminView) return;
+  var u=APP.userData; if(!u||!u.admin_edit_requested_at) return;
+  var bar=document.getElementById('admApproveBanner');
+  if(!bar){ bar=document.createElement('div'); bar.id='admApproveBanner'; bar.style.cssText='position:sticky;top:0;z-index:9998'; document.body.insertBefore(bar, document.body.firstChild); }
+  bar.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;padding:11px 16px;background:rgba(249,115,22,.12);border-bottom:1px solid rgba(249,115,22,.45)"><span style="font-size:13px;color:#fff">🔐 A platform admin requested <strong>edit access</strong> to your dashboard.</span><button onclick="_admApprove()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:#22C55E;border:none;color:#062;cursor:pointer;border-radius:4px;min-height:32px">Approve for 24h</button><button onclick="_admDeny()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(239,68,68,.2);border:1px solid rgba(239,68,68,.5);color:#fff;cursor:pointer;border-radius:4px;min-height:32px">Deny</button></div>';
+}
+async function _admApprove(){ try{ var r=await db.rpc('set_admin_edit_consent',{p_grant:true}); if(r&&r.error)throw new Error(r.error.message); if(APP.userData)APP.userData.admin_edit_requested_at=null; var bar=document.getElementById('admApproveBanner'); if(bar)bar.remove(); (typeof _advShowToast==='function')&&_advShowToast('✓ Admin edit access granted for 24 hours.','success'); }catch(e){ (typeof _advShowToast==='function')&&_advShowToast('Failed: '+(e.message||e),'error'); } }
+async function _admDeny(){ try{ var r=await db.rpc('set_admin_edit_consent',{p_grant:false}); if(r&&r.error)throw new Error(r.error.message); if(APP.userData)APP.userData.admin_edit_requested_at=null; var bar=document.getElementById('admApproveBanner'); if(bar)bar.remove(); (typeof _advShowToast==='function')&&_advShowToast('Admin edit request denied.','success'); }catch(e){} }
+(function(){ var n=0; var iv=setInterval(function(){ n++; if(window.APP&&APP.userData){ try{ _admRenderViewBanner(); _admRenderApproveBanner(); }catch(e){} clearInterval(iv); } else if(n>30) clearInterval(iv); }, 700); })();
 async function updateClientAgent(clientId, agentId){
+  if(_admDashGuard()) return;
   try{
     var _u=await db.from('clients').update({ user_id: agentId||null }).eq('id', clientId);
     if(_u&&_u.error) throw new Error(_u.error.message); // audit silent-save: don't report success / update the UI if the reassignment write failed (the admin copy was fixed; this dashboard sibling was missed)
@@ -2628,6 +2681,7 @@ async function updateClientAgent(clientId, agentId){
   }catch(e){ alert('Could not reassign agent: '+e.message); }
 }
 async function updateClientTier(clientId, tier){
+  if(_admDashGuard()) return;
   try{
     // M0: the dropdown encodes comp-Core / comp-Planning as composite values → split into pfos_tier + comp.
     // Admin grants are DIRECT (no trial stamp; the old non-core→trial auto-grant is removed).
@@ -5036,6 +5090,7 @@ function _advShowCapPrompt(){
   openModal('advCapModal');
 }
 function openNewClientModal(){
+  if(typeof _admDashGuard==='function' && _admDashGuard()) return; // admin view-as: read-only
   if(_advAtCap()){ _advShowCapPrompt(); return; } // Phase E: block new clients past the cap → advisor checkout
   set('clientModalTitle','New Client');
   document.getElementById('editClientId').value='';
@@ -5084,6 +5139,7 @@ function openEditClientModal(){
   openModal('clientModal');
 }
 async function saveClientRecord(){
+  if(_admDashGuard()) return;
   var errEl=document.getElementById('clientModalErr');
   var fn=v('mc-firstName'), ln=v('mc-lastName');
   clearInvalid(['mc-firstName']);
