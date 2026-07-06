@@ -32732,7 +32732,11 @@ function _cpStartSelfBuild(){
       }
       if(!_customNm&&f.title.indexOf('Disability coverage gap')===0)_customNm='Disability Coverage Gap Review';
     }
-    var pushObj={type:sol.type,amount:0,target:sol.type==='ef'?Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal)):0,phase:0,cascade:'',flagTitle:f.title,flagType:f.type,flagIcon:f.icon,reason:_cpLiteStripBlockedVehicles(f.desc||'')};
+    // Lite: seed action-only PROTECTION reviews straight INTO the plan (phase 1) so the only unassigned items
+    // are the retirement + education CHOOSER cards (owner 2026-07-06). Fundable types (ef/debt/invest) are
+    // auto-funded to phase 1 by _cpLiteAutoSeed regardless; advanced/other types stay phase 0.
+    var _seedPhase=(typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()&&sol.type==='protection')?1:0;
+    var pushObj={type:sol.type,amount:0,target:sol.type==='ef'?Math.round(Math.max(0,CPLAN.efTarget-CPLAN.efBal)):0,phase:_seedPhase,cascade:'',flagTitle:f.title,flagType:f.type,flagIcon:f.icon,reason:_cpLiteStripBlockedVehicles(f.desc||'')};
     if(_customNm)pushObj.customName=_customNm;
     CPLAN.allocations.push(pushObj);
   });
@@ -32833,14 +32837,15 @@ function _cpSyncFlagsToUnassigned(){
       if(_efKeep.amountSelf==null||_efKeep.amountSpouse==null){ var _am=parseFloat(_efKeep.amount)||0; _efKeep.amountSelf=Math.round(_am/2); _efKeep.amountSpouse=Math.round((_am-_efKeep.amountSelf)*100)/100; }
     }
   }
-  // CORE: resolve any RELOADED retirement-chooser ORPHAN — a persisted 'Choose a retirement vehicle' custom card that
-  // lost its _chooserAction/_isPlaceholder identity on save (those fields aren't in the serializer) — to the default real
-  // vehicle. Doing it BEFORE the flag loop means the dedup below sees a real (auto-resolved) retirement card and won't
-  // re-stage a duplicate placeholder; the seeder can then fund it. Lite-only; fresh flags are resolved at the chooser branch.
+  // CORE: a RELOADED retirement chooser loses its _chooserAction/_isPlaceholder identity on save (those fields aren't in
+  // the serializer), leaving a bare 'Choose a retirement vehicle' custom card. RESTORE the chooser identity (owner
+  // 2026-07-06) — instead of the old behavior that auto-resolved it to a concrete Roth/401k — so it re-renders as the
+  // generic selector card + Choose button, and the flag loop's placeholder dedup (a._chooserAction===act) recognizes it
+  // and does not stage a duplicate. Lite-only.
   if(typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()){
     (CPLAN.allocations||[]).forEach(function(a){
       if(a&&a.type==='custom'&&((a._chooserAction==='retirement')||(a.customName==='Choose a retirement vehicle'))){
-        a.type=_cpLiteRetType(); a._autoResolvedFromPlaceholder=true; a.customName=''; delete a._isPlaceholder; delete a._chooserAction;
+        a._chooserAction='retirement'; a._isPlaceholder=true; a.customName='Choose a retirement vehicle';
       }
     });
   }
@@ -32980,16 +32985,10 @@ function _cpSyncFlagsToUnassigned(){
       if(_customNm)nowFlag.customName=_customNm;
     }
     if(chooserActions[act]){
-      // CORE (lite) PRESCRIPTIVE: resolve the RETIREMENT chooser to a real default vehicle so it can be pre-funded and
-      // shows a concrete instruction ("Put $X into your Roth IRA") instead of an unfundable "Choose a vehicle" placeholder
-      // the seeder skips. 401(k) if employed (capture the match) · Roth IRA otherwise · Traditional if over the Roth income
-      // limit (so the Roth MAGI phase-out can't leave a $0 card). Still switchable via the (locked-option) menu. The seeder
-      // (_cpLiteAutoSeed) funds it via the _retGrowth lane. Non-lite (Planning/advisor) keeps the chooser placeholder.
-      if(act==='retirement'&&typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()){
-        CPLAN.allocations.push(_extend(nowFlag,{type:_cpLiteRetType(),amount:0,target:0,phase:0,cascade:'',_autoResolvedFromPlaceholder:true}));
-        _seenChooser[act+'|'+(_isSpouseFlag?'spouse':'self')]=true;
-        return;
-      }
+      // (Owner 2026-07-06) The retirement flag is NO LONGER auto-resolved to a concrete vehicle in lite — it falls
+      // through to the generic "Choose a retirement vehicle" placeholder below, so the client gets a real SELECTOR
+      // (basic vehicles selectable, advanced ones shown LOCKED via _cpShowFlagMenu). Existing retirement accounts are
+      // already seeded as funded cards; this chooser is for adding another vehicle. edu is already a generic chooser.
       // Placeholder card. Type is irrelevant for the placeholder render path; we use
       // 'custom' so type-aware code paths gracefully ignore it (no IRS limits, no slider).
       var titleByAct={retirement:'Choose a retirement vehicle',edu:'Choose an education vehicle',rollover:'Choose a rollover destination',growth:'Choose a growth vehicle'};
@@ -32997,7 +32996,9 @@ function _cpSyncFlagsToUnassigned(){
       _seenChooser[act+'|'+(_isSpouseFlag?'spouse':'self')]=true;   // mark this action+owner staged so sibling flags this run don't re-add it
     } else if(actionOnlyMap.hasOwnProperty(act)){
       var t2=actionOnlyMap[act]; if(t2==null)return;
-      CPLAN.allocations.push(_extend(nowFlag,{type:t2,amount:0,target:0,phase:0,cascade:''}));
+      // Lite: action-only reviews (protection is the only lite-allowed one that reaches here) go straight INTO the
+      // plan (phase 1) so only the chooser cards remain unassigned (owner 2026-07-06). Non-lite keeps phase 0.
+      CPLAN.allocations.push(_extend(nowFlag,{type:t2,amount:0,target:0,phase:(typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()?1:0),cascade:''}));
     } else if(directMap[act]){
       var t3=directMap[act];
       // EF target = the gap to the (household, for joint/hybrid) 3-month reserve. For a joint household card we also
@@ -41165,7 +41166,7 @@ function _cpShowFlagMenu(flagAction,phase){
     retirement:{
       title:'Choose retirement vehicles',
       subtitle:'Tax-free and tax-deferred options available — check one or more, then Add Selected to Plan.',
-      categoryKeys:['Retirement — Tax-Free','Retirement — Tax-Deferred','Specialized']
+      categoryKeys:['Retirement — Tax-Free','Retirement — Tax-Deferred','Annuities & Guaranteed Income','Specialized']
     },
     edu:{
       title:'Choose education vehicles',
