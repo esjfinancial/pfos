@@ -1989,41 +1989,15 @@ var _JM_SP_FIELDS_ADMIN = ['spFirstName','spLastName','spEmail','spOccupation','
 async function _jmAdminUnlinkClean(clientId){
   if(!clientId) return {ok:false, error:'no clientId'};
   try{
-    var r = await db.from('client_profiles')
-      .select('id,financial_data,previous_financial_data,previous_financial_data_2')
-      .eq('client_id', clientId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
+    // Server-side cleanup via the SECURITY DEFINER RPC admin_unlink_clean_profile: it recomputes the same
+    // strip-spouse / park-joint / strip-sp-fields transform this function used to do inline and writes it,
+    // so it survives the DB admin-write consent gate (the client being unlinked has not granted consent).
+    // The RPC is admin-only, scoped to coupled clients, and takes NO free-form data, so it cannot be used
+    // as a general write-bypass. Semantically identical to the old inline transform. Owner 2026-07-06.
+    var r = await db.rpc('admin_unlink_clean_profile', { p_client_id: clientId });
     if(r.error) return {ok:false, error:r.error.message};
-    if(!r.data || !r.data.financial_data || !r.data.financial_data.S){ return {ok:true, noop:true}; }
-    var fd = r.data.financial_data;
-    var S = JSON.parse(JSON.stringify(fd.S));
-    var parked = Array.isArray(S._pendingJointCleanup) ? S._pendingJointCleanup.slice() : [];
-    // Strip owner='spouse' items; park owner='joint' items tagged with source array.
-    _JM_MERGE_ARRAYS_ADMIN.forEach(function(arr){
-      if(!Array.isArray(S[arr])) return;
-      var keep = [];
-      S[arr].forEach(function(it){
-        var o = (it && it.owner) ? String(it.owner) : 'self';
-        if(o==='spouse'){ return; }            // drop the other person's data
-        if(o==='joint'){
-          var p = Object.assign({}, it); p._cleanupArr = arr; parked.push(p); return;
-        }
-        keep.push(it);                          // self/personal stays
-      });
-      S[arr] = keep;
-    });
-    // Strip sp* profile fields from the profile object (and any top-level mirror).
-    if(S.profile && typeof S.profile==='object'){
-      _JM_SP_FIELDS_ADMIN.forEach(function(f){ if(f in S.profile) delete S.profile[f]; });
-    }
-    _JM_SP_FIELDS_ADMIN.forEach(function(f){ if(f in S) delete S[f]; });
-    if(parked.length) S._pendingJointCleanup = parked; else delete S._pendingJointCleanup;
-    var fdNew = Object.assign({}, fd, {S:S});
-    var pp = { financial_data:fdNew, allow_data_downgrade:true, updated_at:new Date().toISOString(), previous_financial_data:fd };
-    if(r.data.previous_financial_data) pp.previous_financial_data_2 = r.data.previous_financial_data;
-    if(r.data.previous_financial_data_2) pp.previous_financial_data_3 = r.data.previous_financial_data_2;
-    var w = await db.from('client_profiles').update(pp).eq('id', r.data.id);
-    if(w.error) return {ok:false, error:w.error.message};
-    return {ok:true, parked:parked.length};
+    var d = r.data || {};
+    return {ok:true, parked:(d.parked||0), noop:!!d.noop};
   }catch(e){ return {ok:false, error:e.message}; }
 }
 async function approveUnlinkRequest(reqId, coupleLinkId, requestingClientId){
