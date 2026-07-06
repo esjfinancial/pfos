@@ -5097,7 +5097,11 @@ function _cpLiteAutoSeed(){
   if(pool<=0)return;
   var _hef=(typeof _cpHouseholdEF==='function')?_cpHouseholdEF():{bal:(parseFloat(CPLAN.efBal)||0),target:(parseFloat(CPLAN.efTarget)||0)};   // household-aware EF (joint/hybrid combined) — a funded HOUSEHOLD EF seeds 0% so the freed budget rolls into growth
   var hiDebts=((CPLAN.debts)||[]).filter(function(x){return(parseFloat(x.rate)||0)>10&&(parseFloat(x.balance)||0)>0;});
-  var debtPct=hiDebts.length>0?0.30:0, efPct=(_hef.bal<_hef.target)?0.10:0, matchPct=CPLAN.employer?0.08:0;
+  // Also fund the debt lane for a non-mortgage payable debt even when APR is null/low (e.g. an auto loan) — otherwise a
+  // client whose debts have no stored rate gets a stranded $0 debt card. Mortgage/HELOC stay at minimum payments
+  // (excluded from aggressive payoff, mirroring the Debt Optimizer default). Owner 2026-07-06.
+  var _payableDebts=((CPLAN.debts)||[]).filter(function(x){ var t=String(x.type||'').toLowerCase(), n=String(x.name||'').toLowerCase(); var isMort=(t==='mortgage'||t==='heloc'||/mortgage|heloc|home equity/.test(n)); return !isMort&&(parseFloat(x.balance)||0)>0; });
+  var debtPct=(hiDebts.length>0||_payableDebts.length>0)?0.30:0, efPct=(_hef.bal<_hef.target)?0.10:0, matchPct=CPLAN.employer?0.08:0;
   var growthPct=1-debtPct-efPct-matchPct;
   function _seed(pred,share){
     if(share<=0)return; var amt=Math.round(pool*share); if(amt<=0)return;
@@ -31029,8 +31033,17 @@ function _cpIsActionOnly(a){
   // $0/$X slider in the plan view, looking like a normal allocation that
   // simply hadn't been funded, with no visual cue for why.
   if(a.type==='hsa'&&a._hdhpGated)return true;
-  // Custom items with no target/amount are also treated as action-only
-  if(a.type==='custom'&&!a.target&&!a.amount)return true;
+  // Custom items with no target/amount are also treated as action-only...
+  if(a.type==='custom'&&!a.target&&!a.amount){
+    // ...EXCEPT a named savings GOAL in the LITE plan — that is a fundable card (render a $/mo slider, not the
+    // "action required / review and complete" note). Choosers carry _isPlaceholder/_chooserAction (and are rendered
+    // by the chooser branch upstream anyway), so they are excluded. We also require goalCurrent (the seeded-goal
+    // marker set at the goals push) so that legacy one-time ACTION custom cards — e.g. "Draft a Will" /
+    // "Beneficiary Review" from a committed AI plan that later downgrades Planning→Core — stay action-only and
+    // never render a nonsensical $/mo slider. Non-lite unchanged. Owner 2026-07-06.
+    if(typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()&&a.customName&&typeof a.goalCurrent!=='undefined'&&!a._isPlaceholder&&!a._chooserAction)return false;
+    return true;
+  }
   return false;
 }
 var CP_PRI=['ef','debt','iul','wl','roth','401k','edu','invest','house','custom'];
@@ -32459,6 +32472,12 @@ function _cpStartSelfBuild(){
   CPLAN.planMode='self';
   CPLAN._selectedApproach=null;
   CPLAN._viewingApproach=null;
+  // (Owner 2026-07-06) Seed the SPOUSE's existing accounts too for JOINT/HYBRID households (merged / shared
+  // finances). CPLAN._allowSpouseSeed was dead code — read at 4 seed gates (retirement + investment inline
+  // seeders and the two restore-path builders) but never assigned anywhere, so every spouse-owned account was
+  // silently dropped for EVERY household. Key it on the reliably-set household type; separate/individual stay
+  // per-person (flag false = byte-identical). Recomputed per build so a stale true can't leak into a later context.
+  CPLAN._allowSpouseSeed=(CPLAN._householdType==='joint'||CPLAN._householdType==='hybrid');
   // PRESERVE EXISTING DIY: if the user already has DIY work saved (any
   // allocation with amount > 0 was made previously), restore it instead of
   // wiping and re-seeding from red flags. Per spec: "if they only selected
@@ -32755,7 +32774,9 @@ function _cpStartSelfBuild(){
   (rawS.goals||[]).forEach(function(g){
     if(!g.name)return;
     if(g.recurring===true)return;
-    CPLAN.allocations.push({type:'custom',amount:0,target:parseFloat(g.target)||0,phase:0,cascade:'',customName:g.name,goalCurrent:parseFloat(g.current||g.balance)||0});
+    // Lite: a client's savings goals belong IN the plan (phase 1), leaving only the retirement + education choosers
+    // unassigned (owner 2026-07-06). Non-lite keeps phase 0 (the cascade unassigned pool).
+    CPLAN.allocations.push({type:'custom',amount:0,target:parseFloat(g.target)||0,phase:(typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()?1:0),cascade:'',customName:g.name,goalCurrent:parseFloat(g.current||g.balance)||0});
   });
   _cpRenderPlanV2();
 }
@@ -33020,7 +33041,9 @@ function _cpSyncFlagsToUnassigned(){
         _efExtra={amountSelf:0,amountSpouse:0,_sharedOwnerClientId:null};
         nowFlag.reason='Your household emergency fund — a shared safety net you both contribute to. '+(_hef.bal>=_hef.target?('You already have '+fmt(_hef.bal)+' of your '+fmt(_hef.target)+' (3-month) target — fully funded.'):('Target '+fmt(_hef.target)+' (3 months of combined expenses); '+fmt(_hef.bal)+' saved so far.'));
       }
-      CPLAN.allocations.push(_extend(nowFlag,_extend({type:t3,amount:0,target:tgt,phase:0,cascade:''},_efExtra)));
+      // Lite: the debt card goes straight INTO the plan (phase 1) so it's never a stranded unassigned $0 card
+      // (owner 2026-07-06). Scoped to debt; ef is auto-promoted by _cpLiteAutoSeed. Non-lite keeps phase 0.
+      CPLAN.allocations.push(_extend(nowFlag,_extend({type:t3,amount:0,target:tgt,phase:(typeof _cpSinglePhasePlan==='function'&&_cpSinglePhasePlan()&&t3==='debt'?1:0),cascade:''},_efExtra)));
     } else if(act==='401k'){
       CPLAN.allocations.push(_extend(nowFlag,{type:'401k',amount:0,target:0,phase:0,cascade:''}));
     }
