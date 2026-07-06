@@ -783,14 +783,15 @@ html[data-theme="light"] .tip-pop{background:#FFFFFF!important;color:#334155!imp
     <div id="profileSidebarMeta" style="padding:0 16px 12px;font-size:11px;color:var(--mu)"></div>
     <div class="sb-section">Actions</div>
     <div class="sb-item" id="nav-client-profile" onclick="showPage('client-profile')"><span class="icon">🏠</span> Client Profile</div>
-    <div class="sb-item" onclick="openPFOSForClient()"><span class="icon">⚡</span> Open PFOS</div>
+    <div class="sb-item" id="nav-open-portal" style="display:none" onclick="_admOpenClientPortal()"><span class="icon">👁</span> Open Client Portal</div>
+    <div class="sb-item" id="nav-openpfos" onclick="openPFOSForClient()"><span class="icon">⚡</span> Open PFOS</div>
     <div class="sb-item" id="nav-tracking" onclick="showPage('tracking');renderAdvisorTracking()"><span class="icon">✅</span> Financial Plan Tracking</div>
     <div class="sb-item" id="nav-projections" onclick="showPage('projections');renderAdvisorProjections()"><span class="icon">📈</span> Financial Projections</div>
     <div class="sb-item" id="nav-analysis" onclick="showPage('analysis');renderAdvisorAnalysis()"><span class="icon">🔍</span> Financial Analysis</div>
     <div class="sb-item" id="nav-spending" onclick="showPage('spending');renderAdvisorSpending()"><span class="icon">💰</span> Spending</div>
     <div class="sb-item" id="nav-insurance" onclick="showPage('insurance');renderAdvisorInsurance()"><span class="icon">🛡️</span> Insurance & Annuities</div>
     <div class="sb-item" id="nav-messages" onclick="showPage('messages');loadAdvisorMessages()"><span class="icon">💬</span> Messages <span id="advMsgBadge" style="display:none;background:#5B9BFF;color:#fff;font-size:11px;font-family:var(--fh);font-weight:700;padding:1px 6px;border-radius:10px;margin-left:4px">0</span></div>
-    <div class="sb-item" onclick="generateProgressReport(APP.currentClientId)"><span class="icon">📈</span> Progress Report</div>
+    <div class="sb-item" id="nav-progress" onclick="generateProgressReport(APP.currentClientId)"><span class="icon">📈</span> Progress Report</div>
   </div>
   <div class="sb-bottom">
     <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px;padding:0 4px">
@@ -6498,6 +6499,22 @@ async function openClientProfile(clientId){
   if(convertBtn) convertBtn.style.display = (APP.role==='admin' && isProduct) ? 'flex' : 'none';
   if(removeBtn)  removeBtn.style.display  = (APP.role==='admin' && !isProduct && client.user_id) ? 'flex' : 'none';
   if(typeBadgeEl){ typeBadgeEl.style.display='flex'; typeBadgeEl.innerHTML=ctBadge; }
+  // Self-serve (any NON-advisory) client: collapse the left-nav "Actions" to ONLY "Open Client
+  // Portal". The advisor tools (Open PFOS / Plan Tracking / Projections / Analysis / Spending /
+  // Insurance / Messages / Progress Report) don't apply to a client who manages their own finances
+  // — everything they have lives in their own portal (owner decision 2026-07-06). Advisory clients
+  // keep the full nav. The portal nav item is admin-only (portal access is admin-gated). We key on
+  // !=='advisory' to match the _cpInitPlan plan-card gate exactly, so a blank/legacy client_type can
+  // never show a full advisor nav alongside a suppressed plan card. client/APP.role in scope.
+  var _selfServe = !(client && client.client_type==='advisory');
+  ['nav-client-profile','nav-openpfos','nav-tracking','nav-projections','nav-analysis','nav-spending','nav-insurance','nav-messages','nav-progress'].forEach(function(_navId){
+    var _navEl=document.getElementById(_navId); if(_navEl) _navEl.style.display = _selfServe ? 'none' : '';
+  });
+  var _navPortal=document.getElementById('nav-open-portal');
+  if(_navPortal) _navPortal.style.display = (_selfServe && APP.role==='admin') ? '' : 'none';
+  // Self-serve clients always land on (and stay on) the profile landing — never a stale advisor
+  // tool page (e.g. Projections) left active from a previously-viewed advisory client.
+  if(_selfServe && typeof showPage==='function') showPage('client-profile');
   // Couple link badge
   await loadCouples();
   renderCoupleBadge(client);
@@ -8155,6 +8172,11 @@ async function _cpInitPlan(fd,allocPlan,planMeta){
   }catch(e){console.warn('Couple link load failed:',e);}
   // Phase 1: scale loaded plans if they exceed available budget (sets _scaledOnLoad notice flag)
   _cpEnforce();
+  // Self-serve (PRODUCT) clients get NO advisor plan builder in this deep-dive — their plan
+  // lives only in their own portal (owner decision 2026-07-06). Advisory clients (advisor
+  // builds their plan here) fall through to the builder. NB: _cpInitPlan never sets
+  // CPLAN.hasAdvisor, so read client_type off APP.currentClient directly.
+  if(!(APP.currentClient&&APP.currentClient.client_type==='advisory')){ _cpRenderSelfServePlanNote(); return; }
   _cpRenderPlan();
 }
 // ── M5.1c — dark-launched (PFOS_FLAGS.issuesDetect OFF -> _cpExtractFlags_LEGACY = byte-identical;
@@ -18343,6 +18365,27 @@ function _cpRenderAdvisorPending(){
   h+='<div style="font-size:13px;color:rgba(226,232,240,.75);line-height:1.7">Make sure your financial data is complete so your advisor has everything they need. You can also review your dashboard for current insights.</div>';
   h+='</div>';
   h+='<button onclick="_cpOpenPlanInquiry()" style="padding:12px 28px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:44px;letter-spacing:.04em">💬 Send Message About My Plan</button>';
+  h+='</div>';
+  root.innerHTML=h;
+}
+
+// Self-serve (PRODUCT) clients have no advisor plan in this deep-dive. Their plan is
+// built and owned inside their own portal and is only viewable there. Replaces the
+// (advisor-framed) plan builder for product clients — see _cpInitPlan routing + the
+// owner decision 2026-07-06. Admins get a shortcut to open the client's portal
+// (read-only admin view); advisors do not (portal access is admin-only by decision).
+function _cpRenderSelfServePlanNote(){
+  var root=document.getElementById('profileMainContent');if(!root)return;
+  var nm=(APP.currentClient&&APP.currentClient.name)||'This client';
+  var isAdmin=(APP.role==='admin');
+  var h='<div style="text-align:center;padding:44px 20px 34px;max-width:560px;margin:0 auto">';
+  h+='<div style="font-size:44px;margin-bottom:14px">🧭</div>';
+  h+='<div style="font-family:var(--fh);font-size:20px;font-weight:800;color:var(--wh);margin-bottom:10px">Self-serve client — no plan shown here</div>';
+  h+='<div style="font-size:14px;color:var(--mu);line-height:1.7;margin-bottom:22px">'+esc(nm)+' is a self-serve (Product) client. They build and manage their own financial plan inside their portal, so it isn\'t surfaced in this advisor view. To see it, open their portal and navigate to their plan.</div>';
+  if(isAdmin){
+    h+='<button onclick="_admOpenClientPortal()" style="padding:12px 26px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.12);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:4px;min-height:44px;letter-spacing:.03em">👁 Open Client Portal</button>';
+    h+='<div style="font-size:12px;color:var(--mu);margin-top:12px">Opens their portal in read-only admin view.</div>';
+  }
   h+='</div>';
   root.innerHTML=h;
 }
