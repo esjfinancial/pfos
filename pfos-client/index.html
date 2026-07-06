@@ -2630,6 +2630,22 @@ async function determineRoleAndRoute(){
     if(ud){
       APP.userData = ud;
       APP.role = ud.role || 'agent';
+      // ── ADMIN "Open Portal (view-as)": an admin arrives on /pfos-client with a target client id in
+      // sessionStorage. Load THAT client's data into the portal, flagged _adminView (read-only unless the
+      // client has granted a live 24h edit window). Admin-only; falls through to normal staff routing otherwise. ──
+      var _avc=null; try{ _avc=sessionStorage.getItem('pfos_admin_view_client'); }catch(e){}
+      if(ud.role==='admin' && _avc){
+        try{
+          const { data: vc } = await db.from('clients').select('*').eq('id', _avc).maybeSingle();
+          if(vc){
+            APP.role='client'; APP.currentClientId=vc.id; APP.currentClient=vc;
+            APP._adminView=true; APP._adminViewClientId=vc.id; APP._adminUserId=ud.id;
+            if(vc.user_id){ try{ var {data:advA}=await db.from('users').select('scheduling_url,name').eq('id',vc.user_id).maybeSingle(); if(advA){APP._advisorSchedulingUrl=advA.scheduling_url||'';APP._advisorName=advA.name||'';} }catch(e){} }
+            routeToClientPortal();
+            return;
+          }
+        }catch(e){ console.warn('admin view-as load failed:', e); }
+      }
       // Block suspended accounts before routing
       if(APP.role === 'suspended'){
         showLoginErr('Your account has been suspended. Please contact an administrator.');
@@ -50503,7 +50519,10 @@ function _cpEffTier(){ return APP.currentClient ? getEffectiveTier(APP.currentCl
 // M0 Phase C2 — read-only lock. A self-serve (product) client whose trial expired or subscription
 // was canceled resolves to effective tier 'none': data stays fully VISIBLE, but edits/tools/saves are
 // disabled until they subscribe. Advisory clients are never locked (their advisor manages access).
+// Admin impersonation: a live 24h edit grant (client-approved) unlocks editing; otherwise read-only.
+function _cpAdminEditActive(){ var c=APP.currentClient; return !!(c&&c.admin_edit_until&&new Date(c.admin_edit_until).getTime()>Date.now()); }
 function _cpReadOnly(){
+  if(APP._adminView) return !_cpAdminEditActive(); // admin view-as: read-only unless the client granted a live 24h window
   var c=APP.currentClient;
   if(!c || c.client_type!=='product') return false;
   return _cpEffTier()==='none';
@@ -50607,7 +50626,58 @@ function _cpRenderBillingBanner(){
     }
   }catch(e){}
 }
-(function(){ var n=0; var iv=setInterval(function(){ n++; if(window.APP&&APP.currentClient){ try{_cpRenderBillingBanner();}catch(e){} clearInterval(iv); } else if(n>25) clearInterval(iv); }, 700); })();
+// ── Admin impersonation (view-as) + client-side approval banners ──────────────
+function _cpRenderAdminViewBanner(){
+  if(!APP._adminView) return;
+  var host=document.querySelector('.plat-content'); if(!host) return;
+  var bar=document.getElementById('cpAdminViewBanner');
+  if(!bar){ bar=document.createElement('div'); bar.id='cpAdminViewBanner'; host.insertBefore(bar, host.firstChild); }
+  var name=(APP.currentClient&&APP.currentClient.name)||'this client';
+  var exitBtn='<button onclick="_cpExitAdminView()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(226,232,240,.1);border:1px solid rgba(226,232,240,.2);color:var(--wh);cursor:pointer;border-radius:4px;min-height:32px">Exit</button>';
+  if(_cpAdminEditActive()){
+    var until=new Date(APP.currentClient.admin_edit_until).toLocaleString();
+    bar.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;padding:10px 16px;margin:0 0 12px;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.35);border-radius:6px"><span style="font-size:13px;color:var(--wh)">✏️ <strong>Admin edit access</strong> to '+esc(name)+' — expires '+esc(until)+'</span>'+exitBtn+'</div>';
+  } else {
+    var pending=!!(APP.currentClient&&APP.currentClient.admin_edit_requested_at);
+    var reqBtn=pending?'<span style="font-size:12px;color:var(--mu)">Edit request pending client approval…</span>':'<button onclick="_cpAdminRequestEdit()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:var(--pu);border:none;color:#fff;cursor:pointer;border-radius:4px;min-height:32px">Request edit access</button>';
+    bar.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;padding:10px 16px;margin:0 0 12px;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.35);border-radius:6px"><span style="font-size:13px;color:var(--wh)">👁 <strong>Admin view</strong> of '+esc(name)+' — read-only.</span>'+reqBtn+exitBtn+'</div>';
+  }
+}
+async function _cpAdminRequestEdit(){
+  if(!APP._adminView||!APP.currentClientId) return;
+  try{
+    var r=await db.from('clients').update({admin_edit_requested_at:new Date().toISOString(), admin_edit_requested_by:APP._adminUserId||null}).eq('id',APP.currentClientId);
+    if(r&&r.error) throw new Error(r.error.message);
+    if(APP.currentClient) APP.currentClient.admin_edit_requested_at=new Date().toISOString();
+    _cpRenderAdminViewBanner();
+    if(typeof _cpToast==='function')_cpToast('Edit request sent — the client must approve it.');
+  }catch(e){ if(typeof _cpToast==='function')_cpToast('Request failed: '+(e.message||e)); }
+}
+function _cpExitAdminView(){ try{ sessionStorage.removeItem('pfos_admin_view_client'); }catch(e){} window.location.href='https://pfos.esjfinancial.com/pfos-dashboard'; }
+// CLIENT's own session: surface a pending admin edit-access request → Approve (24h) / Deny.
+function _cpRenderAdminAccessRequest(){
+  if(APP._adminView) return;
+  var c=APP.currentClient; if(!c||!c.admin_edit_requested_at) return;
+  var host=document.querySelector('.plat-content'); if(!host) return;
+  var bar=document.getElementById('cpAdminReqBanner');
+  if(!bar){ bar=document.createElement('div'); bar.id='cpAdminReqBanner'; host.insertBefore(bar, host.firstChild); }
+  bar.innerHTML='<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;justify-content:center;padding:12px 16px;margin:0 0 12px;background:rgba(249,115,22,.1);border:1px solid rgba(249,115,22,.4);border-radius:6px"><span style="font-size:13px;color:var(--wh)">🔐 A platform admin requested <strong>edit access</strong> to your account.</span><button onclick="_cpApproveAdminEdit()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:var(--gr);border:none;color:#062;cursor:pointer;border-radius:4px;min-height:32px">Approve for 24h</button><button onclick="_cpDenyAdminEdit()" style="padding:6px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.4);color:#fff;cursor:pointer;border-radius:4px;min-height:32px">Deny</button></div>';
+}
+async function _cpApproveAdminEdit(){
+  if(!APP.currentClientId) return;
+  try{
+    var r=await db.rpc('set_admin_edit_consent',{p_grant:true});
+    if(r&&r.error) throw new Error(r.error.message);
+    if(APP.currentClient){ APP.currentClient.admin_edit_until=new Date(Date.now()+24*3600*1000).toISOString(); APP.currentClient.admin_edit_requested_at=null; }
+    var bar=document.getElementById('cpAdminReqBanner'); if(bar) bar.remove();
+    if(typeof _cpToast==='function')_cpToast('✓ Admin edit access granted for 24 hours.');
+  }catch(e){ if(typeof _cpToast==='function')_cpToast('Failed: '+(e.message||e)); }
+}
+async function _cpDenyAdminEdit(){
+  if(!APP.currentClientId) return;
+  try{ var r=await db.rpc('set_admin_edit_consent',{p_grant:false}); if(r&&r.error)throw new Error(r.error.message); if(APP.currentClient)APP.currentClient.admin_edit_requested_at=null; var bar=document.getElementById('cpAdminReqBanner'); if(bar) bar.remove(); if(typeof _cpToast==='function')_cpToast('Admin edit request denied.'); }catch(e){ if(typeof _cpToast==='function')_cpToast('Failed: '+(e.message||e)); }
+}
+(function(){ var n=0; var iv=setInterval(function(){ n++; if(window.APP&&APP.currentClient){ try{_cpRenderBillingBanner();_cpRenderAdminViewBanner();_cpRenderAdminAccessRequest();}catch(e){} clearInterval(iv); } else if(n>25) clearInterval(iv); }, 700); })();
 // Return from Stripe (?billing=success|cancel|managed).
 function _cpHandleBillingReturn(){
   try{
