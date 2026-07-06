@@ -14421,13 +14421,21 @@ async function _cpSectionMergeSave(state, calcs, scores, _saveToId, _cpSave){
       }
 
       if(ex&&ex.data){
-        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id);
+        var _r=await db.from('client_profiles').update(pp).eq('id',ex.data.id).select('data_version').maybeSingle();
         if(_r.error){
           if(_r.error.message&&_r.error.message.indexOf('DATA_PROTECTION')>=0){console.warn('[PFOS] ⛔ Database blocked destructive overwrite');}
           else if(_r.error.message&&_r.error.message.indexOf('RATE_LIMIT')>=0){console.warn('[PFOS] ⛔ Rate limit hit');}
           else{console.error('[PFOS] client_profiles UPDATE failed:',_r.error.message);_queueFailedSave(_saveToId,{financial_data:pp.financial_data,scores:pp.scores,updated_at:pp.updated_at});}
           return false; // G4: signal failure to the secondary callers (clientSaveOwnData → "Save failed"; the queue/data-protection block still handles retry/guarding). The debounced handler ignores the return, so its behavior is unchanged.
-        } else {console.log('[PFOS] Auto-saved OK');_updateLastSaved();}
+        } else {
+          // Advance our version cursor to what the DB now holds. The BEFORE-UPDATE trigger
+          // trg_increment_version bumps data_version by 1 on every write; without syncing here,
+          // _lastDataVersion stayed at the PRE-write value, so the NEXT save read THIS tab's own
+          // bump as if another tab wrote it — the "edited in another tab" banner false-fired on
+          // every save after the first and never cleared on refresh. Owner 2026-07-06.
+          APP._lastDataVersion=(_r.data&&_r.data.data_version)||((ex.data.data_version||0)+1);
+          console.log('[PFOS] Auto-saved OK');_updateLastSaved();
+        }
       }
       else { var _r2=await db.from('client_profiles').insert(pp); if(_r2.error){console.error('[PFOS] client_profiles INSERT failed:',_r2.error.message); return false;} else console.log('[PFOS] Inserted new profile'); }
       return true;
