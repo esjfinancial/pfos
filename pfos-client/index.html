@@ -37096,6 +37096,39 @@ function _cpEngDrain(maxMs){
     })();
   });
 }
+// Seeded PRNG (mulberry32) — reproducible so the frontier is stable across regenerations.
+function _cpMulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;var t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+// Monte Carlo on the equity (taxable-brokerage) bucket: this is what makes the
+// IBC-vs-invest comparison RISK-FAIR instead of comparing a guaranteed ~4% policy
+// to a risk-free-assumed 6.5%. Each of `sims` paths compounds the SAME contribution
+// stream (start balance + a level annual contribution C) at per-year returns drawn
+// N(mean, vol) — so market loss / dispersion / sequence risk are modeled. C is
+// SELF-CALIBRATED (below) so the MEAN path reproduces the deterministic bucket the
+// plan chart shows; the median lands lower (volatility drag) and the low percentiles
+// show the bad-market downside. Returns the AFTER-TAX bucket distribution (15% LTCG
+// on gain above basis; the policy CV it's compared to is tax-free) + the probability
+// the equity bucket clears `threshold` (= the bucket value at which equity net worth
+// ties IBC's guaranteed net worth) → P(equity beats IBC).
+function _cpEquityMC(startBal,annualContrib,years,mean,vol,basis,threshold,sims){
+  var rng=_cpMulberry32(0x9E3779B9),ends=[],nBeat=0,i,y;
+  for(i=0;i<sims;i++){
+    var bal=startBal;
+    for(y=1;y<=years;y++){
+      var g0=rng(),g1=rng();
+      var z=Math.sqrt(-2*Math.log(Math.max(1e-12,g0)))*Math.cos(6.283185307179586*g1); // Box–Muller normal
+      var r=mean+vol*z;
+      bal=(bal+annualContrib)*(1+r);          // contributions-then-annual-return (matches the sim's convention)
+      if(bal<0)bal=0;
+    }
+    var at=bal-Math.max(0,bal-basis)*0.15;    // after-tax: LTCG on the gain only
+    ends.push(at);
+    if(at>threshold)nBeat++;
+  }
+  ends.sort(function(a,b){return a-b;});
+  function pct(p){return ends[Math.max(0,Math.min(ends.length-1,Math.floor(p*ends.length)))];}
+  var sum=0;for(i=0;i<ends.length;i++)sum+=ends[i];
+  return {median:Math.round(pct(0.5)),p25:Math.round(pct(0.25)),p10:Math.round(pct(0.10)),worst5:Math.round(pct(0.05)),best5:Math.round(pct(0.95)),mean:Math.round(sum/ends.length),pBeat:Math.round(100*nBeat/sims)};
+}
 // One arm: route `frac` of the debt budget through an IBC/WL policy and (1−frac)
 // as direct taxable investing; the debt is eliminated by whichever mechanic owns
 // it (IBC loan-off when debtStrategy='ibc', else avalanche). Both arms cascade any
@@ -37129,22 +37162,26 @@ function _cpRunDebtArm(frac,dB,endIdx,hiRateMin){
     // dollars that actually flowed into 'invest': direct contributions (blend) from
     // month 0, plus the freed cashflow (avalanche frees dB+mins; IBC/blend free the
     // minimums) from the debt-free month onward. IBC cash value is tax-free (not here).
-    var dfm=s.debtFreeMonth||0,monthsInv=Math.max(0,endIdx*12-dfm),investBal=0;
+    var dfm=s.debtFreeMonth||0,monthsInv=Math.max(0,endIdx*12-dfm),investBal=0,startBal=0;
     if(s.allocSeries){
       CPLAN.allocations.forEach(function(a,i){
         if(a.type!=='invest')return;
         var ser=s.allocSeries['invest_'+i];if(!ser||!ser.length)return;
         investBal+=ser[Math.min(endIdx,ser.length-1)]||0;
+        startBal+=ser[0]||0;   // year-0 seed of the equity bucket (existing brokerage matched in)
       });
     }
     var directInv=(frac>0&&frac<1)?invAmt:0;
     var freedMo=(frac===0)?(dB+(hiRateMin||0)):(hiRateMin||0);
-    var basis=directInv*endIdx*12+freedMo*monthsInv;
+    var basis=startBal+directInv*endIdx*12+freedMo*monthsInv;
     var gain=Math.max(0,investBal-basis);
     var afterTax=nw-gain*0.15;
     out={endNetWorth:Math.round(afterTax),preTaxNetWorth:Math.round(nw),
          retIncomeMo:Math.round(_cpSustainableMonthly(afterTax/Math.pow(1.03,endIdx),_cpYearsInRetirement(),0.01)),
-         debtFreeMonth:dfm};
+         debtFreeMonth:dfm,
+         // for the equity Monte Carlo (avalanche arm): the deterministic bucket, its
+         // year-0 seed, the non-equity remainder of net worth, and the LTCG basis.
+         equityBucket:Math.round(investBal),startBal:Math.round(startBal),commonTerms:Math.round(nw-investBal),basis:Math.round(basis)};
   }catch(e){out=null;}
   finally{CPLAN.allocations=sA;CPLAN._sim=sS;CPLAN._projectionMode=sM;CPLAN.debtStrategy=sDS;}
   return out;
@@ -37162,30 +37199,46 @@ async function _cpBuildDebtGrowthFacts(){
     var hiDebts=(CPLAN.debts||[]).filter(function(d){return(parseFloat(d.balance)||0)>0&&(parseFloat(d.rate)||0)>10&&(parseFloat(d.min)||parseFloat(d.payment)||0)>0;});
     if(dB<=0||!hiDebts.length)return null;                // nothing to compare
     var hiRateMin=hiDebts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
-    var A,I,M,warm=false;
+    var A,I,warm=false;
     for(var it=0;it<6&&!warm;it++){
-      A=_cpRunDebtArm(0,dB,endIdx,hiRateMin);            // pure avalanche + reinvest
-      I=_cpRunDebtArm(1,dB,endIdx,hiRateMin);            // pure IBC
-      M=_cpRunDebtArm(0.5,dB,endIdx,hiRateMin);          // 50/50 partial-IBC blend
+      A=_cpRunDebtArm(0,dB,endIdx,hiRateMin);            // avalanche → taxable brokerage (RISKY)
+      I=_cpRunDebtArm(1,dB,endIdx,hiRateMin);            // IBC → WL cash value (GUARANTEED floor)
       if(!Object.keys(_cpEngPending).length){warm=true;break;}  // every _cpEngGet hit warm cache → real numbers
       await _cpEngDrain(4000);                           // let the fired engine fetches resolve, then re-run
     }
     if(!warm||!A||!I)return null;                         // couldn't fully warm both endpoints → unavailable
-    var pts=[{ibcPct:0,r:A},{ibcPct:50,r:M},{ibcPct:100,r:I}].filter(function(p){return p.r;});
-    var frontier=pts.map(function(p){return{ibcPct:p.ibcPct,endNetWorth:p.r.endNetWorth,preTaxNetWorth:p.r.preTaxNetWorth,retIncomeMo:p.r.retIncomeMo,debtFreeMonth:p.r.debtFreeMonth};});
-    var best=frontier.reduce(function(m,p){return p.endNetWorth>m.endNetWorth?p:m;},frontier[0]);
-    var ep0=A.endNetWorth,ep100=I.endNetWorth;
+    // ── RISK-FAIR comparison: the equity arm is stochastic, IBC is a guaranteed floor. ──
+    // A single deterministic 6.5% vs a guaranteed ~4% is rigged toward equities (it ignores
+    // market loss / dispersion / sequence risk — the entire point of a guaranteed asset). So
+    // we Monte-Carlo the equity bucket. Self-calibrate a level annual contribution C so the
+    // MC's MEAN path reproduces the deterministic bucket A.equityBucket (from the real sim),
+    // then let per-year N(6.5%, risk-profile vol) returns disperse it.
+    var g=0.065,n=endIdx,pw=Math.pow(1+g,n),annFac=(1+g)*(pw-1)/g;
+    var C=annFac>0?Math.max(0,(A.equityBucket-A.startBal*pw)/annFac):0;
+    var rp=(CPLAN.riskProfile||'moderate').toLowerCase();
+    var vol=rp==='conservative'?0.08:rp==='aggressive'?0.18:0.12;   // engine's own risk-profile volatilities
+    var threshold=I.endNetWorth-A.commonTerms;            // equity-bucket value at which equity NW ties IBC NW
+    var mc=_cpEquityMC(A.startBal,C,n,g,vol,A.basis,threshold,10000);
+    var eqMean=A.commonTerms+mc.mean,eqMed=A.commonTerms+mc.median,eqP25=A.commonTerms+mc.p25,eqW5=A.commonTerms+mc.worst5;
+    var yInRet=_cpYearsInRetirement();
+    var incOf=function(v){return Math.round(_cpSustainableMonthly(v/Math.pow(1.03,endIdx),yInRet,0.01));};
     return{
       debtBudgetMo:Math.round(dB),
       horizonYears:endIdx,
-      reinvestVehicle:'taxable_brokerage',
       ibcChassis:'wl',
+      reinvestVehicle:'taxable_brokerage',
+      riskProfile:rp,
+      equityMeanReturnPct:g*100,
+      equityVolPct:Math.round(vol*100),
       taxBasis:'after-tax (15% LTCG on brokerage gain; IBC cash value tax-free)',
-      frontier:frontier,
-      best:{ibcPct:best.ibcPct,endNetWorth:best.endNetWorth},
-      endpointGap:Math.abs(ep0-ep100),
-      mixLift:Math.max(0,best.endNetWorth-Math.max(ep0,ep100)),
-      computedBy:'real-cascade-sim (client _cpRunSimulation, warmed)'
+      debtFreeMonthAvalanche:A.debtFreeMonth,
+      debtFreeMonthIbc:I.debtFreeMonth,
+      // IBC = contractually guaranteed floor (no market downside).
+      ibc:{guaranteedNetWorth:I.endNetWorth,retIncomeMo:I.retIncomeMo},
+      // Equity = risky: a distribution, not a point. meanNetWorth ≈ the old deterministic
+      // figure; medianNetWorth is lower (volatility drag); worst5NetWorth is the bad-market case.
+      equity:{meanNetWorth:eqMean,medianNetWorth:eqMed,p25NetWorth:eqP25,worst5NetWorth:eqW5,retIncomeMedianMo:incOf(eqMed),pBeatIbcPct:mc.pBeat},
+      computedBy:'real-cascade-sim + 10k-path equity Monte Carlo (per-year N('+(g*100)+'%, '+Math.round(vol*100)+'% vol) returns), warmed'
     };
   }catch(e){return null;}
 }
