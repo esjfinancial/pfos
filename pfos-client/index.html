@@ -7142,7 +7142,7 @@ async function _pushToggleRowHtml(){
 // once enabled or after an OS block. iOS-in-Safari (push unavailable because PFOS isn't an installed PWA) gets an
 // install hint instead of a dead Enable button. Metric-inert — touches only push + localStorage, never S/calc/engine.
 var _pushSoftAskShownSession=false;
-var _PUSH_ASK_MAX_DISMISS=3;
+var _PUSH_ASK_MAX_DISMISS=2;                        // lifetime cap backstop (was 3); one dismiss already opts out below
 function _pushAskState(){ try{ return JSON.parse(localStorage.getItem('pfos_pushask')||'{}')||{}; }catch(e){ return {}; } }
 function _pushAskStore(o){ try{ localStorage.setItem('pfos_pushask', JSON.stringify(o||{})); }catch(e){} }
 function _pushIsIOS(){ return /iPad|iPhone|iPod/.test(navigator.userAgent||''); }
@@ -7152,6 +7152,10 @@ async function _pushSoftAskMode(){
   if(!APP.currentClientId) return null;
   var st=_pushAskState();
   if(st.enabled) return null;                                  // already on (sticky) — never nag
+  // Respect a dismissal: once the user taps "Not now" (or an enable attempt fails), stop auto-asking for
+  // good — no re-popping on refresh. They were told where to turn it on (the Notifications tab) and can
+  // enable it there whenever they want. This is the fix for "keeps asking after every refresh if dismissed".
+  if(st.optedOut) return null;
   if(_pushSupported()){
     if(Notification.permission==='granted'){ if(await _pushIsOn()){ st.enabled=true; _pushAskStore(st); return null; } return (st.dismissed||0)>=_PUSH_ASK_MAX_DISMISS?null:'enable'; }
     if(Notification.permission==='denied') return null;        // OS-blocked: can't re-ask, don't nag
@@ -7192,10 +7196,12 @@ function _showPushSoftAsk(mode){
 }
 async function _acceptPushSoftAsk(){
   var ok=false; try{ ok=await _pushSubscribe(); }catch(e){}
-  if(ok){ var st=_pushAskState(); st.enabled=true; _pushAskStore(st); }
+  var st=_pushAskState();
+  if(ok){ st.enabled=true; _pushAskStore(st); }
+  else { st.optedOut=true; _pushAskStore(st); }  // enable failed/declined → stop auto-asking (no re-nag on refresh). _pushAutoSync silently reclaims if permission is actually granted; the Notifications-tab toggle stays available to retry.
   _closePushSoftAsk();
 }
-function _dismissPushSoftAsk(){ var st=_pushAskState(); st.dismissed=(st.dismissed||0)+1; _pushAskStore(st); _closePushSoftAsk(); }
+function _dismissPushSoftAsk(){ var st=_pushAskState(); st.dismissed=(st.dismissed||0)+1; st.optedOut=true; _pushAskStore(st); _closePushSoftAsk(); if(typeof _cpToast==='function') _cpToast('No problem — you can turn on alerts anytime from the Notifications tab.'); }
 function _closePushSoftAsk(){ var el=document.getElementById('pushSoftAskModal'); if(el&&el.parentNode) el.parentNode.removeChild(el); document.body.style.overflow=''; }
 
 // ── M4 §4.2a — alert_state snapshot + channel prefs. The client computes the 6 alert signals via its EXISTING
@@ -13734,8 +13740,20 @@ function _cpContinueSetup(){ var n=_cpGuidedNextStep(); if(n&&n.go){ try{ n.go()
 function _cpStartGuidedOnboarding(force){
   var c=window.APP&&APP.currentClient; if(!c||c.client_type!=='product') return;
   var key='pfos_onb_seen_'+APP.currentClientId;
-  if(!force){ try{ if(localStorage.getItem(key)==='1') return; }catch(e){} if(!_cpGuidedNextStep()) return; }
-  try{ localStorage.setItem(key,'1'); }catch(e){}
+  if(!force){
+    try{ if(localStorage.getItem(key)==='1') return; }catch(e){}
+    // Durable stop: once the client has actually started — income entered OR a plan built — never
+    // auto-show the welcome again, even if the per-device localStorage 'seen' flag was lost (private
+    // mode, cleared cache, or a different browser/device). This is the real fix for the welcome
+    // re-popping after setup is underway; the localStorage flag alone was too fragile to rely on.
+    var _onbS=(_lastPfosState&&_lastPfosState.state)||{};
+    var _onbHasIncome=!!(_onbS.incomeSources&&_onbS.incomeSources.some(function(s){return (typeof _incSrcMonthlyTakeHome==='function'?_incSrcMonthlyTakeHome(s):(s&&s.amount))>0;}));
+    var _onbAp=(APP&&APP._portalFd&&APP._portalFd.allocation_plan)||null;
+    var _onbHasPlan=!!(_onbAp&&((_onbAp.allocations&&_onbAp.allocations.length)||_onbAp.planCommitted||(_onbAp.ai_generations&&_onbAp.ai_generations.length)));
+    if(_onbHasIncome||_onbHasPlan){ try{ if(APP.currentClientId) localStorage.setItem(key,'1'); }catch(e){} return; }
+    if(!_cpGuidedNextStep()) return;
+  }
+  try{ if(APP.currentClientId) localStorage.setItem(key,'1'); }catch(e){}
   var m=document.getElementById('cpOnbModal');
   if(!m){ m=document.createElement('div'); m.id='cpOnbModal'; m.className='modal-bg'; m.onclick=function(e){ if(e.target===m) closeModal('cpOnbModal'); }; document.body.appendChild(m); }
   m.innerHTML='<div class="modal" style="max-width:440px;text-align:center">'
@@ -35177,6 +35195,14 @@ function _cpShowApproachFork(){
     h+='<div style="font-size:14px;color:var(--mu);line-height:1.6">'+(_renderCards.length>1?'Approaches built from your exact financial data. ':'')+'Same surplus (<strong style="color:var(--gr)">'+fmt(_pool)+'/mo</strong>)'+(_renderCards.length>1?', different vehicles.':'.')+'</div>';
   }
   h+='</div>';
+  // Persistent "Regenerate plan" affordance on the fork. The stale banner below only appears when the
+  // data changed since generation — without this there was no way to re-run the AI from the approach
+  // screen at all. Shown only when real AI approaches exist, the plan isn't advisor-managed, and the
+  // stale banner isn't already offering "Regenerate All" (avoids two regenerate buttons stacked).
+  // Routes through _cpRegenerateAiConfirm so the user confirms before a generation is spent.
+  if(_renderCards.length>0 && !CPLAN.hasAdvisor && !_isStale){
+    h+='<div style="text-align:center;margin:-6px 0 20px"><button onclick="_cpRegenerateAiConfirm()" style="padding:8px 18px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;background:rgba(168,85,247,.08);border:1px solid rgba(168,85,247,.3);color:#A855F7;border-radius:4px;cursor:pointer;min-height:36px">🔄 Regenerate plan</button></div>';
+  }
   // Stale-data banner — appears when current surplus/income/age differs from
   // the values in effect when these approaches were generated.
   if(_isStale){
