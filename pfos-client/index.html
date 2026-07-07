@@ -36853,6 +36853,13 @@ function _cpDoAIGenerate(){
       var pSharedList=[].concat(CPLAN._jointSharedCards||[]).concat(CPLAN.partnerSharedCards||[]);
       if(pSharedList.length)baseBody.partnerSharedCards=pSharedList.map(function(c){return{type:c.type,owner:c.owner,amount:c.amount,customName:c.customName||''};});
     }
+    // Compute the debt-strategy growth comparison (real cascade engine, equal-
+    // dollar, after-tax) ONCE and attach to baseBody for all 3 approach calls, so
+    // the AI picks debtStrategy by projected growth rather than a viability default.
+    // Never blocks generation: any failure/absence → the edge fn's qualitative debt
+    // framing (debtGrowthFacts is simply absent). See _cpBuildDebtGrowthFacts.
+    return _cpBuildDebtGrowthFacts().catch(function(){return null;}).then(function(_dgf){
+    if(_dgf)baseBody.debtGrowthFacts=_dgf;
     // Initialize approaches as undefined (=loading). Do NOT call
     // _cpShowApproachFork() yet — that would overwrite the checkmark
     // progress page (rendered by _cpConfirmedAIGen) with loading-state
@@ -36936,6 +36943,7 @@ function _cpDoAIGenerate(){
           }
         }
       });
+    });
     });
   });
 }
@@ -37059,6 +37067,127 @@ function _cpProjectApproachWithSim(approachData,approachKey){
   }
   if(result)approachData._simResult=result;
   return result;
+}
+
+// ── DEBT-STRATEGY GROWTH COMPARISON (IBC vs avalanche+reinvest vs blend) ──────
+// Feeds the AI plan generator REAL, equal-dollar, after-tax end-state net-worth
+// numbers for the debt budget, computed by the SAME cascade sim (_cpRunSimulation)
+// that draws the client's plan chart — so the AI picks debtStrategy by PROJECTED
+// GROWTH, not a viability heuristic. Neutral by construction: same engine, same
+// dollars (_dB on every arm), same horizon; the only asymmetry is real IRS tax
+// law (IBC cash value is tax-free; taxable brokerage owes ~15% LTCG on gains).
+//
+// CRITICAL — engine-cache warming. _cpRunSimulation reads IBC math via _cpEngGet,
+// which returns null on a COLD cache and then silently degrades the IBC arm to the
+// avalanche fallback (:45390) + flat-rate CV (:46137) — a bias toward avalanche.
+// _cpEngGet's cache is populated ONLY by its own async .then; awaiting pfosCalc
+// directly does NOT warm it, and the policy-projection key depends on the resolved
+// _ibcPolicyDefaults (a dependency chain). So we run each arm COLD (which fires
+// _cpEngGet's fetches with the EXACT keys the sim uses), drain _cpEngPending, and
+// re-run — looping until a full pass fires ZERO new fetches (fully warm). If it
+// never converges, we return null (comparison unavailable) rather than a biased
+// number. See the ibc-vs-avalanche methodology spec.
+function _cpEngDrain(maxMs){
+  return new Promise(function(resolve){
+    var t0=Date.now();
+    (function poll(){
+      if(!Object.keys(_cpEngPending).length||Date.now()-t0>maxMs)return resolve();
+      setTimeout(poll,80);
+    })();
+  });
+}
+// One arm: route `frac` of the debt budget through an IBC/WL policy and (1−frac)
+// as direct taxable investing; the debt is eliminated by whichever mechanic owns
+// it (IBC loan-off when debtStrategy='ibc', else avalanche). Both arms cascade any
+// freed cash to the SAME 'invest' vehicle (symmetry). Returns AFTER-TAX net worth
+// at the horizon. Mirrors _cpEngineCapture's save/restore; never mutates the saved
+// arrays (builds fresh allocs per arm; restores all four fields in finally).
+function _cpRunDebtArm(frac,dB,endIdx,hiRateMin){
+  var sA=CPLAN.allocations,sS=CPLAN._sim,sM=CPLAN._projectionMode,sDS=CPLAN.debtStrategy;
+  var out=null;
+  try{
+    CPLAN._projectionMode='preview';                 // trajectory mode: gate off, all planned contribs count
+    var ibcAmt=Math.round(frac*dB),invAmt=Math.round((1-frac)*dB),allocs=[];
+    if(ibcAmt>0){
+      // IBC leg: a single _ibcDebtStrategy debt alloc (the only debt the engine
+      // honors). Its premium loans off the debt fast; its CV compounds tax-free.
+      allocs.push({type:'debt',_ibcDebtStrategy:true,_ibcUnderlyingType:'wl',_ibcEndChoice:'continue',amount:ibcAmt,cascade:'invest'});
+      CPLAN.debtStrategy='ibc';
+      if(invAmt>0)allocs.push({type:'invest',amount:invAmt,cascade:''});   // blend: remainder → direct brokerage from month 0
+      allocs.push({type:'invest',amount:0,cascade:''});                     // landing envelope for freed minimums (at CV=AV)
+    }else{
+      // Pure avalanche: extra principal clears the debt fast; freed (budget+mins) → brokerage.
+      allocs.push({type:'debt',_ibcDebtStrategy:false,amount:dB,cascade:'invest'});
+      allocs.push({type:'invest',amount:0,cascade:''});                     // landing for freed budget+minimums
+      CPLAN.debtStrategy='avalanche';
+    }
+    CPLAN.allocations=allocs;
+    _cpRunSimulation();
+    var s=CPLAN._sim||{};
+    var nw=(s.netWorth&&s.netWorth[endIdx])||0;      // NET WORTH at horizon (debt-subtracted, pre-tax)
+    // After-tax: only the taxable-brokerage GAIN is taxed (~15% LTCG). Basis =
+    // dollars that actually flowed into 'invest': direct contributions (blend) from
+    // month 0, plus the freed cashflow (avalanche frees dB+mins; IBC/blend free the
+    // minimums) from the debt-free month onward. IBC cash value is tax-free (not here).
+    var dfm=s.debtFreeMonth||0,monthsInv=Math.max(0,endIdx*12-dfm),investBal=0;
+    if(s.allocSeries){
+      CPLAN.allocations.forEach(function(a,i){
+        if(a.type!=='invest')return;
+        var ser=s.allocSeries['invest_'+i];if(!ser||!ser.length)return;
+        investBal+=ser[Math.min(endIdx,ser.length-1)]||0;
+      });
+    }
+    var directInv=(frac>0&&frac<1)?invAmt:0;
+    var freedMo=(frac===0)?(dB+(hiRateMin||0)):(hiRateMin||0);
+    var basis=directInv*endIdx*12+freedMo*monthsInv;
+    var gain=Math.max(0,investBal-basis);
+    var afterTax=nw-gain*0.15;
+    out={endNetWorth:Math.round(afterTax),preTaxNetWorth:Math.round(nw),
+         retIncomeMo:Math.round(_cpSustainableMonthly(afterTax/Math.pow(1.03,endIdx),_cpYearsInRetirement(),0.01)),
+         debtFreeMonth:dfm};
+  }catch(e){out=null;}
+  finally{CPLAN.allocations=sA;CPLAN._sim=sS;CPLAN._projectionMode=sM;CPLAN.debtStrategy=sDS;}
+  return out;
+}
+// Orchestrator: equal-dollar debt budget, warm the engine, run 3 arms (0% / 50% /
+// 100% IBC), pick the growth-max. Returns the debtGrowthFacts wire object, or null
+// (no high-rate debt / couldn't warm / an endpoint failed) → edge fn falls back to
+// its qualitative debt framing. NEVER throws (guarded), so it can't block the AI.
+async function _cpBuildDebtGrowthFacts(){
+  try{
+    var yrsToRet=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
+    var endIdx=Math.min(yrsToRet,_cpHorizonYears());
+    var brPct=(CPLAN._breathingPct!=null?CPLAN._breathingPct:15);
+    var dB=Math.round((CPLAN.surplus||0)*(1-brPct/100));  // whole deployable pool, aimed at debt on both arms
+    var hiDebts=(CPLAN.debts||[]).filter(function(d){return(parseFloat(d.balance)||0)>0&&(parseFloat(d.rate)||0)>10&&(parseFloat(d.min)||parseFloat(d.payment)||0)>0;});
+    if(dB<=0||!hiDebts.length)return null;                // nothing to compare
+    var hiRateMin=hiDebts.reduce(function(t,d){return t+(parseFloat(d.min)||parseFloat(d.payment)||0);},0);
+    var A,I,M,warm=false;
+    for(var it=0;it<6&&!warm;it++){
+      A=_cpRunDebtArm(0,dB,endIdx,hiRateMin);            // pure avalanche + reinvest
+      I=_cpRunDebtArm(1,dB,endIdx,hiRateMin);            // pure IBC
+      M=_cpRunDebtArm(0.5,dB,endIdx,hiRateMin);          // 50/50 partial-IBC blend
+      if(!Object.keys(_cpEngPending).length){warm=true;break;}  // every _cpEngGet hit warm cache → real numbers
+      await _cpEngDrain(4000);                           // let the fired engine fetches resolve, then re-run
+    }
+    if(!warm||!A||!I)return null;                         // couldn't fully warm both endpoints → unavailable
+    var pts=[{ibcPct:0,r:A},{ibcPct:50,r:M},{ibcPct:100,r:I}].filter(function(p){return p.r;});
+    var frontier=pts.map(function(p){return{ibcPct:p.ibcPct,endNetWorth:p.r.endNetWorth,preTaxNetWorth:p.r.preTaxNetWorth,retIncomeMo:p.r.retIncomeMo,debtFreeMonth:p.r.debtFreeMonth};});
+    var best=frontier.reduce(function(m,p){return p.endNetWorth>m.endNetWorth?p:m;},frontier[0]);
+    var ep0=A.endNetWorth,ep100=I.endNetWorth;
+    return{
+      debtBudgetMo:Math.round(dB),
+      horizonYears:endIdx,
+      reinvestVehicle:'taxable_brokerage',
+      ibcChassis:'wl',
+      taxBasis:'after-tax (15% LTCG on brokerage gain; IBC cash value tax-free)',
+      frontier:frontier,
+      best:{ibcPct:best.ibcPct,endNetWorth:best.endNetWorth},
+      endpointGap:Math.abs(ep0-ep100),
+      mixLift:Math.max(0,best.endNetWorth-Math.max(ep0,ep100)),
+      computedBy:'real-cascade-sim (client _cpRunSimulation, warmed)'
+    };
+  }catch(e){return null;}
 }
 
 // ── AUTO-SUGGEST v2: All phases funded from day 1, balanced allocation ──
