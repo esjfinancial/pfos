@@ -29541,6 +29541,10 @@ function _cpConsolidateIBCDebtCardsOnLoad(){
   var debtIdxs=[];
   CPLAN.allocations.forEach(function(a,i){if(a.type==='debt'&&a.amount>0)debtIdxs.push(i);});
   if(debtIdxs.length===0)return;// no debt cards to process
+  // Conservative (tax_free): never tag/consolidate a debt card as an IBC/WL policy on load — the debt door
+  // is closed for capital-preservation plans (edge fn gates IBC-for-debt to Hybrid + sanitizes debtStrategy).
+  // Defense-in-depth so a stale conservative plan with an IBC-titled debt card can't resurrect a WL/IUL policy.
+  if((CPLAN._selectedApproach||CPLAN._viewingApproach)==='tax_free')return;
   // ── Title/reason-based IBC detection for ANY debt card ───────────────────
   // Even when there's only one debt card (no duplicates to consolidate), we
   // still need to detect whether it's the IBC strategy and tag it. Legacy
@@ -34026,9 +34030,15 @@ function _cpConvertAIRecs(aiData){
     var _aiDebtStratIBC=(aiData.debtStrategy==='ibc');
     var _titleIBC=(r.title||'').toLowerCase();
     var _titleSaysIBC=_titleIBC.indexOf('ibc')>=0||_titleIBC.indexOf('infinite banking')>=0||(_titleIBC.indexOf('whole life')>=0&&(_titleIBC.indexOf('debt')>=0||_titleIBC.indexOf('elimination')>=0));
-    var _isIBCDebtStrat=(r.section==='debt'&&map.type==='debt'&&_isIBCStrat)
+    // Conservative (tax_free) NEVER builds an IBC/WL debt policy — the debt door is closed there (the edge
+    // fn gates IBC-for-debt to Hybrid + sanitizes debtStrategy off 'ibc'). Defense-in-depth for a stale plan
+    // saved with debtStrategy='ibc' before that fix: it can't rebuild a WL/IUL policy in a capital-preservation
+    // plan. Hybrid/Traditional are unaffected.
+    var _convApproachIBC=(aiData&&aiData.approach)||CPLAN._selectedApproach||CPLAN._viewingApproach;
+    var _isIBCDebtStrat=(_convApproachIBC!=='tax_free')&&(
+                        (r.section==='debt'&&map.type==='debt'&&_isIBCStrat)
                        ||(_aiDebtStratIBC&&_isIBCStrat)
-                       ||(_aiDebtStratIBC&&_titleSaysIBC);
+                       ||(_aiDebtStratIBC&&_titleSaysIBC));
     // When flagged: CANONICALIZE this allocation to type='debt' so the
     // simulator's `find(a.type==='debt')` picks it up and runs the IBC
     // branch. Without this canonicalization, an AI emitting section='insurance'
@@ -34078,6 +34088,9 @@ function _cpConvertAIRecs(aiData){
   // ($1,200 IBC), the user's commitment is the same total. Merging preserves
   // the deployment surface without losing budgeted dollars.
   (function _consolidateIBCDebtCards(){
+    // Conservative (tax_free): no IBC-debt consolidation — the title-fallback below must not retroactively
+    // flag a stale conservative debt card as an IBC/WL policy (debt-door de-funnel, defense-in-depth).
+    if(((aiData&&aiData.approach)||CPLAN._selectedApproach||CPLAN._viewingApproach)==='tax_free')return;
     var debtIdxs=[];
     CPLAN.allocations.forEach(function(a,i){if(a.type==='debt'&&a.amount>0)debtIdxs.push(i);});
     if(debtIdxs.length<2)return;// nothing to consolidate
@@ -37463,15 +37476,20 @@ function _cpAutoSuggestV2(){
   var _deployedSoFar=CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0);
   var growPool=Math.max(0,pool-_deployedSoFar);
   if(growPool>0){
+    // CONSERVATIVE reframe: the conservative branch of each score is rebalanced so the plan is
+    // fixed_income (bond core) + Roth (equity sleeve) + a MODEST WL slice — NOT WL/IUL-dominant.
+    // Aggressive + Moderate scores are unchanged (agg: roth60/invest55/iul35/wl20; mod: roth55/iul55/invest37/wl30).
     var _vehicles=[
-      {type:'roth',phase:1,score:50+(isAgg?10:isCon?-5:5)},
-      {type:'iul',phase:1,score:30+(isCon?15:isAgg?5:25)},
-      {type:'wl',phase:1,score:20+(isCon?35:isAgg?0:10)},
+      {type:'roth',phase:1,score:50+(isAgg?10:isCon?0:5)},            // con equity sleeve (was 45)
+      {type:'fixed_income',phase:1,score:isCon?55:0},                  // con bond core (absent in agg/mod)
+      {type:'iul',phase:1,score:30+(isCon?-30:isAgg?5:25)},           // con: excluded (was 45); agg 35 / mod 55 unchanged
+      {type:'wl',phase:1,score:20+(isCon?10:isAgg?0:10)},             // con: modest slice 30 (was 55); agg 20 / mod 30 unchanged
       {type:'invest',phase:1,score:25+(isAgg?30:isCon?0:12)}
     ];
-    // Tax-Free approach: exclude taxable investment accounts
+    // Conservative (tax_free): exclude taxable EQUITY (invest) and indexed insurance (iul) — equity lives in
+    // tax-free Roth, the bond sleeve is fixed_income + a modest WL slice.
     var _curApproach=CPLAN._selectedApproach||CPLAN._viewingApproach||'';
-    if(_curApproach==='tax_free')_vehicles=_vehicles.filter(function(v){return v.type!=='invest';});
+    if(_curApproach==='tax_free')_vehicles=_vehicles.filter(function(v){return v.type!=='invest'&&v.type!=='iul';});
     _vehicles.sort(function(a,b){return b.score-a.score;});
     var _selected=_vehicles.filter(function(v){return v.score>=30;});
     if(_selected.length<2)_selected=_vehicles.slice(0,2);
@@ -37515,6 +37533,12 @@ function _cpAutoSuggestV2(){
         _vReason+='\n📊 Liquid; pre-retirement access without penalty; LTCG treatment after one year.';
         _vReason+='\n💰 Fees: Choose a low-cost custodian with expense ratios near 0.03%.';
         _vReason+='\n🏛️ Tax: Qualified dividends and long-term capital gains taxed at federal preferential rates; state tax applies.';
+      } else if(v.type==='fixed_income'){
+        _vName='Fixed Income — Bonds, CDs & Treasuries';
+        _vReason='The conservative bond/cash sleeve — capital preservation with steady, predictable interest.';
+        _vReason+='\n📊 Low volatility, protected floor; deterministic ~4.3% vs equity-market swings.';
+        _vReason+='\n💰 Fees: Directly-held bonds/CDs/treasuries carry near-zero fees.';
+        _vReason+='\n🏛️ Tax: Interest is taxed as ordinary income.';
       } else {
         _vName=CP_NM&&CP_NM[v.type]||v.type;
         _vReason='Growth allocation — funded from day 1 so compounding starts immediately.';
