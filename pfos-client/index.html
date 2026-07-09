@@ -35309,6 +35309,19 @@ function _cpShowApproachFork(){
   // For visual balance: if only the DIY card is showing, center it at a
   // reasonable max-width so it doesn't stretch edge-to-edge.
   var _gridMaxWidth = (_aiCardCount === 0 && _earlyDiyHasWork) ? 'max-width:340px;margin:0 auto 20px;' : 'margin-bottom:20px;';
+  // Phase 5: editable Monte Carlo assumptions — Planning only (adv_projections, level-2). Inflation +
+  // confidence (target-success) are editable; each approach's volatility stays risk-derived (read-only).
+  // Lite users never reach the fork (hard-gated), so this panel is inherently Planning-scoped.
+  if(_renderCards.length>0 && typeof clientHasFeature==='function' && clientHasFeature('adv_projections')){
+    h+='<details style="margin:0 auto 18px;max-width:520px;background:rgba(148,163,184,.05);border:1px solid rgba(148,163,184,.16);border-radius:6px;padding:0 14px">'
+      +'<summary style="cursor:pointer;padding:11px 0;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;color:var(--mu)">⚙️ Monte Carlo assumptions</summary>'
+      +'<div style="padding:0 0 12px;display:flex;gap:16px;flex-wrap:wrap;align-items:flex-end">'
+        +'<label style="font-size:12px;color:var(--mu)">Inflation<br><input type="number" step="0.1" min="0" max="10" value="'+(Math.round(_cpMCInfl()*1000)/10)+'" onchange="_cpMCSetInfl(this.value)" style="width:76px;padding:6px 8px;margin-top:4px;background:rgba(0,0,0,.2);border:1px solid rgba(148,163,184,.25);border-radius:4px;color:var(--wh);min-height:34px"> %</label>'
+        +'<label style="font-size:12px;color:var(--mu)">Confidence<br><input type="number" step="1" min="50" max="99" value="'+Math.round(_cpMCTarget()*100)+'" onchange="_cpMCSetTarget(this.value)" style="width:76px;padding:6px 8px;margin-top:4px;background:rgba(0,0,0,.2);border:1px solid rgba(148,163,184,.25);border-radius:4px;color:var(--wh);min-height:34px"> %</label>'
+        +'<div style="font-size:11px;color:var(--mu);opacity:.75;flex:1;min-width:170px">Volatility is set by each approach’s risk level (read-only). The downside floor is the value you beat this % of the time.</div>'
+      +'</div>'
+    +'</details>';
+  }
   h+='<div style="display:grid;grid-template-columns:repeat('+_forkColCount+',1fr);gap:14px;'+_gridMaxWidth+'">';
   var _recApproach=(typeof _cpRecommendedApproach==='function')?_cpRecommendedApproach():'';
   _renderCards.forEach(function(cd){
@@ -35505,6 +35518,19 @@ function _cpShowApproachFork(){
       h+='<div style="font-size:12px;color:var(--mu)">projected at retirement</div>';
       h+='<div style="font-size:10px;color:var(--mu);opacity:.6">Estimated end-state — see plan view for the full year-by-year trajectory</div>';
       h+='</div>';
+      // Phase 5: Monte Carlo range — the value above is the mean path; this shows the MEDIAN and the downside
+      // FLOOR (the outcome beaten (confidence)% of the time) at the approach's risk-derived volatility, so an
+      // equity-heavy plan's higher median is shown alongside its bigger downside. Planning-only (fork = Planning).
+      if(_simBased&&_simBased.mcMedian>0){
+        h+='<div style="margin:-6px 0 14px;padding:9px 11px;background:rgba(148,163,184,.06);border:1px solid rgba(148,163,184,.14);border-radius:4px">'
+          +'<div style="font-size:10px;letter-spacing:.06em;color:var(--mu);margin-bottom:4px">MONTE CARLO · MARKET RISK ('+Math.round(_cpMCTarget()*100)+'% CONFIDENCE)</div>'
+          +'<div style="display:flex;justify-content:space-between;gap:10px;font-size:12px">'
+            +'<span style="color:var(--mu)">Median <strong style="color:var(--wh);font-family:var(--fd)">'+fmtK(_simBased.mcMedian)+'</strong></span>'
+            +'<span style="color:var(--mu)">Downside floor <strong style="color:'+cd.color+';font-family:var(--fd)">'+fmtK(_simBased.mcFloor)+'</strong></span>'
+          +'</div>'
+          +(_simBased.mcFloorIncome>0?'<div style="font-size:11px;color:var(--mu);margin-top:4px">Bad-market income <strong style="color:var(--wh)">'+fmt(_simBased.mcFloorIncome)+'/mo</strong> · median <strong style="color:var(--wh)">'+fmt(_simBased.mcMedianIncome)+'/mo</strong></div>':'')
+        +'</div>';
+      }
       // Retirement income with tax breakdown
       h+='<div style="margin-bottom:14px;padding:10px;background:rgba(0,0,0,.15);border-radius:4px">';
       h+='<div style="font-size:11px;color:var(--mu);letter-spacing:.06em;margin-bottom:6px">RETIREMENT INCOME</div>';
@@ -37087,6 +37113,42 @@ function _cpDoAIGenerate(){
 // Cached on approachData._simResult so re-renders during loading don't
 // re-run the sim. Cache is naturally invalidated when CPLAN._approaches[k]
 // is reassigned on regenerate (the data object is replaced wholesale).
+// ═══ Phase 5 — approach-projection Monte Carlo (Planning) ═══════════════════════════════════════════
+// Faithful port of the coded engine MC (monte-carlo.ts: mulberry32 PRNG + Box-Muller + MC_DRAW_RATES + fixed
+// seed). Runs the 3 approach retirement projections through MC at their RISK-DERIVED draw rates so the fork
+// comparison reflects market DOWNSIDE — an equity-heavy plan's higher median comes with a lower floor, which is
+// the honesty the risk-level reframe needs. Inflation + target-success are Planning-editable; the draw mean/std
+// stay risk-derived (read-only). Fixed seed → reproducible across renders. No engine change (mirrors coded values).
+var _CP_MC_DRAW_RATES={conservative:{mean:0.045,std:0.06},moderate:{mean:0.055,std:0.095},aggressive:{mean:0.065,std:0.13}}; // = monte-carlo.ts MC_DRAW_RATES
+var _CP_MC_SEED=0x9e3779b9, _CP_MC_SIMS=1000;   // = monte-carlo.ts MC_SEED / MC_SIMS
+function _cpMcRiskForApproach(k){ return k==='traditional'?'aggressive':k==='tax_free'?'conservative':'moderate'; }
+function _cpMCInfl(){ return (CPLAN&&CPLAN._mcInfl!=null&&isFinite(CPLAN._mcInfl))?CPLAN._mcInfl:0.03; }              // editable (default MC_INFL 0.03)
+function _cpMCTarget(){ return (CPLAN&&CPLAN._mcTargetSuccess!=null&&isFinite(CPLAN._mcTargetSuccess))?CPLAN._mcTargetSuccess:0.95; } // editable (default MC_TARGET_SUCCESS 0.95)
+function _cpMCApply(){ try{ var ap=CPLAN._approaches||{}; ['traditional','tax_free','hybrid'].forEach(function(k){ if(ap[k])delete ap[k]._simResult; }); }catch(e){} if(typeof _cpShowApproachFork==='function')_cpShowApproachFork(); } // assumptions changed → clear cached per-approach sims so the MC re-runs, then re-render
+function _cpMCSetInfl(v){ var n=parseFloat(v); if(isFinite(n))CPLAN._mcInfl=Math.max(0,Math.min(0.10,n/100)); _cpMCApply(); }               // clamp 0-10%
+function _cpMCSetTarget(v){ var n=parseFloat(v); if(isFinite(n))CPLAN._mcTargetSuccess=Math.max(0.50,Math.min(0.99,n/100)); _cpMCApply(); } // clamp 50-99%
+function _cpMulberry32(seed){ var a=seed>>>0; return function(){ a|=0;a=(a+0x6d2b79f5)|0; var t=Math.imul(a^(a>>>15),1|a); t=(t+Math.imul(t^(t>>>7),61|t))^t; return ((t^(t>>>14))>>>0)/4294967296; }; }
+function _cpMcRandNorm(rng){ var u=1-rng(),v=rng(); return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v); }
+// Nominal end-balance distribution: each year bal = bal*(1+draw)+annualContrib, draw~N(mean,std) at the
+// approach's risk level. Returns nominal median + the (1-targetSuccess) downside floor. Fixed seed → reproducible.
+function _cpApproachMC(startBal, annualContrib, years, riskLevel, opts){
+  opts=opts||{};
+  var dr=_CP_MC_DRAW_RATES[riskLevel]||_CP_MC_DRAW_RATES.moderate;
+  var mean=(opts.mean!=null&&isFinite(opts.mean))?opts.mean:dr.mean;   // caller may override the growth MEAN (calibration); the STD stays risk-derived
+  var std=(opts.std!=null&&isFinite(opts.std))?opts.std:dr.std;
+  var sims=opts.sims||_CP_MC_SIMS, seed=opts.seed||_CP_MC_SEED, yrs=Math.max(1,Math.round(years||1));
+  var rng=_cpMulberry32(seed), ends=[];
+  for(var s=0;s<sims;s++){
+    var b=startBal||0;
+    for(var y=0;y<yrs;y++){ b=b*(1+(mean+std*_cpMcRandNorm(rng)))+(annualContrib||0); }   // ordinary annuity: contribution added AFTER growth
+    ends.push(b);
+  }
+  ends.sort(function(x,y){return x-y;});
+  var pct=function(p){ return ends[Math.min(ends.length-1,Math.max(0,Math.floor(p*(ends.length-1))))]; };
+  var tgt=(opts.targetSuccess!=null?opts.targetSuccess:0.95);
+  var _sum=0; for(var _k=0;_k<ends.length;_k++)_sum+=ends[_k];
+  return { median:pct(0.5), floor:pct(Math.min(0.49,Math.max(0.01,1-tgt))), best:pct(0.9), mean:_sum/ends.length, sims:sims };
+}
 function _cpProjectApproachWithSim(approachData,approachKey){
   if(!approachData||!approachData.recommendations||!approachData.recommendations.length)return null;
   if(approachData._simResult)return approachData._simResult;
@@ -37140,6 +37202,7 @@ function _cpProjectApproachWithSim(approachData,approachKey){
       var _yrsToRet=Math.max(1,(CPLAN.retirementAge||65)-(CPLAN.age||35));
       var allocEndBalances=[];
       var totalEndBalance=0;
+      var totalStartBalance=0;   // Phase 5: year-0 retirement-bucket seed (for the MC self-calibration)
       if(sim.allocSeries){
         CPLAN.allocations.forEach(function(a,i){
           // Skip pure debt allocations — debt-elimination is netted into
@@ -37164,6 +37227,7 @@ function _cpProjectApproachWithSim(approachData,approachKey){
               var _eType=(a.type==='debt'&&a._ibcDebtStrategy)?'ibc':a.type;
               allocEndBalances.push({type:_eType,strategy:_eType,endBal:endBal});
               totalEndBalance+=endBal;
+              totalStartBalance+=series[0]||0;
             }
           }
         });
@@ -37172,7 +37236,7 @@ function _cpProjectApproachWithSim(approachData,approachKey){
       // dynamic mortality (PFOS Main retLifeExp − retirementAge). Uses the same
       // PMT formula as the rest of the platform for consistency.
       var _yrsInRet2=_cpYearsInRetirement();
-      var _retIncomeFromTotal=Math.round(_cpSustainableMonthly(totalEndBalance/Math.pow(1.03,_yrsToRet),_yrsInRet2,0.01));
+      var _retIncomeFromTotal=Math.round(_cpSustainableMonthly(totalEndBalance/Math.pow(1+_cpMCInfl(),_yrsToRet),_yrsInRet2,0.01));   // Phase 5: editable inflation (default 3%) — one basis shared with the MC income
       result={
         retValue: totalEndBalance>0 ? Math.round(totalEndBalance) : (sim.projRetValue||0),
         retIncome: _retIncomeFromTotal>0 ? _retIncomeFromTotal : (sim.projRetIncome||0),
@@ -37181,6 +37245,34 @@ function _cpProjectApproachWithSim(approachData,approachKey){
         events:(sim.events||[]).slice(),
         totalDeployed:CPLAN.allocations.reduce(function(t,a){return t+(parseFloat(a.amount)||0);},0)
       };
+      // Phase 5: run this approach through Monte Carlo at its RISK-DERIVED draw rates so the fork reflects market
+      // downside. Self-calibrate a level annual contribution so the MC MEAN reproduces the deterministic bucket
+      // (same technique as the debt-vs-IBC MC), then disperse via N(mean,std) at the approach's risk level. Income
+      // deflates by the editable inflation. Never throws (guarded) — a failure just leaves the deterministic view.
+      try{
+        var _mcRisk=_cpMcRiskForApproach(approachKey);
+        var _mcMean=_CP_MC_DRAW_RATES[_mcRisk].mean, _mcStd=_CP_MC_DRAW_RATES[_mcRisk].std;
+        // Self-calibrate a level annual contribution so the MC MEAN path reproduces the deterministic bucket.
+        // ORDINARY-annuity factor (contribution added AFTER growth each year — matches the _cpApproachMC loop).
+        var _mcPw=Math.pow(1+_mcMean,_yrsToRet), _mcAnnFac=(_mcPw-1)/_mcMean;
+        var _mcC=_mcAnnFac>0?((totalEndBalance-totalStartBalance*_mcPw)/_mcAnnFac):0;
+        if(_mcC<0){
+          // The deterministic bucket grew SLOWER than the risk mean (typical: a WL/bond-heavy Conservative plan
+          // with a large existing balance — deterministic ~4-4.3% < conservative MC mean 4.5%). No positive
+          // contribution reconciles it, and using the risk mean would OVERSHOOT the deterministic end (the median
+          // would sit ABOVE the headline). Instead grow the existing balance at the pure IMPLIED rate with zero
+          // contribution so the MC mean == the deterministic end; keep the risk-derived STD for the dispersion.
+          _mcC=0;
+          _mcMean=(totalStartBalance>0&&_yrsToRet>0)?Math.max(0,Math.pow(totalEndBalance/Math.max(1,totalStartBalance),1/_yrsToRet)-1):_mcMean;
+        }
+        var _mc=_cpApproachMC(totalStartBalance,_mcC,_yrsToRet,_mcRisk,{targetSuccess:_cpMCTarget(),mean:_mcMean,std:_mcStd});
+        var _mcInflN=_cpMCInfl();
+        result.mcRiskLevel=_mcRisk;
+        result.mcMedian=Math.round(_mc.median);
+        result.mcFloor=Math.round(_mc.floor);
+        result.mcMedianIncome=Math.round(_cpSustainableMonthly(_mc.median/Math.pow(1+_mcInflN,_yrsToRet),_yrsInRet2,0.01));
+        result.mcFloorIncome=Math.round(_cpSustainableMonthly(_mc.floor/Math.pow(1+_mcInflN,_yrsToRet),_yrsInRet2,0.01));
+      }catch(_mce){}
     }
   }catch(e){
     console.warn('Approach simulation failed:',e&&e.message);
