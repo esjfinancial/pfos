@@ -3442,7 +3442,7 @@ function _cpPersistSubsSummary(d){
       computedAt:new Date().toISOString() };
     var _sid=APP.currentClientId;
     db.from('client_profiles').select('id').eq('client_id',_sid).order('updated_at',{ascending:false}).limit(1).maybeSingle().then(function(ex){
-      if(ex&&ex.data&&ex.data.id){ db.from('client_profiles').update({subs_summary:summary}).eq('id',ex.data.id).then(function(){},function(e){ if(window.console)console.warn('subs summary persist:',e&&e.message); }); }
+      if(ex&&ex.data&&ex.data.id){ db.from('client_profiles').update({subs_summary:summary}).eq('id',ex.data.id).select('data_version').maybeSingle().then(function(r){_cpSyncVer(r);},function(e){ if(window.console)console.warn('subs summary persist:',e&&e.message); }); }
     },function(){});
   }catch(_){}
 }
@@ -6639,7 +6639,7 @@ async function loadClientPortalData(){
         // Apply applied — schedule persist
         APP._portalFd._spendingVisibility=_pvAfterExpiry;
         if(profile.id){
-          db.from('client_profiles').update({spending_visibility:_pvAfterExpiry,updated_at:new Date().toISOString()}).eq('id',profile.id).then(function(){}).catch(function(e){console.warn('PV expiry persist:',e&&e.message);});
+          db.from('client_profiles').update({spending_visibility:_pvAfterExpiry,updated_at:new Date().toISOString()}).eq('id',profile.id).select('data_version').maybeSingle().then(function(r){_cpSyncVer(r);}).catch(function(e){console.warn('PV expiry persist:',e&&e.message);});
         }
       } else {
         APP._portalFd._spendingVisibility=_pvLoaded;
@@ -14367,6 +14367,14 @@ var _cpLastGoodWeight={};
 // update/insert. Secondary save paths (clientSaveOwnData, logout background save)
 // route through here so they can no longer clobber sections another tab advanced.
 // The 5 params are the only inputs; everything else is a module-level global.
+// Multi-tab conflict cursor sync. The BEFORE-UPDATE trigger trg_increment_version bumps
+// client_profiles.data_version by 1 on EVERY write. Background writers (tracking sync, spending-
+// visibility, subs summary, calc scenarios, plan publish) update the SAME row WITHOUT advancing
+// APP._lastDataVersion — so the next _cpSectionMergeSave reads THIS session's own bump as if another
+// tab wrote it, and the "edited in another tab" banner false-fires and never clears (see the check
+// below at the multi-tab detection block). Each such writer now selects data_version and passes the
+// response here to keep the cursor in sync, so ONLY a genuine external edit can trip the banner.
+function _cpSyncVer(r){ try{ var v=r&&r.data&&r.data.data_version; if(v&&typeof APP!=='undefined'&&(!APP._lastDataVersion||v>APP._lastDataVersion))APP._lastDataVersion=v; }catch(e){} }
 async function _cpSectionMergeSave(state, calcs, scores, _saveToId, _cpSave){
       if(typeof _cpReadOnly==='function' && _cpReadOnly()){ return false; } // C2 read-only lock — no save path may write for a locked (expired/canceled) self-serve client
       // ══ SECTION-LEVEL MERGE: protect untouched sections from being overwritten ══
@@ -17871,7 +17879,7 @@ async function _calcScenariosFlush(){
   try{
     var q=db.from('client_profiles').update({calc_scenarios:_calcScenarios});
     q=_calcScenRowId?q.eq('id',_calcScenRowId):q.eq('client_id',id);   // target the exact row we read (client_id has no UNIQUE constraint)
-    await q;
+    var _qr=await q.select('data_version').maybeSingle();_cpSyncVer(_qr);
   }catch(e){ console.warn('[calcScen] save failed',e&&e.message); }
 }
 function _calcScenEntry(){ var fn=_currentCalcRender; if(!fn)return null; var root=_calcScenRoot(); if(!root[fn])root[fn]={}; return root[fn]; }
@@ -28629,7 +28637,7 @@ function _trackSyncToSupabase(){
     var plan=res.data.allocation_plan||{};
     plan.tracking=_cpTracking;
     plan.planCalendar=_cpPlanCalendar;
-    db.from('client_profiles').update({allocation_plan:plan,updated_at:new Date().toISOString()}).eq('id',res.data.id).then(function(){}).catch(function(e){console.warn('tracking sync error:',e);});
+    db.from('client_profiles').update({allocation_plan:plan,updated_at:new Date().toISOString()}).eq('id',res.data.id).select('data_version').maybeSingle().then(function(r){_cpSyncVer(r);}).catch(function(e){console.warn('tracking sync error:',e);});
   }).catch(function(e){console.warn('tracking sync load error:',e);});
 }
 function ordSuffix2(d){var s=['th','st','nd','rd'];var v=d%100;return s[(v-20)%10]||s[v]||s[0];}
@@ -44739,7 +44747,7 @@ async function _pvPersistVisibility(newVis){
     var _pvSvId=(_pvSv&&_pvSv.household_type==='joint')?_pvSv.client_a_id:APP.currentClientId;
     var check=await db.from('client_profiles').select('id').eq('client_id',_pvSvId).order('updated_at',{ascending:false}).limit(1).maybeSingle();
     if(!check||!check.data)return{ok:false,error:'no profile row'};
-    var res=await db.from('client_profiles').update({spending_visibility:newVis,updated_at:new Date().toISOString()}).eq('id',check.data.id);
+    var res=await db.from('client_profiles').update({spending_visibility:newVis,updated_at:new Date().toISOString()}).eq('id',check.data.id).select('data_version').maybeSingle();_cpSyncVer(res);
     if(res&&res.error)return{ok:false,error:res.error.message};
     return{ok:true};
   }catch(e){return{ok:false,error:(e&&e.message)||String(e)};}
@@ -51120,7 +51128,8 @@ function cplanSave(){
       if(b3){b3.textContent='✓ Saved locally';b3.style.color='var(--yl)';setTimeout(function(){b3.textContent='💾 Save my plan';b3.style.color='';},2000);}
       return;
     }
-    db.from('client_profiles').update({allocation_plan:plan,updated_at:new Date().toISOString()}).eq('id',check.data.id).then(function(r){
+    db.from('client_profiles').update({allocation_plan:plan,updated_at:new Date().toISOString()}).eq('id',check.data.id).select('data_version').maybeSingle().then(function(r){
+      _cpSyncVer(r);
       // Echo-suppression timestamp for the Joint-household client_profiles
       // realtime subscription. Stamped right after the write fires so the
       // subscription handler can detect and skip our own echo (1.5s window).
