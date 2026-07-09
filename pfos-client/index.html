@@ -31045,7 +31045,7 @@ function renderClientAnalysis(){
 
 // ── CLIENT FINANCIAL PLANNER v3 ─────────────────────────
 var CPLAN={allocations:[],surplus:0,income:0,expenses:0,totalDebt:0,debtMin:0,debts:[],efBal:0,efTarget:0,age:30,retirementAge:65,riskProfile:'',riskDone:false,mode:'guided',hasAdvisor:false,advisorPlan:null,modified:false,exploring:false,ibcDismissed:false,tier:'core',policies:[],employer:'',children:[],debtStrategy:'avalanche',marital:'single',_renderTimer:null,_activePhaseTab:1};
-var CP_COL={ef:'#5B9BFF',iul:'#A855F7',wl:'#C084FC',debt:'#F97316',roth:'#22C55E','401k':'#16A34A',house:'#EAB308',edu:'#06B6D4',invest:'#EC4899',custom:'#94A3B8',
+var CP_COL={ef:'#5B9BFF',iul:'#A855F7',wl:'#C084FC',debt:'#F97316',roth:'#22C55E','401k':'#16A34A',house:'#EAB308',edu:'#06B6D4',invest:'#EC4899',fixed_income:'#14B8A6',custom:'#94A3B8',
   // Action-only & extended types (added in step 4 of the red-flag restructure)
   protection:'#5B9BFF',umbrella:'#0EA5E9',estate:'#A855F7','ibc_audit':'#F59E0B','annuity_research':'#EAB308',diversify:'#06B6D4',
   // Retirement vehicle variants
@@ -31059,7 +31059,7 @@ var CP_NM={ef:'Build safety net',iul:'Tax-free retirement (IUL)',wl:'Guaranteed 
   rollover:'Roll over old account',hsa:'HSA',ibc:'IBC Policy',roth401k:'Roth 401(k)',trad_ira:'Traditional IRA',solo401k:'Solo 401(k)',sep_ira:'SEP IRA',rental:'Rental property',
   // Annuity sub-types
   fixed_annuity:'Fixed Annuity / MYGA',fia:'Fixed Indexed Annuity',variable_annuity:'Variable Annuity',spia:'Income Annuity (SPIA)'};
-var CP_IC={ef:'🛡️',iul:'📈',wl:'🏦',debt:'⚡',roth:'🎯','401k':'💼',house:'🏠',edu:'🎓',invest:'📊',custom:'⭐',
+var CP_IC={ef:'🛡️',iul:'📈',wl:'🏦',debt:'⚡',roth:'🎯','401k':'💼',house:'🏠',edu:'🎓',invest:'📊',fixed_income:'🏛️',custom:'⭐',
   // Action-only items
   protection:'🛡️',umbrella:'☂️',estate:'📜','ibc_audit':'🔍','annuity_research':'🛡️',diversify:'📌',
   // Retirement vehicle variants
@@ -35245,8 +35245,8 @@ function _cpShowApproachFork(){
   });
   var cards=[
     {key:'traditional',label:'Aggressive',icon:'📈',desc:'Market-driven growth — 401(k), Roth, index funds. Equity-heavy and diversified, for a long horizon and higher expected return.',color:'#5B9BFF',taxRatio:1},
-    {key:'tax_free',label:'Conservative',icon:'🛡️',desc:'Capital preservation — bonds, treasuries, CDs and cash, plus a right-sized whole-life slice as a bond alternative. Low volatility, protected floor.',color:'#22C55E',taxRatio:0},
-    {key:'hybrid',label:'Moderate',icon:'⚖️',desc:'A balanced blend — market growth cushioned by bonds and protection, between the growth and preservation ends.',color:'#A855F7',taxRatio:0.5}
+    {key:'hybrid',label:'Moderate',icon:'⚖️',desc:'A balanced blend — market growth cushioned by bonds and protection, between the growth and preservation ends.',color:'#A855F7',taxRatio:0.5},
+    {key:'tax_free',label:'Conservative',icon:'🛡️',desc:'Capital preservation — bonds, treasuries, CDs and cash, plus a right-sized whole-life slice as a bond alternative. Low volatility, protected floor.',color:'#22C55E',taxRatio:0}
   ];
   // Which AI cards to actually render? Only the ones that already have data in
   // CPLAN._approaches OR are currently being generated (CPLAN._cpGenInProgress).
@@ -45826,6 +45826,25 @@ function _cpRunSimulation(){
   // otherwise a target:0 529 never "completes" and absorbs the post-debt cascade without bound (owner fix).
   if(typeof _cpBackstopEduTargets==='function')_cpBackstopEduTargets();
 
+  // Cascade "freed-cash-flow" sinks are pure projection artifacts: the overflow pass re-derives them
+  // deterministically from freed cash on every sim run. Strip the PRIOR run's sinks BEFORE allocAmounts
+  // re-seeds from a.amount below — otherwise a persisted sink would be counted once at its stored amount
+  // AND again when the overflow pass re-fills it (a double-count that balloons the projection each render).
+  // Two catch conditions: (1) _overflowSink for a sink spawned earlier THIS session; (2) a "zombie" that
+  // round-tripped through a plan save — the serializer allowlist doesn't carry _overflowSink, so a reloaded
+  // sink keeps _cascadeSpawned but loses _overflowSink. The ONLY thing that stamps _cascadeSpawned on an
+  // invest/fixed_income allocation is this sink (spawned insurance is always wl/iul; real user/AI brokerage
+  // + bond allocations are never _cascadeSpawned), so that pair uniquely re-catches the zombie without
+  // touching anything legitimate. (Owner directive: freed cash must keep compounding, never idle "cash savings".)
+  if(CPLAN.allocations&&CPLAN.allocations.length){
+    CPLAN.allocations=CPLAN.allocations.filter(function(_a){
+      if(!_a)return true;
+      if(_a._overflowSink)return false;
+      if(_a._cascadeSpawned&&(_a.type==='invest'||_a.type==='fixed_income'))return false;
+      return true;
+    });
+  }
+
   // ── Tracking gate (per-allocation) ─────────────────────────────────────
   // The gate's job is to keep the projection HONEST: contributions only count
   // once the user has actually opened the account and started funding it.
@@ -46079,13 +46098,13 @@ function _cpRunSimulation(){
       if(!_cascadeOwnerOK(a.owner))return false;
       var t=a.type;
       if(_cascadeTaxAdv.indexOf(t)>=0)return true;
-      if(t==='invest')return _planApproach!=='tax_free';
-      // Taxable FIXED INCOME (bonds/CDs/treasuries) — the conservative counterpart to 'invest'.
-      // Eligible for every approach: a fixed_income card only exists where the approach's target
-      // mix placed it (conservative ~50% / moderate ~30% / aggressive ~15% bond weight), so topping
-      // it up completes the planned mix rather than inventing concentration. For tax_free — where
-      // 'invest' is excluded above — this is the natural taxable destination for freed money.
-      if(t==='fixed_income')return true;
+      // Taxable stock ('invest') + bond ('fixed_income') sleeves are NOT boosted here — the
+      // TARGET-MIX OVERFLOW ROUTER (end of the overflow pass below) is their SINGLE authority. It
+      // splits freed cash across both sleeves by the approach's coded stock:bond ratio (ALLOC_MODELS:
+      // conservative 30/50, moderate 60/30, aggressive 80/15), so the mix holds across every cascade
+      // event instead of the generic boost dumping it all into whichever sleeve it finds first.
+      // (Directed cascadeSplit / specific-cascade targets above still route to them explicitly.)
+      if(t==='invest'||t==='fixed_income')return false;
       if(t==='iul'||t==='wl'||t==='ibc')return !!a._overflowAbsorber&&(_planApproach==='tax_free'||_planApproach==='hybrid');
       return false;
     };
@@ -46260,8 +46279,9 @@ function _cpRunSimulation(){
           if(x.a.type==='protection')return false;
           if(x.a.type==='custom'&&(!x.a.target||x.a.target<=0))return false;
           if(!_cascadeOwnerOK(x.a.owner))return false;// Phase D: hybrid owner gate
-          if(x.a.type==='invest'&&_planApproach==='tax_free')return false;// tax-free avoids taxable — don't newly-fund a brokerage
-          return['roth','401k','roth401k','iul','wl','invest','fixed_income','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;
+          // invest + fixed_income are owned by the target-mix overflow router below — not newly funded here.
+          if(x.a.type==='invest'||x.a.type==='fixed_income')return false;
+          return['roth','401k','roth401k','iul','wl','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;
         })
         .sort(function(a4,b4){return(a4.a.phase||99)-(b4.a.phase||99);});
       unfunded.forEach(function(uf){
@@ -46297,32 +46317,17 @@ function _cpRunSimulation(){
     //      lost — at worst it shows as "+ unallocated cash" the user can act on.
     // Tax-Free plans without an `invest` allocation will fall through to (3).
     if(freed>0){
-      // (1) Existing taxable overflow sink — no real IRS cap, accepts unlimited overflow. On the
-      //     conservative (tax_free) approach this sink is FIXED INCOME (bonds/CDs/treasuries), since
-      //     that approach avoids taxable brokerage; every other approach uses 'invest'. This is what
-      //     lands conservative freed money in the fixed-income sleeve instead of idle unallocated cash.
-      var _sinkType=(_planApproach==='tax_free')?'fixed_income':'invest';
-      var _investIdx=CPLAN.allocations.findIndex(function(a){return a.type===_sinkType;});
-      if(_investIdx>=0){
-        var _investMax=_cpIRSMax(_sinkType,CPLAN.allocations[_investIdx]);
-        var _investHeadroom=Math.max(0,_investMax-allocAmounts[_investIdx]);
-        var _investAdd=Math.min(freed,_investHeadroom);
-        if(_investAdd>0){
-          allocAmounts[_investIdx]+=_investAdd;
-          allocFuture[_investIdx].futureAmount=allocAmounts[_investIdx];
-          if(allocFuture[_investIdx].startsMonth<0)allocFuture[_investIdx].startsMonth=ev.month;
-          allocFuture[_investIdx].boosts.push({month:ev.month,amount:_investAdd,from:ev.label+' (overflow)'});
-          var _existInv=destinations.find(function(d){return d.type===_sinkType;});
-          if(_existInv)_existInv.amount+=_investAdd;
-          else destinations.push({type:_sinkType,name:CP_NM[_sinkType]||(_sinkType==='fixed_income'?'Fixed Income':'Taxable Brokerage'),amount:_investAdd});
-          freed-=_investAdd;
-        }
-      }
-      // (2) Any non-insurance growth allocation with headroom (very aggressive)
+      // (1) The taxable stock/bond sleeves (invest / fixed_income) are NOT topped up here — the
+      //     TARGET-MIX OVERFLOW ROUTER at the end of this pass is their single authority, so freed
+      //     cash is split across the approach's coded stock:bond mix (never lumped into one box).
+      // (2) Any non-insurance growth allocation with headroom — tax-advantaged top-ups + planned
+      //     _overflowAbsorber policies only (invest/fixed_income are excluded in the filter below).
       if(freed>0){
         var _allGrowth=CPLAN.allocations.map(function(a,i){return{a:a,i:i};})
           .filter(function(x){
             if(x.a.type==='debt'||x.a.type==='ef'||x.a.type==='protection')return false;
+            // invest/fixed_income are owned by the target-mix router at the end of this pass — don't lump here.
+            if(x.a.type==='invest'||x.a.type==='fixed_income')return false;
             // Insurance premiums (iul/wl/ibc) are normally FIXED at policy
             // inception. EXCEPTION: allocations explicitly tagged with
             // _overflowAbsorber:true are designed to accept additional
@@ -46510,6 +46515,75 @@ function _cpRunSimulation(){
             freed=0;
           }
         }
+      }
+      // ── TARGET-MIX OVERFLOW ROUTER ─────────────────────────────────────────
+      // Whatever freed cash remains is post-tax-advantaged, taxable-only money (capped retirement +
+      // planned _overflowAbsorber policies above already took their share). Route it across the
+      // approach's TARGET stock/bond mix so it is NEVER a single lump — the funnel the whole risk-
+      // reframe exists to kill (owner: "there should never be any cash savings," and balance comes
+      // from the target asset mix, not a lump). Coded ratios mirror ALLOC_MODELS (planning.ts) = the
+      // asset-allocation calculator: Conservative 30/50/20 · Moderate 60/30/10 · Aggressive 80/15/5
+      // (stock/bond/cash). Split the STOCK:BOND portion only (the cash weight is the EF/reserve, funded
+      // separately). EQUITY sleeve = taxable brokerage 'invest'; BOND sleeve = taxable 'fixed_income'.
+      // Conservative holds NO taxable equity (its 30% equity lives in capped tax-free space), so its
+      // overflow is 100% fixed income — its own 50/20 bond+cash sleeve, not a lump. This router is the
+      // SOLE authority for the taxable stock/bond sleeves (excluded from _cascadeBoostEligible + the
+      // unfunded/step-2 passes), so the mix holds across EVERY cascade event instead of drifting into
+      // whichever box a prior pass found first. Each sleeve reuses an existing owner-matching allocation
+      // (top it up) or is created as a spawned sink (tagged _cascadeSpawned+_overflowSink → stripped/
+      // re-derived each pass = double-count-safe; excluded from pool/deployed math; allocFuture mirrors
+      // the standard shape so currentAmount:0 prevents the trajectory NaN). Coded ratios per [[use-coded-financial-assumptions]].
+      if(freed>0){
+        var _mixEq,_mixBd;
+        if(_planApproach==='tax_free'){_mixEq=0;_mixBd=1;}
+        else if(_planApproach==='hybrid'){_mixEq=60/90;_mixBd=30/90;}// ALLOC_MODELS.moderate 60/30 stock:bond
+        else{_mixEq=80/95;_mixBd=15/95;}// ALLOC_MODELS.aggressive 80/15 stock:bond (traditional / default)
+        var _routeMixSleeve=function(_stype,_amt){
+          if(_amt<=0.5)return 0;
+          var _done=0;
+          // (a) reuse an existing owner-OK allocation of this sleeve type (AI-placed OR spawned earlier this
+          // pass). PREFER an already-spawned _overflowSink of this type+owner first, so multi-event overflow
+          // always consolidates into the SAME one sink — even if a lower-index AI-placed card of the same type
+          // has saturated its finite _cpIRSMax ceiling and would otherwise keep winning findIndex at $0 headroom
+          // and force step (b) to spawn a duplicate every event. Guarantees at most one spawned sink per
+          // type+owner (the ONE-box invariant this router exists to enforce). Falls back to the lowest-index
+          // owner-OK card of the type when no sink exists yet (so a real AI card still absorbs before we spawn).
+          var _ri=CPLAN.allocations.findIndex(function(_a){return _a.type===_stype&&_a._overflowSink&&_cascadeOwnerOK(_a.owner);});
+          if(_ri<0)_ri=CPLAN.allocations.findIndex(function(_a){return _a.type===_stype&&_cascadeOwnerOK(_a.owner);});
+          if(_ri>=0){
+            var _rad=Math.min(_amt,Math.max(0,_cpIRSMax(_stype,CPLAN.allocations[_ri])-allocAmounts[_ri]));
+            if(_rad>0){
+              allocAmounts[_ri]+=_rad;
+              if(allocFuture[_ri].startsMonth<0)allocFuture[_ri].startsMonth=ev.month;
+              allocFuture[_ri].futureAmount=allocAmounts[_ri];
+              allocFuture[_ri].boosts.push({month:ev.month,amount:_rad,from:ev.label+' (freed → growth)'});
+              var _rd=destinations.find(function(d){return d.type===_stype;});
+              if(_rd)_rd.amount+=_rad;else destinations.push({type:_stype,name:CPLAN.allocations[_ri].customName||CP_NM[_stype]||_stype,amount:_rad});
+              _done+=_rad;_amt-=_rad;
+            }
+          }
+          // (b) create a spawned sink for anything still unplaced (taxable sleeves are uncapped → clears _amt)
+          if(_amt>0.5){
+            var _snm=(_stype==='fixed_income'?'Fixed Income — Freed Cash Flow':'Taxable Brokerage — Freed Cash Flow');
+            var _sph=2;
+            if(events&&events.length){var _pc=events.filter(function(e3){return (e3.month||0)<ev.month&&((e3.freed||0)>0||(e3._ibcContinues||0)>0);}).length;_sph=Math.max(2,_pc+2);}
+            var _sidx=CPLAN.allocations.length;
+            CPLAN.allocations.push({type:_stype,amount:_amt,target:0,phase:_sph,cascade:'',customName:_snm,
+              reason:'Cash freed when earlier commitments (debt payoff, emergency fund, funded goals) completed — its target-mix share routed into '+(_stype==='fixed_income'?'the fixed-income sleeve (bonds, CDs, treasuries)':'a low-cost taxable brokerage index portfolio')+' so it keeps compounding instead of sitting idle in cash.',
+              flagTitle:'',flagType:'opp',flagIcon:'',eduVehicle:'',owner:(_srcOwner||'self'),_state:'proposed',_cascadeSpawned:true,_overflowSink:true});
+            allocAmounts.push(_amt);
+            allocFuture.push({idx:_sidx,type:_stype,currentAmount:0,futureAmount:_amt,startsMonth:ev.month,reason:'',boosts:[{month:ev.month,amount:_amt,from:ev.label+' (freed → growth)'}]});
+            destinations.push({type:_stype,name:CP_NM[_stype]||_snm,amount:_amt});
+            _done+=_amt;_amt=0;
+          }
+          return _done;
+        };
+        var _eqShare=freed*_mixEq;
+        var _bdShare=freed-_eqShare;// bond gets the remainder (no FP drift; tax_free → 100% here)
+        freed-=_routeMixSleeve('invest',_eqShare);
+        freed-=_routeMixSleeve('fixed_income',_bdShare);
+        // Sub-dollar rounding remnant (headroom-limited reuse can leave a sliver) → bond sleeve, never cash.
+        if(freed>0.5)freed-=_routeMixSleeve('fixed_income',freed);
       }
       if(freed>0){
         ev._cascadeOverflow=(ev._cascadeOverflow||0)+freed;
@@ -50960,6 +51034,11 @@ function cplanSave(){
   // cards stay (they're co-owned and we DO save them); only cards owned by
   // the partner via shared_card_grants are filtered.
   var cleanAllocs=CPLAN.allocations.filter(function(a){
+    // Never persist the cascade's transient freed-cash-flow sink — it's a projection artifact the
+    // simulator re-derives on every run. The allowlist map below doesn't carry _overflowSink, so a
+    // saved sink would reload as a double-counting zombie; keep the primary write clean at the source.
+    // (The sim-start strip re-catches any sink that slips through other save paths as a belt-and-braces.)
+    if(a&&(a._overflowSink||(a._cascadeSpawned&&(a.type==='invest'||a.type==='fixed_income'))))return false;
     return !(a&&a._sharedOwnerClientId&&a._sharedOwnerClientId!==APP.currentClientId&&a.owner!=='joint');
   }).map(function(a){return{type:a.type,owner:a.owner||'self',_sharedId:a._sharedId||null,amountSelf:parseFloat(a.amountSelf)||0,amountSpouse:parseFloat(a.amountSpouse)||0,amount:a.amount,target:a.target||0,phase:a.phase||1,cascade:a.cascade||'',customName:a.customName||'',eduVehicle:a.eduVehicle||'',_grossReturn:a._grossReturn||null,_feeRate:a._feeRate||null,_completed:a._completed||false,_completedDate:a._completedDate||'',reason:a.reason||'',flagTitle:a.flagTitle||'',flagType:a.flagType||'',flagIcon:a.flagIcon||'',addressesIssueId:a.addressesIssueId||undefined,goalCurrent:a.goalCurrent||0,ongoingSpend:a.ongoingSpend||0,_ibcUnderlyingType:a._ibcUnderlyingType||null,_state:a._state||'proposed',_policyId:a._policyId||null,_policyNumber:a._policyNumber||null,_lockedPremium:a._lockedPremium||null,_openedDate:a._openedDate||null,_hdhpGated:a._hdhpGated||false,_overflowAbsorber:a._overflowAbsorber===true,_cascadeSpawned:a._cascadeSpawned===true,_spawnedByOverflow:a._spawnedByOverflow===true,_spawnEventLabel:a._spawnEventLabel||'',_ibcDebtStrategy:a._ibcDebtStrategy===true,_userMadePersonal:a._userMadePersonal===true,_userAdded:a._userAdded===true,_liteSeededAmt:(a._liteSeededAmt!=null?a._liteSeededAmt:undefined),_autoResolvedFromPlaceholder:a._autoResolvedFromPlaceholder===true,
   // _liteSeededAmt: the Core auto-seed's stamped amount (distinguishes a seeded default from a user-nudged slider so re-seeding never clobbers an edit). _autoResolvedFromPlaceholder: the retirement chooser was auto-resolved to a real vehicle in Core.
