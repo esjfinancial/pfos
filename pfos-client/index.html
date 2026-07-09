@@ -5122,6 +5122,7 @@ function _cpLiteAutoSeed(){
   var _ok=function(x){return x&&!x._isPlaceholder&&!_isAO(x);};
   var _hasRet=CPLAN.allocations.some(function(x){return _ok(x)&&_retOnly[x.type];});
   var _hasInv=CPLAN.allocations.some(function(x){return _ok(x)&&x.type==='invest';});
+  var _hasFI=CPLAN.allocations.some(function(x){return _ok(x)&&x.type==='fixed_income';});   // Phase 4c: conservative bond sleeve
   var _g=matchPct+growthPct;
   // GROWTH BUDGET — distribute _g across the available growth vehicles by weight. Retirement is prioritized (weight 6);
   // taxable investing (4) preserves the prior 60/40 retirement:invest ratio when there is no college lane; and when the
@@ -5129,10 +5130,14 @@ function _cpLiteAutoSeed(){
   // monthly college amount (owner decision) instead of college always falling to $0 "can't fund yet". A childless
   // household contributes NO college weight — its (saved) college card is zeroed below and hidden (_cpHideChildlessEdu).
   var _hasEduKids=(CPLAN.children&&CPLAN.children.length>0)&&CPLAN.allocations.some(function(x){return _ok(x)&&x.type==='edu';});
-  var _wRet=_hasRet?6:0, _wInv=_hasInv?4:0, _wEdu=_hasEduKids?3:0, _wTot=_wRet+_wInv+_wEdu;
+  // Phase 4c: the taxable-growth weight (4) goes to fixed_income for a conservative risk profile and to
+  // invest for aggressive/moderate — the builder (_cpAutoSuggestV2, riskProfile-keyed scores) creates only
+  // one of the two, so they're mutually exclusive in practice; both carry weight 4 so the seed funds whichever exists.
+  var _wRet=_hasRet?6:0, _wInv=_hasInv?4:0, _wFI=_hasFI?4:0, _wEdu=_hasEduKids?3:0, _wTot=_wRet+_wInv+_wFI+_wEdu;
   if(_wTot>0){
     _seed(function(x){return !!_retOnly[x.type];}, _g*(_wRet/_wTot));
     _seed(function(x){return x.type==='invest';}, _g*(_wInv/_wTot));
+    _seed(function(x){return x.type==='fixed_income';}, _g*(_wFI/_wTot));   // conservative bond sleeve
   }
   // EDUCATION lane — college gets its weighted share of the growth budget when children exist; a childless household's
   // (saved) college card is zeroed (and hidden). Custom seed (not _seed) so a STALE auto-staged amount is recomputed: a
@@ -32517,6 +32522,32 @@ function _cpLinkAIAllocationsToAccounts(){
   return linkedCount;
 }
 
+// Lite (Core) risk-assessment HARD-GATE view. The single Core plan is risk-tolerance-driven, so we render
+// a CTA (not a plan) into the plan root until the assessment is complete. The CTA takes the user to the
+// engine's Risk Profile panel; on return to the Plan tab, initClientPlan re-checks CPLAN.riskDone and renders
+// the plan. Reached only from the _liteActive() && !riskDone branch of initClientPlan's view dispatch.
+function _cpRenderLiteRiskGate(){
+  var root=document.getElementById('cplanRoot');if(!root)return;
+  root.innerHTML='<div style="max-width:520px;margin:24px auto 0">'
+    +(typeof _renderEmptyState==='function'?_renderEmptyState('empty',{
+      icon:'📐',
+      title:'First, a 2-minute risk assessment',
+      message:'Your Core plan is built around how much risk you’re comfortable taking. Answer a few quick questions and we’ll tailor your plan — Conservative, Moderate, or Aggressive — to you.',
+      ctaLabel:'Start the 2-minute assessment',
+      ctaOnclick:'_cpGotoRiskAssessment()',
+      ctaAriaLabel:'Start the 2-minute risk assessment'
+    }):'<div style="text-align:center;padding:24px"><button class="btn" onclick="_cpGotoRiskAssessment()">Start the 2-minute assessment</button></div>')
+    +'</div>';
+}
+function _cpGotoRiskAssessment(){
+  // Show the engine data-entry view, then navigate the engine iframe to the Risk Profile panel (step 17,
+  // pfos-main). PFOS_NAV is the established client->engine navigation message. Re-post over ~1.5s so a COLD
+  // iframe (first-ever visit → multi-second remote load, handler not yet registered) still receives it once
+  // ready; navigating to step 17 more than once is idempotent (harmless) so the retries can't misbehave.
+  try{ if(typeof showClientPage==='function') showClientPage('pfos'); }catch(e){}
+  var _navPost=function(){ try{ if(typeof pfosPost==='function') pfosPost({type:'PFOS_NAV', step:17}); }catch(e){} };
+  [200,700,1500].forEach(function(ms){ setTimeout(_navPost,ms); });
+}
 function _cpStartSelfBuild(){
   // Phase 2 — Hybrid gate: both spouses must mark profile complete before DIY
   var _gate=_cpCheckProfileCompletionGate();
@@ -35231,6 +35262,21 @@ function _cpShowApproachFork(){
     h+='<div style="font-size:14px;color:var(--mu);line-height:1.6">'+(_renderCards.length>1?'Approaches built from your exact financial data. ':'')+'Same surplus (<strong style="color:var(--gr)">'+fmt(_pool)+'/mo</strong>)'+(_renderCards.length>1?', different risk levels.':'.')+'</div>';
   }
   h+='</div>';
+  // Planning SOFT-PROMPT (owner D6): if the client hasn't taken the risk assessment, nudge them to — so the
+  // fork can highlight the approach matched to their tolerance. Dismissible; generation is NOT blocked
+  // (Planning proceeds; the recommendation just defaults to Moderate). Lite users never reach the fork (hard-gated).
+  if(!CPLAN.riskDone && !CPLAN._riskPromptDismissed){
+    h+='<div style="margin-bottom:18px;padding:13px 16px;background:rgba(91,155,255,.07);border:1px solid rgba(91,155,255,.28);border-radius:6px;display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap">'
+      +'<div style="display:flex;align-items:center;gap:10px;flex:1;min-width:240px">'
+        +'<span style="font-size:18px">📐</span>'
+        +'<div style="font-size:13px;color:rgba(226,232,240,.9);line-height:1.5">Take the quick <strong>2-minute risk assessment</strong> and we’ll highlight the approach that fits your risk tolerance.</div>'
+      +'</div>'
+      +'<div style="display:flex;gap:8px;align-items:center">'
+        +'<button onclick="_cpGotoRiskAssessment()" style="padding:8px 14px;font-family:var(--fh);font-size:12px;font-weight:700;letter-spacing:.04em;background:rgba(91,155,255,.14);border:1px solid rgba(91,155,255,.4);color:#5B9BFF;border-radius:4px;cursor:pointer;white-space:nowrap;min-height:34px">Take the assessment</button>'
+        +'<button onclick="CPLAN._riskPromptDismissed=true;_cpShowApproachFork()" aria-label="Dismiss" style="padding:6px 10px;font-size:14px;background:transparent;border:none;color:var(--mu);cursor:pointer;min-height:34px">✕</button>'
+      +'</div>'
+    +'</div>';
+  }
   // Persistent "Regenerate plan" affordance on the fork. The stale banner below only appears when the
   // data changed since generation — without this there was no way to re-run the AI from the approach
   // screen at all. Shown only when real AI approaches exist, the plan isn't advisor-managed, and the
@@ -37747,6 +37793,11 @@ function _cpRenderPlanV2(){
   // 'plan_builder' feature (Core, post-M0) → a READ-ONLY ranked-priority preview + upgrade panel instead
   // of the interactive builder. Portal only — the advisor profile twin (_cpRenderPlanFull) must NEVER get this.
   if(window.PFOS_FLAGS&&PFOS_FLAGS.planTeaser&&typeof clientHasFeature==='function'&&!clientHasFeature('plan_builder')){_cpRenderPlanTeaser();return;}
+  // Lite (Core) HARD-GATE — enforced at the RENDERER, not just initClientPlan's view dispatch: any DIRECT
+  // _cpRenderPlanV2 call (realtime shared-couple sync ~28487, a data-refresh re-render, etc.) must NOT paint a
+  // plan over the risk-assessment gate for an unassessed lite user. Mirrors the dispatch guard. Portal-only
+  // (_liteActive is false for advisor/Planning); the advisor twin uses a different renderer.
+  if(typeof _liteActive==='function'&&_liteActive()&&!CPLAN.riskDone){_cpRenderLiteRiskGate();return;}
   // No allocations yet: a self-serve (product) client gets the build/AI/consult fork; an ADVISORY client must get
   // the advisor-pending view, NOT the bare self-serve builder shell. The initial-load path routes this, but a
   // re-render (e.g. a postMessage data refresh) used to fall through here for advisory clients (gate bypass).
@@ -44153,13 +44204,20 @@ function initClientPlan(){
     CPLAN.allocations.forEach(function(a){if(a.phase===undefined)a.phase=1;});
     _cpRenderPlanV2();
   } else if(typeof _liteActive==='function' && _liteActive()){
-    // Lite/trial clients skip the build-fork entirely and go straight into the lite plan builder
-    // (owner decision 2026-07-06). The fork's only lite-relevant option was "build my own", and its
-    // "Compare AI strategies [PLANNING]" card was a dead upsell. _cpStartSelfBuild restores any saved
-    // DIY work or seeds a fresh lite plan, then renders the single-phase lite builder. Full/Planning
-    // users still get the fork(s) below; advisory clients are handled above; committed lite clients
-    // already took the plan-view branch above.
-    _cpStartSelfBuild();
+    // Lite (Core) HARD-GATE (owner): the single Core plan is built around the client's risk tolerance, so
+    // the plan does not render until the 2-minute risk assessment is complete. Scoped strictly to lite —
+    // Planning/advisor/committed clients take other branches and are never trapped by this gate.
+    if(!CPLAN.riskDone){
+      _cpRenderLiteRiskGate();
+    } else {
+      // Lite/trial clients skip the build-fork entirely and go straight into the lite plan builder
+      // (owner decision 2026-07-06). The fork's only lite-relevant option was "build my own", and its
+      // "Compare AI strategies [PLANNING]" card was a dead upsell. _cpStartSelfBuild restores any saved
+      // DIY work or seeds a fresh lite plan, then renders the single-phase lite builder. Full/Planning
+      // users still get the fork(s) below; advisory clients are handled above; committed lite clients
+      // already took the plan-view branch above.
+      _cpStartSelfBuild();
+    }
   } else if((typeof clientHasFeature==='function' && clientHasFeature('plan_builder_full') && (
               // A generation is IN FLIGHT (the 2-min AI call) — CPLAN._approaches is reset to {} at the start of
               // _cpDoAIGenerate, so without this guard any initClientPlan re-entry during generation would drop the
