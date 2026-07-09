@@ -37010,6 +37010,8 @@ function _cpProjectApproachWithSim(approachData,approachKey){
   var _savedAllocs=CPLAN.allocations;
   var _savedSim=CPLAN._sim;
   var _savedProjMode=CPLAN._projectionMode;
+  var _savedSelApproach=CPLAN._selectedApproach;
+  var _savedViewApproach=CPLAN._viewingApproach;
   var result=null;
   try{
     // Force trajectory mode — fork comparisons assume "all accounts in place".
@@ -37017,6 +37019,11 @@ function _cpProjectApproachWithSim(approachData,approachKey){
     // any allocation not yet marked Done (which is all of them, since the user
     // hasn't picked an approach yet).
     CPLAN._projectionMode='preview';
+    // Pin the approach to THIS card. The cascade is now approach-aware (freed debt
+    // money routes by the chosen strategy), so each fork card must be projected under
+    // ITS OWN approach. Without this pin, all three comparison cards would be projected
+    // under the globally-selected approach — corrupting the side-by-side the user picks from.
+    CPLAN._selectedApproach=approachKey;CPLAN._viewingApproach=approachKey;
     // Convert recs to allocations (this clears CPLAN.allocations and rebuilds via secMap/stratMap)
     _cpConvertAIRecs(approachData);
     // Tax-Free guard: if any invest allocation slipped through (e.g., AI returned
@@ -37099,6 +37106,8 @@ function _cpProjectApproachWithSim(approachData,approachKey){
     CPLAN._sim=_savedSim;
     if(_savedProjMode==null)delete CPLAN._projectionMode;
     else CPLAN._projectionMode=_savedProjMode;
+    CPLAN._selectedApproach=_savedSelApproach;
+    CPLAN._viewingApproach=_savedViewApproach;
   }
   if(result)approachData._simResult=result;
   return result;
@@ -45826,6 +45835,26 @@ function _cpRunSimulation(){
       var dOwn=destOwner||'self';
       return dOwn===_srcOwner||dOwn==='joint';
     };
+    // APPROACH-AWARE cascade routing. Previously every approach cascaded freed money through
+    // ONE hardcoded vehicle list (retirement + taxable, insurance excluded), so tax-free and
+    // hybrid collapsed into traditional the moment debt cleared. _cascadeBoostEligible steers
+    // where freed money may flow by the user's chosen approach:
+    //   - tax-advantaged retirement (roth/401k/ira/hsa/edu): eligible for ALL approaches
+    //   - taxable brokerage (invest): every approach EXCEPT tax-free (which avoids taxable;
+    //     for tax-free it stays a last-resort in the overflow pass, never the primary boost)
+    //   - permanent insurance (iul/wl/ibc): ONLY a planned overflow-absorber policy, and ONLY
+    //     on tax-free/hybrid. A plain FIXED-premium issued policy stays excluded (Fix #8 — you
+    //     can't add premium to an in-force policy), so this does not over-fund owned policies.
+    var _planApproach=CPLAN._selectedApproach||CPLAN._viewingApproach||'';
+    var _cascadeTaxAdv=['roth','401k','roth401k','trad_ira','solo401k','sep_ira','hsa','edu'];
+    var _cascadeBoostEligible=function(a){
+      if(!_cascadeOwnerOK(a.owner))return false;
+      var t=a.type;
+      if(_cascadeTaxAdv.indexOf(t)>=0)return true;
+      if(t==='invest')return _planApproach!=='tax_free';
+      if(t==='iul'||t==='wl'||t==='ibc')return !!a._overflowAbsorber&&(_planApproach==='tax_free'||_planApproach==='hybrid');
+      return false;
+    };
     // IBC debt strategy: at the debt-free milestone, the WL/IBC policy carries
     // a loan balance to itself (= sum of debts paid off via policy loans, with
     // accumulated simple interest). The continuation card transformation (in
@@ -45926,14 +45955,14 @@ function _cpRunSimulation(){
     if(freed>0){
       // Priority: INCREASE existing growth allocations (they're already compounding)
       // Phase D: hybrid restricts to owner-matching growth
-      // Fix #8: insurance premiums (iul/wl/ibc) are FIXED at policy inception and
-      // cannot be increased mid-policy without a new contract. Excluded from the
-      // BOOST pass so cascade redirects to non-insurance growth (Roth/401k/invest/
-      // HSA) instead. The UNFUNDED pass below (line ~30130) still allows initial
-      // funding of currently-$0 insurance allocations (Phase 2 starter pattern),
-      // which doesn't violate the lock since the policy hasn't been issued yet.
+      // APPROACH-AWARE boost (see _cascadeBoostEligible above). Fix #8 still holds for a
+      // plain FIXED-premium issued policy — it stays excluded — but a planned overflow-
+      // absorber policy (tax-free/hybrid) IS a legitimate destination, and taxable brokerage
+      // is excluded on tax-free so freed money can't leak into the one vehicle that approach
+      // exists to avoid. Traditional is unchanged (retirement + taxable, no policy). The
+      // UNFUNDED pass below still handles initial funding of a currently-$0 policy.
       var growth=CPLAN.allocations.map(function(a5,i5){return{a:a5,i:i5};})
-        .filter(function(x){return allocAmounts[x.i]>0&&['roth','401k','roth401k','invest','edu','trad_ira','solo401k','sep_ira','hsa'].indexOf(x.a.type)>=0&&_cascadeOwnerOK(x.a.owner);})
+        .filter(function(x){return allocAmounts[x.i]>0&&_cascadeBoostEligible(x.a);})
         .sort(function(a6,b6){return(a6.a.phase||99)-(b6.a.phase||99);});
       if(growth.length>0){
         // BUG FIX: proportions must be computed against INITIAL freed, not the
@@ -45997,6 +46026,7 @@ function _cpRunSimulation(){
           if(x.a.type==='protection')return false;
           if(x.a.type==='custom'&&(!x.a.target||x.a.target<=0))return false;
           if(!_cascadeOwnerOK(x.a.owner))return false;// Phase D: hybrid owner gate
+          if(x.a.type==='invest'&&_planApproach==='tax_free')return false;// tax-free avoids taxable — don't newly-fund a brokerage
           return['roth','401k','roth401k','iul','wl','invest','edu','trad_ira','solo401k','sep_ira','hsa','ibc'].indexOf(x.a.type)>=0;
         })
         .sort(function(a4,b4){return(a4.a.phase||99)-(b4.a.phase||99);});
