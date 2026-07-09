@@ -26963,6 +26963,17 @@ function _cpUpdateLinkCard(){
     var lr=(Array.isArray(st.retAccounts)?st.retAccounts:[]).filter(function(x){return x&&x._source==='plaid';});
     var li=(Array.isArray(st.investments)?st.investments:[]).filter(function(x){return x&&x._source==='plaid';});
     var n=lc.length+ld.length+lr.length+li.length;
+    // Reconcile with the LIVE Plaid connection. S.linkedCash + plaid-sourced rows persist in the profile
+    // even after every bank is unlinked or the connection drops server-side, leaving an orphaned
+    // "N accounts linked" that contradicts the Manage modal (it reads live plaid_items/plaid_accounts).
+    // Fire a one-time live count; when it CONFIRMS zero live connections, don't claim accounts are linked
+    // — fall through to the invite state. Unknown/errored keeps the saved view (never hide a real
+    // connection on a transient failure). _cpRenderManageList refreshes APP._plaidLiveN when the modal opens.
+    if(db && APP._plaidLiveN===undefined){
+      APP._plaidLiveN=null;
+      try{ db.from('plaid_items').select('id',{count:'exact',head:true}).in('status',['active','error']).then(function(_pr){ var _pc=(_pr&&typeof _pr.count==='number')?_pr.count:null; if(_pc!==APP._plaidLiveN){ APP._plaidLiveN=_pc; try{_cpUpdateLinkCard();}catch(_e){} } }).catch(function(){ APP._plaidLiveN=null; }); }catch(_e){ APP._plaidLiveN=null; }
+    }
+    if(APP._plaidLiveN===0)n=0;
     if(n===0){
       inner.style.borderColor='rgba(168,85,247,.25)';inner.style.background='rgba(168,85,247,.04)';
       inner.innerHTML='<div style="width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,rgba(168,85,247,.15),rgba(168,85,247,.05));display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">🔗</div>'
@@ -27243,6 +27254,9 @@ function _cpRenderManageList(accounts, items){
   // banks BEFORE the empty check so a connection whose accounts are ALL unsupported (card/loan-only,
   // mapped_section 'ignore') still shows its health + Reconnect row instead of a misleading "No linked accounts".
   var banks=(items||[]).filter(function(i){return i&&(i.status==='active'||i.status==='error')&&i.item_id;});
+  // Keep the dashboard summary card honest with this live read (its orphaned-S reconciliation trusts
+  // APP._plaidLiveN over stale S.linkedCash): the number of live connections wins.
+  try{ if(typeof APP!=='undefined' && APP._plaidLiveN!==banks.length){ APP._plaidLiveN=banks.length; if(typeof _cpUpdateLinkCard==='function')_cpUpdateLinkCard(); } }catch(_e){}
   if(!supported.length && !banks.length){ el.innerHTML=_renderEmptyState('empty',{icon:'🔗',title:'No linked accounts yet',message:'Use “Link your accounts” to connect one.'}); return; }
   var banksHtml='';
   if(banks.length){
