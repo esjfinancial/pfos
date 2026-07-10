@@ -26971,10 +26971,40 @@ function _cpUpdateLinkCard(){
     // connection on a transient failure). _cpRenderManageList refreshes APP._plaidLiveN when the modal opens.
     if(db && APP._plaidLiveN===undefined){
       APP._plaidLiveN=null;
-      try{ db.from('plaid_items').select('id',{count:'exact',head:true}).in('status',['active','error']).then(function(_pr){ var _pc=(_pr&&typeof _pr.count==='number')?_pr.count:null; if(_pc!==APP._plaidLiveN){ APP._plaidLiveN=_pc; try{_cpUpdateLinkCard();}catch(_e){} } }).catch(function(){ APP._plaidLiveN=null; }); }catch(_e){ APP._plaidLiveN=null; }
+      // Fetch STATUSES (not just a count) so we can tell "no connections at all" (→ show the disconnect
+      // prompt) from "connections exist but archived" (→ let _cpCheckPlaidArchived own the auto-freeze;
+      // don't flash a competing prompt). Live = active/error; archived is handled by that other path.
+      try{ db.from('plaid_items').select('status').then(function(_pr){ var _rows=(_pr&&_pr.data)||null; if(_rows){ APP._plaidLiveN=_rows.filter(function(r){return r&&(r.status==='active'||r.status==='error');}).length; APP._plaidHasArchived=_rows.some(function(r){return r&&r.status==='archived';}); } else { APP._plaidLiveN=null; } try{_cpUpdateLinkCard();}catch(_e){} }).catch(function(){ APP._plaidLiveN=null; }); }catch(_e){ APP._plaidLiveN=null; }
+    }
+    if(APP._plaidLiveN===0 && n>0 && APP._plaidHasArchived===false){
+      // ORPHANED PLAID DATA: the live connection is gone (0 live plaid_items) but S still holds the last-
+      // synced balances. Owner directive: ASK the user rather than silently keeping (stale net worth) or
+      // purging. Inline card with Reconnect / Keep-as-manual / Remove (wired to the engine freeze/delete).
+      var _om=(typeof fmt==='function')?fmt:function(v){return '$'+Math.round(v).toLocaleString();};
+      var _orphCash=lc.reduce(function(t,x){return t+pf(x.balance);},0);
+      var _oSync=null;[].concat(lc,ld,lr,li).forEach(function(x){if(x&&x._lastSynced){var d=new Date(x._lastSynced);if(!isNaN(d.getTime())&&(!_oSync||d>_oSync))_oSync=d;}});
+      var _oTxt='';if(_oSync){var _od=Math.floor((Date.now()-_oSync.getTime())/86400000);_oTxt=_od<=0?' today':(_od===1?' yesterday':' '+_od+' days ago');}
+      inner.style.borderColor='rgba(245,158,11,.35)';inner.style.background='rgba(245,158,11,.05)';
+      inner.innerHTML='<div style="width:44px;height:44px;border-radius:12px;background:rgba(245,158,11,.12);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">⚠️</div>'
+        +'<div style="flex:1;min-width:0"><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">Your linked accounts aren\'t connected anymore</div>'
+        +'<div style="font-size:13px;color:var(--mu);margin-top:2px">'+(_orphCash>0?'Still showing '+_om(_orphCash)+' from your last sync'+_oTxt+'. ':'')+'What would you like to do with the saved balances?</div>'
+        +'<div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:10px">'
+          +'<button onclick="_cpStartPlaidLink()" style="padding:7px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(91,155,255,.1);border:1px solid rgba(91,155,255,.3);color:#5B9BFF;cursor:pointer;border-radius:3px;min-height:34px">🔗 Reconnect</button>'
+          +'<button onclick="_cpPlaidKeepOrphaned()" style="padding:7px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(34,197,94,.1);border:1px solid rgba(34,197,94,.3);color:#22C55E;cursor:pointer;border-radius:3px;min-height:34px">Keep balances</button>'
+          +'<button onclick="_cpPlaidRemoveOrphaned()" style="padding:7px 14px;font-family:var(--fh);font-size:12px;font-weight:700;background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.28);color:#EF4444;cursor:pointer;border-radius:3px;min-height:34px">Remove</button>'
+        +'</div></div>';
+      return;
     }
     if(APP._plaidLiveN===0)n=0;
     if(n===0){
+      if(APP._plaidKeptAt && (Date.now()-APP._plaidKeptAt)<12000){
+        // Just kept-as-manual — show a positive confirmation, not the cold "link your accounts" invite.
+        inner.style.borderColor='rgba(34,197,94,.28)';inner.style.background='rgba(34,197,94,.05)';
+        inner.innerHTML='<div style="width:44px;height:44px;border-radius:12px;background:rgba(34,197,94,.15);display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">✅</div>'
+          +'<div style="flex:1"><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">Balances saved as manual</div>'
+          +'<div style="font-size:13px;color:var(--mu);margin-top:2px">Those accounts are no longer linked, but their balances stay in your plan. · <a onclick="_cpStartPlaidLink()" style="color:#5B9BFF;cursor:pointer;text-decoration:underline">Link a bank</a></div></div>';
+        return;
+      }
       inner.style.borderColor='rgba(168,85,247,.25)';inner.style.background='rgba(168,85,247,.04)';
       inner.innerHTML='<div style="width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,rgba(168,85,247,.15),rgba(168,85,247,.05));display:flex;align-items:center;justify-content:center;font-size:22px;flex-shrink:0">🔗</div>'
         +'<div style="flex:1"><div style="font-family:var(--fh);font-size:14px;font-weight:700;color:var(--wh)">Link your accounts</div>'
@@ -26993,6 +27023,30 @@ function _cpUpdateLinkCard(){
       +'<div style="font-size:13px;color:var(--mu);margin-top:2px">'+sub+'</div></div>'
       +'<button onclick="_cpStartPlaidLink()" style="padding:8px 16px;font-family:var(--fh);font-size:13px;font-weight:700;background:rgba(91,155,255,.08);border:1px solid rgba(91,155,255,.25);color:#5B9BFF;cursor:pointer;border-radius:2px;white-space:nowrap">+ Add more</button>';
   }catch(e){}
+}
+
+// ── Orphaned-Plaid reconciliation (owner: ASK the user, don't silently keep-or-purge) ──────────────
+// When the live Plaid connection is gone but S still holds the last-synced balances, the link card
+// offers Reconnect / Keep-as-manual / Remove. These post to the engine (sole S writer) which folds
+// (keep) or drops (remove) the matched plaid rows via _freezePlaidIds.
+function _cpOrphanedPlaidIds(){
+  var st=(_lastPfosState&&_lastPfosState.state)||{}; var ids=[];
+  (Array.isArray(st.linkedCash)?st.linkedCash:[]).forEach(function(x){ if(x&&x._plaidAccountId)ids.push(x._plaidAccountId); });
+  ['debts','retAccounts','investments'].forEach(function(k){ (Array.isArray(st[k])?st[k]:[]).forEach(function(x){ if(x&&x._source==='plaid'&&x._plaidAccountId)ids.push(x._plaidAccountId); }); });
+  return ids;
+}
+function _cpPlaidKeepOrphaned(){
+  pfosPost({type:'PFOS_PLAID_UNLINK_ITEM', plaidAccountIds:_cpOrphanedPlaidIds(), whole:true, purgeSpending:false});
+  APP._plaidLiveN=undefined; APP._plaidKeptAt=Date.now();
+  if(typeof _cpToast==='function')_cpToast('Kept — those balances are now saved as manual entries.');
+  setTimeout(function(){ try{_cpUpdateLinkCard();}catch(e){} }, 500);
+}
+function _cpPlaidRemoveOrphaned(){
+  if(typeof window!=='undefined'&&window.confirm&&!window.confirm('Remove the last-synced balances (and any linked debts) from your plan? Your net worth updates to match. You can re-link the accounts anytime.'))return;
+  pfosPost({type:'PFOS_PLAID_UNLINK_ITEM', plaidAccountIds:_cpOrphanedPlaidIds(), whole:true, del:true, purgeSpending:true});
+  APP._plaidLiveN=undefined;
+  if(typeof _cpToast==='function')_cpToast('Removed — those disconnected balances were cleared from your plan.');
+  setTimeout(function(){ try{_cpUpdateLinkCard();}catch(e){} }, 500);
 }
 
 function _clientOpenScheduling(){
