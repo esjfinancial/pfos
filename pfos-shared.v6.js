@@ -293,7 +293,7 @@ function _issuesDetect(ctx){
       if(!hasRet&&!hasExistingRet&&d.age>=25&&d.income>0)
         flags.push({type:'warn',icon:'🕒',title:'No retirement savings active',desc:'Time is the most powerful factor in retirement planning. Starting now, even small amounts compound significantly.',action:'retirement'});
       else if(!hasRet&&hasExistingRet&&d.age>=25&&d.income>0)
-        flags.push({type:'opp',icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle (Roth, IRA, IUL, and more).',action:'retirement'});
+        flags.push({type:'opp',icon:'🎯',title:'Add to retirement savings',desc:'Existing retirement savings are a great start, but one account often isn\'t enough to reach the goal. Consider adding or boosting a retirement vehicle (Roth IRA, Traditional IRA, IUL, and more).',action:'retirement'});
     } else {
       // ===== CLIENT branch =====
       if(!hasRet&&d.age>=25&&d.income>0)
@@ -301,7 +301,7 @@ function _issuesDetect(ctx){
     }
 
     // Children but no education savings
-    if(d.children.length>0&&!d.allocations.some(function(a){return a.type==='edu'&&a.amount>0;}))
+    if(d.children.length>0&&!d.allocations.some(function(a){return a.type==='edu';}))   // ANY edu card (funded or not) means education IS represented — don't fire "add education" when a College fund already exists (it may be momentarily $0 pre-seed)
       flags.push({type:'opp',icon:'🎓',title:'No education funding for '+d.children.length+' child'+(d.children.length>1?'ren':''),desc:'Tax-advantaged education savings grow significantly with time. Multiple vehicle options available.',action:'edu'});
 
     // Old/orphaned retirement accounts (rollover candidates) — identical
@@ -548,7 +548,12 @@ function _issuesDetect(ctx){
     // estate_tax, the Roth-strategy items — are deferred pending rank/owner decisions, see M5.2d notes.)
     var _calc=rawS2.calcs||{};
     var _idle=parseFloat(_calc.idleCash)||0;
-    if(_idle>2000) flags.push({type:'opp',icon:'💤',title:'Idle cash: '+fmtK(_idle),desc:fmtK(_idle)+' sits above your emergency-fund target, losing ~'+fmt(Math.round(_idle*0.035))+'/yr to inflation. Putting it to work (money market, index fund) captures the return you\'re currently giving up.',action:'savings'});
+    // Idle cash is only "put it to work" advice once high-interest debt is gone — investing at ~7% while paying 15%+
+    // on debt loses money. When hiDebts exist, the idle-cash card DEFERS to debt payoff (fixes the cross-card
+    // contradiction where one card said "attack 28% debt first" and this one said "invest at 7%"). Guarded:
+    // hiDebts is a function-scoped var that may be unassigned if the debt branch never ran.
+    var _idleHiDebt=(typeof hiDebts!=='undefined'&&hiDebts&&hiDebts.length>0);
+    if(_idle>2000) flags.push({type:'opp',icon:'💤',title:'Idle cash: '+fmtK(_idle),desc:(_idleHiDebt?fmtK(_idle)+' sits above your emergency-fund target — but clear your high-interest debt first (investing at ~7% while paying 15%+ on debt loses money), then put the rest to work.':fmtK(_idle)+' sits above your emergency-fund target, losing ~'+fmt(Math.round(_idle*0.035))+'/yr to inflation. Putting it to work (money market, index fund) captures the return you\'re currently giving up.'),action:'savings'});
     var _aCash=parseFloat(_calc.aCash)||0, _tAssets=parseFloat(_calc.totalAssets)||0, _cashRatio=_tAssets>0?_aCash/_tAssets:0;
     if(_cashRatio>0.6&&_aCash>10000&&(parseFloat(_calc.efMonths)||0)>6) flags.push({type:'opp',icon:'🏦',title:'High cash allocation: '+Math.round(_cashRatio*100)+'%',desc:fmtK(_aCash)+' is in cash while your emergency fund is already full — cash loses purchasing power to inflation (~'+fmt(Math.round(_aCash*0.035))+'/yr). Consider moving the excess into investments.',action:'savings'});
     var _dti=parseFloat(_calc.dti)||0;
@@ -804,6 +809,142 @@ function _issuesDetect(ctx){
     var ranked=_issuesRank(flagCards.map(function(c){ return { action:c.flagAction, type:c.flagType, _a:c }; }));
     return ranked.map(function(w){ return w._a; }).concat(others);
   }
+  // ── Section A (decisionCards) — pure spec-format DECISION-CARD builder. Maps a detected ISSUE + the
+  // pre-computed calcs into the canonical Decision-card view-model: diagnosis {current/target/gap} ·
+  // priority {level/severity/why} · nextAction {$/mo + timeline + projection} · impact. PURE (the 5b
+  // firewall): reads ONLY issue + calcs, never S/CPLAN/computeCalcs/DOM, mutates nothing, returns a NEW
+  // object (or null → callers fall through to the legacy card). card.id === _issueId(issue) (the RAW
+  // issue id; recs link via addressesIssueId === this — prefixed rec ids NEVER appear here). Section A
+  // fills the EF + Retirement families from calcs; debt/protection/estate/other return a shell with null
+  // diagnosis/nextAction/impact for B/D/E to fill ADDITIVELY (never renaming these fields). All $ copy is
+  // built here with the shared fmt (which includes the '$').
+  function _dcFamily(act){
+    if(act==='ef')return'ef';
+    if(act==='retirement'||act==='edu'||act==='growth'||act==='diversify')return'retirement';
+    if(act==='debt')return'debt';
+    if(act==='protection'||act==='protection_ext')return'protection';
+    if(act==='estate'||act==='estate_tax')return'estate';
+    return'other';
+  }
+  function _dcNum(v){ var n=parseFloat(v); return isFinite(n)?n:0; }
+  function _decisionCard(issue, calcs){
+    if(!issue) return null;
+    var a=String(issue.action||'').replace(/_spouse$/,'');   // _spouse-strip (mirrors _issuesRank:786 / _issueId:932)
+    var fam=_dcFamily(a);
+    var lvl=_ACTION_LEVEL[a]; lvl=(lvl!=null?lvl:3);
+    var sev=_TYPE_SEV[issue.type]; sev=(sev!=null?sev:3);
+    var card={
+      id:_issueId(issue), family:fam, action:a, type:(issue.type||'info'),
+      title:(issue.title||''), icon:(issue.icon||''),
+      diagnosis:null,
+      priority:{ level:lvl, severity:sev, why:'' },
+      nextAction:null, impact:null
+    };
+    var c=calcs||{};
+    if(fam==='ef'){
+      var ecur=_dcNum(c.efBal), etgt=_dcNum(c.efT3);
+      var egap=(c.efS3!=null?_dcNum(c.efS3):Math.max(0,etgt-ecur));
+      if(egap<=0){
+        // Already at/over the target — there is NO "build" action. Show the FUNDED state instead of the nonsensical
+        // "Set aside $0/mo → fully funded in about 3 months" (a divide-by-recommended-amount that yields a garbage
+        // timeline when the recommended amount is 0). nextAction:null so the teaser drops the ▸ action line.
+        card.diagnosis={ metric:'Emergency fund', current:ecur, target:etgt, gap:0, unit:'money',
+          text:'You have '+fmt(ecur)+' — your '+fmt(etgt)+' (3-month) safety net is fully funded.' };
+        card.nextAction=null;
+        card.impact={ text:'Your cushion is set — new surplus can go to higher-return goals.' };
+        card.priority.why='Your safety net is fully funded.';
+        return card;
+      }
+      var emo=(c.efBuildMonths3>0?c.efBuildMonths3:3);                 // EF framing LOCKED: one consistent pair
+      var esugg=Math.max(0,Math.ceil(egap/Math.max(1,c.efBuildMonths3||3)));  // suggest = gap/efBuildMonths3, timeline = efBuildMonths3
+      card.diagnosis={ metric:'Emergency fund', current:ecur, target:etgt, gap:egap, unit:'money',
+        text:'You have '+fmt(ecur)+' of a '+fmt(etgt)+' (3-month) target — '+fmt(egap)+' short.' };
+      card.nextAction={ suggestedMonthly:esugg, timelineMonths:emo,
+        timelineText:'~'+emo+' month'+(emo===1?'':'s')+' at '+fmt(esugg)+'/mo',
+        projectionText:'Set aside '+fmt(esugg)+'/mo → fully funded in about '+emo+' month'+(emo===1?'':'s')+'.' };
+      card.impact={ text:'A full 3-month cushion lets you invest for the future without raiding it in an emergency.' };
+      card.priority.why='Stability first — without a cushion, one surprise expense forces you into debt.';
+    } else if(fam==='retirement'){
+      var rcur=_dcNum(c.projRetBal), rtgt=_dcNum(c.fiNumber);
+      var rgap=(c.retGap!=null?Math.max(0,_dcNum(c.retGap)):Math.max(0,rtgt-rcur));
+      var rsugg=Math.max(0,_dcNum(c.requiredMonthlyIncrease));
+      var ryrs=(c.yearsToRetire>0?c.yearsToRetire:0), rage=_dcNum(c.retAge);
+      card.diagnosis={ metric:'Retirement savings', current:rcur, target:rtgt, gap:rgap, unit:'money',
+        text:'Projected '+fmtK(rcur)+' vs a '+fmtK(rtgt)+' FI target'+(rgap>0?(' — '+fmtK(rgap)+' short.'):' — on track.') };
+      card.nextAction={ suggestedMonthly:rsugg, timelineMonths:ryrs*12,
+        timelineText:(rsugg>0?'add '+fmt(rsugg)+'/mo over '+ryrs+' year'+(ryrs===1?'':'s'):'on track'),
+        projectionText:(rsugg>0?'Add '+fmt(rsugg)+'/mo → closes the gap by age '+rage+'.':'On track to reach your FI number by age '+rage+'.') };
+      card.impact={ text:(rsugg>0?'Adding '+fmt(rsugg)+'/mo keeps you on track to be financially independent at age '+rage+'.':'You are on track for financial independence at age '+rage+'.') };
+      card.priority.why='Growth lever — closing this gap is what makes work optional on time.';
+    } else {
+      // debt/protection/estate/other — shell only; B/D/E fill diagnosis/nextAction/impact ADDITIVELY.
+      card.priority.why=(lvl===1?'Stability first — secure the basics before anything else.':lvl===2?'Protect what you have before optimizing.':lvl===3?'An efficiency win — free up money working against you.':'A growth opportunity once the essentials are covered.');
+    }
+    return card;
+  }
+  // ── Section D (decisionCards) — shared PRESENTATION-layer balancer for the staged plan CARDS. Promotes
+  // the teaser-only _cpRebalanceTop into ONE canonical fn used by every priority surface. Three jobs, all
+  // DISPLAY-only (the canonical _ACTION_LEVEL rank is untouched — NO re-level, NO v7 bump): (1) CONSOLIDATE
+  // the protection sub-flags (life/disability/LTC/umbrella) into ONE Protection card per owner, and the
+  // estate docs (will/POA/beneficiary) into ONE Estate card per owner — collapsing the "wall of insurance"
+  // (estate_tax stays its OWN L4 card); (2) CAP at ≤1 protection + ≤1 estate card per owner; (3) lead with
+  // MONEY-MOVES — weave the L2 cards in AFTER the L1 stability block so a genuine L1 EF/cash-flow crit is
+  // never demoted (the fix over _cpRebalanceTop's blind position-1 insert), and protection leads index 0
+  // ONLY when no money-move exists (it is genuinely the top risk). PURE: returns a NEW array; consolidated
+  // survivors are NEW objects with addressesIssueId=null (display-only — the granular staged cards keep
+  // their per-issue ids so funded-state suppression still works); existing cards pass by reference, never
+  // mutated. Does NOT slice — the caller keeps its top-N cap.
+  function _dcHumanList(a){ a=a||[]; if(a.length<=1) return a[0]||''; if(a.length===2) return a[0]+' and '+a[1]; return a.slice(0,-1).join(', ')+', and '+a[a.length-1]; }
+  function _balBaseAct(c){ var a=(c&&(c.flagAction||c.type))||''; var k=a.indexOf('_spouse'); return k>0?a.slice(0,k):a; }
+  function _balFam(b){ if(b==='protection'||b==='protection_ext') return 'protection'; if(b==='estate') return 'estate'; return ''; }
+  function _consolidateFamily(members, fam, owner){
+    var best=members[0], bestSev=99;
+    members.forEach(function(m){ var s=_TYPE_SEV[m.flagType]; s=(s!=null?s:3); if(s<bestSev){ bestSev=s; best=m; } });
+    var titles=[]; members.forEach(function(m){ if(m.flagTitle) titles.push(m.flagTitle); });
+    var isEstate=(fam==='estate'), reason;
+    if(isEstate){
+      reason='Your estate basics — will, power of attorney, and beneficiaries — need attention.';
+    } else {
+      var flavors=[]; members.forEach(function(m){ var f=(_issueId({ action:(m.flagAction||m.type), title:m.flagTitle, owner:m.owner }).split(':')[1]||''); if(f&&f!=='other'&&flavors.indexOf(f)<0) flavors.push(f); });   // map CARD→issue shape (cards carry flagAction/flagTitle; _issueId reads action/title)
+      reason=flavors.length?('Gaps in your '+_dcHumanList(flavors)+' coverage — worth getting quotes.'):(best.reason||'Review your insurance coverage.');
+    }
+    return {
+      type:(isEstate?'estate':'protection'), flagAction:(isEstate?'estate':'protection'),
+      flagType:(best.flagType||'warn'), flagIcon:(isEstate?'📝':'🛡️'),
+      flagTitle:(members.length+' '+(isEstate?'estate':'protection')+' gap'+(members.length===1?'':'s')),
+      customName:(isEstate?'Estate planning':'Protection review'), reason:reason, owner:owner,
+      amount:0, target:0, phase:0,
+      _consolidated:titles, _mergedCount:members.length, addressesIssueId:null   // display-only; granular cards keep per-issue ids
+    };
+  }
+  function _issuesBalance(cards){
+    if(!cards||cards.length<2) return cards||[];
+    var ranked=_issuesRankCards(cards);                       // STEP 1 — canonical (level,severity) order
+    // STEP 2/3 — collapse each protection/estate family to ONE card per owner, at its highest-ranked slot
+    var groups={}, out1=[];
+    ranked.forEach(function(c){
+      var fam=_balFam(_balBaseAct(c));
+      if(!fam){ out1.push(c); return; }
+      var key=fam+'|'+((c&&c.owner==='spouse')?'spouse':'self');
+      if(!groups[key]){ groups[key]={ fam:fam, owner:((c&&c.owner==='spouse')?'spouse':'self'), members:[], idx:out1.length }; out1.push({ __g:key }); }
+      groups[key].members.push(c);
+    });
+    for(var key in groups){ if(!Object.prototype.hasOwnProperty.call(groups,key)) continue;
+      var g=groups[key];
+      out1[g.idx]=(g.members.length===1)?g.members[0]:_consolidateFamily(g.members, g.fam, g.owner);
+    }
+    // STEP 4 — lead with money-moves; weave the consolidated L2 cards in AFTER the L1 block (don't demote L1)
+    var money=[], prot=[];
+    out1.forEach(function(c){ (_balFam(_balBaseAct(c))?prot:money).push(c); });
+    if(!prot.length||!money.length) return out1;
+    var L1=0; money.forEach(function(c){ if(_ACTION_LEVEL[_balBaseAct(c)]===1) L1++; });
+    var p=Math.max(L1,1);                                     // protection inserts AFTER all L1 cards (≥1 so a money-move can lead)
+    var out=money.slice();
+    out.splice(Math.min(p,out.length),0,prot[0]);
+    if(prot.length>1) out.splice(Math.min(p+2,out.length),0,prot[1]);   // weave a 2nd L2 card (estate / other owner) with a money-move between
+    for(var i=2;i<prot.length;i++) out.push(prot[i]);                   // any remaining L2 cards trail
+    return out;
+  }
   // ── M5.2b-2 — SELF-SERVE PORTAL spouse-issue VISIBILITY policy (household-aware privacy). The advisor
   // always sees both spouses; in the self-serve portal what one spouse sees OF THE PARTNER is gated by
   // household type: joint = ALL (merged finances, no privacy barrier); separate = NONE (independent —
@@ -972,7 +1113,7 @@ function _issuesDetect(ctx){
   function _healthImplScore(recs){
     if(!Array.isArray(recs)||!recs.length)return null;
     var active=0,done=0;
-    recs.forEach(function(r){ if(!r||r.status==='dismissed')return; active++; if(r.status==='completed')done++; });
+    recs.forEach(function(r){ if(!r||r.status==='dismissed'||r.source==='committed')return; active++; if(r.status==='completed')done++; });   // 'committed' recs (Section F user card-commitments) are tracked via adherence, NOT the implementation score (they have no completed path → would only drag it down)
     if(!active)return null;                 // recs exist but all dismissed → empty (not 0); present-with-0-completed → 0
     return Math.round(done/active*10);
   }
@@ -990,6 +1131,8 @@ function _issuesDetect(ctx){
   g.PFOSIssues.rankCards = _issuesRankCards;   // rank unassigned plan cards by flagAction/flagType; goals trail (M5.2b)
   g.PFOSIssues.spouseVisible = _spouseVisibleSelfServe;   // self-serve portal household-aware spouse-issue visibility (M5.2b-2)
   g.PFOSIssues.issueId = _issueId;   // M5.4 U2 — stable issue identity for addressesIssueId linkage + funded-state suppression
+  g.PFOSIssues.decisionCard = _decisionCard;   // Section A — pure spec-format decision-card builder (diagnosis/priority/nextAction/impact); consumed by B/C/D/E behind PFOS_FLAGS.decisionCards
+  g.PFOSIssues.balance = _issuesBalance;   // Section D — shared presentation balancer: consolidate protection/estate per owner + cap + lead-with-money-moves (display-only; canonical rank untouched); behind PFOS_FLAGS.decisionCards
   g.PFOSHealth = g.PFOSHealth || {};   // canonical financial-health scorer (6-category: 4 engine + 2 new)
   g.PFOSHealth.score = _healthScore;                 // M5.7a — 0–10 lineage-A rollup (4 engine + ≤2 new), per-site averager, pure
   g.PFOSHealth.implScore = _healthImplScore;         // new cat: completed-rec ratio → 0–10 | null
@@ -1003,7 +1146,12 @@ function _issuesDetect(ctx){
   g.PFOSRecs.find = _recsFind;                      // find by id (pure)
   g.PFOSRecs.upsert = _recsUpsert;                  // replace-by-id or append; returns a NEW array (pure)
   g.PFOSRecs.setStatus = _recsSetStatus;            // normalized status change; returns a NEW array (pure)
-  g.PFOS_FLAGS = g.PFOS_FLAGS || {};   // dark-launch bag — each M5 sub-section gates here; default OFF = byte-identical
+  g.PFOS_FLAGS = g.PFOS_FLAGS || {};   // dark-launch bag — each M5 sub-section gates here
+  // ── M5 SHIP ── Flip the FOS-moat + Core-decision engines ON for production. They were dark-launched (default OFF =
+  // byte-identical to the legacy paths); each ON path was verified conforming (10-agent re-audit, 0 must-fix) and is
+  // exercised flags-ON by the _sLITE / _core-regression harnesses. To roll back, delete this forEach (reverts to OFF).
+  // NOTE: budgetV2 is NOT here — it stays separately email-gated via budgetV2Enabled() (M1, not shipping globally yet).
+  ['litePlanner','issuesDetect','sharedSelfFlags','priorityEngine','spouseVisibility','planTeaser','recStore','recLifecycle','coreAids','impactForecast','healthV2','decisionCards','decisionCardsHeadline','decisionCardsCommit'].forEach(function(_f){ if(g.PFOS_FLAGS[_f]===undefined)g.PFOS_FLAGS[_f]=true; });
   g.PFOSShared.PFOSIssues = g.PFOSIssues;
   g.PFOSShared.PFOSHealth = g.PFOSHealth;
   g.PFOSShared.PFOSImpact = g.PFOSImpact;
